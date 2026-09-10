@@ -291,6 +291,95 @@ func freeLocalPort() (int, error) {
 	return l.Addr().(*net.TCPAddr).Port, nil
 }
 
+// nodeView 出口节点在管理界面的展示条目
+type nodeView struct {
+	Name    string `json:"name"`
+	Type    string `json:"type"`
+	Source  string `json:"source"`
+	Running bool   `json:"running"`
+}
+
+// nodeLinkScheme 取节点链接/代理的协议名
+func nodeLinkScheme(line string) string {
+	scheme, _, ok := strings.Cut(line, "://")
+	if !ok {
+		return "unknown"
+	}
+	return scheme
+}
+
+// nodeDisplayName 节点链接的展示名: #名称(解码) 或 host:port
+func nodeDisplayName(line string) string {
+	if i := strings.LastIndex(line, "#"); i >= 0 {
+		name := line[i+1:]
+		if dec, err := url.QueryUnescape(name); err == nil {
+			name = dec
+		}
+		if name != "" {
+			return name
+		}
+	}
+	if u, err := url.Parse(line); err == nil && u.Host != "" {
+		return u.Host
+	}
+	if i := strings.Index(line, "://"); i >= 0 {
+		return line[i+3:]
+	}
+	return line
+}
+
+// subNodeDisplayName 订阅出站 tag(sub-<序>-名称)的展示名
+func subNodeDisplayName(tag string) string {
+	parts := strings.SplitN(tag, "-", 3)
+	if len(parts) == 3 && parts[2] != "" {
+		return parts[2]
+	}
+	return tag
+}
+
+// nodeViews 出口池全量条目: 手动代理/节点 + 订阅节点, 按池内顺序
+func nodeViews() []nodeView {
+	cfg := getZenConfig()
+	out := make([]nodeView, 0, len(cfg.Proxies)+8)
+	for _, p := range cfg.Proxies {
+		line := strings.TrimSpace(p)
+		if line == "" {
+			continue
+		}
+		if isNodeLink(line) {
+			out = append(out, nodeView{
+				Name: nodeDisplayName(line), Type: nodeLinkScheme(line),
+				Source: "手动", Running: nodeLocalAddr(line) != "",
+			})
+			continue
+		}
+		out = append(out, nodeView{
+			Name: maskProxyURL(line), Type: nodeLinkScheme(line),
+			Source: "手动", Running: true,
+		})
+	}
+	subMu.Lock()
+	entries := append([]any(nil), subNodes...)
+	subMu.Unlock()
+	for _, e := range entries {
+		switch v := e.(type) {
+		case string:
+			out = append(out, nodeView{
+				Name: nodeDisplayName(v), Type: nodeLinkScheme(v),
+				Source: "订阅", Running: nodeLocalAddr(v) != "",
+			})
+		case map[string]any:
+			tag, _ := v["tag"].(string)
+			typ, _ := v["type"].(string)
+			out = append(out, nodeView{
+				Name: subNodeDisplayName(tag), Type: typ,
+				Source: "订阅", Running: nodeLocalAddr("sbox://"+tag) != "",
+			})
+		}
+	}
+	return out
+}
+
 // dialNodeProxy 经节点本地 mixed 入站建立 CONNECT 隧道
 func dialNodeProxy(ctx context.Context, link, network, addr string) (net.Conn, error) {
 	local := nodeLocalAddr(link)

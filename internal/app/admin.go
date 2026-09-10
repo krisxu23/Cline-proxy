@@ -69,6 +69,7 @@ func registerAdminRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("/admin/api/config/update", corsHandler(handleAdminUpdateConfig))
 	mux.HandleFunc("/admin/api/opencode/config", corsHandler(handleZenConfig))
 	mux.HandleFunc("/admin/api/opencode/config/update", corsHandler(handleZenConfigUpdate))
+	mux.HandleFunc("/admin/api/opencode/nodes", corsHandler(handleZenNodes))
 	mux.HandleFunc("/admin/api/opencode/models", corsHandler(handleZenModels))
 	mux.HandleFunc("/admin/api/opencode/models/refresh", corsHandler(handleZenModelsRefresh))
 	mux.HandleFunc("/admin/api/opencode/stats", corsHandler(handleZenStats))

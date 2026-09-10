@@ -214,7 +214,16 @@ func strSliceEqual(a, b []string) bool {
 	return true
 }
 
-// GET /admin/api/opencode/models — 只返回免费模型
+// GET /admin/api/opencode/nodes — 出口池节点列表(手动+订阅)
+func handleZenNodes(w http.ResponseWriter, r *http.Request) {
+	if r.Method != "GET" {
+		writeAPI(w, http.StatusMethodNotAllowed, apiResponse{Error: "method not allowed"})
+		return
+	}
+	writeAPI(w, http.StatusOK, apiResponse{Success: true, Data: nodeViews()})
+}
+
+// GET /admin/api/zen/models — 只返回免费模型
 func handleZenModels(w http.ResponseWriter, r *http.Request) {
 	if r.Method != "GET" {
 		writeAPI(w, http.StatusMethodNotAllowed, apiResponse{Error: "method not allowed"})
