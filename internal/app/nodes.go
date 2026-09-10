@@ -32,6 +32,8 @@ var (
 var nodeSchemes = map[string]bool{
 	"vmess": true, "vless": true, "trojan": true,
 	"ss": true, "hy2": true, "hysteria2": true, "tuic": true,
+	"hysteria": true, "anytls": true,
+	"ssh": true, "shadowtls": true, "snell": true,
 }
 
 func isNodeLink(s string) bool {
@@ -223,6 +225,16 @@ func nodeOutbound(link, tag string) (map[string]any, error) {
 		return parseHy2(rest, tag)
 	case "tuic":
 		return parseTuic(rest, tag)
+	case "hysteria":
+		return parseHysteria(rest, tag)
+	case "anytls":
+		return parseAnytls(rest, tag)
+	case "ssh":
+		return parseSSH(rest, tag)
+	case "shadowtls":
+		return parseShadowtls(rest, tag)
+	case "snell":
+		return parseSnell(rest, tag)
 	default:
 		return nil, fmt.Errorf("unsupported scheme %q", scheme)
 	}
@@ -516,6 +528,175 @@ func parseTuic(rest, tag string) (map[string]any, error) {
 	}
 	if len(alpn) > 0 {
 		ob["alpn"] = alpn
+	}
+	return ob, nil
+}
+
+// parseHysteria hysteria://auth@host:port?peer=&upmbps=&downmbps=&obfs=&insecure=
+// (兼容 auth 放在 query 的 hysteria://host:port?auth= 形式)
+func parseHysteria(rest, tag string) (map[string]any, error) {
+	u, err := url.Parse("//" + rest)
+	if err != nil {
+		return nil, err
+	}
+	host := u.Hostname()
+	port, err := strconv.Atoi(u.Port())
+	if err != nil || host == "" {
+		return nil, fmt.Errorf("hysteria: bad host/port")
+	}
+	q := u.Query()
+	auth := q.Get("auth")
+	if auth == "" && u.User != nil {
+		if p, _ := u.User.Password(); p != "" {
+			auth = p
+		} else {
+			auth = u.User.Username()
+		}
+	}
+	if auth == "" {
+		return nil, fmt.Errorf("hysteria: missing auth")
+	}
+	ob := map[string]any{
+		"type": "hysteria", "tag": tag, "server": host, "server_port": port,
+		"auth_str": auth,
+		"tls":      tlsBlock(orDefault(q.Get("peer"), host), q.Get("insecure") == "1" || q.Get("insecure") == "true", nil),
+	}
+	// hysteria v1 强制要求带宽参数, 链接缺省时按常见转换器的默认值补齐
+	// ponytail: 仅影响发送速率整形, 不影响链路正确性
+	if v, err := strconv.Atoi(q.Get("upmbps")); err == nil && v > 0 {
+		ob["up_mbps"] = v
+	} else if _, ok := ob["up_mbps"]; !ok {
+		ob["up_mbps"] = 50
+	}
+	if v, err := strconv.Atoi(q.Get("downmbps")); err == nil && v > 0 {
+		ob["down_mbps"] = v
+	} else if _, ok := ob["down_mbps"]; !ok {
+		ob["down_mbps"] = 100
+	}
+	if o := q.Get("obfs"); o != "" {
+		ob["obfs"] = o
+	}
+	return ob, nil
+}
+
+// parseAnytls anytls://password@host:port?sni=&insecure=&fp=
+func parseAnytls(rest, tag string) (map[string]any, error) {
+	u, err := url.Parse("//" + rest)
+	if err != nil {
+		return nil, err
+	}
+	host := u.Hostname()
+	port, err := strconv.Atoi(u.Port())
+	if err != nil || host == "" {
+		return nil, fmt.Errorf("anytls: bad host/port")
+	}
+	password := u.User.Username()
+	if password == "" {
+		return nil, fmt.Errorf("anytls: missing password")
+	}
+	q := u.Query()
+	ob := map[string]any{
+		"type": "anytls", "tag": tag, "server": host, "server_port": port, "password": password,
+		"tls": tlsBlock(orDefault(q.Get("sni"), host), q.Get("insecure") == "1" || q.Get("insecure") == "true", map[string]any{
+			"utls": map[string]any{"enabled": true, "fingerprint": orDefault(q.Get("fp"), "chrome")},
+		}),
+	}
+	return ob, nil
+}
+
+// parseSSH ssh://user:password@host:port?host_key=a,b (公钥认证场景请用密钥管理, 链接形式仅支持密码)
+func parseSSH(rest, tag string) (map[string]any, error) {
+	u, err := url.Parse("//" + rest)
+	if err != nil {
+		return nil, err
+	}
+	host := u.Hostname()
+	port, err := strconv.Atoi(orDefault(u.Port(), "22"))
+	if err != nil || host == "" {
+		return nil, fmt.Errorf("ssh: bad host/port")
+	}
+	user := u.User.Username()
+	if user == "" {
+		return nil, fmt.Errorf("ssh: missing user")
+	}
+	pass, _ := u.User.Password()
+	ob := map[string]any{"type": "ssh", "tag": tag, "server": host, "server_port": port, "user": user}
+	if pass != "" {
+		ob["password"] = pass
+	}
+	if hk := u.Query().Get("host_key"); hk != "" {
+		var keys []string
+		for _, k := range strings.Split(hk, ",") {
+			if k = strings.TrimSpace(k); k != "" {
+				keys = append(keys, k)
+			}
+		}
+		if len(keys) > 0 {
+			ob["host_key"] = keys
+		}
+	}
+	return ob, nil
+}
+
+// parseShadowtls shadowtls://password@host:port?version=3&sni=&insecure=&fp=
+func parseShadowtls(rest, tag string) (map[string]any, error) {
+	u, err := url.Parse("//" + rest)
+	if err != nil {
+		return nil, err
+	}
+	host := u.Hostname()
+	port, err := strconv.Atoi(u.Port())
+	if err != nil || host == "" {
+		return nil, fmt.Errorf("shadowtls: bad host/port")
+	}
+	password := u.User.Username()
+	if password == "" {
+		return nil, fmt.Errorf("shadowtls: missing password")
+	}
+	q := u.Query()
+	version, err := strconv.Atoi(orDefault(q.Get("version"), "3"))
+	if err != nil || version < 1 || version > 3 {
+		version = 3
+	}
+	return map[string]any{
+		"type": "shadowtls", "tag": tag, "server": host, "server_port": port,
+		"version": version, "password": password,
+		"tls": tlsBlock(orDefault(q.Get("sni"), host), q.Get("insecure") == "1" || q.Get("insecure") == "true", map[string]any{
+			"utls": map[string]any{"enabled": true, "fingerprint": orDefault(q.Get("fp"), "chrome")},
+		}),
+	}, nil
+}
+
+// parseSnell snell://psk@host:port?version=4&obfs=http&obfs-host=
+func parseSnell(rest, tag string) (map[string]any, error) {
+	u, err := url.Parse("//" + rest)
+	if err != nil {
+		return nil, err
+	}
+	host := u.Hostname()
+	port, err := strconv.Atoi(u.Port())
+	if err != nil || host == "" {
+		return nil, fmt.Errorf("snell: bad host/port")
+	}
+	psk := u.User.Username()
+	if psk == "" {
+		return nil, fmt.Errorf("snell: missing psk")
+	}
+	q := u.Query()
+	version, err := strconv.Atoi(orDefault(q.Get("version"), "4"))
+	if err != nil || (version != 4 && version != 6) {
+		version = 4
+	}
+	ob := map[string]any{
+		"type": "snell", "tag": tag, "server": host, "server_port": port,
+		"psk": psk, "version": version,
+	}
+	if o := q.Get("obfs"); o != "" {
+		if version == 4 {
+			ob["obfs"] = map[string]any{"type": o, "host": q.Get("obfs-host")}
+		} else {
+			return nil, fmt.Errorf("snell v6 不支持 obfs 参数")
+		}
 	}
 	return ob, nil
 }

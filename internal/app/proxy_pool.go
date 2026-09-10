@@ -188,7 +188,7 @@ func dialViaProxy(ctx context.Context, raw, network, addr string) (net.Conn, err
 	switch u.Scheme {
 	case "http", "https":
 		return dialHTTPProxy(ctx, u, network, addr)
-	case "socks5", "socks5h":
+	case "socks5", "socks5h", "socks":
 		auth := &proxy.Auth{}
 		if u.User != nil {
 			auth.User = u.User.Username()

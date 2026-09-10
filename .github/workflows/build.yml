@@ -71,14 +71,16 @@ jobs:
           GOARCH: ${{ matrix.goarch }}
           CGO_ENABLED: '0'
         shell: bash
-        # Windows 构建为 GUI 子系统: 双击无控制台窗口, 托盘 + 管理窗口交互
+        # 构建标签开启 sing-box 的 QUIC(hysteria/hysteria2/tuic)、grpc 传输与
+        # uTLS 指纹支持; 缺省构建不含这些协议栈。
+        # naive 出站依赖 Chromium cronet 原生库, 与纯 Go 交叉编译不兼容, 不启用
         run: |
           if [ "${{ matrix.gui }}" = "true" ]; then
             LDFLAGS="-s -w -H=windowsgui"
           else
             LDFLAGS="-s -w"
           fi
-          go build -ldflags="$LDFLAGS" -o cline-proxy-${{ matrix.target }}${{ matrix.ext }} .
+          go build -tags with_quic,with_grpc,with_utls -ldflags="$LDFLAGS" -o cline-proxy-${{ matrix.target }}${{ matrix.ext }} .
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4

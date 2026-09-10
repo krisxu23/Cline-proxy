@@ -133,8 +133,52 @@ func TestParseTrojanWs(t *testing.T) {
 	}
 }
 
+func TestParseHysteriaV1(t *testing.T) {
+	link := "hysteria://authstring@7.7.7.7:36712?peer=hy1.example.com&insecure=1&upmbps=80&downmbps=200&obfs=Xplus#hy1"
+	ob, err := nodeOutbound(link, "out-5")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ob["auth_str"] != "authstring" || ob["up_mbps"] != 80 || ob["down_mbps"] != 200 {
+		t.Fatalf("ob: %v", ob)
+	}
+	if ob["obfs"] != "Xplus" {
+		t.Fatalf("obfs: %v", ob["obfs"])
+	}
+	if ob["tls"].(map[string]any)["server_name"] != "hy1.example.com" {
+		t.Fatal("peer sni not applied")
+	}
+	// query 形式 auth
+	ob2, err := nodeOutbound("hysteria://7.7.7.7:36712?auth=qauth#hy1", "out-5b")
+	if err != nil || ob2["auth_str"] != "qauth" {
+		t.Fatalf("query auth: %v %v", ob2, err)
+	}
+}
+
+func TestParseAnytlsSSHShadowtlsSnell(t *testing.T) {
+	ob, err := nodeOutbound("anytls://anypass@1.1.1.1:8443?sni=at.example.com#anytls", "t")
+	if err != nil || ob["type"] != "anytls" || ob["password"] != "anypass" {
+		t.Fatalf("anytls: %v %v", ob, err)
+	}
+	ob, err = nodeOutbound("ssh://root:sshpw@4.4.4.4:2222?host_key=sha256-AAA,BBB#ssh", "t")
+	if err != nil || ob["user"] != "root" || ob["password"] != "sshpw" || ob["server_port"] != 2222 {
+		t.Fatalf("ssh: %v %v", ob, err)
+	}
+	if hk, _ := ob["host_key"].([]string); len(hk) != 2 {
+		t.Fatalf("ssh host_key: %v", ob["host_key"])
+	}
+	ob, err = nodeOutbound("shadowtls://stpass@5.5.5.5:443?version=2&sni=st.example.com#stls", "t")
+	if err != nil || ob["type"] != "shadowtls" || ob["version"] != 2 || ob["password"] != "stpass" {
+		t.Fatalf("shadowtls: %v %v", ob, err)
+	}
+	ob, err = nodeOutbound("snell://snpsk@6.6.6.6:6160?version=4&obfs=http#snell", "t")
+	if err != nil || ob["type"] != "snell" || ob["psk"] != "snpsk" || ob["version"] != 4 {
+		t.Fatalf("snell: %v %v", ob, err)
+	}
+}
+
 func TestIsNodeLink(t *testing.T) {
-	for _, s := range []string{"vmess://x", "vless://x", "ss://x", "hy2://x", "hysteria2://x", "tuic://x", "trojan://x"} {
+	for _, s := range []string{"vmess://x", "vless://x", "ss://x", "hy2://x", "hysteria2://x", "tuic://x", "trojan://x", "hysteria://x", "anytls://x", "ssh://x", "shadowtls://x", "snell://x"} {
 		if !isNodeLink(s) {
 			t.Fatalf("%s should be node link", s)
 		}
@@ -212,6 +256,33 @@ func TestNodeBridgeEndToEnd(t *testing.T) {
 	}
 
 	syncNodeBox(nil)
+}
+
+// TestAllOutboundTypesRegistered 验证带构建标签的产物中,
+// 全部受支持节点类型都能被 sing-box 实例化(出站惰性拨号, 无需真实服务器)。
+func TestAllOutboundTypesRegistered(t *testing.T) {
+	cfg := map[string]any{
+		"log": map[string]any{"disabled": true},
+		"dns": map[string]any{"servers": []any{map[string]any{"type": "udp", "tag": "dns-direct", "server": "8.8.8.8"}}},
+		"outbounds": []any{
+			map[string]any{"type": "shadowsocks", "tag": "ss", "server": "1.2.3.4", "server_port": 8388, "method": "aes-128-gcm", "password": "p"},
+			map[string]any{"type": "vmess", "tag": "vmess", "server": "1.2.3.4", "server_port": 443, "uuid": "b831381d-6324-4d53-ad4f-8cda48b30811", "security": "auto", "alter_id": 0},
+			map[string]any{"type": "vless", "tag": "vless-grpc", "server": "1.2.3.4", "server_port": 443, "uuid": "b831381d-6324-4d53-ad4f-8cda48b30811",
+				"tls":         map[string]any{"enabled": true, "server_name": "x.com", "utls": map[string]any{"enabled": true, "fingerprint": "chrome"}},
+				"transport":   map[string]any{"type": "grpc", "service_name": "svc"}},
+			map[string]any{"type": "trojan", "tag": "trojan", "server": "1.2.3.4", "server_port": 443, "password": "p", "tls": map[string]any{"enabled": true, "server_name": "x.com"}},
+			map[string]any{"type": "hysteria2", "tag": "hy2", "server": "1.2.3.4", "server_port": 443, "password": "p", "tls": map[string]any{"enabled": true, "server_name": "x.com"}},
+			map[string]any{"type": "tuic", "tag": "tuic", "server": "1.2.3.4", "server_port": 443, "uuid": "b831381d-6324-4d53-ad4f-8cda48b30811", "password": "p", "tls": map[string]any{"enabled": true, "server_name": "x.com"}},
+			map[string]any{"type": "hysteria", "tag": "hy1", "server": "1.2.3.4", "server_port": 443, "auth_str": "p", "up_mbps": 50, "down_mbps": 100, "tls": map[string]any{"enabled": true, "server_name": "x.com"}},
+			map[string]any{"type": "anytls", "tag": "anytls", "server": "1.2.3.4", "server_port": 443, "password": "p", "tls": map[string]any{"enabled": true, "server_name": "x.com"}},
+			map[string]any{"type": "ssh", "tag": "ssh", "server": "1.2.3.4", "server_port": 22, "user": "u", "password": "p"},
+			map[string]any{"type": "shadowtls", "tag": "shadowtls", "server": "1.2.3.4", "server_port": 443, "version": 3, "password": "p", "tls": map[string]any{"enabled": true, "server_name": "x.com"}},
+			map[string]any{"type": "snell", "tag": "snell", "server": "1.2.3.4", "server_port": 6160, "psk": "p", "version": 4},
+			map[string]any{"type": "direct", "tag": "direct"},
+		},
+	}
+	instance := startTestBox(t, cfg)
+	instance.Close()
 }
 
 func startTestBox(t *testing.T, cfg map[string]any) *box.Box {

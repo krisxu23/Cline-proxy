@@ -412,6 +412,9 @@ func validateProxyList(proxies []string) error {
 			}
 			continue
 		}
+		if scheme, _, ok := strings.Cut(line, "://"); ok && (scheme == "naive" || strings.HasPrefix(scheme, "naive+")) {
+			return fmt.Errorf("naive 节点 %q 不受支持: 其出站依赖 Chromium cronet 原生库, 无法随本程序纯 Go 构建", line)
+		}
 		u, err := url.Parse(line)
 		if err != nil {
 			return fmt.Errorf("代理格式无效 %q: %v", line, err)
