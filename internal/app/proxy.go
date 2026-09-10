@@ -161,6 +161,20 @@ func StartProxy(host string, port int) error {
 				})
 			}
 		}
+		// 合并 ClinePass 订阅模型
+		for _, m := range clinePassProvider().ListModels() {
+			data = append(data, map[string]any{
+				"id":       m.ID,
+				"object":   "model",
+				"created":  time.Now().UnixMilli(),
+				"owned_by": "clinepass",
+				"source":   "clinepass",
+				"status":   "active",
+				"cost":     m.Cost,
+				"context":  m.Context,
+				"output":   m.Output,
+			})
+		}
 		writeJSON(w, http.StatusOK, map[string]any{"object": "list", "data": data})
 	})
 	mux.HandleFunc("/v1/models", modelsHandler)
@@ -171,16 +185,6 @@ func StartProxy(host string, port int) error {
 			writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method not allowed"})
 			return
 		}
-		if activeCount == 0 && len(loadPool().Accounts) == 0 {
-			writeJSON(w, http.StatusUnauthorized, map[string]any{
-				"error": map[string]string{
-					"message": "No accounts in pool. Run with --add-account or POST /admin/login to add accounts.",
-					"type":    "auth_error",
-				},
-			})
-			return
-		}
-
 		body, err := io.ReadAll(r.Body)
 		if err != nil {
 			writeJSON(w, http.StatusBadRequest, map[string]any{
@@ -206,6 +210,23 @@ func StartProxy(host string, port int) error {
 		}
 		model, _ := params["model"].(string)
 		log.Printf("  client: stream=%v tools=%d model=%s", isStream, toolCount, model)
+
+		// ClinePass 订阅池: cline-pass/ 前缀模型使用独立 key 池,
+		// 不依赖 Cline 账号,须在账号池守卫之前分流。
+		if strings.HasPrefix(strings.TrimSpace(model), "cline-pass/") {
+			handleClinePassChat(w, r, params, isStream)
+			return
+		}
+
+		if activeCount == 0 && len(loadPool().Accounts) == 0 {
+			writeJSON(w, http.StatusUnauthorized, map[string]any{
+				"error": map[string]string{
+					"message": "No accounts in pool. Run with --add-account or POST /admin/login to add accounts.",
+					"type":    "auth_error",
+				},
+			})
+			return
+		}
 
 		// Override system prompt from override.md for OpenAI format
 		applyOverride(params)
@@ -233,7 +254,7 @@ func StartProxy(host string, port int) error {
 			}
 		}
 
-		resp, acc, err := callClineAPI(params, upstreamStream)
+		resp, acc, err := callClineAPIFailover(params, upstreamStream)
 		if err != nil {
 			log.Printf("  api error: %v", err)
 			writeJSON(w, http.StatusInternalServerError, map[string]any{
@@ -510,6 +531,50 @@ func clineHeaders(token, sessionID string) http.Header {
 	}
 
 	return h
+}
+
+// callClineAPIFailover wraps callClineAPI with cross-account failover
+// (borrowed from okhsunrog/claude-proxy-rs's retry-and-rotate idea):
+// retryable failures (429 / network / token refresh) re-pick the next
+// account — pickAccount() already excludes cooled-down and expired
+// accounts, so each retry naturally rotates — while non-retryable 4xx
+// errors return immediately. Attempts are bounded by the pool size.
+func callClineAPIFailover(params map[string]any, stream bool) (*http.Response, *Account, error) {
+	total := len(loadPool().Accounts)
+	if total < 1 {
+		total = 1
+	}
+	var (
+		resp *http.Response
+		acc  *Account
+		err  error
+	)
+	for attempt := 0; attempt < total; attempt++ {
+		resp, acc, err = callClineAPI(params, stream)
+		if err == nil {
+			return resp, acc, nil
+		}
+		if !isRetryableUpstreamError(err) {
+			return nil, acc, err
+		}
+		log.Printf("  failover: attempt %d/%d failed (%v), rotating account", attempt+1, total, err)
+	}
+	return nil, acc, err
+}
+
+// isRetryableUpstreamError reports whether the error from callClineAPI is
+// worth retrying with a different account.
+func isRetryableUpstreamError(err error) bool {
+	if err == nil {
+		return false
+	}
+	s := err.Error()
+	for _, mark := range []string{"429", "token failed", "token expired", "refresh failed", "network error", "upstream request", "upstream retry"} {
+		if strings.Contains(s, mark) {
+			return true
+		}
+	}
+	return false
 }
 
 func callClineAPI(params map[string]any, stream bool) (*http.Response, *Account, error) {
@@ -1279,6 +1344,13 @@ func openAIToAnthropic(openAI map[string]any) map[string]any {
 
 	contentBlocks := []any{map[string]any{"type": "text", "text": text}}
 
+	// reasoning_content -> thinking block (非流式路径, 与流式 thinking 透传一致)
+	if msg != nil {
+		if rc, ok := msg["reasoning_content"].(string); ok && rc != "" {
+			contentBlocks = append([]any{map[string]any{"type": "thinking", "thinking": rc}}, contentBlocks...)
+		}
+	}
+
 	// Convert tool_calls to Anthropic tool_use blocks
 	if msg != nil {
 		if tc, ok := msg["tool_calls"].([]any); ok && len(tc) > 0 {
@@ -1385,7 +1457,7 @@ func handleAnthropicMessages(w http.ResponseWriter, r *http.Request) {
 
 	log.Printf("  anthropic: model=%s stream=%v msgs=%d", req.Model, req.Stream, len(req.Messages))
 
-	// zen 免费模型路由
+	// zen / clinepass 免费模型路由
 	if route := routeModel(req.Model); route == "zen" {
 		handleZenAnthropic(w, r, req, openAIReq, toolSchemas)
 		return
@@ -1393,6 +1465,12 @@ func handleAnthropicMessages(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, map[string]any{
 			"error": map[string]string{"message": fmt.Sprintf("model %q is a paid zen model; only free zen models are proxied", req.Model), "type": "invalid_request_error"},
 		})
+		return
+	}
+
+	// ClinePass 订阅池: cline-pass/ 前缀模型
+	if strings.HasPrefix(strings.TrimSpace(req.Model), "cline-pass/") {
+		handleClinePassAnthropic(w, r, req, openAIReq, toolSchemas)
 		return
 	}
 
@@ -1420,7 +1498,7 @@ func handleAnthropicMessages(w http.ResponseWriter, r *http.Request) {
 		log.Printf("  anthropic model %s requires stream: forcing upstream stream, will aggregate", req.Model)
 	}
 
-	resp, acc, err := callClineAPI(openAIReq, upstreamStream)
+	resp, acc, err := callClineAPIFailover(openAIReq, upstreamStream)
 	if err != nil {
 		log.Printf("  anthropic api error: %v", err)
 		writeJSON(w, http.StatusInternalServerError, map[string]any{
@@ -1621,6 +1699,9 @@ func handleAnthropicStreamWithUsage(w http.ResponseWriter, upstream *http.Respon
 	textIndex := new(int)
 	*textIndex = -1
 	hasText := false
+	thinkingIndex := new(int)
+	*thinkingIndex = -1
+	hasThinking := false
 	pendingTools := map[int]*toolAccumulator{}
 	emitIndex := 0
 	nextIndex := func() int {
@@ -1744,6 +1825,32 @@ func handleAnthropicStreamWithUsage(w http.ResponseWriter, upstream *http.Respon
 			})
 		}
 
+		// reasoning_content -> thinking block (reasoning 透传,
+		// borrowed from hayou2002/clinepass-proxy: CherryStudio 等客户端
+		// 依赖 thinking 块显示思考过程).
+		if rc, ok := delta["reasoning_content"].(string); ok && rc != "" {
+			if !hasThinking {
+				hasThinking = true
+				*thinkingIndex = nextIndex()
+				emit("content_block_start", map[string]any{
+					"type":  "content_block_start",
+					"index": *thinkingIndex,
+					"content_block": map[string]any{
+						"type":     "thinking",
+						"thinking": "",
+					},
+				})
+			}
+			emit("content_block_delta", map[string]any{
+				"type":  "content_block_delta",
+				"index": *thinkingIndex,
+				"delta": map[string]any{
+					"type":     "thinking_delta",
+					"thinking": rc,
+				},
+			})
+		}
+
 		if tcRaw, ok := delta["tool_calls"].([]any); ok {
 			for _, tc := range tcRaw {
 				tcMap, _ := tc.(map[string]any)
@@ -1804,6 +1911,14 @@ func handleAnthropicStreamWithUsage(w http.ResponseWriter, upstream *http.Respon
 		emit("content_block_stop", map[string]any{
 			"type":  "content_block_stop",
 			"index": *textIndex,
+		})
+	}
+
+	// Stop thinking block if active
+	if hasThinking {
+		emit("content_block_stop", map[string]any{
+			"type":  "content_block_stop",
+			"index": *thinkingIndex,
 		})
 	}
 

@@ -496,12 +496,18 @@ func handleResponses(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// ClinePass 订阅池: cline-pass/ 前缀模型
+	if strings.HasPrefix(strings.TrimSpace(chatModel), "cline-pass/") {
+		handleClinePassResponses(w, r, params, chat, isStream)
+		return
+	}
+
 	// cline 上游
 	stream := isStream
 	if !isStream && modelNeedsStream(normalizeRequestModel(chatModel)) {
 		stream = true
 	}
-	up, acc, err := callClineAPI(chat, stream)
+	up, acc, err := callClineAPIFailover(chat, stream)
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]any{
 			"error": map[string]string{"message": err.Error(), "type": "api_error"},
