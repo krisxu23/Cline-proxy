@@ -64,6 +64,7 @@ func handleZenConfigUpdate(w http.ResponseWriter, r *http.Request) {
 		BaseURLs        []string `json:"baseURLs"`
 		Proxies         []string `json:"proxies"`
 		Subs            []string `json:"subs"`
+		SubsViaProxy    *bool    `json:"subsViaProxy"`
 		ProxyStrategy   *string  `json:"proxyStrategy"`
 		MaxConcurrency  *int     `json:"maxConcurrency"`
 		Retries         *int     `json:"retries"`
@@ -89,6 +90,7 @@ func handleZenConfigUpdate(w http.ResponseWriter, r *http.Request) {
 		BaseURLs:        cur.BaseURLs,
 		Proxies:         cur.Proxies,
 		Subs:            cur.Subs,
+		SubsViaProxy:    cur.SubsViaProxy,
 		ProxyStrategy:   cur.ProxyStrategy,
 		MaxConcurrency:  cur.MaxConcurrency,
 		Retries:         cur.Retries,
@@ -148,6 +150,9 @@ func handleZenConfigUpdate(w http.ResponseWriter, r *http.Request) {
 		}
 		next.Subs = cleaned
 	}
+	if patch.SubsViaProxy != nil {
+		next.SubsViaProxy = *patch.SubsViaProxy
+	}
 	if patch.ProxyStrategy != nil && *patch.ProxyStrategy != "" {
 		next.ProxyStrategy = *patch.ProxyStrategy
 	}
@@ -185,9 +190,11 @@ func handleZenConfigUpdate(w http.ResponseWriter, r *http.Request) {
 		}
 		next.Compaction = base
 	}
-	subsChanged := patch.Subs != nil && !strSliceEqual(patch.Subs, cur.Subs)
+	subsChanged := (patch.Subs != nil && !strSliceEqual(patch.Subs, cur.Subs)) ||
+		(patch.SubsViaProxy != nil && *patch.SubsViaProxy != cur.SubsViaProxy)
 	setZenConfig(next)
 	if subsChanged {
+		// 增删订阅或切换抓取方式都重新抓取; 空列表会清空订阅节点
 		go resolveSubscriptions(next.Subs)
 	}
 	writeAPI(w, http.StatusOK, apiResponse{Success: true, Data: getZenConfig()})

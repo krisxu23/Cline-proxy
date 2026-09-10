@@ -93,8 +93,16 @@ func effectiveProxyList() []string {
 	return list
 }
 
+// nodeDialable 节点出口是否已就绪(普通代理恒为可拨)
+func nodeDialable(p string) bool {
+	if !isNodeLink(p) {
+		return true
+	}
+	return nodeLocalAddr(p) != ""
+}
+
 // pickZenProxy 按策略选择代理,返回 (代理URL, 索引);无代理返回 ("", -1)。
-// 跳过冷却中的代理;全部冷却时返回最早恢复的近似(轮询位)。
+// 跳过冷却中或未就绪的节点;全部不可用时返回直连。
 // 每次调用递增计数,保证 round_robin 顺序与日志索引一致。
 func pickZenProxy() (string, int) {
 	list := effectiveProxyList()
@@ -109,12 +117,15 @@ func pickZenProxy() (string, int) {
 	case "fill":
 		idx = 0
 	}
-	// 冷却跳过:线性探测下一个可用代理
+	// 冷却/未就绪跳过:线性探测下一个可用代理
 	for i := 0; i < n; i++ {
-		if zenProxyAvailable(idx) {
+		if zenProxyAvailable(idx) && nodeDialable(list[idx]) {
 			break
 		}
 		idx = (idx + 1) % n
+	}
+	if !nodeDialable(list[idx]) {
+		return "", -1
 	}
 	return list[idx], idx
 }

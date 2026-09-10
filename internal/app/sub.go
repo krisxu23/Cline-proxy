@@ -27,8 +27,9 @@ const subRefreshInterval = 6 * time.Hour
 
 var (
 	subMu       sync.Mutex
-	subNodes    []any                // 解析后的节点: 节点链接 string 或 sing-box 出站 map
-	subNodeKeys []string             // 与 subNodes 一一对应的池内键(节点链接或 sbox://tag)
+	subFetchMu  sync.Mutex            // 串行化抓取轮次, 保证后到的清理/更新不被在途抓取覆盖
+	subNodes    []any                 // 解析后的节点: 节点链接 string 或 sing-box 出站 map
+	subNodeKeys []string              // 与 subNodes 一一对应的池内键(节点链接或 sbox://tag)
 	subStatus   = map[string]string{} // 订阅 URL -> 最近抓取结果
 )
 
@@ -73,6 +74,8 @@ func loadSubCache() {
 		rebuildSubKeysLocked()
 		subMu.Unlock()
 		log.Printf("  订阅缓存: %d 个节点已恢复", len(subNodes))
+		// 缓存节点立即进入出口池, 不等首次订阅抓取
+		syncNodeBox()
 	}
 }
 
@@ -98,6 +101,10 @@ func subEntryKey(e any) string {
 
 // resolveSubscriptions 抓取全部订阅并重建节点池
 func resolveSubscriptions(urls []string) {
+	// 串行化: 防止在途抓取与新的清理/更新交错覆盖
+	subFetchMu.Lock()
+	defer subFetchMu.Unlock()
+
 	clean := make([]string, 0, len(urls))
 	for _, u := range urls {
 		if u = strings.TrimSpace(u); u != "" {
@@ -108,11 +115,27 @@ func resolveSubscriptions(urls []string) {
 		subMu.Lock()
 		subNodes = nil
 		subNodeKeys = nil
+		subStatus = map[string]string{}
 		saveSubCacheLocked()
 		subMu.Unlock()
 		syncNodeBox()
 		return
 	}
+	// 清理已移除订阅的状态记录
+	subMu.Lock()
+	for k := range subStatus {
+		found := false
+		for _, u := range clean {
+			if u == k {
+				found = true
+				break
+			}
+		}
+		if !found {
+			delete(subStatus, k)
+		}
+	}
+	subMu.Unlock()
 	var merged []any
 	for _, u := range clean {
 		nodes, err := fetchSubscription(u)
@@ -151,7 +174,22 @@ func refreshSubsLoop(subs []string) {
 }
 
 func fetchSubscription(u string) ([]any, error) {
-	client := &http.Client{Timeout: 25 * time.Second}
+	// 订阅抓取可走代理出口(订阅地址被墙时), 失败自动退回直连
+	if getZenConfig().SubsViaProxy && len(effectiveProxyList()) > 0 {
+		body, err := doFetch(u, getZenHTTPClient())
+		if err == nil {
+			return parseSubContent(string(body))
+		}
+		log.Printf("  订阅 %s 经代理抓取失败(%v), 退回直连", u, err)
+	}
+	body, err := doFetch(u, &http.Client{Timeout: 25 * time.Second})
+	if err != nil {
+		return nil, err
+	}
+	return parseSubContent(string(body))
+}
+
+func doFetch(u string, client *http.Client) ([]byte, error) {
 	req, err := http.NewRequestWithContext(context.Background(), http.MethodGet, u, nil)
 	if err != nil {
 		return nil, err
@@ -166,11 +204,7 @@ func fetchSubscription(u string) ([]any, error) {
 	if resp.StatusCode != http.StatusOK {
 		return nil, fmt.Errorf("HTTP %d", resp.StatusCode)
 	}
-	body, err := io.ReadAll(io.LimitReader(resp.Body, 8<<20))
-	if err != nil {
-		return nil, err
-	}
-	return parseSubContent(string(body))
+	return io.ReadAll(io.LimitReader(resp.Body, 8<<20))
 }
 
 // parseSubContent 识别订阅内容格式并解析为节点列表

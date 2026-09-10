@@ -458,8 +458,16 @@ body:not([data-theme="dark"]) .theme-toggle .dark-label{display:none}
         <textarea id="ocProxies" rows="4" placeholder="每行一个: http://user:pass@host:port / socks5://host:port&#10;或节点链接: vmess:// vless:// trojan:// ss:// hy2:// tuic:// hysteria:// anytls:// ssh:// shadowtls:// snell://"></textarea>
       </div>
       <div class="field"><label>订阅链接</label>
-        <textarea id="ocSubs" rows="2" placeholder="每行一个订阅地址(https://...), 保存后自动抓取并每 6 小时刷新, 支持 sing-box JSON / Clash YAML / base64 节点列表"></textarea>
-        <div class="hint" id="ocSubsInfo" style="margin-top:6px;font-size:12px;color:var(--text3)"></div>
+        <div id="ocSubsList" style="display:flex;flex-direction:column;gap:6px;margin-bottom:8px"></div>
+        <div style="display:flex;gap:8px">
+          <input id="ocSubNew" placeholder="https://订阅地址" style="flex:1" />
+          <select id="ocSubsViaProxy" style="width:auto;flex:none">
+            <option value="false">抓取: 直连</option>
+            <option value="true">抓取: 走代理出口</option>
+          </select>
+          <button type="button" onclick="addOcSub()" style="flex:none;padding:9px 14px">添加</button>
+        </div>
+        <div class="hint" id="ocSubsInfo" style="margin-top:6px;font-size:12px;color:var(--text3);white-space:pre-wrap"></div>
       </div>
     </div>
     <div class="form-row">
@@ -1083,7 +1091,9 @@ async function loadOcConfig() {
     _('ocKey').value = c.key || 'public';
     _('ocBaseURLs').value = (c.baseURLs && c.baseURLs.length ? c.baseURLs : (c.baseURL ? [c.baseURL] : [])).join('\n');
     _('ocProxies').value = (c.proxies || []).join('\n');
-    _('ocSubs').value = (c.subs || []).join('\n');
+    ocSubsArr = (c.subs || []).slice();
+    renderOcSubs();
+    _('ocSubsViaProxy').value = String(!!c.subsViaProxy);
     _('ocStrategy').value = c.proxyStrategy || 'round_robin';
     _('ocMaxConc').value = c.maxConcurrency || 8;
     _('ocRetries').value = c.retries || 3;
@@ -1112,21 +1122,45 @@ async function loadOcConfig() {
   } catch (e) { /* ignore */ }
 }
 
+let ocSubsArr = [];
+function renderOcSubs() {
+  const el = _('ocSubsList');
+  if (!ocSubsArr.length) {
+    el.innerHTML = '<div style="font-size:12px;color:var(--text3);padding:2px 0">暂无订阅, 在下方添加; 保存后自动抓取并每 6 小时刷新, 支持 sing-box JSON / Clash YAML / base64 节点列表</div>';
+    return;
+  }
+  el.innerHTML = ocSubsArr.map((u, i) =>
+    '<div style="display:flex;align-items:center;gap:10px;padding:8px 12px;background:rgba(148,163,184,.06);border:1px solid var(--border);border-radius:10px">' +
+    '<span style="flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:13px">' + u.replace(/</g, '&lt;') + '</span>' +
+    '<button type="button" class="btn" style="flex:none;padding:4px 10px;font-size:12px" onclick="delOcSub(' + i + ')">删除</button></div>'
+  ).join('');
+}
+function addOcSub() {
+  const u = _('ocSubNew').value.trim();
+  if (!/^https?:\/\//.test(u)) { toast('订阅需以 http(s):// 开头', 'error'); return; }
+  if (ocSubsArr.includes(u)) { toast('订阅已存在', 'error'); return; }
+  ocSubsArr.push(u);
+  _('ocSubNew').value = '';
+  renderOcSubs();
+}
+function delOcSub(i) {
+  ocSubsArr.splice(i, 1);
+  renderOcSubs();
+}
+
 async function saveOcConfig() {
   const proxies = _('ocProxies').value.split('\n').map(s => s.trim()).filter(Boolean);
   const PROXY_RE = /^(https?|socks5h?):\/\/[^\s]+:\d+/;
   const NODE_RE = /^(vmess|vless|trojan|ss|hy2|hysteria2|tuic|hysteria|anytls|ssh|shadowtls|snell|sbox):\/\//;
   const bad = proxies.find(p => !(PROXY_RE.test(p) || NODE_RE.test(p)));
   if (bad) { toast('代理格式无效: ' + bad.slice(0, 60) + '（支持 http/socks5 代理或 vmess/vless/trojan/ss/hy2/tuic 等节点链接）', 'error'); return; }
-  const subs = _('ocSubs').value.split('\n').map(s => s.trim()).filter(Boolean);
-  const badSub = subs.find(s => !/^https?:\/\//.test(s));
-  if (badSub) { toast('订阅格式无效: ' + badSub.slice(0, 60), 'error'); return; }
   const body = {
     enabled: _('ocEnabled').value === 'true',
     key: _('ocKey').value.trim(),
     baseURLs: _('ocBaseURLs').value.split('\n').map(s => s.trim()).filter(Boolean),
     proxies: proxies,
-    subs: subs,
+    subs: ocSubsArr,
+    subsViaProxy: _('ocSubsViaProxy').value === 'true',
     proxyStrategy: _('ocStrategy').value,
     maxConcurrency: parseInt(_('ocMaxConc').value) || 8,
     retries: parseInt(_('ocRetries').value) || 3,

@@ -175,6 +175,7 @@ type zenConfigData struct {
 	BaseURLs        []string         `json:"baseURLs"`        // 全部端点: 主端点 + CDN 镜像, 重试时轮换
 	Proxies         []string         `json:"proxies"`         // http(s)/socks5 代理与节点链接,轮询出口
 	Subs            []string         `json:"subs,omitempty"`  // 订阅链接, 定期抓取展开为节点并入池
+	SubsViaProxy    bool             `json:"subsViaProxy"`    // 订阅抓取走代理出口(默认直连, 失败自动退回直连)
 	ProxyStrategy   string           `json:"proxyStrategy"`   // round_robin / random / fill
 	MaxConcurrency  int              `json:"maxConcurrency"`  // zen 上游最大并发,防 worker 瞬时超限,默认 8
 	Retries         int              `json:"retries"`         // 限流/网络错误重试次数,默认 3

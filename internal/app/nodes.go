@@ -157,34 +157,28 @@ func syncNodeBox() {
 		})
 		ports[key] = port
 	}
+	ports, inbounds, outbounds, rules, hasMap := buildNodeParts(entries)
 	if len(outbounds) == 0 {
 		return
 	}
 	outbounds = append(outbounds, map[string]any{"type": "direct", "tag": "direct"})
 
-	boxCfg := map[string]any{
-		"log":       map[string]any{"disabled": true},
-		"dns":       map[string]any{"servers": []any{map[string]any{"type": "udp", "tag": "dns-direct", "server": "8.8.8.8"}}},
-		"inbounds":  inbounds,
-		"outbounds": outbounds,
-		"route": map[string]any{
-			"rules":                    rules,
-			"final":                    "direct",
-			"default_domain_resolver":  map[string]any{"server": "dns-direct"},
-		},
-	}
-	data, err := json.Marshal(boxCfg)
-	if err != nil {
-		log.Printf("  nodes: 构建配置失败: %v", err)
-		return
-	}
 	ctx := include.Context(context.Background())
-	opts, err := sjson.UnmarshalExtendedContext[option.Options](ctx, data)
-	if err != nil {
-		log.Printf("  nodes: 配置解析失败: %v", err)
-		return
+	instance, err := startNodeInstance(ctx, inbounds, outbounds, rules)
+	if err != nil && hasMap {
+		// 订阅提供的原始出站可能有个别不合法: 退回仅手动节点链接重建,
+		// 避免单个坏节点拖垮全部出口
+		log.Printf("  nodes: 全量构建失败(%v), 退回仅手动节点重建", err)
+		var p2, inb2, outb2, rules2, _ = buildNodeParts(stringEntries(entries))
+		if len(outb2) > 0 {
+			outb2 = append(outb2, map[string]any{"type": "direct", "tag": "direct"})
+			if inst2, err2 := startNodeInstance(ctx, inb2, outb2, rules2); err2 == nil {
+				instance, ports, err = inst2, p2, nil
+			} else {
+				err = err2
+			}
+		}
 	}
-	instance, err := box.New(box.Options{Context: ctx, Options: opts})
 	if err != nil {
 		log.Printf("  nodes: 启动失败: %v", err)
 		return
@@ -198,6 +192,93 @@ func syncNodeBox() {
 	nodePorts = ports
 	nodePortsKeys = joined
 	log.Printf("  nodes: %d 个高级节点出口已就绪", len(ports))
+}
+
+func stringEntries(entries []any) []any {
+	var out []any
+	for _, e := range entries {
+		if _, ok := e.(string); ok {
+			out = append(out, e)
+		}
+	}
+	return out
+}
+
+// buildNodeParts 为每个节点条目分配本地端口并生成 sing-box 配置部件
+func buildNodeParts(entries []any) (ports map[string]int, inbounds, outbounds, rules []map[string]any, hasMap bool) {
+	ports = map[string]int{}
+	for i, e := range entries {
+		var ob map[string]any
+		var key string
+		var port int
+		var err error
+		switch v := e.(type) {
+		case string:
+			port, err = freeLocalPort()
+			if err != nil {
+				log.Printf("  node %d: 分配本地端口失败: %v", i+1, err)
+				continue
+			}
+			ob, err = nodeOutbound(v, fmt.Sprintf("out-%d", i))
+			if err != nil {
+				log.Printf("  node %d: 解析失败已跳过: %v", i+1, err)
+				continue
+			}
+			key = nodeLocalKey(v)
+		case map[string]any:
+			hasMap = true
+			port, err = freeLocalPort()
+			if err != nil {
+				log.Printf("  node %d: 分配本地端口失败: %v", i+1, err)
+				continue
+			}
+			cp := map[string]any{"tag": fmt.Sprintf("out-%d", i)}
+			for k, val := range v {
+				if k != "tag" {
+					cp[k] = val
+				}
+			}
+			ob = cp
+			key = subEntryKey(v)
+		default:
+			continue
+		}
+		tag := ob["tag"].(string)
+		inbounds = append(inbounds, map[string]any{
+			"type": "mixed", "tag": fmt.Sprintf("in-%d", i),
+			"listen": "127.0.0.1", "listen_port": port,
+		})
+		outbounds = append(outbounds, ob)
+		rules = append(rules, map[string]any{
+			"action": "route", "inbound": []string{fmt.Sprintf("in-%d", i)}, "outbound": tag,
+		})
+		ports[key] = port
+	}
+	return ports, inbounds, outbounds, rules, hasMap
+}
+
+// startNodeInstance 组装并创建 sing-box 实例(不 Start)
+func startNodeInstance(ctx context.Context, inbounds, outbounds, rules []map[string]any) (*box.Box, error) {
+	boxCfg := map[string]any{
+		"log":       map[string]any{"disabled": true},
+		"dns":       map[string]any{"servers": []any{map[string]any{"type": "udp", "tag": "dns-direct", "server": "8.8.8.8"}}},
+		"inbounds":  inbounds,
+		"outbounds": outbounds,
+		"route": map[string]any{
+			"rules":                    rules,
+			"final":                    "direct",
+			"default_domain_resolver":  map[string]any{"server": "dns-direct"},
+		},
+	}
+	data, err := json.Marshal(boxCfg)
+	if err != nil {
+		return nil, err
+	}
+	opts, err := sjson.UnmarshalExtendedContext[option.Options](ctx, data)
+	if err != nil {
+		return nil, err
+	}
+	return box.New(box.Options{Context: ctx, Options: opts})
 }
 
 // freeLocalPort 预分配一个空闲端口(存在极小竞态窗口, 冲突由 box 启动报错兜底)
@@ -214,7 +295,7 @@ func freeLocalPort() (int, error) {
 func dialNodeProxy(ctx context.Context, link, network, addr string) (net.Conn, error) {
 	local := nodeLocalAddr(link)
 	if local == "" {
-		return nil, fmt.Errorf("node outbound not running")
+		return nil, fmt.Errorf("node outbound not running: %s", nodeLocalKey(link))
 	}
 	u, err := url.Parse(local)
 	if err != nil {
