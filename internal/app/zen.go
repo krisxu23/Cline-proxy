@@ -557,7 +557,11 @@ func callZenAPI(ctx context.Context, params map[string]any, stream bool) (*http.
 
 		resp, err := getZenHTTPClient().Do(req)
 		if err != nil {
-			// 网络错误:退避重试(不计入故障转移,瞬时可恢复);重试会自动换端点
+			// 网络错误: 当前出口短冷却, 避免重试再次命中同一失效节点
+			if idx := lastZenProxyIdx(); idx >= 0 {
+				cooldownZenProxy(idx, 2*time.Minute)
+			}
+			// 退避重试(不计入故障转移,瞬时可恢复);重试会自动换端点
 			if attempt < retries {
 				log.Printf("  zen network error (%v), retry %d/%d after %v", err, attempt+1, retries, delay)
 				time.Sleep(kit.WithRetryJitter(delay))

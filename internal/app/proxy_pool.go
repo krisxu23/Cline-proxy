@@ -117,9 +117,9 @@ func pickZenProxy() (string, int) {
 	case "fill":
 		idx = 0
 	}
-	// 冷却/未就绪跳过:线性探测下一个可用代理
+	// 冷却/未就绪/已检测不可达的出口跳过: 线性探测下一个可用代理
 	for i := 0; i < n; i++ {
-		if zenProxyAvailable(idx) && nodeDialable(list[idx]) {
+		if zenProxyAvailable(idx) && nodeDialable(list[idx]) && nodeUsable(list[idx]) {
 			break
 		}
 		idx = (idx + 1) % n
@@ -128,6 +128,15 @@ func pickZenProxy() (string, int) {
 		return "", -1
 	}
 	return list[idx], idx
+}
+
+// nodeUsable 已检测为不可达的节点不再参与轮询, 未检测的按可用处理。
+// 连通检测结果需要这层过滤才生效: 否则轮询会持续撞上失效节点。
+func nodeUsable(p string) bool {
+	if !isNodeLink(p) {
+		return true
+	}
+	return healthOf(nodeLocalKey(p)) != "fail"
 }
 
 // lastZenProxyIdx 最近一次选择的代理索引(日志用)

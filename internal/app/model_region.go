@@ -220,7 +220,7 @@ func pickZenProxyForModel(modelID string) (string, int) {
 	}
 	cand := make([]int, 0, len(list))
 	for i, p := range list {
-		if !zenProxyAvailable(i) || !nodeDialable(p) {
+		if !zenProxyAvailable(i) || !nodeDialable(p) || !nodeUsable(p) {
 			continue
 		}
 		if ok, known := regionNodeUsable(modelID, nodeLocalKey(p)); known && ok {
