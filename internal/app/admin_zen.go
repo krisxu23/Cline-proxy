@@ -23,6 +23,8 @@ func handleZenConfig(w http.ResponseWriter, r *http.Request) {
 		"baseURL":         cfg.BaseURL,
 		"baseURLs":        zenBaseURLList(cfg),
 		"proxies":         cfg.Proxies,
+		"subs":            cfg.Subs,
+		"subsViaProxy":    cfg.SubsViaProxy,
 		"proxyStrategy":   cfg.ProxyStrategy,
 		"maxConcurrency":  cfg.MaxConcurrency,
 		"retries":         cfg.Retries,
