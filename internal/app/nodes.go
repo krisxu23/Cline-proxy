@@ -2,6 +2,7 @@ package app
 
 import (
 	"context"
+	"crypto/tls"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
@@ -12,6 +13,9 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
+
+	"cline-go-proxy/internal/cline"
 
 	box "github.com/sagernet/sing-box"
 	"github.com/sagernet/sing-box/include"
@@ -192,6 +196,103 @@ func syncNodeBox() {
 	nodePorts = ports
 	nodePortsKeys = joined
 	log.Printf("  nodes: %d 个高级节点出口已就绪", len(ports))
+	go checkAllNodeHealth()
+}
+
+// ===== 节点连通检测: 经节点出口向 opencode zen / cline 上游发起真实 TLS 连接 =====
+
+var (
+	nodeHealthMu sync.RWMutex
+	nodeHealth   = map[string]nodeHealthState{}
+)
+
+type nodeHealthState struct {
+	Ok bool
+	At time.Time
+}
+
+// healthCheckTargets 连通检测目标: zen 主端点与 cline 上游的 host
+func healthCheckTargets() []string {
+	var hosts []string
+	if raw := zenBaseURLList(getZenConfig()); len(raw) > 0 {
+		if u, err := url.Parse(raw[0]); err == nil && u.Hostname() != "" {
+			hosts = append(hosts, u.Hostname())
+		}
+	}
+	if u, err := url.Parse(cline.ClineAPIBase); err == nil && u.Hostname() != "" {
+		hosts = append(hosts, u.Hostname())
+	}
+	return hosts
+}
+
+// checkNodeHealth 经单个节点出口连到上游: 任一目标 TLS 握手成功即健康
+func checkNodeHealth(key string) bool {
+	targets := healthCheckTargets()
+	if len(targets) == 0 {
+		return false
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 14*time.Second)
+	defer cancel()
+	for _, host := range targets {
+		conn, err := dialNodeProxy(ctx, key, "tcp", host+":443")
+		if err != nil {
+			continue
+		}
+		hsCtx, hsCancel := context.WithTimeout(ctx, 7*time.Second)
+		err = tls.Client(conn, &tls.Config{ServerName: host}).HandshakeContext(hsCtx)
+		hsCancel()
+		conn.Close()
+		if err == nil {
+			return true
+		}
+	}
+	return false
+}
+
+// checkAllNodeHealth 并发检测全部节点出口(10 并发)
+func checkAllNodeHealth() {
+	nodeMu.Lock()
+	keys := make([]string, 0, len(nodePorts))
+	for k := range nodePorts {
+		keys = append(keys, k)
+	}
+	nodeMu.Unlock()
+	if len(keys) == 0 {
+		return
+	}
+	var okCount int32
+	var mu sync.Mutex
+	sem := make(chan struct{}, 10)
+	var wg sync.WaitGroup
+	for _, k := range keys {
+		wg.Add(1)
+		go func(key string) {
+			defer wg.Done()
+			sem <- struct{}{}
+			defer func() { <-sem }()
+			ok := checkNodeHealth(key)
+			mu.Lock()
+			if ok {
+				okCount++
+			}
+			mu.Unlock()
+			nodeHealthMu.Lock()
+			nodeHealth[key] = nodeHealthState{Ok: ok, At: time.Now()}
+			nodeHealthMu.Unlock()
+		}(k)
+	}
+	wg.Wait()
+	log.Printf("  nodes: 连通检测完成, %d/%d 个出口可达", okCount, len(keys))
+}
+
+// startNodeHealthLoop 每 30 分钟复检
+func startNodeHealthLoop() {
+	t := time.NewTicker(30 * time.Minute)
+	go func() {
+		for range t.C {
+			checkAllNodeHealth()
+		}
+	}()
 }
 
 func stringEntries(entries []any) []any {
@@ -227,6 +328,10 @@ func buildNodeParts(entries []any) (ports map[string]int, inbounds, outbounds, r
 			key = nodeLocalKey(v)
 		case map[string]any:
 			hasMap = true
+			if verr := validateOutboundEntry(v); verr != nil {
+				log.Printf("  node %d(%s): 出站无效已剔除: %v", i+1, subEntryKey(v), verr)
+				continue
+			}
 			port, err = freeLocalPort()
 			if err != nil {
 				log.Printf("  node %d: 分配本地端口失败: %v", i+1, err)
@@ -281,6 +386,40 @@ func startNodeInstance(ctx context.Context, inbounds, outbounds, rules []map[str
 	return box.New(box.Options{Context: ctx, Options: opts})
 }
 
+// validateOutboundEntry 单独构建校验一个订阅出站, 单个坏节点不影响其他节点
+func validateOutboundEntry(ob map[string]any) error {
+	entry := map[string]any{"tag": "check"}
+	for k, v := range ob {
+		if k != "tag" {
+			entry[k] = v
+		}
+	}
+	boxCfg := map[string]any{
+		"log":       map[string]any{"disabled": true},
+		"dns":       map[string]any{"servers": []any{map[string]any{"type": "udp", "tag": "dns-direct", "server": "8.8.8.8"}}},
+		"outbounds": []any{entry, map[string]any{"type": "direct", "tag": "direct"}},
+		"route": map[string]any{
+			"final":                   "direct",
+			"default_domain_resolver": map[string]any{"server": "dns-direct"},
+		},
+	}
+	data, err := json.Marshal(boxCfg)
+	if err != nil {
+		return err
+	}
+	ctx := include.Context(context.Background())
+	opts, err := sjson.UnmarshalExtendedContext[option.Options](ctx, data)
+	if err != nil {
+		return err
+	}
+	instance, err := box.New(box.Options{Context: ctx, Options: opts})
+	if err != nil {
+		return err
+	}
+	instance.Close()
+	return nil
+}
+
 // freeLocalPort 预分配一个空闲端口(存在极小竞态窗口, 冲突由 box 启动报错兜底)
 func freeLocalPort() (int, error) {
 	l, err := net.Listen("tcp", "127.0.0.1:0")
@@ -297,6 +436,21 @@ type nodeView struct {
 	Type    string `json:"type"`
 	Source  string `json:"source"`
 	Running bool   `json:"running"`
+	Health  string `json:"health"` // ok / fail / unknown
+}
+
+// healthOf 节点最近一次连通检测结果
+func healthOf(key string) string {
+	nodeHealthMu.RLock()
+	defer nodeHealthMu.RUnlock()
+	st, ok := nodeHealth[key]
+	if !ok {
+		return "unknown"
+	}
+	if st.Ok {
+		return "ok"
+	}
+	return "fail"
 }
 
 // nodeLinkScheme 取节点链接/代理的协议名
@@ -347,15 +501,16 @@ func nodeViews() []nodeView {
 			continue
 		}
 		if isNodeLink(line) {
+			key := nodeLocalKey(line)
 			out = append(out, nodeView{
 				Name: nodeDisplayName(line), Type: nodeLinkScheme(line),
-				Source: "手动", Running: nodeLocalAddr(line) != "",
+				Source: "手动", Running: nodeLocalAddr(line) != "", Health: healthOf(key),
 			})
 			continue
 		}
 		out = append(out, nodeView{
 			Name: maskProxyURL(line), Type: nodeLinkScheme(line),
-			Source: "手动", Running: true,
+			Source: "手动", Running: true, Health: "ok",
 		})
 	}
 	subMu.Lock()
@@ -364,16 +519,18 @@ func nodeViews() []nodeView {
 	for _, e := range entries {
 		switch v := e.(type) {
 		case string:
+			key := nodeLocalKey(v)
 			out = append(out, nodeView{
 				Name: nodeDisplayName(v), Type: nodeLinkScheme(v),
-				Source: "订阅", Running: nodeLocalAddr(v) != "",
+				Source: "订阅", Running: nodeLocalAddr(v) != "", Health: healthOf(key),
 			})
 		case map[string]any:
 			tag, _ := v["tag"].(string)
 			typ, _ := v["type"].(string)
+			key := "sbox://" + tag
 			out = append(out, nodeView{
 				Name: subNodeDisplayName(tag), Type: typ,
-				Source: "订阅", Running: nodeLocalAddr("sbox://"+tag) != "",
+				Source: "订阅", Running: nodeLocalAddr(key) != "", Health: healthOf(key),
 			})
 		}
 	}

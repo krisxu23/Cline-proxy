@@ -438,9 +438,16 @@ func clashToOutbound(m map[string]any, i int) (map[string]any, error) {
 		if cc, _ := m["congestion-controller"].(string); cc != "" {
 			ob["congestion_control"] = cc
 		}
-		if alpn := yStrList(m["alpn"]); len(alpn) > 0 {
-			ob["alpn"] = alpn
+		if tls != nil {
+			if alpn := yStrList(m["alpn"]); len(alpn) > 0 {
+				tls["alpn"] = alpn
+			}
+			ob["tls"] = tls
 		}
+	case "anytls":
+		password, _ := m["password"].(string)
+		ob["type"] = "anytls"
+		ob["password"] = password
 		if tls != nil {
 			ob["tls"] = tls
 		}
@@ -464,9 +471,7 @@ func clashToOutbound(m map[string]any, i int) (map[string]any, error) {
 		return nil, fmt.Errorf("不支持的类型 %q", typ)
 	}
 	return ob, nil
-}
-
-// clashTLS Clash 节点的 TLS 相关字段 → sing-box tls 块
+}// clashTLS Clash 节点的 TLS 相关字段 → sing-box tls 块
 func clashTLS(m map[string]any, server, typ string) map[string]any {
 	b, _ := m["tls"].(bool)
 	reality, _ := m["reality-opts"].(map[string]any)

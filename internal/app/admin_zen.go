@@ -223,6 +223,16 @@ func handleZenNodes(w http.ResponseWriter, r *http.Request) {
 	writeAPI(w, http.StatusOK, apiResponse{Success: true, Data: nodeViews()})
 }
 
+// POST /admin/api/opencode/nodes/check — 触发全部出口的真实连通检测(异步)
+func handleZenNodesCheck(w http.ResponseWriter, r *http.Request) {
+	if r.Method != "POST" {
+		writeAPI(w, http.StatusMethodNotAllowed, apiResponse{Error: "method not allowed"})
+		return
+	}
+	go checkAllNodeHealth()
+	writeAPI(w, http.StatusOK, apiResponse{Success: true, Message: "连通检测已启动"})
+}
+
 // GET /admin/api/zen/models — 只返回免费模型
 func handleZenModels(w http.ResponseWriter, r *http.Request) {
 	if r.Method != "GET" {

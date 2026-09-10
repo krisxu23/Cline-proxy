@@ -72,6 +72,7 @@ func StartProxy(host string, port int) error {
 
 	startModelsRefresher()
 	startZenModelsRefresher()
+	startNodeHealthLoop()
 	syncNodeBox()
 	loadSubCache()
 	if subs := getZenConfig().Subs; len(subs) > 0 {

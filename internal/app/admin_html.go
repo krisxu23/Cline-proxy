@@ -474,7 +474,7 @@ body:not([data-theme="dark"]) .theme-toggle .dark-label{display:none}
     </div>
     <div class="form-row">
       <div class="field"><label style="display:flex;align-items:center;justify-content:space-between">节点列表
-        <button type="button" class="btn" style="padding:3px 10px;font-size:12px" onclick="loadOcNodes()">刷新</button></label>
+        <button type="button" class="btn" style="padding:3px 10px;font-size:12px" onclick="refreshOcNodes()">连通检测</button></label>
         <div id="ocNodesBox" style="max-height:190px;overflow-y:auto;border:1px solid var(--border);border-radius:10px;background:rgba(2,6,23,.3)"></div>
       </div>
     </div>
@@ -1165,16 +1165,27 @@ async function loadOcNodes() {
       _('ocNodesBox').innerHTML = '<div style="padding:10px 12px;font-size:12px;color:var(--text3)">暂无出口节点, 在上方添加代理/节点链接或订阅</div>';
       return;
     }
-    const manual = list.filter(n => n.source === '手动').length;
+    const okN = list.filter(n => n.health === 'ok').length;
+    const failN = list.filter(n => n.health === 'fail').length;
+    const unkN = list.length - okN - failN;
+    const icon = n => n.health === 'ok' ? '🟢' : (n.health === 'fail' ? '🔴' : '⚪');
     _('ocNodesBox').innerHTML = list.map(n =>
       '<div style="display:flex;align-items:center;gap:9px;padding:5px 12px;font-size:12.5px;border-bottom:1px solid rgba(148,163,184,.07)">' +
-      '<span style="flex:none">' + (n.running ? '🟢' : '⚪') + '</span>' +
+      '<span style="flex:none">' + icon(n) + '</span>' +
       '<span style="flex:none;min-width:58px;color:var(--text3);font-family:monospace">' + esc(n.type) + '</span>' +
       '<span style="flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">' + esc(n.name) + '</span>' +
       '<span style="flex:none;font-size:11px;color:var(--text3)">' + n.source + '</span></div>'
     ).join('') +
-    '<div style="padding:6px 12px;font-size:11px;color:var(--text3)">共 ' + list.length + ' 个出口（手动 ' + manual + ' · 订阅 ' + (list.length - manual) + '），🟢 已就绪 ⚪ 未就绪</div>';
+    '<div style="padding:6px 12px;font-size:11px;color:var(--text3)">共 ' + list.length + ' 个出口 · 🟢 可达 ' + okN + ' · 🔴 不可达 ' + failN + ' · ⚪ 未检测 ' + unkN + '（连通 = 经节点真实连接 opencode/cline 上游）</div>';
   } catch (e) { _('ocNodesBox').textContent = '加载失败: ' + e.message; }
+}
+
+async function refreshOcNodes() {
+  try { await api('POST', '/opencode/nodes/check'); } catch (e) { /* ignore */ }
+  toast('连通检测已启动, 结果稍后自动刷新', 'success');
+  await loadOcNodes();
+  setTimeout(loadOcNodes, 15000);
+  setTimeout(loadOcNodes, 35000);
 }
 
 async function saveOcConfig() {
