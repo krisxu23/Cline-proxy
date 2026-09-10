@@ -23,31 +23,37 @@ jobs:
             goos: windows
             goarch: amd64
             ext: .exe
+            gui: 'true'
           - os: windows-latest
             target: windows-arm64
             goos: windows
             goarch: arm64
             ext: .exe
+            gui: 'true'
           - os: ubuntu-latest
             target: linux-amd64
             goos: linux
             goarch: amd64
             ext: ""
+            gui: 'false'
           - os: ubuntu-latest
             target: linux-arm64
             goos: linux
             goarch: arm64
             ext: ""
+            gui: 'false'
           - os: macos-latest
             target: macos-amd64
             goos: darwin
             goarch: amd64
             ext: ""
+            gui: 'false'
           - os: macos-latest
             target: macos-arm64
             goos: darwin
             goarch: arm64
             ext: ""
+            gui: 'false'
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -64,7 +70,15 @@ jobs:
           GOOS: ${{ matrix.goos }}
           GOARCH: ${{ matrix.goarch }}
           CGO_ENABLED: '0'
-        run: go build -ldflags="-s -w" -o cline-proxy-${{ matrix.target }}${{ matrix.ext }} .
+        shell: bash
+        # Windows 构建为 GUI 子系统: 双击无控制台窗口, 托盘 + 管理窗口交互
+        run: |
+          if [ "${{ matrix.gui }}" = "true" ]; then
+            LDFLAGS="-s -w -H=windowsgui"
+          else
+            LDFLAGS="-s -w"
+          fi
+          go build -ldflags="$LDFLAGS" -o cline-proxy-${{ matrix.target }}${{ matrix.ext }} .
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
