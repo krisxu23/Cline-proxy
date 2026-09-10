@@ -123,6 +123,14 @@ func (w *statusWriter) Write(b []byte) (int, error) {
 	return w.ResponseWriter.Write(b)
 }
 
+// Flush 透传底层 Flusher: SSE 流式中继依赖 http.Flusher 断言,
+// 包装层若不实现该接口会导致流式响应静默退化为空响应体。
+func (w *statusWriter) Flush() {
+	if f, ok := w.ResponseWriter.(http.Flusher); ok {
+		f.Flush()
+	}
+}
+
 // requestLogMiddleware 记录所有进入代理的请求（API 调用与对话历史）。
 func requestLogMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
