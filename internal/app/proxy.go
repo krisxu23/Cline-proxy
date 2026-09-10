@@ -218,21 +218,10 @@ func StartProxy(host string, port int) error {
 			return
 		}
 
-		if activeCount == 0 && len(loadPool().Accounts) == 0 {
-			writeJSON(w, http.StatusUnauthorized, map[string]any{
-				"error": map[string]string{
-					"message": "No accounts in pool. Run with --add-account or POST /admin/login to add accounts.",
-					"type":    "auth_error",
-				},
-			})
-			return
-		}
-
-		// Override system prompt from override.md for OpenAI format
-		applyOverride(params)
-
-		// zen 免费模型路由
+		// zen 免费模型路由: zen 上游匿名可用,不依赖 Cline 账号,
+		// 同样须在账号池守卫之前分流。
 		if route := routeModel(model); route == "zen" {
+			applyOverride(params)
 			handleZenChat(w, r, params)
 			return
 		} else if route == "reject" {
@@ -241,6 +230,19 @@ func StartProxy(host string, port int) error {
 			})
 			return
 		}
+
+		if activeCount == 0 && len(loadPool().Accounts) == 0 {
+			writeJSON(w, http.StatusServiceUnavailable, map[string]any{
+				"error": map[string]string{
+					"message": "No Cline accounts in pool. Add one in the admin panel (/admin/), or use *-free / cline-pass/* models.",
+					"type":    "no_accounts_available",
+				},
+			})
+			return
+		}
+
+		// Override system prompt from override.md for OpenAI format
+		applyOverride(params)
 
 		upstreamStream := isStream
 		if !isStream {
@@ -1483,10 +1485,10 @@ func handleAnthropicMessages(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if activeCount == 0 && len(p.Accounts) == 0 {
-		writeJSON(w, http.StatusUnauthorized, map[string]any{
+		writeJSON(w, http.StatusServiceUnavailable, map[string]any{
 			"error": map[string]string{
-				"message": "No accounts in pool",
-				"type":    "auth_error",
+				"message": "No Cline accounts in pool. Add one in the admin panel (/admin/), or use *-free / cline-pass/* models.",
+				"type":    "no_accounts_available",
 			},
 		})
 		return
