@@ -8,7 +8,6 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"runtime"
 
 	"fyne.io/systray"
 )
@@ -93,15 +92,25 @@ func appendU32LE(dst []byte, vals ...uint32) []byte {
 	return dst
 }
 
-// findEdge 按常见安装路径查找 Edge; 找不到返回空串。
-func findEdge() string {
-	candidates := []string{
-		filepath.Join(os.Getenv("ProgramFiles(x86)"), `Microsoft\Edge\Application\msedge.exe`),
-		filepath.Join(os.Getenv("ProgramFiles"), `Microsoft\Edge\Application\msedge.exe`),
-		filepath.Join(os.Getenv("LocalAppData"), `Microsoft\Edge\Application\msedge.exe`),
+// appBrowsers 支持应用窗口模式(--app)的 Chromium 系浏览器, 按优先级排列。
+var appBrowsers = []string{
+	`Microsoft\Edge\Application\msedge.exe`,
+	`Google\Chrome\Application\chrome.exe`,
+}
+
+// findAppBrowser 在常见安装目录查找支持 --app 模式的浏览器; 找不到返回空串。
+func findAppBrowser() string {
+	roots := []string{
+		os.Getenv("ProgramFiles"),
+		os.Getenv("ProgramFiles(x86)"),
+		os.Getenv("LocalAppData"),
 	}
-	for _, p := range candidates {
-		if p != "" && runtime.GOOS == "windows" {
+	for _, root := range roots {
+		if root == "" {
+			continue
+		}
+		for _, rel := range appBrowsers {
+			p := filepath.Join(root, rel)
 			if _, err := os.Stat(p); err == nil {
 				return p
 			}
@@ -110,12 +119,12 @@ func findEdge() string {
 	return ""
 }
 
-// OpenAdminWindow 用 Edge App 模式打开管理界面(独立窗口、无地址栏、
-// 独立任务栏图标,观感即桌面应用); 无 Edge 时回退到默认浏览器。
+// OpenAdminWindow 用 Edge/Chrome 应用模式打开管理界面(独立窗口、无地址栏、
+// 独立任务栏图标,观感即桌面应用); 都没有时回退到默认浏览器。
 func OpenAdminWindow(adminURL string) {
-	if edge := findEdge(); edge != "" {
+	if browser := findAppBrowser(); browser != "" {
 		// ponytail: --app 窗口由用户手动关闭; 服务端继续运行,托盘可再次打开。
-		cmd := exec.Command(edge, "--app="+adminURL, "--window-size=1280,860")
+		cmd := exec.Command(browser, "--app="+adminURL, "--window-size=1280,860")
 		if err := cmd.Start(); err == nil {
 			return
 		}
