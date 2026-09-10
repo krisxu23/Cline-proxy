@@ -62,14 +62,18 @@ api.cline.bot   opencode.ai/zen    api.cline.bot
 
 ```bash
 # Windows GUI 构建（无控制台窗口）
-go build -ldflags "-s -w -H=windowsgui" -o cline-proxy.exe .
+go build -tags "with_quic,with_grpc,with_utls" -ldflags "-s -w -H=windowsgui" -o cline-proxy.exe .
 
 # 控制台构建（调试用，或 Linux/macOS）
-go build -o cline-proxy.exe .
+go build -tags "with_quic,with_grpc,with_utls" -o cline-proxy.exe .
 
 # 构建 + 启动 + 打开浏览器
-go run . -start
+go run -tags "with_quic,with_grpc,with_utls" . -start
 ```
+
+> 构建标签 `with_quic,with_grpc,with_utls` 不可省略：缺少时 reality/uTLS 与
+> QUIC（hysteria2/tuic）类节点会被 sing-box 判为无效出站并从出口池剔除，
+> 可用节点数会大幅减少。
 
 ```bash
 # 编译并启动（默认监听所有网卡，局域网可访问）

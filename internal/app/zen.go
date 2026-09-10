@@ -507,6 +507,8 @@ func buildZenBody(params map[string]any, stream bool) map[string]any {
 func callZenAPI(ctx context.Context, params map[string]any, stream bool) (*http.Response, int, error) {
 	cfg := getZenConfig()
 	body := buildZenBody(params, stream)
+	// 拨号层需要知道目标模型: 地区受限模型只走通过地区校验的出口节点
+	ctx = context.WithValue(ctx, ctxKeyZenModel, zenModelIDOf(params))
 
 	bodyJSON, err := json.Marshal(body)
 	if err != nil {
@@ -571,6 +573,10 @@ func callZenAPI(ctx context.Context, params map[string]any, stream bool) (*http.
 
 		bodyBytes := kit.ReadBody(resp)
 		resp.Body.Close()
+		// 首次遇到地区限制时自动登记该模型, 并触发节点能力探测
+		if isRegionError(bodyBytes) {
+			markModelRegionRestricted(zenModelIDOf(params))
+		}
 
 		if isRateLimited(resp.StatusCode, bodyBytes) {
 			rateLimited++

@@ -283,6 +283,8 @@ func checkAllNodeHealth() {
 	}
 	wg.Wait()
 	log.Printf("  nodes: 连通检测完成, %d/%d 个出口可达", okCount, len(keys))
+	// 连通性刷新后, 同步刷新地区受限模型的节点能力标记
+	probeRegionModelsAsync()
 }
 
 // startNodeHealthLoop 每 30 分钟复检
@@ -432,11 +434,12 @@ func freeLocalPort() (int, error) {
 
 // nodeView 出口节点在管理界面的展示条目
 type nodeView struct {
-	Name    string `json:"name"`
-	Type    string `json:"type"`
-	Source  string `json:"source"`
-	Running bool   `json:"running"`
-	Health  string `json:"health"` // ok / fail / unknown
+	Name    string   `json:"name"`
+	Type    string   `json:"type"`
+	Source  string   `json:"source"`
+	Running bool     `json:"running"`
+	Health  string   `json:"health"`            // ok / fail / unknown
+	Regions []string `json:"regions,omitempty"` // 该出口已验证可用的地区受限模型
 }
 
 // healthOf 节点最近一次连通检测结果
@@ -505,6 +508,7 @@ func nodeViews() []nodeView {
 			out = append(out, nodeView{
 				Name: nodeDisplayName(line), Type: nodeLinkScheme(line),
 				Source: "手动", Running: nodeLocalAddr(line) != "", Health: healthOf(key),
+				Regions: regionNodeSupport(key),
 			})
 			continue
 		}
@@ -523,6 +527,7 @@ func nodeViews() []nodeView {
 			out = append(out, nodeView{
 				Name: nodeDisplayName(v), Type: nodeLinkScheme(v),
 				Source: "订阅", Running: nodeLocalAddr(v) != "", Health: healthOf(key),
+				Regions: regionNodeSupport(key),
 			})
 		case map[string]any:
 			tag, _ := v["tag"].(string)
@@ -531,6 +536,7 @@ func nodeViews() []nodeView {
 			out = append(out, nodeView{
 				Name: subNodeDisplayName(tag), Type: typ,
 				Source: "订阅", Running: nodeLocalAddr(key) != "", Health: healthOf(key),
+				Regions: regionNodeSupport(key),
 			})
 		}
 	}

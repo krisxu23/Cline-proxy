@@ -1177,14 +1177,17 @@ async function loadOcNodes() {
     const failN = list.filter(n => n.health === 'fail').length;
     const unkN = list.length - okN - failN;
     const icon = n => n.health === 'ok' ? '🟢' : (n.health === 'fail' ? '🔴' : '⚪');
-    _('ocNodesBox').innerHTML = list.map(n =>
-      '<div style="display:flex;align-items:center;gap:9px;padding:5px 12px;font-size:12.5px;border-bottom:1px solid rgba(148,163,184,.07)">' +
+    const regionN = list.filter(n => (n.regions || []).length).length;
+    _('ocNodesBox').innerHTML = list.map(n => {
+      const regions = (n.regions || []).map(r => r.replace(/-free$/, ''));
+      return '<div style="display:flex;align-items:center;gap:9px;padding:5px 12px;font-size:12.5px;border-bottom:1px solid rgba(148,163,184,.07)">' +
       '<span style="flex:none">' + icon(n) + '</span>' +
       '<span style="flex:none;min-width:58px;color:var(--text3);font-family:monospace">' + esc(n.type) + '</span>' +
       '<span style="flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">' + esc(n.name) + '</span>' +
-      '<span style="flex:none;font-size:11px;color:var(--text3)">' + n.source + '</span></div>'
-    ).join('') +
-    '<div style="padding:6px 12px;font-size:11px;color:var(--text3)">共 ' + list.length + ' 个出口 · 🟢 可达 ' + okN + ' · 🔴 不可达 ' + failN + ' · ⚪ 未检测 ' + unkN + '（连通 = 经节点真实连接 opencode/cline 上游）</div>';
+      (regions.length ? '<span style="flex:none;font-size:10.5px;color:#16a34a;border:1px solid currentColor;border-radius:4px;padding:0 5px" title="该出口已验证可用于地区受限模型">🌍 ' + esc(regions.join(',')) + '</span>' : '') +
+      '<span style="flex:none;font-size:11px;color:var(--text3)">' + n.source + '</span></div>';
+    }).join('') +
+    '<div style="padding:6px 12px;font-size:11px;color:var(--text3)">共 ' + list.length + ' 个出口 · 🟢 可达 ' + okN + ' · 🔴 不可达 ' + failN + ' · ⚪ 未检测 ' + unkN + ' · 🌍 可用于地区受限模型 ' + regionN + '（连通 = 经节点真实连接 opencode/cline 上游）</div>';
   } catch (e) { _('ocNodesBox').textContent = '加载失败: ' + e.message; }
 }
 
@@ -1194,6 +1197,7 @@ async function refreshOcNodes() {
   await loadOcNodes();
   setTimeout(loadOcNodes, 15000);
   setTimeout(loadOcNodes, 35000);
+  setTimeout(loadOcNodes, 90000);
 }
 
 async function saveOcConfig() {

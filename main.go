@@ -113,10 +113,11 @@ func buildAndStart(host string, port int) {
 	}
 
 	fmt.Println("Building proxy...")
-	args := []string{"build", "-ldflags", "-s -w"}
+	// tags 不可省略: 缺少 with_utls/with_quic 时 reality、QUIC 类节点会被剔除
+	args := []string{"build", "-tags", "with_quic,with_grpc,with_utls", "-ldflags", "-s -w"}
 	if isWindows {
 		// windowsgui 子系统: 双击启动不弹控制台窗口,托盘 + 管理窗口接管交互
-		args = []string{"build", "-ldflags", "-s -w -H=windowsgui"}
+		args = []string{"build", "-tags", "with_quic,with_grpc,with_utls", "-ldflags", "-s -w -H=windowsgui"}
 	}
 	args = append(args, "-o", exe, ".")
 	cmd := exec.Command("go", args...)

@@ -231,7 +231,8 @@ func describeEffectiveExit() string {
 }
 
 func zenDialContext(ctx context.Context, network, addr string) (net.Conn, error) {
-	p, _ := pickZenProxy()
+	modelID, _ := ctx.Value(ctxKeyZenModel).(string)
+	p, _ := pickZenProxyForModel(modelID)
 	setReqExit(ctx, p)
 	if p == "" {
 		d := &net.Dialer{Timeout: 30 * time.Second, KeepAlive: 30 * time.Second}

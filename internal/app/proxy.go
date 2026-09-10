@@ -73,6 +73,7 @@ func StartProxy(host string, port int) error {
 
 	startModelsRefresher()
 	startZenModelsRefresher()
+	initRegionModels()
 	startNodeHealthLoop()
 	syncNodeBox()
 
@@ -367,8 +368,20 @@ func initLogFile() {
 		log.Printf("  open log file failed: %v", err)
 		return
 	}
-	log.SetOutput(io.MultiWriter(os.Stderr, f))
+	log.SetOutput(logFanout{f, os.Stderr})
 	log.Printf("========== proxy started, log file: %s ==========", path)
+}
+
+// logFanout 逐目标分发日志, 单个目标写入失败不影响其它目标。
+// 桌面模式(GUI 子系统, 双击启动)下 os.Stderr 句柄无效, io.MultiWriter
+// 会在首个 writer 出错时短路, 导致文件日志一并丢失, 故不走 MultiWriter。
+type logFanout []io.Writer
+
+func (w logFanout) Write(p []byte) (int, error) {
+	for _, dst := range w {
+		dst.Write(p)
+	}
+	return len(p), nil
 }
 
 func corsHandler(h http.HandlerFunc) http.HandlerFunc {
