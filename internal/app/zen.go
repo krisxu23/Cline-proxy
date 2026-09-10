@@ -136,7 +136,7 @@ func routeModel(id string) string {
 		if !ok || !isZenFreeModel(zm) {
 			return "reject"
 		}
-		if cfg.Failover && zenFailedNow() {
+		if cfg.Failover && zenFailedNow() && clinePoolReady() {
 			log.Printf("  failover: zen degraded, %q routed to cline pool", id)
 			return "cline"
 		}
@@ -150,7 +150,7 @@ func routeModel(id string) string {
 			_, inCline := modelsCache[id]
 			modelsMu.Unlock()
 			if !inCline {
-				if cfg.Failover && zenFailedNow() {
+				if cfg.Failover && zenFailedNow() && clinePoolReady() {
 					log.Printf("  failover: zen degraded, %q routed to cline pool", id)
 					return "cline"
 				}
@@ -164,7 +164,7 @@ func routeModel(id string) string {
 		short := strings.TrimPrefix(id, "opencode/")
 		if zm, ok := resolveZenModel(short); ok {
 			if isZenFreeModel(zm) {
-				if cfg.Failover && zenFailedNow() {
+				if cfg.Failover && zenFailedNow() && clinePoolReady() {
 					log.Printf("  failover: zen degraded, %q routed to cline pool", id)
 					return "cline"
 				}
@@ -174,6 +174,23 @@ func routeModel(id string) string {
 		}
 	}
 	return "cline"
+}
+
+// clinePoolReady cline 账号池是否存在可用账号(active 或冷却已到期)。
+// zen 熔断降级前用它判断可行性: 池内无可用账号时降级只会立即失败,
+// 此时保持 zen 路由继续尝试上游是更优选择。
+func clinePoolReady() bool {
+	p := loadPool()
+	now := time.Now()
+	for _, a := range p.Accounts {
+		if a.Status == "active" {
+			return true
+		}
+		if a.Status == "cooldown" && !a.CooldownUntil.IsZero() && now.After(a.CooldownUntil) {
+			return true
+		}
+	}
+	return false
 }
 
 // ============ zen 配置 ============

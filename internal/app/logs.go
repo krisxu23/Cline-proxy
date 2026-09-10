@@ -97,6 +97,18 @@ func LoadRequestLogsFromFile() {
 	reqLogs = reqLogs0
 }
 
+// upstreamFromRouteHeader 从 X-Proxy-Route 响应头提取实际上游名。
+// 头格式: "upstream=cline; model=zen/x; failover=zen-degraded"。
+func upstreamFromRouteHeader(v string) string {
+	for _, part := range strings.Split(v, ";") {
+		part = strings.TrimSpace(part)
+		if rest, ok := strings.CutPrefix(part, "upstream="); ok {
+			return strings.TrimSpace(rest)
+		}
+	}
+	return ""
+}
+
 // isRequestNoise 该条记录是否为管理轮询等噪音(与中间件过滤同一判定)
 func isRequestNoise(l RequestLog) bool {
 	if l.Route == "admin" && l.Method == "GET" {
@@ -188,6 +200,12 @@ func requestLogMiddleware(next http.Handler) http.Handler {
 			route = "cline"
 		case strings.Contains(r.URL.Path, "models") || strings.Contains(r.URL.Path, "health"):
 			route = "meta"
+		}
+
+		// 路由判定优先采用 handler 实际选择的出口(X-Proxy-Route):
+		// zen 熔断降级到 cline 池时, 仅凭 model 前缀会把请求误标为 zen。
+		if up := upstreamFromRouteHeader(sw.Header().Get("X-Proxy-Route")); up == "zen" || up == "cline" {
+			route = up
 		}
 
 		// 请求日志只抓重点: 对话/模型调用、配置写操作与错误记录。
