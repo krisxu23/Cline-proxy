@@ -81,3 +81,21 @@ func HasChoices(obj map[string]any) bool {
 	choices, ok := obj["choices"].([]any)
 	return ok && len(choices) > 0
 }
+
+// HasFinishReason reports whether any choice in a parsed OpenAI chunk
+// carries a non-null finish_reason. Used to detect streams that end
+// without a terminal chunk so a synthetic stop chunk can be appended.
+func HasFinishReason(obj map[string]any) bool {
+	choices, ok := obj["choices"].([]any)
+	if !ok {
+		return false
+	}
+	for _, ch := range choices {
+		if c, ok := ch.(map[string]any); ok {
+			if fr, present := c["finish_reason"]; present && fr != nil {
+				return true
+			}
+		}
+	}
+	return false
+}

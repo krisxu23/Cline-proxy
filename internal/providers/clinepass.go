@@ -162,24 +162,29 @@ func (p *clinepassProvider) ChatStream(ctx context.Context, req ChatRequest, w i
 	}
 	defer resp.Body.Close()
 
-	emittedChoice := false
+	sawFinish := false // 上游是否已发过 finish_reason
 	events, errc := protocol.ScanSSE(resp.Body)
 	for {
 		select {
 		case ev, ok := <-events:
 			if !ok {
-				return protocol.AppendEmptyChunkIfNoChoice(w, emittedChoice, req.Model)
+				// 上游断流(未发 [DONE]): 合成 finish_reason + [DONE] 收尾
+				if err := protocol.AppendStopChunkIfNoFinish(w, sawFinish, req.Model); err != nil {
+					return err
+				}
+				_, err := io.WriteString(w, "data: [DONE]\n\n")
+				return err
 			}
 			if ev.Done {
-				if err := protocol.AppendEmptyChunkIfNoChoice(w, emittedChoice, req.Model); err != nil {
+				if err := protocol.AppendStopChunkIfNoFinish(w, sawFinish, req.Model); err != nil {
 					return err
 				}
 				_, err := io.WriteString(w, "data: [DONE]\n\n")
 				return err
 			}
 			if ev.Payload != nil {
-				if protocol.HasChoices(ev.Payload) {
-					emittedChoice = true
+				if !sawFinish && protocol.HasFinishReason(ev.Payload) {
+					sawFinish = true
 				}
 				if onUsage != nil {
 					if u, ok := ev.Payload["usage"].(map[string]any); ok && len(u) > 0 {

@@ -58,8 +58,9 @@ func initZenModels() {
 	}
 }
 
-// resolveZenModel 解析模型名到 zen 模型。支持 "opencode/<id>" 前缀与别名。
-// 别名优先: 同步来的付费同名模型(如 deepseek-v4-flash)不会覆盖 free 别名解析。
+// resolveZenModel 解析模型名到 zen 模型。支持 "zen/<id>"、"opencode/<id>"
+// 前缀与裸别名。别名优先: 同步来的付费同名模型(如 deepseek-v4-flash)不会
+// 覆盖 free 别名解析。
 func resolveZenModel(id string) (*ZenModel, bool) {
 	id = strings.TrimSpace(id)
 	if id == "" {
@@ -70,13 +71,15 @@ func resolveZenModel(id string) (*ZenModel, bool) {
 	if m, ok := zenAliases[id]; ok {
 		return m, true
 	}
-	if strings.HasPrefix(id, "opencode/") {
-		short := strings.TrimPrefix(id, "opencode/")
-		if m, ok := zenAliases[short]; ok {
-			return m, true
-		}
-		if m, ok := zenModels[short]; ok {
-			return m, true
+	for _, prefix := range []string{"zen/", "opencode/"} {
+		if strings.HasPrefix(id, prefix) {
+			short := strings.TrimPrefix(id, prefix)
+			if m, ok := zenAliases[short]; ok {
+				return m, true
+			}
+			if m, ok := zenModels[short]; ok {
+				return m, true
+			}
 		}
 	}
 	if m, ok := zenModels[id]; ok {
@@ -104,11 +107,23 @@ func resolveZenFreeModel(id string) (*ZenModel, bool) {
 
 // routeModel 决定请求走哪个上游: "zen" / "cline" / "reject"
 // zen 免费模型 -> zen; zen 付费模型 -> reject(400); 其他 -> cline
+// 显式 "zen/" 前缀只接受免费 zen 模型,付费或未知一律 reject,不会误入 cline 池
 // 故障转移: zen 连续失败期间,zen 免费模型请求临时路由到 cline 账号池
 func routeModel(id string) string {
 	id = strings.TrimSpace(id)
 	initZenModels()
 	cfg := getZenConfig()
+	if strings.HasPrefix(id, "zen/") {
+		zm, ok := resolveZenModel(id)
+		if !ok || !isZenFreeModel(zm) {
+			return "reject"
+		}
+		if cfg.Failover && zenFailedNow() {
+			log.Printf("  failover: zen degraded, %q routed to cline pool", id)
+			return "cline"
+		}
+		return "zen"
+	}
 	if zm, ok := resolveZenModel(id); ok {
 		if isZenFreeModel(zm) {
 			// 与 cline 模型表冲突时(几乎不可能)走 cline
@@ -538,7 +553,7 @@ func zenModelList() []map[string]any {
 		}
 		cp := *m
 		out = append(out, map[string]any{
-			"id":      cp.ID,
+			"id":      "zen/" + cp.ID,
 			"context": cp.Context,
 			"output":  cp.Output,
 			"source":  cp.Source,

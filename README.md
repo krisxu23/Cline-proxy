@@ -31,10 +31,10 @@ api.cline.bot   opencode.ai/zen    api.cline.bot
 | model 形态 | 上游 | 鉴权 |
 |---|---|---|
 | `cline-pass/*` | ClinePass 订阅池 | 独立 key 池（`/admin/` 管理） |
-| `*-free`、`opencode/*` | opencode zen | 匿名/自配 key |
+| `zen/*`（如 `zen/mimo-v2.5-free`）或裸 `*-free` | opencode zen | 匿名/自配 key |
 | 其余（如 `deepseek/deepseek-v4-flash`） | Cline 账号池 | OAuth 账号轮询 |
 
-zen 连续失败时自动故障转移到 Cline 账号池；Cline 账号 429/掉线时自动换号重试（受池内可用账号数限制）。
+`zen/` 前缀只接受免费 zen 模型，付费或未知模型明确 400 拒绝，不会误入 Cline 池。裸 `*-free` 名称继续兼容。zen 连续失败时自动故障转移到 Cline 账号池；Cline 账号 429/掉线时自动换号重试（受池内可用账号数限制）。
 
 ## 快速开始
 
@@ -102,7 +102,7 @@ docker compose down
 Base URL: http://<本机局域网IP>:3457/v1
 API Key:  <在管理后台生成的 Key>
 Model:    deepseek/deepseek-v4-flash        # Cline 账号池
-          deepseek-v4-flash-free            # zen 免费模型
+          zen/mimo-v2.5-free                # opencode zen 免费模型
           cline-pass/deepseek-v4-flash      # ClinePass 订阅
 ```
 
@@ -187,12 +187,14 @@ curl http://127.0.0.1:3457/admin/api/clinepass/models
 
 ### opencode zen（免费）
 
+模型 ID 带 `zen/` 前缀（裸 `*-free` 名称同样可用）：
+
 | 模型 ID | 上下文 | 说明 |
 |---------|:----:|------|
-| `deepseek-v4-flash-free` | 200K | 别名 `deepseek-v4-flash` |
-| `nemotron-3-ultra-free` | 1M | 免费里最大上下文 |
-| `north-mini-code-free` | 256K | |
-| `mimo-v2.5-free` / `ling-3.0-flash-free` / `laguna-s-2.1-free` / `longcat-2.0-free` / `big-pickle` | 200K | |
+| `zen/deepseek-v4-flash-free` | 200K | 别名 `deepseek-v4-flash` |
+| `zen/nemotron-3-ultra-free` | 1M | 免费里最大上下文 |
+| `zen/north-mini-code-free` | 256K | |
+| `zen/mimo-v2.5-free` / `zen/ling-3.0-flash-free` / `zen/laguna-s-2.1-free` / `zen/longcat-2.0-free` / `zen/big-pickle` | 200K | |
 
 ### ClinePass（需订阅）
 

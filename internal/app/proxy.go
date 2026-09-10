@@ -3,6 +3,7 @@ package app
 import (
 	"cline-go-proxy/internal/cline"
 	"cline-go-proxy/internal/kit"
+	"cline-go-proxy/internal/protocol"
 	"bufio"
 	"bytes"
 	"encoding/json"
@@ -732,6 +733,9 @@ func handleStreamResponseWithUsage(w http.ResponseWriter, upstream *http.Respons
 	}
 
 	reader := bufio.NewReader(upstream.Body)
+	sawFinish := false // 上游是否已发过 finish_reason
+	sawDone := false   // 上游是否已发过 [DONE]
+	lastModel := ""    // 用于兜底 chunk 的 model 字段
 	for {
 		line, err := reader.ReadString('\n')
 		if err != nil {
@@ -747,7 +751,19 @@ func handleStreamResponseWithUsage(w http.ResponseWriter, upstream *http.Respons
 
 		if strings.HasPrefix(line, "data:") {
 			payload := strings.TrimSpace(line[5:])
-			if payload == "" || payload == "[DONE]" {
+			if payload == "" {
+				w.Write([]byte(line + "\n\n"))
+				flusher.Flush()
+				continue
+			}
+			if payload == "[DONE]" {
+				// 上游结束但从未给出 finish_reason: 补一个终止 chunk
+				if !sawFinish {
+					if b, mErr := json.Marshal(protocol.EmptyOpenAIChunk(lastModel).Payload); mErr == nil {
+						w.Write([]byte("data: " + string(b) + "\n\n"))
+					}
+				}
+				sawDone = true
 				w.Write([]byte(line + "\n\n"))
 				flusher.Flush()
 				continue
@@ -772,7 +788,13 @@ func handleStreamResponseWithUsage(w http.ResponseWriter, upstream *http.Respons
 						}
 					}
 				}
+				if m, ok := obj["model"].(string); ok && m != "" {
+					lastModel = m
+				}
 				normalized := normalizeOpenAIResponse(obj)
+				if !sawFinish && protocol.HasFinishReason(normalized) {
+					sawFinish = true
+				}
 				if normBytes, err := json.Marshal(normalized); err == nil {
 					w.Write([]byte("data: " + string(normBytes) + "\n\n"))
 					flusher.Flush()
@@ -782,6 +804,19 @@ func handleStreamResponseWithUsage(w http.ResponseWriter, upstream *http.Respons
 		}
 
 		w.Write([]byte(line + "\n"))
+		flusher.Flush()
+	}
+
+	// 上游断流未发 [DONE](或发 [DONE] 前无 finish_reason): 合成收尾,
+	// 避免客户端报 "Stream ended without finish_reason" 或挂起等待。
+	if !sawFinish {
+		if b, mErr := json.Marshal(protocol.EmptyOpenAIChunk(lastModel).Payload); mErr == nil {
+			w.Write([]byte("data: " + string(b) + "\n\n"))
+			flusher.Flush()
+		}
+	}
+	if !sawDone {
+		w.Write([]byte("data: [DONE]\n\n"))
 		flusher.Flush()
 	}
 }

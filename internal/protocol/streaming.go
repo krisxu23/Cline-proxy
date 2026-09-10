@@ -133,6 +133,23 @@ func ReasonToAnthropicStop(reason string) string {
 	}
 }
 
+// AppendStopChunkIfNoFinish writes a final chunk carrying
+// finish_reason "stop" when the upstream stream ended without any
+// finish_reason, so OpenAI-compatible clients (e.g. the Cline extension)
+// do not fail with "Stream ended without finish_reason". No-op when a
+// finish_reason was already seen.
+func AppendStopChunkIfNoFinish(w io.Writer, sawFinish bool, model string) error {
+	if sawFinish {
+		return nil
+	}
+	b, err := json.Marshal(EmptyOpenAIChunk(model).Payload)
+	if err != nil {
+		return err
+	}
+	_, err = fmt.Fprintf(w, "data: %s\n\n", string(b))
+	return err
+}
+
 // AppendEmptyChunkIfNoChoice is a small convenience that the proxy layer
 // can call after the upstream stream closes; if no SSEEvent reported a
 // choices array, the helper writes an empty chunk to w (in OpenAI SSE
