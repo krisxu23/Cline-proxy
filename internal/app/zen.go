@@ -3,6 +3,7 @@ package app
 import (
 	"cline-go-proxy/internal/kit"
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -103,6 +104,23 @@ func resolveZenFreeModel(id string) (*ZenModel, bool) {
 		return nil, false
 	}
 	return m, true
+}
+
+// stripDisplayPrefix 去掉模型列表展示用前缀 "cline/", 仅当剩余部分
+// 确实在 cline 模型表中才剥离, 避免误伤原生 vendor/model 名称
+func stripDisplayPrefix(model string) string {
+	rest, ok := strings.CutPrefix(strings.TrimSpace(model), "cline/")
+	if !ok || rest == "" {
+		return model
+	}
+	initModelsCache()
+	modelsMu.Lock()
+	_, inCline := modelsCache[rest]
+	modelsMu.Unlock()
+	if inCline {
+		return rest
+	}
+	return model
 }
 
 // routeModel 决定请求走哪个上游: "zen" / "cline" / "reject"
@@ -469,7 +487,7 @@ func buildZenBody(params map[string]any, stream bool) map[string]any {
 // callZenAPI 调用 zen 上游,带限流防御: 并发信号量 + 指数退避重试 + 端点轮换
 // + 代理冷却 + 故障计数。每次重试自动切换到下一个端点(官方 → CDN 镜像)。
 // 返回 (响应, 命中限流次数, 错误)
-func callZenAPI(params map[string]any, stream bool) (*http.Response, int, error) {
+func callZenAPI(ctx context.Context, params map[string]any, stream bool) (*http.Response, int, error) {
 	cfg := getZenConfig()
 	body := buildZenBody(params, stream)
 
@@ -498,7 +516,7 @@ func callZenAPI(params map[string]any, stream bool) (*http.Response, int, error)
 		// 官方地址失败后自然落到 CDN 镜像。
 		base := baseURLs[attempt%len(baseURLs)]
 		endpoint := base + "/chat/completions"
-		req, err := http.NewRequest("POST", endpoint, bytes.NewReader(bodyJSON))
+		req, err := http.NewRequestWithContext(ctx, "POST", endpoint, bytes.NewReader(bodyJSON))
 		if err != nil {
 			return nil, rateLimited, fmt.Errorf("create zen request: %w", err)
 		}

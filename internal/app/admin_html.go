@@ -196,10 +196,9 @@ body:not([data-theme="dark"]) .theme-toggle .dark-label{display:none}
 <h1><span class="logo">⚡</span><span class="brand-name">Cline 代理</span><button class="theme-toggle" onclick="toggleTheme()" title="切换主题"><span class="icon" id="themeIcon">🌙</span><span class="light-label">浅色</span><span class="dark-label">深色</span></button></h1>
 <div class="nav-item active" data-tab="dashboard"><span class="nav-ico">📊</span> 仪表盘</div>
 <div class="nav-item" data-tab="accounts"><span class="nav-ico">👤</span> 账号管理</div>
-<div class="nav-item" data-tab="import"><span class="nav-ico">📥</span> 导入账号</div>
+<div class="nav-item" data-tab="models"><span class="nav-ico">🧠</span> 模型列表</div>
 <div class="nav-item" data-tab="settings"><span class="nav-ico">⚙️</span> 设置</div>
 <div class="nav-item" data-tab="logs"><span class="nav-ico">📜</span> 请求日志</div>
-<div class="nav-item" data-tab="opencode"><span class="nav-ico">🌐</span> opencode 免费模型</div>
 <div class="sidebar-footer">
   <div>管理面板: <a href="/admin/">/admin/</a></div>
   <div>API 地址: <span id="footerApiAddr">http://127.0.0.1:3457</span></div>
@@ -219,11 +218,19 @@ body:not([data-theme="dark"]) .theme-toggle .dark-label{display:none}
 <div class="section">
   <div class="section-title">📋 快捷操作</div>
   <div class="section-body" style="display:flex;gap:10px;flex-wrap:wrap">
-    <button class="btn btn-primary" onclick="switchTab('import')">➕ 添加账号</button>
+    <button class="btn btn-primary" onclick="switchTab('accounts')">➕ 添加账号</button>
     <button class="btn" onclick="refreshAllTokens()">🔄 刷新全部 Token</button>
     <button class="btn" onclick="document.getElementById('fileInput').click()">📄 从文件导入</button>
     <input type="file" id="fileInput" accept=".json,.txt" style="display:none" onchange="handleFileImport(event)">
-    <button class="btn" onclick="switchTab('settings');generateKey()">🔑 生成 API 密钥</button>
+    <button class="btn" onclick="switchTab('models')">🧠 模型列表</button>
+    <button class="btn" onclick="switchTab('settings')">⚙️ 设置</button>
+  </div>
+</div>
+<div class="section">
+  <div class="section-title">🌐 opencode 上游统计</div>
+  <div class="section-body">
+    <div class="table-wrap"><div id="ocStatsBox"></div></div>
+    <div id="ocModelStatsBox" style="margin-top:14px"></div>
   </div>
 </div>
 </div>
@@ -233,7 +240,7 @@ body:not([data-theme="dark"]) .theme-toggle .dark-label{display:none}
   <h2>👤 账号管理</h2>
   <div style="display:flex;gap:8px">
     <button class="btn btn-sm" onclick="exportAccounts()">📤 导出账号</button>
-    <button class="btn btn-primary btn-sm" onclick="switchTab('import')">➕ 添加</button>
+    <button class="btn btn-primary btn-sm" onclick="switchTab('accounts')">➕ 添加</button>
     <button class="btn btn-sm" onclick="loadAccounts()">🔄 刷新</button>
   </div>
 </div>
@@ -254,10 +261,8 @@ body:not([data-theme="dark"]) .theme-toggle .dark-label{display:none}
     </div>
   </div>
 </div>
-</div>
 
-<div id="tab-import" class="tab-panel" style="display:none">
-<h2>📥 导入账号</h2>
+<h2 style="margin-top:26px">📥 导入账号</h2>
 <div class="section">
   <div class="tabs" id="importTabs">
     <div class="tab active" data-tab="oauth">🔑 OAuth 浏览器登录</div>
@@ -319,6 +324,43 @@ body:not([data-theme="dark"]) .theme-toggle .dark-label{display:none}
     <div id="batchResult" style="margin-top:8px"></div>
   </div>
 </div>
+
+<div class="section" style="margin-top:26px">
+  <div class="section-title">🌐 opencode 上游配置</div>
+  <div class="section-body">
+    <div class="form-row">
+      <div class="field"><label>启用 opencode 上游</label>
+        <select id="ocEnabled"><option value="true">开启</option><option value="false">关闭</option></select>
+      </div>
+      <div class="field"><label>API Key</label><input type="text" id="ocKey" placeholder="public"></div>
+    </div>
+    <div class="form-row">
+      <div class="field"><label>API 端点（每行一个，第一个为主端点，其余为 CDN 镜像，重试自动轮换）</label>
+        <textarea id="ocBaseURLs" rows="4" placeholder="https://opencode.ai/zen/v1"></textarea>
+      </div>
+    </div>
+    <div class="form-actions"><button class="btn btn-primary" onclick="saveOcConfig()">💾 保存上游配置</button></div>
+  </div>
+</div>
+</div>
+
+<div id="tab-models" class="tab-panel" style="display:none">
+<h2>🧠 模型列表</h2>
+<div class="hint" style="margin:-4px 0 16px;padding:11px 14px;border:1px solid var(--border);border-radius:10px;background:rgba(148,163,184,.05)">
+  ℹ️ 前缀仅用于区分来源: <strong style="color:var(--text)">cline/</strong> 走 Cline 账号池, <strong style="color:var(--text)">zen/</strong> 走 opencode 上游。请求时携带带前缀的名称, 网关会自动还原为上游原始模型名。
+</div>
+<div class="section">
+  <div class="section-title">🟣 Cline 模型 <span id="modelsProbeInfo" class="probe-pill" style="font-weight:normal"></span>
+    <button class="btn btn-sm" onclick="refreshModels()" style="margin-left:auto">🔄 同步</button>
+  </div>
+  <div class="section-body" style="padding:6px"><div id="modelsList" style="padding:12px">加载中...</div></div>
+</div>
+<div class="section">
+  <div class="section-title">🌐 opencode 模型
+    <button class="btn btn-sm" onclick="refreshOcModels()" style="margin-left:auto">🔄 同步</button>
+  </div>
+  <div class="section-body" style="padding:6px"><div id="ocModelsList" style="padding:12px">加载中...</div></div>
+</div>
 </div>
 
 <div id="tab-settings" class="tab-panel" style="display:none">
@@ -333,17 +375,6 @@ body:not([data-theme="dark"]) .theme-toggle .dark-label{display:none}
     </div>
     <div id="keysList"></div>
     <div id="keyGenResult" style="margin-top:8px"></div>
-  </div>
-</div>
-
-<div class="section">
-  <div class="section-title">🧠 可用模型 <span id="modelsProbeInfo" class="probe-pill" style="font-weight:normal"></span></div>
-  <div class="section-body">
-    <div class="flex" style="margin-bottom:10px;gap:10px">
-      <button class="btn btn-sm btn-primary" onclick="refreshModels()">🔄 刷新模型</button>
-      <span class="hint" style="margin:0">自动同步上游官方免费模型（60 秒），仅显示不消耗额度的模型</span>
-    </div>
-    <div id="modelsList">加载中...</div>
   </div>
 </div>
 
@@ -398,60 +429,13 @@ body:not([data-theme="dark"]) .theme-toggle .dark-label{display:none}
 </div>
 
 <div class="section">
-  <div class="section-title">🗑️ 危险操作</div>
+  <div class="section-title">🌐 出口代理与节点</div>
   <div class="section-body">
-    <div style="display:flex;gap:10px;flex-wrap:wrap">
-      <button class="btn btn-danger" onclick="deleteAllAccounts()">🗑️ 删除全部账号</button>
-      <button class="btn btn-danger" onclick="deleteAllKeys()">🗑️ 删除全部密钥</button>
-    </div>
-  </div>
-</div>
-</div>
-
-<div id="tab-logs" class="tab-panel" style="display:none">
-<div class="flex justify-between" style="margin-bottom:16px">
-  <h2>📜 请求日志 <span class="probe-pill" style="font-weight:normal">最近 500 条，落盘 data/requests.jsonl</span></h2>
-  <div style="display:flex;gap:8px">
-    <button class="btn btn-sm" onclick="loadLogs()">🔄 刷新</button>
-  </div>
-</div>
-<div class="section">
-  <div class="section-body" style="padding:6px">
-    <div class="table-wrap">
-    <table>
-      <thead>
-        <tr><th>时间</th><th>来源</th><th>方法</th><th>路径</th><th>模型</th><th>路由</th><th>状态</th><th>耗时</th></tr>
-      </thead>
-      <tbody id="logsTableBody">
-        <tr><td colspan="8" class="empty">加载中...</td></tr>
-      </tbody>
-    </table>
-    </div>
-  </div>
-</div>
-</div>
-
-<div id="tab-opencode" class="tab-panel" style="display:none">
-<h2>🌐 opencode 免费模型（统一网关）</h2>
-
-<div class="section">
-  <div class="section-title">🔄 上游配置</div>
-  <div class="section-body">
-    <div class="form-row">
-      <div class="field"><label>启用 opencode 上游</label>
-        <select id="ocEnabled"><option value="true">开启</option><option value="false">关闭</option></select>
-      </div>
-      <div class="field"><label>API Key</label><input type="text" id="ocKey" placeholder="public"></div>
-    </div>
-    <div class="form-row">
-      <div class="field"><label>API 端点（每行一个，第一个为主端点，重试自动轮换）</label>
-        <textarea id="ocBaseURLs" rows="4" placeholder="https://opencode.ai/zen/v1"></textarea>
-      </div>
-    </div>
     <div class="form-row">
       <div class="field"><label>代理策略</label>
         <select id="ocStrategy"><option value="round_robin">轮询 round_robin</option><option value="random">随机 random</option><option value="fill">固定 fill</option></select>
       </div>
+      <div class="field"><label>代理冷却</label><span id="ocCooldownInfo" class="hint" style="margin:0;align-self:center">-</span></div>
     </div>
     <div class="form-row">
       <div class="field"><label>代理列表</label>
@@ -478,10 +462,7 @@ body:not([data-theme="dark"]) .theme-toggle .dark-label{display:none}
         <div id="ocNodesBox" style="max-height:190px;overflow-y:auto;border:1px solid var(--border);border-radius:10px;background:rgba(2,6,23,.3)"></div>
       </div>
     </div>
-    <div class="form-row">
-      <div class="field"><label>代理冷却</label><span id="ocCooldownInfo" class="hint" style="margin:0;align-self:center">-</span></div>
-    </div>
-    <div class="form-actions"><button class="btn btn-primary" onclick="saveOcConfig()">💾 保存配置</button></div>
+    <div class="form-actions"><button class="btn btn-primary" onclick="saveOcConfig()">💾 保存出口配置</button></div>
   </div>
 </div>
 
@@ -527,23 +508,36 @@ body:not([data-theme="dark"]) .theme-toggle .dark-label{display:none}
 </div>
 
 <div class="section">
-  <div class="section-title">🧠 opencode 模型列表
-    <button class="btn btn-sm" onclick="refreshOcModels()" style="margin-left:auto">🔄 手动同步</button>
-  </div>
-  <div class="section-body" style="padding:6px">
-    <div id="ocModelsList" style="padding:12px">加载中...</div>
-  </div>
-</div>
-
-<div class="section">
-  <div class="section-title">📊 opencode 统计</div>
+  <div class="section-title">🗑️ 危险操作</div>
   <div class="section-body">
-    <div class="table-wrap"><div id="ocStatsBox"></div></div>
-    <div id="ocModelStatsBox" style="margin-top:14px"></div>
+    <div style="display:flex;gap:10px;flex-wrap:wrap">
+      <button class="btn btn-danger" onclick="deleteAllAccounts()">🗑️ 删除全部账号</button>
+      <button class="btn btn-danger" onclick="deleteAllKeys()">🗑️ 删除全部密钥</button>
+    </div>
   </div>
 </div>
 </div>
 
+<div id="tab-logs" class="tab-panel" style="display:none">
+<div class="flex justify-between" style="margin-bottom:16px">
+  <h2>📜 请求日志 <span class="probe-pill" style="font-weight:normal">最近 500 条，落盘 data/requests.jsonl</span></h2>
+  <div style="display:flex;gap:8px">
+    <button class="btn btn-sm" onclick="loadLogs()">🔄 刷新</button>
+  </div>
+</div>
+<div class="section">
+  <div class="section-body" style="padding:6px">
+    <div class="table-wrap">
+    <table>
+      <thead>
+        <tr><th>时间</th><th>来源</th><th>方法</th><th>路径</th><th>模型</th><th>路由</th><th>状态</th><th>耗时</th></tr>
+      </thead>
+      <tbody id="logsTableBody">
+        <tr><td colspan="8" class="empty">加载中...</td></tr>
+      </tbody>
+    </table>
+    </div>
+  </div>
 </div>
 </div>
 
@@ -603,11 +597,11 @@ document.querySelectorAll('.nav-item').forEach(el => {
     el.classList.add('active');
     document.querySelectorAll('.tab-panel').forEach(e => e.style.display = 'none');
     _('tab-' + el.dataset.tab).style.display = 'block';
-    if (el.dataset.tab === 'dashboard') { loadStats(); loadAccounts(); }
-    if (el.dataset.tab === 'accounts') loadAccounts();
-    if (el.dataset.tab === 'settings') { loadKeys(); loadModels(); loadConfig(); }
+    if (el.dataset.tab === 'dashboard') { loadStats(); loadOcStats(); }
+    if (el.dataset.tab === 'accounts') { loadAccounts(); loadOcConfig(); }
+    if (el.dataset.tab === 'models') { loadModels(); loadOcModels(); }
+    if (el.dataset.tab === 'settings') { loadKeys(); loadConfig(); loadOcConfig(); loadOcNodes(); }
     if (el.dataset.tab === 'logs') loadLogs();
-    if (el.dataset.tab === 'opencode') { loadOcConfig(); loadOcModels(); loadOcStats(); }
   });
 });
 
@@ -617,11 +611,11 @@ function switchTab(name) {
   });
   document.querySelectorAll('.tab-panel').forEach(e => e.style.display = 'none');
   _('tab-' + name).style.display = 'block';
-  if (name === 'dashboard') { loadStats(); loadAccounts(); }
-  if (name === 'accounts') loadAccounts();
-  if (name === 'settings') { loadKeys(); loadModels(); }
+  if (name === 'dashboard') { loadStats(); loadOcStats(); }
+  if (name === 'accounts') { loadAccounts(); loadOcConfig(); }
+  if (name === 'models') { loadModels(); loadOcModels(); }
+  if (name === 'settings') { loadKeys(); loadConfig(); loadOcConfig(); loadOcNodes(); }
   if (name === 'logs') loadLogs();
-  if (name === 'opencode') { loadOcConfig(); loadOcModels(); loadOcStats(); }
 }
 
 // 导入子标签
@@ -665,7 +659,7 @@ async function loadAccounts() {
     const list = d.data.accounts;
     const tbody = _('accountTableBody');
     if (!list || list.length === 0) {
-      tbody.innerHTML = '<tr><td colspan="6" class="empty">暂无账号，前往 <a href="#" onclick="switchTab(\'import\')" style="color:var(--accent);cursor:pointer">导入账号</a> 页添加</td></tr>';
+      tbody.innerHTML = '<tr><td colspan="6" class="empty">暂无账号，可在下方「导入账号」区域添加</td></tr>';
       return;
     }
     const sn = { active: '活跃', cooldown: '冷却', expired: '已过期' };
@@ -924,7 +918,7 @@ async function loadLogs() {
     if (!logs.length) { tbody.innerHTML = '<tr><td colspan="8" class="empty">暂无请求记录</td></tr>'; return; }
     tbody.innerHTML = logs.map(l => {
       const t = l.time ? new Date(l.time).toLocaleString('zh-CN') : '-';
-      const route = ROUTE_LABEL[l.route] || l.route || '-';
+      const route = (ROUTE_LABEL[l.route] || l.route || '-') + (l.exit ? ' · ' + l.exit : '');
       const st = l.status || 0;
       return '<tr>' +
         '<td class="mono" style="font-size:11px">' + t + '</td>' +
@@ -1010,6 +1004,18 @@ const MODEL_STYLE = {
 };
 const COST_LABEL = { free: '免费', pass: '订阅', quota: '消耗额度' };
 
+function copyText(t) {
+  const done = () => toast('已复制: ' + t, 'success');
+  if (navigator.clipboard && navigator.clipboard.writeText) {
+    navigator.clipboard.writeText(t).then(done).catch(() => { fallbackCopy(t); done(); });
+  } else { fallbackCopy(t); done(); }
+}
+function fallbackCopy(t) {
+  const i = document.createElement('textarea');
+  i.value = t; document.body.appendChild(i); i.select();
+  document.execCommand('copy'); i.remove();
+}
+
 async function loadModels() {
   try {
     const d = await api('GET', '/models');
@@ -1022,8 +1028,10 @@ async function loadModels() {
       const st = MODEL_STYLE[m.status] || MODEL_STYLE.unknown;
       const cost = COST_LABEL[m.cost] || m.cost || '';
       const synced = m.syncedAt ? new Date(m.syncedAt).toLocaleTimeString('zh-CN') : '-';
+      const disp = 'cline/' + m.id;
       return '<div style="display:flex;align-items:center;gap:10px;padding:8px 12px;margin:5px 0;background:rgba(148,163,184,.06);border:1px solid var(--border);border-radius:10px;transition:.15s">' +
-        '<span style="font-family:\'JetBrains Mono\',monospace;font-size:13px;flex:1">' + esc(m.id) + '</span>' +
+        '<span style="font-family:\'JetBrains Mono\',monospace;font-size:13px;flex:1">' + esc(disp) + '</span>' +
+        '<span class="copy-icon" title="复制" onclick="copyText(\'' + esc(disp).replace(/'/g, "\\'") + '\')">📋</span>' +
         (m.cost === 'free' ? '<span style="font-size:11px;color:var(--accent2)">不扣费</span>' : '') +
         (cost ? '<span class="model-tag">' + esc(cost) + '</span>' : '') +
         '<span class="model-tag" style="' + st.css + '">' + st.label + '</span>' +
@@ -1226,8 +1234,13 @@ async function loadOcModels() {
   try {
     const d = await api('GET', '/opencode/models');
     const models = d.data.models || [];
-    _('ocModelsList').innerHTML = '<div class="table-wrap"><table><thead><tr><th style="text-align:left">模型 ID</th><th>上下文</th><th>输出</th><th>来源</th></tr></thead><tbody>' +
-      models.map(m => '<tr><td style="text-align:left;font-family:monospace">' + esc(m.id) + '</td><td>' + m.context + '</td><td>' + m.output + '</td><td>' + m.source + '</td></tr>').join('') +
+    _('ocModelsList').innerHTML = '<div class="table-wrap"><table><thead><tr><th style="text-align:left">模型 ID</th><th style="width:44px"></th><th>上下文</th><th>输出</th><th>来源</th></tr></thead><tbody>' +
+      models.map(m => {
+        const disp = 'zen/' + m.id;
+        return '<tr><td style="text-align:left;font-family:monospace">' + esc(disp) + '</td>' +
+          '<td><span class="copy-icon" title="复制" onclick="copyText(\'' + esc(disp).replace(/'/g, "\\'") + '\')">📋</span></td>' +
+          '<td>' + m.context + '</td><td>' + m.output + '</td><td>' + m.source + '</td></tr>';
+      }).join('') +
       '</tbody></table></div><div class="hint">共 ' + models.length + ' 个免费模型（每 10 分钟自动同步）</div>';
   } catch (e) { _('ocModelsList').textContent = '加载失败'; }
 }

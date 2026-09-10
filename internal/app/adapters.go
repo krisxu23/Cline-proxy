@@ -45,6 +45,7 @@ func classifyModel(model string) string {
 	if strings.HasPrefix(strings.TrimSpace(model), "cline-pass/") {
 		return "clinepass"
 	}
+	model = stripDisplayPrefix(model)
 	switch routeModel(model) {
 	case "zen":
 		return "zen"
@@ -123,7 +124,7 @@ func (zenAdapter) Kind() string { return "zen" }
 
 func (zenAdapter) Chat(ctx context.Context, req providers.ChatRequest) (*providers.ChatResponse, error) {
 	params := chatRequestToParams(req)
-	resp, _, err := callZenAPI(params, false)
+	resp, _, err := callZenAPI(ctx, params, false)
 	if err != nil {
 		return nil, err
 	}
@@ -146,7 +147,7 @@ func (zenAdapter) ChatStream(ctx context.Context, req providers.ChatRequest, w i
 		return fmt.Errorf("zen streaming requires http.ResponseWriter")
 	}
 	params := chatRequestToParams(req)
-	resp, _, err := callZenAPI(params, true)
+	resp, _, err := callZenAPI(ctx, params, true)
 	if err != nil {
 		return err
 	}

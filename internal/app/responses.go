@@ -450,6 +450,8 @@ func handleResponses(w http.ResponseWriter, r *http.Request) {
 
 	chat := responsesToChat(params)
 	chatModel, _ := chat["model"].(string)
+	chatModel = stripDisplayPrefix(chatModel)
+	chat["model"] = chatModel
 	route := routeModel(chatModel)
 	if route == "reject" {
 		writeJSON(w, http.StatusBadRequest, map[string]any{
@@ -471,7 +473,7 @@ func handleResponses(w http.ResponseWriter, r *http.Request) {
 		if out.changed {
 			log.Printf("  responses zen: %s", out.note)
 		}
-		resp, _, err := callZenAPI(chat, isStream)
+		resp, _, err := callZenAPI(r.Context(), chat, isStream)
 		if err != nil {
 			writeJSON(w, http.StatusBadGateway, map[string]any{
 				"error": map[string]string{"message": err.Error(), "type": "api_error"},

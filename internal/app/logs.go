@@ -2,6 +2,7 @@ package app
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"io"
 	"net"
@@ -22,6 +23,7 @@ type RequestLog struct {
 	Path     string    `json:"path"`
 	Model    string    `json:"model,omitempty"`
 	Route    string    `json:"route"` // zen | cline | admin | other
+	Exit     string    `json:"exit,omitempty"`
 	Status   int       `json:"status"`
 	Duration int64     `json:"duration_ms"`
 	Note     string    `json:"note,omitempty"`
@@ -150,6 +152,10 @@ func requestLogMiddleware(next http.Handler) http.Handler {
 			}
 		}
 
+		// 出口收集器: zen 拨号层经 request context 回写实际使用的出口
+		exit := &reqExit{}
+		r = r.WithContext(context.WithValue(r.Context(), ctxKeyReqExit, exit))
+
 		next.ServeHTTP(sw, r)
 
 		if sw.status == 0 {
@@ -177,6 +183,7 @@ func requestLogMiddleware(next http.Handler) http.Handler {
 			Path:     r.URL.Path,
 			Model:    model,
 			Route:    route,
+			Exit:     exit.name,
 			Status:   sw.status,
 			Duration: time.Since(start).Milliseconds(),
 		})

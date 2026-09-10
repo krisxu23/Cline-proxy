@@ -186,8 +186,32 @@ func zenHTTP2Transport() *http2.Transport {
 	}
 }
 
+// reqExit 单次请求实际使用的出口, 由日志中间件经 request context 收集
+type reqExit struct{ name string }
+
+type ctxKeyReqExitType struct{}
+
+var ctxKeyReqExit = ctxKeyReqExitType{}
+
+// setReqExit 把本次请求选择的出口写入请求上下文(若存在)
+func setReqExit(ctx context.Context, proxy string) {
+	info, ok := ctx.Value(ctxKeyReqExit).(*reqExit)
+	if !ok {
+		return
+	}
+	switch {
+	case proxy == "":
+		info.name = "直连"
+	case isNodeLink(proxy):
+		info.name = "节点: " + nodeDisplayName(proxy)
+	default:
+		info.name = "代理: " + maskProxyURL(proxy)
+	}
+}
+
 func zenDialContext(ctx context.Context, network, addr string) (net.Conn, error) {
 	p, _ := pickZenProxy()
+	setReqExit(ctx, p)
 	if p == "" {
 		d := &net.Dialer{Timeout: 30 * time.Second, KeepAlive: 30 * time.Second}
 		return d.DialContext(ctx, network, addr)

@@ -216,6 +216,8 @@ func StartProxy(host string, port int) error {
 			}
 		}
 		model, _ := params["model"].(string)
+		model = stripDisplayPrefix(model)
+		params["model"] = model
 		log.Printf("  client: stream=%v tools=%d model=%s", isStream, toolCount, model)
 
 		// ClinePass 订阅池: cline-pass/ 前缀模型使用独立 key 池,
@@ -450,7 +452,7 @@ func handleZenChat(w http.ResponseWriter, r *http.Request, params map[string]any
 		log.Printf("  zen: %s", out.note)
 	}
 
-	resp, rateLimited, err := callZenAPI(params, isStream)
+	resp, rateLimited, err := callZenAPI(r.Context(), params, isStream)
 	if err != nil {
 		log.Printf("  zen api error: %v", err)
 		tracker.rec.RateLimited = rateLimited
@@ -1516,6 +1518,8 @@ func handleAnthropicMessages(w http.ResponseWriter, r *http.Request) {
 	}
 
 	openAIReq := anthropicToOpenAI(req)
+	req.Model = stripDisplayPrefix(req.Model)
+	openAIReq["model"] = req.Model
 
 	log.Printf("  anthropic: model=%s stream=%v msgs=%d", req.Model, req.Stream, len(req.Messages))
 
@@ -1665,7 +1669,7 @@ func handleZenAnthropic(w http.ResponseWriter, r *http.Request, req anthropicReq
 		log.Printf("  anthropic zen: %s", out.note)
 	}
 
-	resp, rateLimited, err := callZenAPI(openAIReq, isStream)
+	resp, rateLimited, err := callZenAPI(r.Context(), openAIReq, isStream)
 	if err != nil {
 		log.Printf("  anthropic zen api error: %v", err)
 		tracker.rec.RateLimited = rateLimited
