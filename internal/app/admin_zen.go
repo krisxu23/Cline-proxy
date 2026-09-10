@@ -21,6 +21,7 @@ func handleZenConfig(w http.ResponseWriter, r *http.Request) {
 		"enabled":         cfg.Enabled,
 		"key":             cfg.Key,
 		"baseURL":         cfg.BaseURL,
+		"baseURLs":        zenBaseURLList(cfg),
 		"proxies":         cfg.Proxies,
 		"proxyStrategy":   cfg.ProxyStrategy,
 		"maxConcurrency":  cfg.MaxConcurrency,
@@ -55,6 +56,7 @@ func handleZenConfigUpdate(w http.ResponseWriter, r *http.Request) {
 		Enabled         *bool    `json:"enabled"`
 		Key             *string  `json:"key"`
 		BaseURL         *string  `json:"baseURL"`
+		BaseURLs        []string `json:"baseURLs"`
 		Proxies         []string `json:"proxies"`
 		ProxyStrategy   *string  `json:"proxyStrategy"`
 		MaxConcurrency  *int     `json:"maxConcurrency"`
@@ -78,6 +80,7 @@ func handleZenConfigUpdate(w http.ResponseWriter, r *http.Request) {
 		Enabled:         cur.Enabled,
 		Key:             cur.Key,
 		BaseURL:         cur.BaseURL,
+		BaseURLs:        cur.BaseURLs,
 		Proxies:         cur.Proxies,
 		ProxyStrategy:   cur.ProxyStrategy,
 		MaxConcurrency:  cur.MaxConcurrency,
@@ -95,6 +98,26 @@ func handleZenConfigUpdate(w http.ResponseWriter, r *http.Request) {
 	}
 	if patch.BaseURL != nil && *patch.BaseURL != "" {
 		next.BaseURL = strings.TrimRight(*patch.BaseURL, "/")
+	}
+	if patch.BaseURLs != nil {
+		// 端点列表整体替换;空数组 = 恢复默认(官方 + 全部镜像)
+		cleaned := make([]string, 0, len(patch.BaseURLs))
+		for _, u := range patch.BaseURLs {
+			u = strings.TrimRight(strings.TrimSpace(u), "/")
+			if u == "" {
+				continue
+			}
+			if !strings.HasPrefix(u, "http://") && !strings.HasPrefix(u, "https://") {
+				writeAPI(w, http.StatusBadRequest, apiResponse{Error: fmt.Sprintf("端点 %q 协议无效（需 http:// 或 https://）", u)})
+				return
+			}
+			cleaned = append(cleaned, u)
+		}
+		next.BaseURLs = cleaned
+		// 主端点同步为列表第一个,保持旧字段语义
+		if len(cleaned) > 0 {
+			next.BaseURL = cleaned[0]
+		}
 	}
 	if patch.Proxies != nil {
 		if err := validateProxyList(patch.Proxies); err != nil {

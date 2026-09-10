@@ -156,7 +156,8 @@ type zenCompactConfig struct {
 type zenConfigData struct {
 	Enabled         bool             `json:"enabled"`
 	Key             string           `json:"key"`
-	BaseURL         string           `json:"baseURL"`
+	BaseURL         string           `json:"baseURL"`         // 主端点(兼容旧配置字段)
+	BaseURLs        []string         `json:"baseURLs"`        // 全部端点: 主端点 + CDN 镜像, 重试时轮换
 	Proxies         []string         `json:"proxies"`         // http(s)/socks5 代理,轮询出口
 	ProxyStrategy   string           `json:"proxyStrategy"`   // round_robin / random / fill
 	MaxConcurrency  int              `json:"maxConcurrency"`  // zen 上游最大并发,防 worker 瞬时超限,默认 8
@@ -167,11 +168,50 @@ type zenConfigData struct {
 	Compaction      zenCompactConfig `json:"compaction"`
 }
 
+// zenEndpointMirrors 官方源之外的 CDN 镜像端点(实测镜像透传官方完整路径,须带 /v1)。
+var zenEndpointMirrors = []string{
+	"https://opencode.ai.cmliussss.net/zen/v1",
+	"https://opencode.fastly.cmliussss.net/zen/v1",
+	"https://opencode.gcore.cmliussss.net/zen/v1",
+}
+
+// defaultZenBaseURLs 官方 + 全部镜像,官方在前。
+func defaultZenBaseURLs() []string {
+	return append([]string{zenAPIBase}, zenEndpointMirrors...)
+}
+
+// zenBaseURLList 返回去重后的端点列表: 主端点在前,镜像在后。
+// 兼容三种来源: 旧配置只有 BaseURL、新配置 BaseURLs、以及空值默认。
+func zenBaseURLList(cfg *zenConfigData) []string {
+	seen := map[string]bool{}
+	out := make([]string, 0, 1+len(zenEndpointMirrors))
+	add := func(u string) {
+		u = strings.TrimRight(strings.TrimSpace(u), "/")
+		if u == "" || seen[u] {
+			return
+		}
+		seen[u] = true
+		out = append(out, u)
+	}
+	add(cfg.BaseURL)
+	for _, u := range cfg.BaseURLs {
+		add(u)
+	}
+	if len(out) == 0 {
+		add(zenAPIBase)
+		for _, u := range zenEndpointMirrors {
+			add(u)
+		}
+	}
+	return out
+}
+
 func defaultZenConfig() *zenConfigData {
 	return &zenConfigData{
 		Enabled:         true,
 		Key:             "public",
 		BaseURL:         zenAPIBase,
+		BaseURLs:        defaultZenBaseURLs(),
 		ProxyStrategy:   "round_robin",
 		MaxConcurrency:  8,
 		Retries:         3,
@@ -286,6 +326,10 @@ func loadZenConfig() *zenConfigData {
 	if cfg.BaseURL == "" {
 		cfg.BaseURL = zenAPIBase
 	}
+	// 旧配置迁移: 只有 baseURL 没有 baseURLs 时,按默认端点表填充(官方 + 镜像)
+	if len(cfg.BaseURLs) == 0 {
+		cfg.BaseURLs = defaultZenBaseURLs()
+	}
 	return cfg
 }
 
@@ -367,7 +411,8 @@ func buildZenBody(params map[string]any, stream bool) map[string]any {
 	return body
 }
 
-// callZenAPI 调用 zen 上游,带限流防御: 并发信号量 + 指数退避重试 + 代理冷却 + 故障计数
+// callZenAPI 调用 zen 上游,带限流防御: 并发信号量 + 指数退避重试 + 端点轮换
+// + 代理冷却 + 故障计数。每次重试自动切换到下一个端点(官方 → CDN 镜像)。
 // 返回 (响应, 命中限流次数, 错误)
 func callZenAPI(params map[string]any, stream bool) (*http.Response, int, error) {
 	cfg := getZenConfig()
@@ -378,7 +423,7 @@ func callZenAPI(params map[string]any, stream bool) (*http.Response, int, error)
 		return nil, 0, fmt.Errorf("marshal zen body: %w", err)
 	}
 
-	endpoint := strings.TrimRight(cfg.BaseURL, "/") + "/chat/completions"
+	baseURLs := zenBaseURLList(cfg)
 
 	zenStateMu.Lock()
 	sem := zenSem
@@ -394,6 +439,10 @@ func callZenAPI(params map[string]any, stream bool) (*http.Response, int, error)
 	rateLimited := 0
 
 	for attempt := 0; ; attempt++ {
+		// 端点轮换: 第 N 次尝试用第 N % len(baseURLs) 个端点,
+		// 官方地址失败后自然落到 CDN 镜像。
+		base := baseURLs[attempt%len(baseURLs)]
+		endpoint := base + "/chat/completions"
 		req, err := http.NewRequest("POST", endpoint, bytes.NewReader(bodyJSON))
 		if err != nil {
 			return nil, rateLimited, fmt.Errorf("create zen request: %w", err)
@@ -411,12 +460,12 @@ func callZenAPI(params map[string]any, stream bool) (*http.Response, int, error)
 		if m, ok := resolveZenModel(model); ok {
 			req.Header.Set("x-opencode-model", m.ID)
 		}
-		log.Printf("  zen upstream: model=%s stream=%v msgs=%d via=%s attempt=%d session=%s",
-			body["model"], stream, getMsgCount(params), describeZenProxy(), attempt+1, kit.Truncate(sess, 24))
+		log.Printf("  zen upstream: model=%s stream=%v msgs=%d via=%s endpoint=%s attempt=%d session=%s",
+			body["model"], stream, getMsgCount(params), describeZenProxy(), base, attempt+1, kit.Truncate(sess, 24))
 
 		resp, err := getZenHTTPClient().Do(req)
 		if err != nil {
-			// 网络错误:退避重试(不计入故障转移,瞬时可恢复)
+			// 网络错误:退避重试(不计入故障转移,瞬时可恢复);重试会自动换端点
 			if attempt < retries {
 				log.Printf("  zen network error (%v), retry %d/%d after %v", err, attempt+1, retries, delay)
 				time.Sleep(kit.WithRetryJitter(delay))
@@ -450,7 +499,8 @@ func callZenAPI(params map[string]any, stream bool) (*http.Response, int, error)
 				if retryAfter := parseRetryAfter(resp.Header.Get("Retry-After")); retryAfter > wait {
 					wait = retryAfter
 				}
-				log.Printf("  zen rate limited (%d), retry %d/%d after %v", resp.StatusCode, attempt+1, retries, wait)
+				log.Printf("  zen rate limited (%d), retry %d/%d after %v (next endpoint: %s)",
+					resp.StatusCode, attempt+1, retries, wait, baseURLs[(attempt+1)%len(baseURLs)])
 				time.Sleep(kit.WithRetryJitter(wait))
 				delay *= 2
 				continue
@@ -498,26 +548,47 @@ func zenModelList() []map[string]any {
 	return out
 }
 
-// syncZenModels 拉取 zen /v1/models,动态合并到模型表
+// syncZenModels 拉取 zen /v1/models,动态合并到模型表。
+// 逐端点尝试: 官方地址失败后依次落 CDN 镜像。
 func syncZenModels() (int, error) {
 	initZenModels()
 	cfg := getZenConfig()
-	endpoint := strings.TrimRight(cfg.BaseURL, "/") + "/models"
-	req, err := http.NewRequest("GET", endpoint, nil)
-	if err != nil {
-		return 0, err
+	var lastErr error
+	for _, base := range zenBaseURLList(cfg) {
+		endpoint := base + "/models"
+		req, err := http.NewRequest("GET", endpoint, nil)
+		if err != nil {
+			return 0, err
+		}
+		req.Header.Set("Authorization", "Bearer "+cfg.Key)
+		client := &http.Client{Timeout: 25 * time.Second}
+		resp, err := client.Do(req)
+		if err != nil {
+			lastErr = err
+			continue
+		}
+		if resp.StatusCode != 200 {
+			body := kit.ReadBody(resp)
+			resp.Body.Close()
+			lastErr = fmt.Errorf("%s HTTP %d: %s", base, resp.StatusCode, kit.Truncate(body, 200))
+			continue
+		}
+		added, err := decodeZenModels(resp)
+		if err != nil {
+			lastErr = err
+			continue
+		}
+		return added, nil
 	}
-	req.Header.Set("Authorization", "Bearer "+cfg.Key)
-	client := &http.Client{Timeout: 25 * time.Second}
-	resp, err := client.Do(req)
-	if err != nil {
-		return 0, err
+	if lastErr == nil {
+		lastErr = fmt.Errorf("no zen endpoints configured")
 	}
-	defer resp.Body.Close()
-	if resp.StatusCode != 200 {
-		return 0, fmt.Errorf("HTTP %d", resp.StatusCode)
-	}
+	return 0, lastErr
+}
 
+// decodeZenModels 解析 /models 响应并合并进模型表。
+func decodeZenModels(resp *http.Response) (int, error) {
+	defer resp.Body.Close()
 	var payload struct {
 		Data []struct {
 			ID string `json:"id"`

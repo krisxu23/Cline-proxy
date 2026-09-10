@@ -444,7 +444,11 @@ body:not([data-theme="dark"]) .theme-toggle .dark-label{display:none}
       <div class="field"><label>API Key</label><input type="text" id="ocKey" placeholder="public"></div>
     </div>
     <div class="form-row">
-      <div class="field"><label>Base URL</label><input type="text" id="ocBaseURL" placeholder="https://opencode.ai/zen/v1"></div>
+      <div class="field"><label>API 端点（每行一个，第一个为主端点，重试自动轮换）</label>
+        <textarea id="ocBaseURLs" rows="4" placeholder="https://opencode.ai/zen/v1"></textarea>
+      </div>
+    </div>
+    <div class="form-row">
       <div class="field"><label>代理策略</label>
         <select id="ocStrategy"><option value="round_robin">轮询 round_robin</option><option value="random">随机 random</option><option value="fill">固定 fill</option></select>
       </div>
@@ -1073,7 +1077,7 @@ async function loadOcConfig() {
     const c = d.data;
     _('ocEnabled').value = String(c.enabled);
     _('ocKey').value = c.key || 'public';
-    _('ocBaseURL').value = c.baseURL || '';
+    _('ocBaseURLs').value = (c.baseURLs && c.baseURLs.length ? c.baseURLs : (c.baseURL ? [c.baseURL] : [])).join('\n');
     _('ocProxies').value = (c.proxies || []).join('\n');
     _('ocStrategy').value = c.proxyStrategy || 'round_robin';
     _('ocMaxConc').value = c.maxConcurrency || 8;
@@ -1106,7 +1110,7 @@ async function saveOcConfig() {
   const body = {
     enabled: _('ocEnabled').value === 'true',
     key: _('ocKey').value.trim(),
-    baseURL: _('ocBaseURL').value.trim(),
+    baseURLs: _('ocBaseURLs').value.split('\n').map(s => s.trim()).filter(Boolean),
     proxies: proxies,
     proxyStrategy: _('ocStrategy').value,
     maxConcurrency: parseInt(_('ocMaxConc').value) || 8,

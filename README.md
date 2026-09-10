@@ -108,7 +108,7 @@ Model:    同上
 
 ### 2. opencode zen 免费模型
 
-无需配置，启动即启用（匿名 key `public`）。每 10 分钟自动同步官方模型列表；付费 zen 模型显式 400 拒绝。超限时按 opencode 官方算法做摘要压缩（尾部预算 → 锚定摘要模板 → 重组会话）。支持 http/https/socks5 代理池轮询出口（round_robin / random / fill）。后台 **opencode 免费模型** 页可调全部参数。
+无需配置，启动即启用（匿名 key `public`）。官方源 + 3 个 CDN 镜像共 4 个 API 端点（官方在前），重试与模型同步自动跨端点轮换；可在后台「API 端点」里整体替换。每 10 分钟自动同步官方模型列表；付费 zen 模型显式 400 拒绝。超限时按 opencode 官方算法做摘要压缩（尾部预算 → 锚定摘要模板 → 重组会话）。支持 http/https/socks5 代理池轮询出口（round_robin / random / fill）。后台 **opencode 免费模型** 页可调全部参数。
 
 ### 3. ClinePass 订阅池
 
