@@ -457,6 +457,8 @@ body:not([data-theme="dark"]) .theme-toggle .dark-label{display:none}
       <div class="field"><label>代理列表</label>
         <textarea id="ocProxies" rows="4" placeholder="每行一个: http://user:pass@host:port / socks5://host:port&#10;或节点链接: vmess:// vless:// trojan:// ss:// hy2:// tuic:// hysteria:// anytls:// ssh:// shadowtls:// snell://"></textarea>
       </div>
+    </div>
+    <div class="form-row">
       <div class="field"><label>订阅链接</label>
         <div id="ocSubsList" style="display:flex;flex-direction:column;gap:6px;margin-bottom:8px"></div>
         <div style="display:flex;gap:8px">
@@ -469,9 +471,11 @@ body:not([data-theme="dark"]) .theme-toggle .dark-label{display:none}
         </div>
         <div class="hint" id="ocSubsInfo" style="margin-top:6px;font-size:12px;color:var(--text3);white-space:pre-wrap"></div>
       </div>
+    </div>
+    <div class="form-row">
       <div class="field"><label style="display:flex;align-items:center;justify-content:space-between">节点列表
         <button type="button" class="btn" style="padding:3px 10px;font-size:12px" onclick="loadOcNodes()">刷新</button></label>
-        <div id="ocNodesBox" style="max-height:190px;overflow-y:auto;border:1px solid var(--border);border-radius:10px;background:rgba(2,6,23,.3);margin-top:8px"></div>
+        <div id="ocNodesBox" style="max-height:190px;overflow-y:auto;border:1px solid var(--border);border-radius:10px;background:rgba(2,6,23,.3)"></div>
       </div>
     </div>
     <div class="form-row">
