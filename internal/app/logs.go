@@ -71,11 +71,13 @@ func LoadRequestLogs() []RequestLog {
 }
 
 // LoadRequestLogsFromFile 启动时从落盘文件读取尾部记录
+// 与请求日志中间件同规则: 管理面板只读轮询等噪音不载入, 只保留对话/写操作/错误。
 func LoadRequestLogsFromFile() {
 	raw, err := os.ReadFile(reqLogsFile)
 	if err != nil {
 		return
 	}
+	var reqLogs0 []RequestLog
 	lines := splitLinesSafe(string(raw))
 	for _, line := range lines {
 		if line == "" {
@@ -83,12 +85,27 @@ func LoadRequestLogsFromFile() {
 		}
 		var l RequestLog
 		if json.Unmarshal([]byte(line), &l) == nil {
-			reqLogs = append(reqLogs, l)
+			if isRequestNoise(l) {
+				continue
+			}
+			reqLogs0 = append(reqLogs0, l)
 		}
 	}
-	if len(reqLogs) > maxReqLogs {
-		reqLogs = reqLogs[len(reqLogs)-maxReqLogs:]
+	if len(reqLogs0) > maxReqLogs {
+		reqLogs0 = reqLogs0[len(reqLogs0)-maxReqLogs:]
 	}
+	reqLogs = reqLogs0
+}
+
+// isRequestNoise 该条记录是否为管理轮询等噪音(与中间件过滤同一判定)
+func isRequestNoise(l RequestLog) bool {
+	if l.Route == "admin" && l.Method == "GET" {
+		return true
+	}
+	if (l.Route == "meta" || l.Route == "other") && l.Status < http.StatusBadRequest {
+		return true
+	}
+	return false
 }
 
 func splitLinesSafe(s string) []string {
@@ -172,6 +189,21 @@ func requestLogMiddleware(next http.Handler) http.Handler {
 		case strings.Contains(r.URL.Path, "models") || strings.Contains(r.URL.Path, "health"):
 			route = "meta"
 		}
+
+		// 请求日志只抓重点: 对话/模型调用、配置写操作与错误记录。
+		// 管理面板只读轮询与健康心跳等噪音不落盘, 避免占满最近 500 条容量。
+		if isRequestNoise(RequestLog{Route: route, Method: r.Method, Status: sw.status}) {
+			return
+		}
+
+		// 出口回填: keep-alive 复用连接时不会重新拨号(拨号层此时不写 exit),
+		// 用当前轮换命中的出口补齐, 保证每次对话请求都能看到实际出口。
+		if exit.name == "" {
+			if p := describeEffectiveExit(); p != "" {
+				exit.name = p
+			}
+		}
+
 		client := r.RemoteAddr
 		if host, _, err := net.SplitHostPort(client); err == nil {
 			client = host
