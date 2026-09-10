@@ -172,6 +172,24 @@ func requestLogMiddleware(next http.Handler) http.Handler {
 		case strings.Contains(r.URL.Path, "models") || strings.Contains(r.URL.Path, "health"):
 			route = "meta"
 		}
+
+		// 请求日志只抓重点: 对话/模型调用、配置写操作与错误记录。
+		// 管理面板只读轮询与健康心跳等噪音不落盘, 避免占满最近 500 条容量。
+		if route == "admin" && r.Method == http.MethodGet {
+			return
+		}
+		if (route == "meta" || route == "other") && sw.status < http.StatusBadRequest {
+			return
+		}
+
+		// 出口回填: keep-alive 复用连接时不会重新拨号(拨号层此时不写 exit),
+		// 用当前轮换命中的出口补齐, 保证每次对话请求都能看到实际出口。
+		if exit.name == "" {
+			if p := describeEffectiveExit(); p != "" {
+				exit.name = p
+			}
+		}
+
 		client := r.RemoteAddr
 		if host, _, err := net.SplitHostPort(client); err == nil {
 			client = host
