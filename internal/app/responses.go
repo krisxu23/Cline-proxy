@@ -458,6 +458,7 @@ func handleResponses(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if route == "zen" {
+		setRouteHeader(w, "zen", chatModel, "")
 		zm, ok := resolveZenFreeModel(chatModel)
 		if !ok {
 			writeJSON(w, http.StatusBadRequest, map[string]any{
@@ -498,11 +499,17 @@ func handleResponses(w http.ResponseWriter, r *http.Request) {
 
 	// ClinePass 订阅池: cline-pass/ 前缀模型
 	if strings.HasPrefix(strings.TrimSpace(chatModel), "cline-pass/") {
+		setRouteHeader(w, "cline-pass", chatModel, "")
 		handleClinePassResponses(w, r, params, chat, isStream)
 		return
 	}
 
 	// cline 上游
+	if _, isZen := resolveZenFreeModel(chatModel); isZen {
+		setRouteHeader(w, "cline", chatModel, "zen-degraded")
+	} else {
+		setRouteHeader(w, "cline", chatModel, "")
+	}
 	stream := isStream
 	if !isStream && modelNeedsStream(normalizeRequestModel(chatModel)) {
 		stream = true

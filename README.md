@@ -168,6 +168,7 @@ curl http://127.0.0.1:3457/admin/api/clinepass/models
 - **自定义请求头**：后台 **设置** → **请求头**，编辑转发给上游的头（如 `x-client-type: cline-cli`）
 - **thinking 透传**：Anthropic 协议下上游 `reasoning_content` 自动转为 `thinking` 内容块（流式 + 非流式）
 - **SSE 稳健性**：上游流无任何 choices 时自动补一个空 chunk 收尾，避免客户端报 "Provider returned no completion choices"
+- **熔断器与三层自愈**：上游级熔断（连续 5xx/408/429 触发，窗口过期后半开探测，探测失败立即重跳闸，4xx 客户端错误不计入）→ key/账号级冷却（ClinePass key 与 Cline 账号命中 429 独立冷却，成功自动清零）→ 模型级路由（`zen/` 前缀显式分流，付费/未知模型明确拒绝）。每个响应带 `X-Proxy-Route` 头，标注 upstream / model / failover 决策，排查路由一目了然
 - **token 统计**：每请求 JSONL 落盘，按账号/上游/模型聚合，管理后台实时展示
 - **多平台 CI/CD**：GitHub Actions 自动构建 6 平台二进制；Release 从 `v0.0.1` 起按语义版本递增
 

@@ -215,6 +215,7 @@ func StartProxy(host string, port int) error {
 		// ClinePass 订阅池: cline-pass/ 前缀模型使用独立 key 池,
 		// 不依赖 Cline 账号,须在账号池守卫之前分流。
 		if strings.HasPrefix(strings.TrimSpace(model), "cline-pass/") {
+			setRouteHeader(w, "cline-pass", model, "")
 			handleClinePassChat(w, r, params, isStream)
 			return
 		}
@@ -222,6 +223,7 @@ func StartProxy(host string, port int) error {
 		// zen 免费模型路由: zen 上游匿名可用,不依赖 Cline 账号,
 		// 同样须在账号池守卫之前分流。
 		if route := routeModel(model); route == "zen" {
+			setRouteHeader(w, "zen", model, "")
 			applyOverride(params)
 			handleZenChat(w, r, params)
 			return
@@ -240,6 +242,13 @@ func StartProxy(host string, port int) error {
 				},
 			})
 			return
+		}
+
+		// zen 免费模型落到 cline 池 = zen 熔断期间的路由降级
+		if _, isZen := resolveZenFreeModel(model); isZen {
+			setRouteHeader(w, "cline", model, "zen-degraded")
+		} else {
+			setRouteHeader(w, "cline", model, "")
 		}
 
 		// Override system prompt from override.md for OpenAI format
@@ -360,6 +369,16 @@ func corsHandler(h http.HandlerFunc) http.HandlerFunc {
 
 		h(w, r)
 	}
+}
+
+// setRouteHeader 在响应头中标注本次请求的路由决策, 便于客户端侧排查
+// (灵感来自 OmniRoute 的 X-OmniRoute-Decision)。
+func setRouteHeader(w http.ResponseWriter, upstream, model, failover string) {
+	v := "upstream=" + upstream + "; model=" + model
+	if failover != "" {
+		v += "; failover=" + failover
+	}
+	w.Header().Set("X-Proxy-Route", v)
 }
 
 func writeJSON(w http.ResponseWriter, status int, data any) {
@@ -1496,6 +1515,7 @@ func handleAnthropicMessages(w http.ResponseWriter, r *http.Request) {
 
 	// zen / clinepass 免费模型路由
 	if route := routeModel(req.Model); route == "zen" {
+		setRouteHeader(w, "zen", req.Model, "")
 		handleZenAnthropic(w, r, req, openAIReq, toolSchemas)
 		return
 	} else if route == "reject" {
@@ -1507,6 +1527,7 @@ func handleAnthropicMessages(w http.ResponseWriter, r *http.Request) {
 
 	// ClinePass 订阅池: cline-pass/ 前缀模型
 	if strings.HasPrefix(strings.TrimSpace(req.Model), "cline-pass/") {
+		setRouteHeader(w, "cline-pass", req.Model, "")
 		handleClinePassAnthropic(w, r, req, openAIReq, toolSchemas)
 		return
 	}
@@ -1517,6 +1538,13 @@ func handleAnthropicMessages(w http.ResponseWriter, r *http.Request) {
 		if a.Status == "active" {
 			activeCount++
 		}
+	}
+
+	// zen 免费模型落到 cline 池 = zen 熔断期间的路由降级
+	if _, isZen := resolveZenFreeModel(req.Model); isZen {
+		setRouteHeader(w, "cline", req.Model, "zen-degraded")
+	} else {
+		setRouteHeader(w, "cline", req.Model, "")
 	}
 
 	if activeCount == 0 && len(p.Accounts) == 0 {

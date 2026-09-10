@@ -33,6 +33,10 @@ func handleZenConfig(w http.ResponseWriter, r *http.Request) {
 		"runtime": map[string]any{
 			"failoverActive": zenFailedNow(),
 			"proxyCooldowns": zenProxyCooldownStatus(),
+			"circuit": func() map[string]any {
+				open, probing := zenCircuitStatus()
+				return map[string]any{"open": open, "probing": probing}
+			}(),
 		},
 	}
 	writeAPI(w, http.StatusOK, apiResponse{Success: true, Data: data})
