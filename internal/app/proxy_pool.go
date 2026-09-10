@@ -209,6 +209,27 @@ func setReqExit(ctx context.Context, proxy string) {
 	}
 }
 
+// describeEffectiveExit 当前代理池最近一次轮换命中的出口描述(请求日志回填用)
+func describeEffectiveExit() string {
+	list := effectiveProxyList()
+	if len(list) == 0 {
+		return ""
+	}
+	idx := lastZenProxyIdx()
+	if idx < 0 || idx >= len(list) {
+		return ""
+	}
+	p := list[idx]
+	switch {
+	case p == "":
+		return "直连"
+	case isNodeLink(p):
+		return "节点: " + nodeDisplayName(p)
+	default:
+		return "代理: " + maskProxyURL(p)
+	}
+}
+
 func zenDialContext(ctx context.Context, network, addr string) (net.Conn, error) {
 	p, _ := pickZenProxy()
 	setReqExit(ctx, p)

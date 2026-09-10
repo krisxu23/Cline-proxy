@@ -17,6 +17,22 @@ import (
 	"cline-go-proxy/internal/protocol"
 )
 
+// proxyDoer is set by the host app to route upstream calls through the proxy pool.
+// Falls back to kit.HTTPClient when nil (no proxy configured).
+var proxyDoer func(*http.Request) (*http.Response, error)
+
+// SetProxyDoer registers the proxy-aware HTTP client from the main app.
+func SetProxyDoer(fn func(*http.Request) (*http.Response, error)) {
+	proxyDoer = fn
+}
+
+func doRequest(req *http.Request) (*http.Response, error) {
+	if proxyDoer != nil {
+		return proxyDoer(req)
+	}
+	return kit.HTTPClient.Do(req)
+}
+
 // clinepassProvider manages a pool of ClinePass API keys and routes
 // requests to the Cline API with Bearer auth.
 //
@@ -343,5 +359,5 @@ func callClinePassAPI(ctx context.Context, body map[string]any, key string) (*ht
 	}
 	req.Header.Set("Authorization", "Bearer "+key)
 	req.Header.Set("Content-Type", "application/json")
-	return kit.HTTPClient.Do(req)
+	return doRequest(req)
 }

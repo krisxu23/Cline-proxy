@@ -596,17 +596,20 @@ func markZenFailOnStatus(status int) {
 }
 
 func describeZenProxy() string {
-	cfg := getZenConfig()
-	proxies := cfg.Proxies
-	if len(proxies) == 0 {
+	list := effectiveProxyList()
+	if len(list) == 0 {
 		return "direct"
 	}
 	idx := lastZenProxyIdx()
 	if idx < 0 {
 		idx = 0
 	}
-	idx %= len(proxies)
-	return fmt.Sprintf("proxy[%d]=%s", idx+1, kit.Truncate(maskProxyURL(proxies[idx]), 60))
+	idx %= len(list)
+	p := list[idx]
+	if isNodeLink(p) {
+		return fmt.Sprintf("node[%d]=%s", idx+1, nodeDisplayName(p))
+	}
+	return fmt.Sprintf("proxy[%d]=%s", idx+1, kit.Truncate(maskProxyURL(p), 60))
 }
 
 func zenModelList() []map[string]any {
