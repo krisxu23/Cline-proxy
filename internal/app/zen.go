@@ -173,7 +173,8 @@ type zenConfigData struct {
 	Key             string           `json:"key"`
 	BaseURL         string           `json:"baseURL"`         // 主端点(兼容旧配置字段)
 	BaseURLs        []string         `json:"baseURLs"`        // 全部端点: 主端点 + CDN 镜像, 重试时轮换
-	Proxies         []string         `json:"proxies"`         // http(s)/socks5 代理,轮询出口
+	Proxies         []string         `json:"proxies"`         // http(s)/socks5 代理与节点链接,轮询出口
+	Subs            []string         `json:"subs,omitempty"`  // 订阅链接, 定期抓取展开为节点并入池
 	ProxyStrategy   string           `json:"proxyStrategy"`   // round_robin / random / fill
 	MaxConcurrency  int              `json:"maxConcurrency"`  // zen 上游最大并发,防 worker 瞬时超限,默认 8
 	Retries         int              `json:"retries"`         // 限流/网络错误重试次数,默认 3
@@ -395,11 +396,13 @@ func setZenConfig(c *zenConfigData) {
 	saveZenConfig()
 	rebuildZenTransport()
 	rebuildZenSem()
-	syncNodeBox(c.Proxies)
+	syncNodeBox()
 }
 
 // validateProxyList 校验代理列表格式: http/https/socks5/socks5h 代理 URL,
-// 以及 vmess/vless/trojan/ss/hy2/tuic 节点链接(内嵌 sing-box 出口)。
+// 以及 vmess/vless/trojan/ss/hy2/tuic 等节点链接。
+// 节点链接解析失败只记录并跳过(同步节点时同样跳过), 不阻塞整批导入;
+// 普通 http/socks5 代理仍严格校验。
 func validateProxyList(proxies []string) error {
 	for _, p := range proxies {
 		line := strings.TrimSpace(p)
@@ -408,7 +411,7 @@ func validateProxyList(proxies []string) error {
 		}
 		if isNodeLink(line) {
 			if _, err := nodeOutbound(line, "validate"); err != nil {
-				return fmt.Errorf("节点 %q 解析失败: %v", line, err)
+				log.Printf("  代理列表: 节点解析失败已跳过: %v", err)
 			}
 			continue
 		}

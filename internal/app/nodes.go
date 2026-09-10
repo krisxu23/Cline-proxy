@@ -8,6 +8,7 @@ import (
 	"log"
 	"net"
 	"net/url"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -34,6 +35,7 @@ var nodeSchemes = map[string]bool{
 	"ss": true, "hy2": true, "hysteria2": true, "tuic": true,
 	"hysteria": true, "anytls": true,
 	"ssh": true, "shadowtls": true, "snell": true,
+	"sbox": true, // 订阅提供的原始 sing-box 出站的池内伪链接
 }
 
 func isNodeLink(s string) bool {
@@ -60,14 +62,16 @@ func nodeLocalAddr(link string) string {
 	return ""
 }
 
-// syncNodeBox 按代理列表中的节点链接重建 sing-box 实例(setZenConfig/启动时调用)
-func syncNodeBox(proxies []string) {
+// syncNodeBox 按代理列表节点链接 + 订阅解析节点重建 sing-box 实例
+// (setZenConfig/订阅刷新/启动时调用)
+func syncNodeBox() {
 	nodeMu.Lock()
 	defer nodeMu.Unlock()
 
+	cfg := getZenConfig()
+	var entries []any
 	seen := map[string]bool{}
-	var links []string
-	for _, p := range proxies {
+	for _, p := range cfg.Proxies {
 		line := strings.TrimSpace(p)
 		if !isNodeLink(line) {
 			continue
@@ -77,10 +81,21 @@ func syncNodeBox(proxies []string) {
 			continue
 		}
 		seen[key] = true
-		links = append(links, line)
+		entries = append(entries, line)
 	}
-	keys := strings.Join(mapKeysSorted(nodePortsKeysOf(links)), "|")
-	if keys == nodePortsKeys {
+	subMu.Lock()
+	entries = append(entries, subNodes...)
+	subMu.Unlock()
+
+	var keys []string
+	for _, e := range entries {
+		if k := subEntryKey(e); k != "" {
+			keys = append(keys, k)
+		}
+	}
+	sort.Strings(keys)
+	joined := strings.Join(keys, "|")
+	if joined == nodePortsKeys {
 		return
 	}
 
@@ -90,21 +105,45 @@ func syncNodeBox(proxies []string) {
 		nodePorts = nil
 		nodePortsKeys = ""
 	}
-	if len(links) == 0 {
+	if len(entries) == 0 {
 		return
 	}
 
 	var inbounds, outbounds, rules []map[string]any
 	ports := map[string]int{}
-	for i, link := range links {
-		port, err := freeLocalPort()
-		if err != nil {
-			log.Printf("  node %d: 分配本地端口失败: %v", i+1, err)
-			continue
-		}
-		ob, err := nodeOutbound(link, fmt.Sprintf("out-%d", i))
-		if err != nil {
-			log.Printf("  node %d: 解析失败已跳过: %v", i+1, err)
+	for i, e := range entries {
+		var ob map[string]any
+		var key string
+		var port int
+		var err error
+		switch v := e.(type) {
+		case string:
+			port, err = freeLocalPort()
+			if err != nil {
+				log.Printf("  node %d: 分配本地端口失败: %v", i+1, err)
+				continue
+			}
+			ob, err = nodeOutbound(v, fmt.Sprintf("out-%d", i))
+			if err != nil {
+				log.Printf("  node %d: 解析失败已跳过: %v", i+1, err)
+				continue
+			}
+			key = nodeLocalKey(v)
+		case map[string]any:
+			port, err = freeLocalPort()
+			if err != nil {
+				log.Printf("  node %d: 分配本地端口失败: %v", i+1, err)
+				continue
+			}
+			cp := map[string]any{"tag": fmt.Sprintf("out-%d", i)}
+			for k, val := range v {
+				if k != "tag" {
+					cp[k] = val
+				}
+			}
+			ob = cp
+			key = subEntryKey(v)
+		default:
 			continue
 		}
 		tag := ob["tag"].(string)
@@ -116,14 +155,14 @@ func syncNodeBox(proxies []string) {
 		rules = append(rules, map[string]any{
 			"action": "route", "inbound": []string{fmt.Sprintf("in-%d", i)}, "outbound": tag,
 		})
-		ports[nodeLocalKey(link)] = port
+		ports[key] = port
 	}
 	if len(outbounds) == 0 {
 		return
 	}
 	outbounds = append(outbounds, map[string]any{"type": "direct", "tag": "direct"})
 
-	cfg := map[string]any{
+	boxCfg := map[string]any{
 		"log":       map[string]any{"disabled": true},
 		"dns":       map[string]any{"servers": []any{map[string]any{"type": "udp", "tag": "dns-direct", "server": "8.8.8.8"}}},
 		"inbounds":  inbounds,
@@ -134,7 +173,7 @@ func syncNodeBox(proxies []string) {
 			"default_domain_resolver":  map[string]any{"server": "dns-direct"},
 		},
 	}
-	data, err := json.Marshal(cfg)
+	data, err := json.Marshal(boxCfg)
 	if err != nil {
 		log.Printf("  nodes: 构建配置失败: %v", err)
 		return
@@ -157,28 +196,8 @@ func syncNodeBox(proxies []string) {
 	}
 	nodeBox = instance
 	nodePorts = ports
-	nodePortsKeys = keys
+	nodePortsKeys = joined
 	log.Printf("  nodes: %d 个高级节点出口已就绪", len(ports))
-}
-
-func nodePortsKeysOf(links []string) []string {
-	out := make([]string, 0, len(links))
-	for _, l := range links {
-		out = append(out, nodeLocalKey(l))
-	}
-	return out
-}
-
-func mapKeysSorted(m []string) []string {
-	s := append([]string(nil), m...)
-	for i := range s {
-		for j := i + 1; j < len(s); j++ {
-			if s[j] < s[i] {
-				s[i], s[j] = s[j], s[i]
-			}
-		}
-	}
-	return s
 }
 
 // freeLocalPort 预分配一个空闲端口(存在极小竞态窗口, 冲突由 box 启动报错兜底)
@@ -283,6 +302,40 @@ func tlsBlock(serverName string, insecure bool, extra map[string]any) map[string
 	return tls
 }
 
+// isInsecure 分享链接的三种跳过证书校验写法: insecure / allow_insecure / allowInsecure
+func isInsecure(q url.Values) bool {
+	for _, k := range []string{"insecure", "allow_insecure", "allowInsecure"} {
+		switch q.Get(k) {
+		case "1", "true":
+			return true
+		}
+	}
+	return false
+}
+
+// tlsFromQuery 从分享链接 query 构造 TLS 块: sni/insecure/utls 指纹/alpn
+func tlsFromQuery(q url.Values, host, defaultFP string) map[string]any {
+	tls := map[string]any{"enabled": true, "server_name": orDefault(q.Get("sni"), host)}
+	if isInsecure(q) {
+		tls["insecure"] = true
+	}
+	if fp := orDefault(q.Get("fp"), defaultFP); fp != "" {
+		tls["utls"] = map[string]any{"enabled": true, "fingerprint": fp}
+	}
+	if alpn := q.Get("alpn"); alpn != "" {
+		var list []string
+		for _, a := range strings.Split(alpn, ",") {
+			if a = strings.TrimSpace(a); a != "" {
+				list = append(list, a)
+			}
+		}
+		if len(list) > 0 {
+			tls["alpn"] = list
+		}
+	}
+	return tls
+}
+
 func transportBlock(net string, q url.Values) (map[string]any, bool) {
 	switch net {
 	case "ws":
@@ -333,6 +386,9 @@ func parseVmess(rest, tag string) (map[string]any, error) {
 		"type": "vmess", "tag": tag, "server": host, "server_port": port,
 		"uuid": id, "security": "auto", "alter_id": aid,
 	}
+	if scy, _ := info["scy"].(string); scy != "" {
+		ob["security"] = scy
+	}
 	net, _ := info["net"].(string)
 	if tr, ok := transportBlock(net, url.Values{"path": {fmt.Sprint(info["path"])}, "host": {fmt.Sprint(info["host"])}}); ok {
 		ob["transport"] = tr
@@ -350,7 +406,11 @@ func parseVmess(rest, tag string) (map[string]any, error) {
 		case "1", "true":
 			insecure = true
 		}
-		ob["tls"] = tlsBlock(sni, insecure, nil)
+		extra := map[string]any{}
+		if fp, _ := info["fp"].(string); fp != "" {
+			extra["utls"] = map[string]any{"enabled": true, "fingerprint": fp}
+		}
+		ob["tls"] = tlsBlock(sni, insecure, extra)
 	}
 	return ob, nil
 }
@@ -391,22 +451,17 @@ func parseUserinfoNode(rest, tag, typ string) (map[string]any, error) {
 		ob["password"] = secret
 	}
 	security := q.Get("security")
-	insecure := q.Get("insecure") == "1" || q.Get("insecure") == "true"
 	switch {
 	case security == "reality":
 		pbk := q.Get("pbk")
 		if pbk == "" {
 			return nil, fmt.Errorf("vless: reality missing public key")
 		}
-		ob["tls"] = tlsBlock(q.Get("sni"), false, map[string]any{
-			"utls":    map[string]any{"enabled": true, "fingerprint": orDefault(q.Get("fp"), "chrome")},
-			"reality": map[string]any{"enabled": true, "public_key": pbk, "short_id": q.Get("sid")},
-		})
+		tls := tlsFromQuery(q, host, "chrome")
+		tls["reality"] = map[string]any{"enabled": true, "public_key": pbk, "short_id": q.Get("sid")}
+		ob["tls"] = tls
 	case security == "tls" || (typ == "trojan" && security == ""):
-		sni := orDefault(q.Get("sni"), host)
-		ob["tls"] = tlsBlock(sni, insecure, map[string]any{
-			"utls": map[string]any{"enabled": true, "fingerprint": orDefault(q.Get("fp"), "chrome")},
-		})
+		ob["tls"] = tlsFromQuery(q, host, "chrome")
 	}
 	if tr, ok := transportBlock(q.Get("type"), q); ok {
 		ob["transport"] = tr
@@ -421,24 +476,31 @@ func orDefault(v, def string) string {
 	return v
 }
 
-// parseSS ss://base64(method:pass)@host:port#name 或 ss://base64(method:pass@host:port)#name
+// parseSS ss://base64(method:pass)@host:port#name 或 ss://base64(method:pass@host:port)#name,
+// SIP002 插件参数(v2ray-plugin / obfs-local)按 plugin + plugin_opts 透传
 func parseSS(rest, tag string) (map[string]any, error) {
-	if q, err := url.Parse("//" + rest); err == nil && q.Query().Get("plugin") != "" {
-		return nil, fmt.Errorf("ss: plugin 不支持")
+	u, err := url.Parse("//" + rest)
+	if err != nil {
+		return nil, err
+	}
+	q := u.Query()
+	base := rest
+	if i := strings.Index(base, "?"); i >= 0 {
+		base = base[:i]
 	}
 	var method, password, hostport string
-	if at := strings.LastIndex(rest, "@"); at >= 0 {
-		userinfo, err := b64String(rest[:at])
+	if at := strings.LastIndex(base, "@"); at >= 0 {
+		userinfo, err := b64String(base[:at])
 		if err != nil {
-			userinfo, err = url.QueryUnescape(rest[:at])
+			userinfo, err = url.QueryUnescape(base[:at])
 		}
 		if err != nil {
 			return nil, err
 		}
 		method, password, _ = strings.Cut(userinfo, ":")
-		hostport = rest[at+1:]
+		hostport = base[at+1:]
 	} else {
-		whole, err := b64String(rest)
+		whole, err := b64String(base)
 		if err != nil {
 			return nil, err
 		}
@@ -457,10 +519,19 @@ func parseSS(rest, tag string) (map[string]any, error) {
 	if err != nil {
 		return nil, err
 	}
-	return map[string]any{
+	ob := map[string]any{
 		"type": "shadowsocks", "tag": tag, "server": host, "server_port": port,
 		"method": method, "password": password,
-	}, nil
+	}
+	// SIP002 插件: plugin=v2ray-plugin;mode=websocket;host=...;tls;... 原样透传
+	if pv := q.Get("plugin"); pv != "" {
+		parts := strings.Split(pv, ";")
+		ob["plugin"] = parts[0]
+		if len(parts) > 1 {
+			ob["plugin_opts"] = strings.Join(parts[1:], ";")
+		}
+	}
+	return ob, nil
 }
 
 // parseHy2 hy2://password@host:port?sni=&insecure=&obfs=&obfs-password=
@@ -484,7 +555,7 @@ func parseHy2(rest, tag string) (map[string]any, error) {
 	q := u.Query()
 	ob := map[string]any{
 		"type": "hysteria2", "tag": tag, "server": host, "server_port": port, "password": password,
-		"tls": tlsBlock(orDefault(q.Get("sni"), host), q.Get("insecure") == "1" || q.Get("insecure") == "true", nil),
+		"tls": tlsFromQuery(q, host, ""),
 	}
 	if obfs := q.Get("obfs"); obfs != "" {
 		ob["obfs"] = map[string]any{"type": obfs, "password": q.Get("obfs-password")}
@@ -518,7 +589,7 @@ func parseTuic(rest, tag string) (map[string]any, error) {
 	ob := map[string]any{
 		"type": "tuic", "tag": tag, "server": host, "server_port": port,
 		"uuid": uuid, "password": pass,
-		"tls": tlsBlock(orDefault(q.Get("sni"), host), q.Get("insecure") == "1" || q.Get("insecure") == "true", nil),
+		"tls": tlsFromQuery(q, host, ""),
 	}
 	if cc := q.Get("congestion_control"); cc != "" {
 		ob["congestion_control"] = cc
@@ -556,10 +627,13 @@ func parseHysteria(rest, tag string) (map[string]any, error) {
 	if auth == "" {
 		return nil, fmt.Errorf("hysteria: missing auth")
 	}
+	tls := tlsFromQuery(q, host, "")
+	if peer := q.Get("peer"); peer != "" {
+		tls["server_name"] = peer
+	}
 	ob := map[string]any{
 		"type": "hysteria", "tag": tag, "server": host, "server_port": port,
-		"auth_str": auth,
-		"tls":      tlsBlock(orDefault(q.Get("peer"), host), q.Get("insecure") == "1" || q.Get("insecure") == "true", nil),
+		"auth_str": auth, "tls": tls,
 	}
 	// hysteria v1 强制要求带宽参数, 链接缺省时按常见转换器的默认值补齐
 	// ponytail: 仅影响发送速率整形, 不影响链路正确性
@@ -597,9 +671,7 @@ func parseAnytls(rest, tag string) (map[string]any, error) {
 	q := u.Query()
 	ob := map[string]any{
 		"type": "anytls", "tag": tag, "server": host, "server_port": port, "password": password,
-		"tls": tlsBlock(orDefault(q.Get("sni"), host), q.Get("insecure") == "1" || q.Get("insecure") == "true", map[string]any{
-			"utls": map[string]any{"enabled": true, "fingerprint": orDefault(q.Get("fp"), "chrome")},
-		}),
+		"tls": tlsFromQuery(q, host, "chrome"),
 	}
 	return ob, nil
 }
@@ -661,9 +733,7 @@ func parseShadowtls(rest, tag string) (map[string]any, error) {
 	return map[string]any{
 		"type": "shadowtls", "tag": tag, "server": host, "server_port": port,
 		"version": version, "password": password,
-		"tls": tlsBlock(orDefault(q.Get("sni"), host), q.Get("insecure") == "1" || q.Get("insecure") == "true", map[string]any{
-			"utls": map[string]any{"enabled": true, "fingerprint": orDefault(q.Get("fp"), "chrome")},
-		}),
+		"tls": tlsFromQuery(q, host, "chrome"),
 	}, nil
 }
 

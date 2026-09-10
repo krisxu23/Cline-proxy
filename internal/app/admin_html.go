@@ -457,6 +457,10 @@ body:not([data-theme="dark"]) .theme-toggle .dark-label{display:none}
       <div class="field"><label>代理列表</label>
         <textarea id="ocProxies" rows="4" placeholder="每行一个: http://user:pass@host:port / socks5://host:port&#10;或节点链接: vmess:// vless:// trojan:// ss:// hy2:// tuic:// hysteria:// anytls:// ssh:// shadowtls:// snell://"></textarea>
       </div>
+      <div class="field"><label>订阅链接</label>
+        <textarea id="ocSubs" rows="2" placeholder="每行一个订阅地址(https://...), 保存后自动抓取并每 6 小时刷新, 支持 sing-box JSON / Clash YAML / base64 节点列表"></textarea>
+        <div class="hint" id="ocSubsInfo" style="margin-top:6px;font-size:12px;color:var(--text3)"></div>
+      </div>
     </div>
     <div class="form-row">
       <div class="field"><label>代理冷却</label><span id="ocCooldownInfo" class="hint" style="margin:0;align-self:center">-</span></div>
@@ -1079,6 +1083,7 @@ async function loadOcConfig() {
     _('ocKey').value = c.key || 'public';
     _('ocBaseURLs').value = (c.baseURLs && c.baseURLs.length ? c.baseURLs : (c.baseURL ? [c.baseURL] : [])).join('\n');
     _('ocProxies').value = (c.proxies || []).join('\n');
+    _('ocSubs').value = (c.subs || []).join('\n');
     _('ocStrategy').value = c.proxyStrategy || 'round_robin';
     _('ocMaxConc').value = c.maxConcurrency || 8;
     _('ocRetries').value = c.retries || 3;
@@ -1099,19 +1104,29 @@ async function loadOcConfig() {
     _('ocCooldownInfo').textContent = keys.length
       ? keys.map(k => k + ' 冷却至 ' + cd[k]).join('; ')
       : '暂无冷却中的代理';
+    const ss = rt.subsStatus || {};
+    const sk = Object.keys(ss);
+    _('ocSubsInfo').textContent = sk.length
+      ? sk.map(k => k + ' → ' + ss[k]).join('\n')
+      : '订阅尚未抓取';
   } catch (e) { /* ignore */ }
 }
 
 async function saveOcConfig() {
   const proxies = _('ocProxies').value.split('\n').map(s => s.trim()).filter(Boolean);
   const PROXY_RE = /^(https?|socks5h?):\/\/[^\s]+:\d+/;
-  const bad = proxies.find(p => !PROXY_RE.test(p));
-  if (bad) { toast('代理格式无效: ' + bad + '（需 http(s)://host:port 或 socks5://host:port）', 'error'); return; }
+  const NODE_RE = /^(vmess|vless|trojan|ss|hy2|hysteria2|tuic|hysteria|anytls|ssh|shadowtls|snell|sbox):\/\//;
+  const bad = proxies.find(p => !(PROXY_RE.test(p) || NODE_RE.test(p)));
+  if (bad) { toast('代理格式无效: ' + bad.slice(0, 60) + '（支持 http/socks5 代理或 vmess/vless/trojan/ss/hy2/tuic 等节点链接）', 'error'); return; }
+  const subs = _('ocSubs').value.split('\n').map(s => s.trim()).filter(Boolean);
+  const badSub = subs.find(s => !/^https?:\/\//.test(s));
+  if (badSub) { toast('订阅格式无效: ' + badSub.slice(0, 60), 'error'); return; }
   const body = {
     enabled: _('ocEnabled').value === 'true',
     key: _('ocKey').value.trim(),
     baseURLs: _('ocBaseURLs').value.split('\n').map(s => s.trim()).filter(Boolean),
     proxies: proxies,
+    subs: subs,
     proxyStrategy: _('ocStrategy').value,
     maxConcurrency: parseInt(_('ocMaxConc').value) || 8,
     retries: parseInt(_('ocRetries').value) || 3,

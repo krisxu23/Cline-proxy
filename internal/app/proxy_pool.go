@@ -57,14 +57,14 @@ func zenProxyAvailable(idx int) bool {
 }
 
 func zenProxyCooldownStatus() map[string]string {
-	cfg := getZenConfig()
+	list := effectiveProxyList()
 	zenProxyCooldownsMu.Lock()
 	defer zenProxyCooldownsMu.Unlock()
 	out := map[string]string{}
 	for idx, until := range zenProxyCooldowns {
-		if idx >= 0 && idx < len(cfg.Proxies) {
+		if idx >= 0 && idx < len(list) {
 			if time.Now().Before(until) {
-				out[cfg.Proxies[idx]] = until.Format("15:04:05")
+				out[list[idx]] = until.Format("15:04:05")
 			}
 		}
 	}
@@ -84,17 +84,26 @@ func getZenHTTPClient() *http.Client {
 	return zenHTTPClient
 }
 
+// effectiveProxyList 生效的出口列表: 手动代理/节点 + 订阅解析出的节点
+func effectiveProxyList() []string {
+	cfg := getZenConfig()
+	list := make([]string, 0, len(cfg.Proxies)+len(cfg.Subs)*4)
+	list = append(list, cfg.Proxies...)
+	list = append(list, subNodeKeysSnapshot()...)
+	return list
+}
+
 // pickZenProxy 按策略选择代理,返回 (代理URL, 索引);无代理返回 ("", -1)。
 // 跳过冷却中的代理;全部冷却时返回最早恢复的近似(轮询位)。
 // 每次调用递增计数,保证 round_robin 顺序与日志索引一致。
 func pickZenProxy() (string, int) {
-	cfg := getZenConfig()
-	n := len(cfg.Proxies)
+	list := effectiveProxyList()
+	n := len(list)
 	if n == 0 {
 		return "", -1
 	}
 	idx := int(zenProxyCount.Add(1)-1) % n
-	switch cfg.ProxyStrategy {
+	switch getZenConfig().ProxyStrategy {
 	case "random":
 		idx = int(time.Now().UnixNano() % int64(n))
 	case "fill":
@@ -107,7 +116,7 @@ func pickZenProxy() (string, int) {
 		}
 		idx = (idx + 1) % n
 	}
-	return cfg.Proxies[idx], idx
+	return list[idx], idx
 }
 
 // lastZenProxyIdx 最近一次选择的代理索引(日志用)
@@ -116,7 +125,7 @@ func lastZenProxyIdx() int {
 	if v <= 0 {
 		return -1
 	}
-	return int((v - 1) % int64(max(1, len(getZenConfig().Proxies))))
+	return int((v - 1) % int64(max(1, len(effectiveProxyList()))))
 }
 
 func maskProxyURL(raw string) string {

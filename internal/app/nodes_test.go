@@ -233,7 +233,10 @@ func TestNodeBridgeEndToEnd(t *testing.T) {
 	cred := base64.URLEncoding.EncodeToString([]byte("aes-128-gcm:testpass"))
 	link := "ss://" + cred + "@127.0.0.1:" + strconv.Itoa(serverPort) + "#e2e-node"
 
-	syncNodeBox([]string{link})
+	zenConfigMu.Lock()
+	zenConfig.Proxies = []string{link}
+	zenConfigMu.Unlock()
+	syncNodeBox()
 	local := nodeLocalAddr(link)
 	if local == "" {
 		t.Fatal("node bridge did not start")
@@ -255,7 +258,10 @@ func TestNodeBridgeEndToEnd(t *testing.T) {
 		t.Fatalf("echo mismatch: %q", string(buf))
 	}
 
-	syncNodeBox(nil)
+	zenConfigMu.Lock()
+	zenConfig.Proxies = nil
+	zenConfigMu.Unlock()
+	syncNodeBox()
 }
 
 // TestAllOutboundTypesRegistered 验证带构建标签的产物中,

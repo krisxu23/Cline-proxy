@@ -33,6 +33,7 @@ func handleZenConfig(w http.ResponseWriter, r *http.Request) {
 		"runtime": map[string]any{
 			"failoverActive": zenFailedNow(),
 			"proxyCooldowns": zenProxyCooldownStatus(),
+			"subsStatus":     subStatusSnapshot(),
 			"circuit": func() map[string]any {
 				open, probing := zenCircuitStatus()
 				return map[string]any{"open": open, "probing": probing}
@@ -62,6 +63,7 @@ func handleZenConfigUpdate(w http.ResponseWriter, r *http.Request) {
 		BaseURL         *string  `json:"baseURL"`
 		BaseURLs        []string `json:"baseURLs"`
 		Proxies         []string `json:"proxies"`
+		Subs            []string `json:"subs"`
 		ProxyStrategy   *string  `json:"proxyStrategy"`
 		MaxConcurrency  *int     `json:"maxConcurrency"`
 		Retries         *int     `json:"retries"`
@@ -86,6 +88,7 @@ func handleZenConfigUpdate(w http.ResponseWriter, r *http.Request) {
 		BaseURL:         cur.BaseURL,
 		BaseURLs:        cur.BaseURLs,
 		Proxies:         cur.Proxies,
+		Subs:            cur.Subs,
 		ProxyStrategy:   cur.ProxyStrategy,
 		MaxConcurrency:  cur.MaxConcurrency,
 		Retries:         cur.Retries,
@@ -130,6 +133,21 @@ func handleZenConfigUpdate(w http.ResponseWriter, r *http.Request) {
 		}
 		next.Proxies = patch.Proxies
 	}
+	if patch.Subs != nil {
+		cleaned := make([]string, 0, len(patch.Subs))
+		for _, u := range patch.Subs {
+			u = strings.TrimSpace(u)
+			if u == "" {
+				continue
+			}
+			if !strings.HasPrefix(u, "http://") && !strings.HasPrefix(u, "https://") {
+				writeAPI(w, http.StatusBadRequest, apiResponse{Error: fmt.Sprintf("订阅 %q 协议无效（需 http:// 或 https://）", u)})
+				return
+			}
+			cleaned = append(cleaned, u)
+		}
+		next.Subs = cleaned
+	}
 	if patch.ProxyStrategy != nil && *patch.ProxyStrategy != "" {
 		next.ProxyStrategy = *patch.ProxyStrategy
 	}
@@ -167,8 +185,24 @@ func handleZenConfigUpdate(w http.ResponseWriter, r *http.Request) {
 		}
 		next.Compaction = base
 	}
+	subsChanged := patch.Subs != nil && !strSliceEqual(patch.Subs, cur.Subs)
 	setZenConfig(next)
+	if subsChanged {
+		go resolveSubscriptions(next.Subs)
+	}
 	writeAPI(w, http.StatusOK, apiResponse{Success: true, Data: getZenConfig()})
+}
+
+func strSliceEqual(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
 }
 
 // GET /admin/api/opencode/models — 只返回免费模型
