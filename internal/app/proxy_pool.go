@@ -175,8 +175,12 @@ func zenDialContext(ctx context.Context, network, addr string) (net.Conn, error)
 	return dialViaProxy(ctx, p, network, addr)
 }
 
-// dialViaProxy 统一拨号:http/https 走 CONNECT,socks5 走 SOCKS5 握手
+// dialViaProxy 统一拨号:http/https 走 CONNECT,socks5 走 SOCKS5 握手,
+// vmess/vless/trojan/ss/hy2/tuic 节点经内嵌 sing-box 的本地入站转发
 func dialViaProxy(ctx context.Context, raw, network, addr string) (net.Conn, error) {
+	if isNodeLink(raw) {
+		return dialNodeProxy(ctx, raw, network, addr)
+	}
 	u, err := url.Parse(raw)
 	if err != nil {
 		return nil, fmt.Errorf("bad proxy url: %w", err)

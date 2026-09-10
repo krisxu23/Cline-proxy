@@ -137,7 +137,7 @@ Model:    同上
 
 ### 2. opencode zen 免费模型
 
-无需配置，启动即启用（匿名 key `public`）。官方源 + 3 个 CDN 镜像共 4 个 API 端点（官方在前），重试与模型同步自动跨端点轮换；可在后台「API 端点」里整体替换。每 10 分钟自动同步官方模型列表；付费 zen 模型显式 400 拒绝。超限时按 opencode 官方算法做摘要压缩（尾部预算 → 锚定摘要模板 → 重组会话）。支持 http/https/socks5 代理池轮询出口（round_robin / random / fill）。后台 **opencode 免费模型** 页可调全部参数。
+无需配置，启动即启用（匿名 key `public`）。官方源 + 3 个 CDN 镜像共 4 个 API 端点（官方在前），重试与模型同步自动跨端点轮换；可在后台「API 端点」里整体替换。每 10 分钟自动同步官方模型列表；付费 zen 模型显式 400 拒绝。超限时按 opencode 官方算法做摘要压缩（尾部预算 → 锚定摘要模板 → 重组会话）。支持 http/https/socks5 代理池轮询出口（round_robin / random / fill），以及 vmess / vless / trojan / ss / hy2 / tuic 节点链接直接粘贴进代理池——内嵌 sing-box 把每个节点转成本地出口，轮询与冷却机制与普通代理一致。后台 **opencode 免费模型** 页可调全部参数。
 
 ### 3. ClinePass 订阅池
 
@@ -212,6 +212,7 @@ curl http://127.0.0.1:3457/admin/api/clinepass/models
 │   │   ├── clinepass.go       ClinePass 三协议 handler + admin API
 │   │   ├── models.go          Cline 官方免费模型同步
 │   │   ├── zen.go             zen 上游、三态路由、限流状态机、代理池
+│   │   ├── nodes.go           vmess/vless/trojan/ss/hy2/tuic 节点出口（内嵌 sing-box）
 │   │   ├── compact.go         opencode 官方摘要压缩机制移植
 │   │   ├── responses.go       /v1/responses 转换
 │   │   ├── pool.go            账号池管理与持久化

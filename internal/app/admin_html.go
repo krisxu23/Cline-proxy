@@ -455,7 +455,7 @@ body:not([data-theme="dark"]) .theme-toggle .dark-label{display:none}
     </div>
     <div class="form-row">
       <div class="field"><label>代理列表</label>
-        <textarea id="ocProxies" rows="3" placeholder="每行一个: http://user:pass@host:port 或 socks5://host:port"></textarea>
+        <textarea id="ocProxies" rows="4" placeholder="每行一个: http://user:pass@host:port / socks5://host:port&#10;或节点链接: vmess:// vless:// trojan:// ss:// hy2:// tuic://"></textarea>
       </div>
     </div>
     <div class="form-row">

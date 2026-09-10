@@ -395,13 +395,21 @@ func setZenConfig(c *zenConfigData) {
 	saveZenConfig()
 	rebuildZenTransport()
 	rebuildZenSem()
+	syncNodeBox(c.Proxies)
 }
 
-// validateProxyList 校验代理列表格式: 支持 http/https/socks5/socks5h, 必须包含 host:port。
+// validateProxyList 校验代理列表格式: http/https/socks5/socks5h 代理 URL,
+// 以及 vmess/vless/trojan/ss/hy2/tuic 节点链接(内嵌 sing-box 出口)。
 func validateProxyList(proxies []string) error {
 	for _, p := range proxies {
 		line := strings.TrimSpace(p)
 		if line == "" {
+			continue
+		}
+		if isNodeLink(line) {
+			if _, err := nodeOutbound(line, "validate"); err != nil {
+				return fmt.Errorf("节点 %q 解析失败: %v", line, err)
+			}
 			continue
 		}
 		u, err := url.Parse(line)
