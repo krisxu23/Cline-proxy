@@ -38,9 +38,41 @@ zen 连续失败时自动故障转移到 Cline 账号池；Cline 账号 429/掉�
 
 ## 快速开始
 
+### 桌面应用（Windows）
+
+从 Release 下载 `cline-proxy-windows-amd64.exe`，双击即用：
+
+- **无控制台黑窗口**：GUI 子系统构建，启动即进桌面形态
+- **管理窗口**：自动弹出独立应用窗口渲染 Web 后台（无地址栏、独立任务栏图标）
+- **系统托盘**：右下角托盘图标，右键可「打开管理界面 / 退出」
+- **重复双击**：端口被占时自动并入已在运行的实例，直接弹出管理窗口
+- **启动失败**：弹窗提示原因（如端口占用，可换端口）
+
+命令行功能照常可用（终端直跑会回挂控制台）：
+
+```powershell
+.\cline-proxy.exe -list          # 查看账号池
+.\cline-proxy.exe -add-account   # OAuth 添加账号
+.\cline-proxy.exe -desktop -port 3457   # 显式桌面模式
+```
+
+带任意参数从终端启动则进入常规服务器模式，日志实时打印，Ctrl+C 停止。
+
+### 源码编译
+
+```bash
+# Windows GUI 构建（无控制台窗口）
+go build -ldflags "-s -w -H=windowsgui" -o cline-proxy.exe .
+
+# 控制台构建（调试用，或 Linux/macOS）
+go build -o cline-proxy.exe .
+
+# 构建 + 启动 + 打开浏览器
+go run . -start
+```
+
 ```bash
 # 编译并启动（默认监听所有网卡，局域网可访问）
-go build -o cline-proxy.exe .
 ./cline-proxy.exe
 
 # 局域网访问地址：http://<本机局域网IP>:3457/admin/
@@ -49,9 +81,6 @@ go build -o cline-proxy.exe .
 
 # 指定端口
 ./cline-proxy.exe -port 3457
-
-# 构建 + 启动 + 打开浏览器
-go run . -start
 ```
 
 监听所有网卡会开放管理后台给同网设备，建议仅在可信局域网使用，并在系统防火墙中限制 3457 端口。
