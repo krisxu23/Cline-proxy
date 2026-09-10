@@ -571,7 +571,6 @@ func callZenAPI(ctx context.Context, params map[string]any, stream bool) (*http.
 
 		bodyBytes := kit.ReadBody(resp)
 		resp.Body.Close()
-		reason := fmt.Sprintf("zen API %d: %s", resp.StatusCode, kit.Truncate(bodyBytes, 500))
 
 		if isRateLimited(resp.StatusCode, bodyBytes) {
 			rateLimited++
@@ -596,12 +595,32 @@ func callZenAPI(ctx context.Context, params map[string]any, stream bool) (*http.
 				continue
 			}
 			markZenFail()
-			return nil, rateLimited, fmt.Errorf("%s", reason)
+			return nil, rateLimited, &zenUpstreamError{Status: resp.StatusCode, Body: kit.Truncate(bodyBytes, 500)}
 		}
 
 		markZenFailOnStatus(resp.StatusCode)
-		return nil, rateLimited, fmt.Errorf("%s", reason)
+		return nil, rateLimited, &zenUpstreamError{Status: resp.StatusCode, Body: kit.Truncate(bodyBytes, 500)}
 	}
+}
+
+// zenUpstreamError 携带上游 HTTP 状态码与响应体,
+// 上层据此把 4xx(如 RegionError 地域限制)按原状态返回, 而非统一 502。
+type zenUpstreamError struct {
+	Status int
+	Body   string
+}
+
+func (e *zenUpstreamError) Error() string {
+	return fmt.Sprintf("zen API %d: %s", e.Status, e.Body)
+}
+
+// zenErrorStatus 上游 4xx 按原状态返回(如 403 RegionError 地域限制),
+// 网络错误与上游 5xx 统一 502。
+func zenErrorStatus(err error) int {
+	if up, ok := err.(*zenUpstreamError); ok && up.Status >= 400 && up.Status < 500 {
+		return up.Status
+	}
+	return http.StatusBadGateway
 }
 
 // markZenFailOnStatus 仅上游级故障计入熔断: 5xx/408/429 代表上游不可用;
