@@ -132,10 +132,6 @@ const (
 	providerCatalogMaxPages = 10
 	providerCatalogPageSize = "1000"
 	providerCatalogTimeout  = 90 * time.Second
-	// providerCatalogExitRetries 目录抓取的换出口重试预算。
-	// 节点池里对某个上游不通的节点可能不止一个, 目录刷新又是低频操作,
-	// 预算比对话路径(2)放宽到 4, 尽量把节点池走完一圈。
-	providerCatalogExitRetries = 4
 )
 
 // catalogPage 一次目录响应的归一化结果。
@@ -274,7 +270,7 @@ func nativeCatalogParams(rawURL string) bool {
 	return !strings.Contains(strings.ToLower(rawURL), "/openai")
 }
 
-func (p *modelProvider) fetchCatalogPage(ctx context.Context, cfg providerConfig, rawURL, pageToken string) (catalogPage, error) {
+func (p *modelProvider) fetchCatalogPage(ctx context.Context, cfg providerConfig, rawURL, pageToken string, client *http.Client) (catalogPage, error) {
 	u, err := url.Parse(rawURL)
 	if err != nil {
 		return catalogPage{}, err
@@ -295,7 +291,7 @@ func (p *modelProvider) fetchCatalogPage(ctx context.Context, cfg providerConfig
 	for k, v := range catalogHeaders(cfg, u.String()) {
 		req.Header.Set(k, v)
 	}
-	resp, err := providerExitClient().Do(req)
+	resp, err := client.Do(req)
 	if err != nil {
 		return catalogPage{}, err
 	}
@@ -315,40 +311,79 @@ func (p *modelProvider) fetchCatalogPage(ctx context.Context, cfg providerConfig
 	return page, nil
 }
 
-// fetchCatalogPages 逐页拉取一个目录地址直到取完。
-//
-// 与对话请求同一套出口自愈: 网络错误或出口地区被拒时, 冷却刚失败的节点
-// 换下一个重试 —— 节点池里"对这个上游不通"的节点不该卡死目录抓取。
-// 直连模式没有第二个出口可换, 失败原样返回。
+// catalogDirectClient 直连兜底客户端: 不经过出口链路, 专供"节点全部失败后
+// 最后试一次直连"使用。直连模式本身已经是直连, 不会走到这里。
+func catalogDirectClient() *http.Client {
+	return &http.Client{Timeout: providerCatalogTimeout}
+}
+
+// fetchCatalogPages 逐页拉取一个目录地址直到取完。第一页带出口轮换与直连兜底
+// (fetchFirstCatalogPage), 后续页沿用第一页成功的那个客户端。
 func (p *modelProvider) fetchCatalogPages(ctx context.Context, cfg providerConfig, rawURL string) ([]*catalogModel, error) {
-	var listed []*catalogModel
-	pageToken := ""
-	for page := 0; page < providerCatalogMaxPages; page++ {
-		pg, err := p.fetchCatalogPage(ctx, cfg, rawURL, pageToken)
-		if err == nil {
-			listed = append(listed, pg.models...)
-			pageToken = pg.nextPageToken
-			if pageToken == "" {
-				break
-			}
-			continue
-		}
-		// 第一页就碰上出口问题才有换节点的意义: 后续页失败多半是上游本身,
-		// 此时整页重试也拿不到完整目录。
-		if page == 0 && !exitModeDirectNow() && p.retryCatalogOnNextExit(ctx, cfg, rawURL, err) {
-			return p.fetchCatalogPages(ctx, cfg, rawURL)
-		}
+	pg, client, err := p.fetchFirstCatalogPage(ctx, cfg, rawURL)
+	if err != nil {
 		return nil, err
+	}
+	listed := append([]*catalogModel(nil), pg.models...)
+	for page := 1; page < providerCatalogMaxPages && pg.nextPageToken != ""; page++ {
+		pg, err = p.fetchCatalogPage(ctx, cfg, rawURL, pg.nextPageToken, client)
+		if err != nil {
+			return nil, err
+		}
+		listed = append(listed, pg.models...)
 	}
 	return listed, nil
 }
 
+// fetchFirstCatalogPage 拉取目录第一页, 出口策略(按序):
+//  1. 节点出口, 网络错误/出口地区被拒时冷却该节点换下一个 ——
+//     节点池里每个健康节点各试一次, 不设固定次数上限;
+//  2. 节点全部失败后, 用直连兜底再试最后一次。
+//
+// 直连模式本身就只有一步, 不会轮换也不会兜底。返回胜出的客户端供翻页沿用。
+func (p *modelProvider) fetchFirstCatalogPage(ctx context.Context, cfg providerConfig, rawURL string) (catalogPage, *http.Client, error) {
+	pg, err := p.fetchCatalogPage(ctx, cfg, rawURL, "", providerExitClient())
+	if err == nil {
+		return pg, providerExitClient(), nil
+	}
+	if exitModeDirectNow() {
+		return catalogPage{}, nil, err
+	}
+	for p.retryCatalogOnNextExit(err) {
+		pg, err = p.fetchCatalogPage(ctx, cfg, rawURL, "", providerExitClient())
+		if err == nil {
+			return pg, providerExitClient(), nil
+		}
+	}
+	// 直连兜底: 只在真的走过节点出口后才有意义 —— 池里没有出口时,
+	// 出口客户端本身就是直连, 再试一次纯属浪费。
+	if !p.catalogDirectTried && len(effectiveProxyList()) > 0 {
+		p.catalogDirectTried = true
+		log.Printf("  providers: %s 目录经节点全部失败, 用直连兜底再试一次", p.name)
+		cl := catalogDirectClient()
+		pg, derr := p.fetchCatalogPage(ctx, cfg, rawURL, "", cl)
+		if derr == nil {
+			return pg, cl, nil
+		}
+		log.Printf("  providers: %s 直连兜底也失败: %v", p.name, derr)
+	}
+	return catalogPage{}, nil, err
+}
+
+// catalogExitBudget 目录轮换预算 = 节点池里的出口数: 每个节点各试一次。
+// 池为空(理论上不会, 调用方已在直连模式短路)时给 1, 保证函数可终止。
+func catalogExitBudget() int {
+	if n := len(effectiveProxyList()); n > 0 {
+		return n
+	}
+	return 1
+}
+
 // retryCatalogOnNextExit 目录抓取的换出口判定。网络错误或出口地区被拒时,
-// 冷却当前出口并返回 true 让调用方重试; 预算用尽返回 false。
-// 预算比对话路径宽(4 次): 目录刷新是低频操作, 多走几个节点的代价可忽略,
-// 而节点池里"对这个上游不通"的节点往往不止一个。
-func (p *modelProvider) retryCatalogOnNextExit(ctx context.Context, cfg providerConfig, rawURL string, err error) bool {
-	if p.catalogExitRetries >= providerCatalogExitRetries {
+// 冷却当前出口并返回 true 让调用方换下一个重试; 池里节点试完返回 false。
+// 普通 4xx/5xx 换节点无意义, 原样返回真实错误。
+func (p *modelProvider) retryCatalogOnNextExit(err error) bool {
+	if p.catalogExitRetries >= catalogExitBudget() {
 		return false
 	}
 	status, body := 0, []byte(nil)
@@ -395,6 +430,7 @@ func (p *modelProvider) refreshCatalog(ctx context.Context, force bool) error {
 	}
 	p.attemptedAt = now
 	p.catalogExitRetries = 0
+	p.catalogDirectTried = false
 	p.mu.Unlock()
 
 	ctx, cancel := context.WithTimeout(ctx, providerCatalogTimeout)
