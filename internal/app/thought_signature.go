@@ -198,11 +198,6 @@ func providerNeedsThoughtSignatures(p *modelProvider) bool {
 	return providerIsGoogleGenerativeLanguage(p)
 }
 
-// providerUsesProxiedClient 需要海外出口的 provider(generativelanguage)走系统代理。
-func providerUsesProxiedClient(p *modelProvider) bool {
-	return providerIsGoogleGenerativeLanguage(p)
-}
-
 type sigSlot struct {
 	id        string
 	signature string

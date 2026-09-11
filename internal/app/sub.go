@@ -23,7 +23,14 @@ import (
 // 与手动代理合并后一起进入轮询。支持三种内容格式:
 // sing-box JSON 配置(outbounds) / Clash YAML(proxies) / base64 或明文节点链接列表。
 
-const subRefreshInterval = 6 * time.Hour
+const (
+	// defaultSubsRefreshMins 订阅刷新的默认间隔(分钟), 面板可改。
+	defaultSubsRefreshMins = 30
+	// subRefreshMinMins 允许的最短刷新间隔: 再短就是在打订阅端, 无意义。
+	subRefreshMinMins = 1
+	// subRefreshMaxMins 允许的最长刷新间隔(30 天): 更长的需求应改用手动刷新。
+	subRefreshMaxMins = 24 * 60 * 30
+)
 
 var (
 	subMu       sync.Mutex
@@ -160,27 +167,50 @@ func resolveSubscriptions(urls []string) {
 	syncNodeBox()
 }
 
-// refreshSubsLoop 后台定期刷新订阅
+// subsRefreshInterval 当前生效的订阅刷新间隔, 越界值夹回允许区间。
+func subsRefreshInterval() time.Duration {
+	mins := getZenConfig().SubsRefreshMins
+	if mins < subRefreshMinMins {
+		mins = defaultSubsRefreshMins
+	}
+	if mins > subRefreshMaxMins {
+		mins = subRefreshMaxMins
+	}
+	return time.Duration(mins) * time.Minute
+}
+
+// refreshSubsLoop 后台定期刷新订阅。
+// 间隔取自配置(默认 30 分钟)且每次触发前重新读取, 因此在面板上改完即生效,
+// 不需要重启进程。
 func refreshSubsLoop(subs []string) {
 	resolveSubscriptions(subs)
-	t := time.NewTicker(subRefreshInterval)
+	last := time.Now()
+	t := time.NewTicker(time.Minute)
 	defer t.Stop()
 	for range t.C {
-		cfg := getZenConfig()
-		if len(cfg.Subs) > 0 {
-			resolveSubscriptions(cfg.Subs)
+		if time.Since(last) < subsRefreshInterval() {
+			continue
 		}
+		cfg := getZenConfig()
+		if len(cfg.Subs) == 0 {
+			last = time.Now()
+			continue
+		}
+		resolveSubscriptions(cfg.Subs)
+		last = time.Now()
 	}
 }
 
+// fetchSubscription 抓取单个订阅。
+// 出口跟随全局出口模式: 节点模式先经节点出口(订阅地址被墙时的唯一出路),
+// 失败自动退回直连 —— 可用性优先, 不因为出口抖动就丢掉整份订阅。
 func fetchSubscription(u string) ([]any, error) {
-	// 订阅抓取可走代理出口(订阅地址被墙时), 失败自动退回直连
-	if getZenConfig().SubsViaProxy && len(effectiveProxyList()) > 0 {
+	if !exitModeDirectNow() && len(effectiveProxyList()) > 0 {
 		body, err := doFetch(u, getZenHTTPClient())
 		if err == nil {
 			return parseSubContent(string(body))
 		}
-		log.Printf("  订阅 %s 经代理抓取失败(%v), 退回直连", u, err)
+		log.Printf("  订阅 %s 经节点出口抓取失败(%v), 退回直连", u, err)
 	}
 	body, err := doFetch(u, &http.Client{Timeout: 25 * time.Second})
 	if err != nil {

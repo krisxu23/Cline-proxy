@@ -216,6 +216,25 @@ body:not([data-theme="dark"]) .theme-toggle .dark-label{display:none}
   <div class="card"><div class="num red" id="statExpired">-</div><div class="label">已过期</div></div>
 </div>
 <div class="section">
+  <div class="section-title">🔗 网关入口</div>
+  <div class="section-body">
+    <div class="form-row">
+      <div class="field"><label>客户端 API 地址（Base URL）</label>
+        <div style="display:flex;gap:6px">
+          <input type="text" id="dashApiBase" readonly onclick="this.select()" style="font-family:'JetBrains Mono',Consolas,monospace">
+          <button class="btn btn-sm" onclick="copyText(_('dashApiBase').value)" style="flex:none">📋</button>
+        </div>
+      </div>
+      <div class="field"><label>监听地址</label><input type="text" id="dashListenAddr" disabled></div>
+    </div>
+    <div class="form-row">
+      <div class="field"><label>引擎版本</label><input type="text" id="dashVersion" disabled></div>
+      <div class="field"><label>出口模式</label><input type="text" id="dashExitMode" disabled></div>
+    </div>
+    <div class="hint">客户端把 Base URL 指向上面的地址；访问密钥在「设置 → 🔑 API 密钥管理」里生成，出口模式在「设置 → 🌐 出口代理与节点」切换。</div>
+  </div>
+</div>
+<div class="section">
   <div class="section-title">📋 快捷操作</div>
   <div class="section-body" style="display:flex;gap:10px;flex-wrap:wrap">
     <button class="btn btn-primary" onclick="switchTab('accounts')">➕ 添加账号</button>
@@ -227,11 +246,16 @@ body:not([data-theme="dark"]) .theme-toggle .dark-label{display:none}
   </div>
 </div>
 <div class="section">
-  <div class="section-title">🌐 opencode 上游统计</div>
-  <div class="section-body">
-    <div class="table-wrap"><div id="ocStatsBox"></div></div>
-    <div id="ocModelStatsBox" style="margin-top:14px"></div>
-  </div>
+  <div class="section-title">📈 Token 统计（全部上游）</div>
+  <div class="section-body"><div class="table-wrap"><div id="statTotalsBox"></div></div></div>
+</div>
+<div class="section">
+  <div class="section-title">🌐 按上游分布</div>
+  <div class="section-body"><div class="table-wrap"><div id="statUpstreamBox"></div></div></div>
+</div>
+<div class="section">
+  <div class="section-title">🧠 按模型分布</div>
+  <div class="section-body"><div class="table-wrap"><div id="statModelBox"></div></div></div>
 </div>
 </div>
 
@@ -259,6 +283,28 @@ body:not([data-theme="dark"]) .theme-toggle .dark-label{display:none}
       </tbody>
     </table>
     </div>
+  </div>
+</div>
+
+<div class="section" style="margin-top:26px">
+  <div class="section-title">🔵 Cline 账号池</div>
+  <div class="section-body">
+    <div class="form-row">
+      <div class="field"><label>账号文件保存地址</label>
+        <div style="display:flex;gap:6px">
+          <input type="text" id="acctPoolPath" readonly onclick="this.select()" style="font-family:'JetBrains Mono',Consolas,monospace">
+          <button class="btn btn-sm" onclick="copyText(_('acctPoolPath').value)" style="flex:none">📋</button>
+        </div>
+      </div>
+      <div class="field"><label>账号轮询策略</label>
+        <select id="acctStrategy" onchange="savePoolStrategy()">
+          <option value="round_robin">轮询 (round_robin)</option>
+          <option value="fill">填满 (fill)</option>
+          <option value="random">随机 (random)</option>
+        </select>
+      </div>
+    </div>
+    <div class="hint" id="acctPoolHint">账号池按上面的策略在可用账号之间轮换；文件为 JSON 格式，可随时代备份或迁移。</div>
   </div>
 </div>
 
@@ -347,7 +393,22 @@ body:not([data-theme="dark"]) .theme-toggle .dark-label{display:none}
 <div id="tab-models" class="tab-panel" style="display:none">
 <h2>🧠 模型列表</h2>
 <div class="hint" style="margin:-4px 0 16px;padding:11px 14px;border:1px solid var(--border);border-radius:10px;background:rgba(148,163,184,.05)">
-  ℹ️ 前缀仅用于区分来源: <strong style="color:var(--text)">cline/</strong> 走 Cline 账号池, <strong style="color:var(--text)">zen/</strong> 走 opencode 上游。请求时携带带前缀的名称, 网关会自动还原为上游原始模型名。
+  ℹ️ 前缀仅用于区分来源: <strong style="color:var(--text)">cline/</strong> 走 Cline 账号池, <strong style="color:var(--text)">zen/</strong> 走 opencode 上游, <strong style="color:var(--text)">provider名:</strong> 走对应的通用 Provider。请求时携带带前缀的名称, 网关会自动还原为上游原始模型名。
+</div>
+<div class="section">
+  <div class="section-title">⚙️ 默认模型
+    <span class="probe-pill" style="font-weight:normal;margin-left:auto" id="defModelHint">未指定模型时使用</span>
+  </div>
+  <div class="section-body">
+    <div class="form-row">
+      <div class="field"><label>Cline 池默认模型</label>
+        <div style="display:flex;gap:6px;align-items:center">
+          <select id="settingDefModel" style="flex:1;font-family:'JetBrains Mono',Consolas,monospace"></select>
+          <button class="btn btn-sm btn-primary" onclick="saveDefaultModel()">💾 保存</button>
+        </div>
+      </div>
+    </div>
+  </div>
 </div>
 <div class="section">
   <div class="section-title">🟣 Cline 模型 <span id="modelsProbeInfo" class="probe-pill" style="font-weight:normal"></span>
@@ -360,6 +421,12 @@ body:not([data-theme="dark"]) .theme-toggle .dark-label{display:none}
     <button class="btn btn-sm" onclick="refreshOcModels()" style="margin-left:auto">🔄 同步</button>
   </div>
   <div class="section-body" style="padding:6px"><div id="ocModelsList" style="padding:12px">加载中...</div></div>
+</div>
+<div class="section">
+  <div class="section-title">🔌 通用 Provider 模型
+    <button class="btn btn-sm" onclick="loadProviderModels()" style="margin-left:auto">🔄 刷新</button>
+  </div>
+  <div class="section-body" style="padding:6px"><div id="pvModelsList" style="padding:12px">加载中...</div></div>
 </div>
 </div>
 
@@ -379,38 +446,23 @@ body:not([data-theme="dark"]) .theme-toggle .dark-label{display:none}
 </div>
 
 <div class="section">
-  <div class="section-title">🔧 代理配置</div>
-  <div class="section-body">
-    <div class="form-row">
-      <div class="field"><label>监听地址</label><input type="text" id="settingAddr" disabled></div>
-      <div class="field">
-        <label>默认模型</label>
-        <div style="display:flex;gap:6px;align-items:center">
-          <select id="settingDefModel" style="flex:1;font-family:'JetBrains Mono',Consolas,monospace"></select>
-          <button class="btn btn-sm btn-primary" onclick="saveDefaultModel()">💾 保存</button>
-        </div>
-      </div>
-    </div>
-    <div class="form-row">
-      <div class="field">
-        <label>轮询策略</label>
-        <select id="settingStrategy" onchange="updateConfig()">
-          <option value="round_robin">轮询 (round_robin)</option>
-          <option value="fill">填满 (fill)</option>
-          <option value="random">随机 (random)</option>
-        </select>
-      </div>
-      <div class="field"><label>引擎版本</label><input type="text" id="settingVersion" disabled></div>
-    </div>
-    <div class="form-row">
-      <div class="field"><label>账号文件</label><input type="text" id="settingPoolPath" disabled></div>
-    </div>
-  </div>
-</div>
-
-<div class="section">
   <div class="section-title">📨 请求头配置（模拟 Cline CLI 发出）</div>
   <div class="section-body">
+    <div class="form-row">
+      <div class="field"><label>版本对齐方式</label>
+        <div style="display:flex;gap:8px;align-items:center">
+          <select id="hdrAutoMode" style="flex:1" onchange="saveHeaderAuto()">
+            <option value="false">手动（下方表格自行维护）</option>
+            <option value="true">自动对齐官方（推荐）</option>
+          </select>
+          <button class="btn btn-sm" type="button" onclick="syncHeadersNow()" style="flex:none">🔄 立即对齐</button>
+        </div>
+      </div>
+      <div class="field"><label>官方版本</label>
+        <input type="text" id="hdrSyncInfo" disabled>
+      </div>
+    </div>
+    <div class="hint" id="hdrSyncHint">自动对齐会从官方发行渠道读取当前 Cline CLI 与核心版本，改写 User-Agent、X-CLIENT-VERSION、X-PLATFORM-VERSION、X-CORE-VERSION；你自己添加的其他请求头不会被改动。</div>
     <div class="table-wrap">
     <table>
       <thead><tr><th style="width:220px">请求头</th><th>值</th><th style="width:40px"></th></tr></thead>
@@ -423,7 +475,7 @@ body:not([data-theme="dark"]) .theme-toggle .dark-label{display:none}
       <button class="btn btn-sm" onclick="addHeaderRow()">➕ 添加请求头</button>
       <button class="btn btn-sm btn-primary" onclick="saveHeaders()">💾 保存请求头</button>
     </div>
-    <div class="hint">这些请求头会附加到所有转发给 Cline API 的请求中，以模拟官方客户端行为。</div>
+    <div class="hint">这些请求头会附加到所有转发给 Cline API 的请求中，以模拟官方客户端行为。保存为整表替换：删掉的行不会残留。</div>
     <div id="headerSaveResult" style="margin-top:8px"></div>
   </div>
 </div>
@@ -431,11 +483,17 @@ body:not([data-theme="dark"]) .theme-toggle .dark-label{display:none}
 <div class="section">
   <div class="section-title">🌐 出口代理与节点</div>
   <div class="section-body">
+    <p class="hint" style="margin:0 0 14px">出口模式作用于整个网关：<strong style="color:var(--text)">所有上游、所有模型</strong>（Cline 账号池 / opencode / 通用 Provider / 订阅抓取）共用同一套出口决策。</p>
     <div class="form-row">
       <div class="field"><label>代理策略</label>
         <select id="ocStrategy"><option value="round_robin">轮询 round_robin</option><option value="random">随机 random</option><option value="fill">固定 fill</option></select>
       </div>
-      <div class="field"><label>代理冷却</label><span id="ocCooldownInfo" class="hint" style="margin:0;align-self:center">-</span></div>
+      <div class="field"><label>出口模式</label>
+        <select id="ocExitMode">
+          <option value="proxy">节点出口（全部走下面节点列表）</option>
+          <option value="direct">直连（不走任何节点）</option>
+        </select>
+      </div>
     </div>
     <div class="form-row">
       <div class="field"><label>代理列表</label>
@@ -447,10 +505,8 @@ body:not([data-theme="dark"]) .theme-toggle .dark-label{display:none}
         <div id="ocSubsList" style="display:flex;flex-direction:column;gap:6px;margin-bottom:8px"></div>
         <div style="display:flex;gap:8px">
           <input id="ocSubNew" placeholder="https://订阅地址" style="flex:1" />
-          <select id="ocSubsViaProxy" style="width:auto;flex:none">
-            <option value="false">抓取: 直连</option>
-            <option value="true">抓取: 走代理出口</option>
-          </select>
+          <input id="ocSubRefresh" type="number" min="1" max="43200" title="自动刷新间隔（分钟）" placeholder="30" style="width:96px;flex:none" />
+          <span style="align-self:center;font-size:12px;color:var(--text3);flex:none">分钟刷新</span>
           <button type="button" onclick="addOcSub()" style="flex:none;padding:9px 14px">添加</button>
         </div>
         <div class="hint" id="ocSubsInfo" style="margin-top:6px;font-size:12px;color:var(--text3);white-space:pre-wrap"></div>
@@ -462,6 +518,11 @@ body:not([data-theme="dark"]) .theme-toggle .dark-label{display:none}
         <div id="ocNodesBox" style="max-height:190px;overflow-y:auto;border:1px solid var(--border);border-radius:10px;background:rgba(2,6,23,.3)"></div>
       </div>
     </div>
+    <div class="form-row">
+      <div class="field"><label>代理冷却</label>
+        <div id="ocCooldownBox" style="border:1px solid var(--border);border-radius:10px;background:rgba(2,6,23,.3);min-height:42px"></div>
+      </div>
+    </div>
     <div class="form-actions"><button class="btn btn-primary" onclick="saveOcConfig()">💾 保存出口配置</button></div>
   </div>
 </div>
@@ -469,42 +530,34 @@ body:not([data-theme="dark"]) .theme-toggle .dark-label{display:none}
 <div class="section">
   <div class="section-title">🔌 通用 Provider（OpenAI 兼容上游）</div>
   <div class="section-body">
+    <p class="hint" style="margin:0 0 14px">只需要 <strong style="color:var(--text)">Provider 名 + API 地址 + API Key</strong>，保存后会自动拉取模型目录。Google Gemini 只需填 <code>https://generativelanguage.googleapis.com</code>，端点后缀与鉴权方言由程序自动补齐。</p>
     <div class="form-row">
-      <div class="field"><label>Provider 名</label><input type="text" id="pvName" placeholder="openrouter / gemini / tokenrouter / bai"></div>
-      <div class="field"><label>Base URL</label><input type="text" id="pvBaseUrl" placeholder="https://openrouter.ai/api/v1"></div>
+      <div class="field"><label>Provider 名 *</label><input type="text" id="pvName" placeholder="openrouter / gemini / tokenrouter / bai"></div>
+      <div class="field"><label>API 地址 *</label><input type="text" id="pvBaseUrl" placeholder="https://openrouter.ai/api/v1"></div>
     </div>
     <div class="form-row">
-      <div class="field"><label>API Key</label><input type="password" id="pvKey" placeholder="sk-..."></div>
-      <div class="field"><label>目录 / 免费判定</label>
-        <div style="display:flex;gap:8px">
-          <select id="pvCatalog" style="flex:1">
-            <option value="false">不拉目录（白名单）</option>
-            <option value="true">拉取 /models 目录</option>
-          </select>
-          <select id="pvPricing" style="flex:1">
-            <option value="false">按白名单判定免费</option>
-            <option value="true">按目录价格判定免费</option>
-          </select>
-        </div>
+      <div class="field"><label>API Key *</label><input type="password" id="pvKey" placeholder="sk-..."></div>
+      <div class="field"><label>可用模型范围</label>
+        <select id="pvMode">
+          <option value="all">目录中的全部模型（通用默认）</option>
+          <option value="pricing">按目录价格（仅 0 元模型）</option>
+          <option value="whitelist">仅白名单（不拉目录）</option>
+        </select>
       </div>
     </div>
     <div class="form-row">
-      <div class="field"><label>Models URL（Google 原生目录用；留空则用 Base URL + /models）</label>
-        <input type="text" id="pvModelsUrl" placeholder="https://generativelanguage.googleapis.com/v1beta/models"></div>
-      <div class="field"><label>Models Key 头（Google 用 x-goog-api-key）</label>
-        <input type="text" id="pvModelsKeyHeader" placeholder="x-goog-api-key"></div>
-    </div>
-    <div class="form-row">
-      <div class="field"><label>免费模型白名单（每行一个）</label>
-        <textarea id="pvFree" rows="4" placeholder="gemini-3.8-flash&#10;glm-5.3-flash"></textarea></div>
-      <div class="field"><label>连通测试模型（留空用第一个免费模型）</label>
-        <input type="text" id="pvTestModel" placeholder="z-ai/glm-5.3:free"></div>
+      <div class="field"><label>白名单（每行一个，仅「仅白名单」模式使用）</label>
+        <textarea id="pvFree" rows="3" placeholder="glm-5.3-flash"></textarea></div>
+      <div class="field"><label>连通测试模型（留空用第一个可用模型）</label>
+        <input type="text" id="pvTestModel" placeholder="glm-5.3-flash"></div>
     </div>
     <div class="form-actions">
-      <button class="btn btn-primary" onclick="saveProvider()">💾 保存 Provider</button>
+      <button class="btn btn-primary" onclick="saveProvider()">💾 保存并拉取模型</button>
       <button class="btn" onclick="testProvider()">🔍 连通测试</button>
       <button class="btn" onclick="refreshProviderCatalog()">🔄 刷新目录</button>
+      <button class="btn" onclick="resetProviderForm()">✖ 清空表单</button>
     </div>
+    <div id="pvResult" style="margin-top:10px"></div>
     <div id="pvList" style="margin-top:10px;border:1px solid var(--border);border-radius:10px;background:rgba(2,6,23,.3)"></div>
   </div>
 </div>
@@ -640,9 +693,9 @@ document.querySelectorAll('.nav-item').forEach(el => {
     el.classList.add('active');
     document.querySelectorAll('.tab-panel').forEach(e => e.style.display = 'none');
     _('tab-' + el.dataset.tab).style.display = 'block';
-    if (el.dataset.tab === 'dashboard') { loadStats(); loadOcStats(); }
-    if (el.dataset.tab === 'accounts') { loadAccounts(); loadOcConfig(); }
-    if (el.dataset.tab === 'models') { loadModels(); loadOcModels(); }
+    if (el.dataset.tab === 'dashboard') { loadStats(); loadOcStats(); loadConfig(); loadOcConfig(); }
+    if (el.dataset.tab === 'accounts') { loadAccounts(); loadConfig(); }
+    if (el.dataset.tab === 'models') { loadModels(); loadOcModels(); loadProviders(); }
     if (el.dataset.tab === 'settings') { loadKeys(); loadConfig(); loadOcConfig(); loadOcNodes(); loadProviders(); }
     if (el.dataset.tab === 'logs') loadLogs();
   });
@@ -654,9 +707,9 @@ function switchTab(name) {
   });
   document.querySelectorAll('.tab-panel').forEach(e => e.style.display = 'none');
   _('tab-' + name).style.display = 'block';
-  if (name === 'dashboard') { loadStats(); loadOcStats(); }
-  if (name === 'accounts') { loadAccounts(); loadOcConfig(); }
-  if (name === 'models') { loadModels(); loadOcModels(); }
+  if (name === 'dashboard') { loadStats(); loadOcStats(); loadConfig(); loadOcConfig(); }
+  if (name === 'accounts') { loadAccounts(); loadConfig(); }
+  if (name === 'models') { loadModels(); loadOcModels(); loadProviders(); }
   if (name === 'settings') { loadKeys(); loadConfig(); loadOcConfig(); loadOcNodes(); loadProviders(); }
   if (name === 'logs') loadLogs();
 }
@@ -690,8 +743,6 @@ async function loadStats() {
     _('statActive').textContent = s.active;
     _('statCooldown').textContent = s.cooldown;
     _('statExpired').textContent = s.expired;
-    if (s.version) _('settingVersion').value = s.version;
-    if (s.strategy) _('settingStrategy').value = s.strategy;
   } catch (e) { /* ignore */ }
 }
 
@@ -993,12 +1044,40 @@ async function exportAccounts() {
 }
 
 // ========== 配置管理 ==========
-async function updateConfig() {
-  const strategy = _('settingStrategy').value;
+// savePoolStrategy Cline 账号池的轮询策略（原「设置 → 代理配置」，现在账号管理页）。
+async function savePoolStrategy() {
+  const strategy = _('acctStrategy').value;
   try {
     await api('POST', '/config/update', { strategy });
-    toast('策略已更新为: ' + strategy, 'success');
+    toast('账号轮询策略已更新为: ' + strategy, 'success');
   } catch (e) { toast('更新失败: ' + e.message, 'error'); }
+}
+
+// saveHeaderAuto 切换请求头的版本对齐方式。
+async function saveHeaderAuto() {
+  const auto = _('hdrAutoMode').value === 'true';
+  try {
+    await api('POST', '/config/update', { headersAuto: auto });
+    toast(auto ? '已开启自动对齐（每 12 小时，并在启动时对齐一次）' : '已切换为手动维护请求头', 'success');
+    if (auto) await syncHeadersNow(true);
+    else loadConfig();
+  } catch (e) { toast('保存失败: ' + e.message, 'error'); }
+}
+
+// syncHeadersNow 立即向官方发行渠道对齐一次版本类请求头。
+async function syncHeadersNow(quiet) {
+  if (!quiet) toast('正在查询官方版本…', 'info');
+  try {
+    const d = await api('POST', '/config/headers/sync', {});
+    const r = d.data || {};
+    if (!quiet) toast('已对齐 ' + (r.version || '官方版本') + (r.source ? '（来源 ' + r.source + '）' : ''), 'success', 7000);
+    loadConfig();
+    return r;
+  } catch (e) {
+    if (!quiet) toast('对齐失败: ' + e.message, 'error', 8000);
+    loadConfig();
+    return null;
+  }
 }
 
 function addHeaderRow() {
@@ -1123,10 +1202,14 @@ async function loadConfig() {
   try {
     const d = await api('GET', '/config');
     const c = d.data;
-    if (c.address) _('settingAddr').value = c.address;
-    if (c.strategy) _('settingStrategy').value = c.strategy;
-    if (c.version) _('settingVersion').value = c.version;
-    if (c.poolPath) _('settingPoolPath').value = c.poolPath;
+    // 入口信息展示在仪表盘; 账号池信息展示在账号管理页
+    if (_('dashApiBase')) _('dashApiBase').value = c.apiBase || ('http://' + (c.address || ''));
+    if (_('dashListenAddr')) _('dashListenAddr').value = c.listenAddr || c.address || '';
+    if (_('dashVersion')) _('dashVersion').value = c.version || '';
+    if (_('acctPoolPath')) _('acctPoolPath').value = c.poolPath || '';
+    if (_('acctStrategy') && c.strategy) _('acctStrategy').value = c.strategy;
+    if (_('hdrAutoMode')) _('hdrAutoMode').value = String(!!c.headersAuto);
+    renderHeaderSyncInfo(c.headersSync || {}, !!c.headersAuto);
     loadModelOptions();
     if (c.headers) {
       const tbody = _('headersTableBody');
@@ -1141,6 +1224,17 @@ async function loadConfig() {
   } catch (e) { /* ignore */ }
 }
 
+// renderHeaderSyncInfo 展示最近一次自动对齐的结果。
+function renderHeaderSyncInfo(sync, auto) {
+  const el = _('hdrSyncInfo');
+  if (!el) return;
+  const parts = [];
+  if (sync.version) parts.push(sync.version);
+  if (sync.syncedAt) parts.push('对齐于 ' + new Date(sync.syncedAt).toLocaleString('zh-CN'));
+  if (!parts.length) parts.push(auto ? '尚未对齐，启动后会自动执行一次' : '手动维护中');
+  el.value = parts.join(' · ');
+}
+
 // ========== opencode 免费模型 ==========
 async function loadOcConfig() {
   try {
@@ -1152,7 +1246,9 @@ async function loadOcConfig() {
     _('ocProxies').value = (c.proxies || []).join('\n');
     ocSubsArr = (c.subs || []).slice();
     renderOcSubs();
-    _('ocSubsViaProxy').value = String(!!c.subsViaProxy);
+    _('ocExitMode').value = c.exitMode === 'direct' ? 'direct' : 'proxy';
+    _('ocSubRefresh').value = c.subsRefreshMins || 30;
+    if (_('dashExitMode')) _('dashExitMode').value = (c.exitMode === 'direct') ? '直连（不走节点）' : '节点出口（走节点列表）';
     loadOcNodes();
     _('ocStrategy').value = c.proxyStrategy || 'round_robin';
     _('ocMaxConc').value = c.maxConcurrency || 8;
@@ -1169,11 +1265,7 @@ async function loadOcConfig() {
     _('ocFailoverInfo').innerHTML = rt.failoverActive
       ? '<span style="color:var(--danger)">🔴 故障转移中 (opencode 不可用, 请求走 cline 池)</span>'
       : '<span style="color:var(--accent2)">🟢 正常</span>';
-    const cd = rt.proxyCooldowns || {};
-    const keys = Object.keys(cd);
-    _('ocCooldownInfo').textContent = keys.length
-      ? keys.map(k => k + ' 冷却至 ' + cd[k]).join('; ')
-      : '暂无冷却中的代理';
+    renderCooldowns(rt.proxyCooldowns || {}, c.exitMode === 'direct');
     const ss = rt.subsStatus || {};
     const sk = Object.keys(ss);
     _('ocSubsInfo').textContent = sk.length
@@ -1182,11 +1274,32 @@ async function loadOcConfig() {
   } catch (e) { /* ignore */ }
 }
 
+// renderCooldowns 节点列表下方的冷却框: 只列出真正处于冷却期的出口。
+function renderCooldowns(cd, direct) {
+  const el = _('ocCooldownBox');
+  if (!el) return;
+  const keys = Object.keys(cd);
+  if (direct) {
+    el.innerHTML = '<div style="padding:9px 12px;font-size:12px;color:var(--text3)">当前为直连模式，节点不参与出口，冷却不适用</div>';
+    return;
+  }
+  if (!keys.length) {
+    el.innerHTML = '<div style="padding:9px 12px;font-size:12px;color:var(--text3)">暂无冷却中的节点</div>';
+    return;
+  }
+  el.innerHTML = keys.map(k =>
+    '<div style="display:flex;align-items:center;gap:9px;padding:6px 12px;font-size:12.5px;border-bottom:1px solid rgba(148,163,184,.07)">' +
+    '<span style="flex:none">🧊</span>' +
+    '<span style="flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">' + esc(k) + '</span>' +
+    '<span style="flex:none;font-size:11px;color:var(--text3)">冷却至 ' + esc(cd[k]) + '</span></div>'
+  ).join('');
+}
+
 let ocSubsArr = [];
 function renderOcSubs() {
   const el = _('ocSubsList');
   if (!ocSubsArr.length) {
-    el.innerHTML = '<div style="font-size:12px;color:var(--text3);padding:2px 0">暂无订阅, 在下方添加; 保存后自动抓取并每 6 小时刷新, 支持 sing-box JSON / Clash YAML / base64 节点列表</div>';
+    el.innerHTML = '<div style="font-size:12px;color:var(--text3);padding:2px 0">暂无订阅, 在下方添加; 保存后自动抓取并按设定的刷新间隔更新, 支持 sing-box JSON / Clash YAML / base64 节点列表</div>';
     return;
   }
   el.innerHTML = ocSubsArr.map((u, i) =>
@@ -1249,13 +1362,16 @@ async function saveOcConfig() {
   const NODE_RE = /^(vmess|vless|trojan|ss|hy2|hysteria2|tuic|hysteria|anytls|ssh|shadowtls|snell|sbox):\/\//;
   const bad = proxies.find(p => !(PROXY_RE.test(p) || NODE_RE.test(p)));
   if (bad) { toast('代理格式无效: ' + bad.slice(0, 60) + '（支持 http/socks5 代理或 vmess/vless/trojan/ss/hy2/tuic 等节点链接）', 'error'); return; }
+  const refresh = parseInt(_('ocSubRefresh').value) || 30;
+  if (refresh < 1 || refresh > 43200) { toast('刷新间隔需在 1~43200 分钟之间', 'error'); return; }
   const body = {
     enabled: _('ocEnabled').value === 'true',
     key: _('ocKey').value.trim(),
     baseURLs: _('ocBaseURLs').value.split('\n').map(s => s.trim()).filter(Boolean),
     proxies: proxies,
     subs: ocSubsArr,
-    subsViaProxy: _('ocSubsViaProxy').value === 'true',
+    exitMode: _('ocExitMode').value,
+    subsRefreshMins: refresh,
     proxyStrategy: _('ocStrategy').value,
     maxConcurrency: parseInt(_('ocMaxConc').value) || 8,
     retries: parseInt(_('ocRetries').value) || 3,
@@ -1282,78 +1398,182 @@ async function loadProviders() {
   try {
     const d = await api('GET', '/providers');
     pvData = (d.data && d.data.providers) || {};
-    const names = Object.keys(pvData);
-    if (!names.length) {
-      _('pvList').innerHTML = '<div style="padding:10px 12px;font-size:12px;color:var(--text3)">暂无 provider, 填上方表单添加</div>';
-      return;
-    }
-    _('pvList').innerHTML = names.map(n => {
-      const p = pvData[n] || {}, rt = p.runtime || {};
-      let st;
-      if (!rt.configured) { st = '未配置 key'; }
-      else if (rt.error) { st = '❌ ' + esc(rt.error); }
-      else if (p.catalog) { st = '目录 ' + (rt.catalogSize || 0) + ' · 免费 ' + (rt.freeCount || 0) + ' · 可聊 ' + (rt.chatCount || 0); }
-      else { st = '白名单 ' + ((p.freeModels || []).length) + ' 个'; }
-      if (rt.rejected) { st += ' · 剔除 ' + rt.rejected; }
-      return '<div style="display:flex;align-items:center;gap:9px;padding:6px 12px;font-size:12.5px;border-bottom:1px solid rgba(148,163,184,.07)">' +
-        '<span style="flex:none;min-width:92px;font-family:monospace;color:var(--text3)">' + esc(n) + '</span>' +
-        '<span style="flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">' + esc(p.baseUrl || '') + '</span>' +
-        '<span style="flex:none;font-size:11px;color:var(--text3)">' + st + '</span>' +
-        '<button type="button" class="btn" style="padding:2px 8px;font-size:11px" onclick="editProvider(\'' + esc(n).replace(/'/g, "\\'") + '\')">编辑</button>' +
-        '<button type="button" class="btn" style="padding:2px 8px;font-size:11px;color:#f87171" onclick="delProvider(\'' + esc(n).replace(/'/g, "\\'") + '\')">删除</button></div>';
-    }).join('');
+    renderProviderList();
+    renderProviderModels();
   } catch (e) { _('pvList').textContent = '加载失败: ' + e.message; }
 }
+
+// providerMode 把三个开关还原成面板上的单一选择。
+function providerMode(p) {
+  if (p.catalog && p.allModels) return 'all';
+  if (p.catalog && p.pricing) return 'pricing';
+  return 'whitelist';
+}
+
+function renderProviderList() {
+  const names = Object.keys(pvData);
+  if (!names.length) {
+    _('pvList').innerHTML = '<div style="padding:10px 12px;font-size:12px;color:var(--text3)">暂无 provider, 填上方表单添加</div>';
+    return;
+  }
+  _('pvList').innerHTML = names.map(n => {
+    const p = pvData[n] || {}, rt = p.runtime || {};
+    let st;
+    if (!rt.configured) { st = '未配置 key'; }
+    else if (rt.error) { st = '❌ ' + esc(String(rt.error).slice(0, 90)); }
+    else if (p.catalog) { st = '目录 ' + (rt.catalogSize || 0) + ' · 可聊 ' + (rt.chatCount || 0) + ' · 可用 ' + (p.models || []).length; }
+    else { st = '白名单 ' + ((p.freeModels || []).length) + ' 个'; }
+    if (rt.rejected) { st += ' · 剔除 ' + rt.rejected; }
+    const badge = p.google ? '<span style="flex:none;font-size:10.5px;color:#4285f4;border:1px solid currentColor;border-radius:4px;padding:0 5px" title="Google 特殊约定已内置">Google</span>' : '';
+    return '<div style="display:flex;align-items:center;gap:9px;padding:6px 12px;font-size:12.5px;border-bottom:1px solid rgba(148,163,184,.07)">' +
+      '<span style="flex:none;min-width:92px;font-family:monospace;color:var(--text3)">' + esc(n) + '</span>' +
+      badge +
+      '<span style="flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">' + esc(p.baseUrl || '') + '</span>' +
+      '<span style="flex:none;font-size:11px;color:var(--text3);max-width:44%">' + st + '</span>' +
+      '<button type="button" class="btn" style="padding:2px 8px;font-size:11px" onclick="editProvider(\'' + esc(n).replace(/'/g, "\\'") + '\')">编辑</button>' +
+      '<button type="button" class="btn" style="padding:2px 8px;font-size:11px" onclick="testProviderByName(\'' + esc(n).replace(/'/g, "\\'") + '\')">测试</button>' +
+      '<button type="button" class="btn" style="padding:2px 8px;font-size:11px;color:#f87171" onclick="delProvider(\'' + esc(n).replace(/'/g, "\\'") + '\')">删除</button></div>';
+  }).join('');
+}
+
+// renderProviderModels 模型列表页的「通用 Provider 模型」分组。
+function renderProviderModels() {
+  const el = _('pvModelsList');
+  if (!el) return;
+  const names = Object.keys(pvData);
+  const blocks = names.map(n => {
+    const p = pvData[n] || {}, rt = p.runtime || {};
+    const models = p.models || [];
+    let note = '';
+    if (!rt.configured) note = '未配置 API Key';
+    else if (!models.length) note = rt.error ? ('拉取失败：' + String(rt.error).slice(0, 160)) : '目录为空，点「刷新目录」重试';
+    const rows = models.map(m => {
+      const disp = m.id;
+      const ctx = m.context ? m.context : '-';
+      const out = m.output ? m.output : '-';
+      return '<tr>' +
+        '<td style="text-align:left;font-family:monospace">' + esc(disp) + '</td>' +
+        '<td><span class="copy-icon" title="复制" onclick="copyText(\'' + esc(disp).replace(/'/g, "\\'") + '\')">📋</span></td>' +
+        '<td>' + ctx + '</td><td>' + out + '</td></tr>';
+    }).join('');
+    return '<div style="margin-bottom:14px">' +
+      '<div style="display:flex;align-items:center;gap:8px;margin-bottom:6px">' +
+      '<span style="font-weight:600;font-family:monospace">' + esc(n) + '</span>' +
+      '<span class="model-tag">' + models.length + ' 个可用模型</span>' +
+      (p.catalog ? '<span class="model-tag">目录已拉取</span>' : '<span class="model-tag">白名单模式</span>') +
+      '<span style="font-size:11px;color:var(--text3);flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">' + esc(p.baseUrl || '') + '</span>' +
+      '</div>' +
+      (note ? '<div class="hint" style="margin:0">' + esc(note) + '</div>'
+        : '<div class="table-wrap"><table><thead><tr><th style="text-align:left">模型 ID</th><th style="width:44px"></th><th>上下文</th><th>最大输出</th></tr></thead><tbody>' + rows + '</tbody></table></div>') +
+      '</div>';
+  }).join('');
+  el.innerHTML = blocks || '<div class="empty">暂无通用 Provider，在「设置 → 🔌 通用 Provider」里添加</div>';
+}
+
+function loadProviderModels() { loadProviders(); }
+
 function editProvider(n) {
   const p = pvData[n] || {};
   _('pvName').value = n;
   _('pvBaseUrl').value = p.baseUrl || '';
   _('pvKey').value = p.apiKey || '';
-  _('pvCatalog').value = String(!!p.catalog);
-  _('pvPricing').value = String(!!p.pricing);
-  _('pvModelsUrl').value = p.modelsUrl || '';
-  _('pvModelsKeyHeader').value = p.modelsKeyHeader || '';
+  _('pvMode').value = providerMode(p);
   _('pvFree').value = (p.freeModels || []).join('\n');
   toast('已载入 ' + n + ', 修改后点保存', 'success');
 }
+
+function resetProviderForm() {
+  _('pvName').value = '';
+  _('pvBaseUrl').value = '';
+  _('pvKey').value = '';
+  _('pvMode').value = 'all';
+  _('pvFree').value = '';
+  _('pvTestModel').value = '';
+  _('pvResult').innerHTML = '';
+}
+
 async function saveProvider() {
   const name = _('pvName').value.trim();
+  const baseUrl = _('pvBaseUrl').value.trim();
+  const apiKey = _('pvKey').value.trim();
   if (!name) { toast('请填写 Provider 名', 'error'); return; }
+  if (!baseUrl) { toast('请填写 API 地址', 'error'); return; }
+  if (!apiKey) { toast('请填写 API Key', 'error'); return; }
   // 后端按整体替换处理 provider: 表单未编辑的字段(headers、chatPath 等)
   // 必须原样回传, 否则保存会把它们清掉, 已配好的 provider 会静默失真。
   const existing = Object.assign({}, pvData[name] || {});
   delete existing.runtime;
+  delete existing.models;
+  delete existing.google;
+  delete existing.chatEndpoint;
+  delete existing.catalogEndpoint;
+  const mode = _('pvMode').value;
   const body = {
     name,
     provider: Object.assign(existing, {
-      baseUrl: _('pvBaseUrl').value.trim(),
-      apiKey: _('pvKey').value.trim(),
-      catalog: _('pvCatalog').value === 'true',
-      pricing: _('pvPricing').value === 'true',
-      modelsUrl: _('pvModelsUrl').value.trim(),
-      modelsKeyHeader: _('pvModelsKeyHeader').value.trim(),
+      baseUrl,
+      apiKey,
+      catalog: mode !== 'whitelist',
+      pricing: mode === 'pricing',
+      allModels: mode === 'all',
       freeModels: _('pvFree').value.split('\n').map(s => s.trim()).filter(Boolean),
+      // 目录地址与鉴权方言由后端按上游推导, 面板不再暴露
+      modelsUrl: '',
+      modelsKeyHeader: '',
     }),
   };
-  try { await api('POST', '/providers/update', body); toast('已保存 ' + name, 'success'); loadProviders(); }
-  catch (e) { toast('保存失败: ' + e.message, 'error'); }
+  try {
+    await api('POST', '/providers/update', body);
+    toast('已保存 ' + name + '，正在拉取模型目录…', 'success');
+    loadProviders();
+    // 保存后自动拉一次目录, 用户不需要再点「刷新目录」
+    try {
+      await api('POST', '/providers/refresh', { name });
+      setTimeout(loadProviders, 3000);
+      setTimeout(loadProviders, 10000);
+    } catch (e2) { /* 目录拉取失败会显示在 provider 行上 */ }
+  } catch (e) { toast('保存失败: ' + e.message, 'error'); }
 }
+
 async function delProvider(n) {
   if (!confirm('确认删除 provider ' + n + '?')) return;
   try { await api('POST', '/providers/update', { name: n, remove: true }); toast('已删除 ' + n, 'success'); loadProviders(); }
   catch (e) { toast('删除失败: ' + e.message, 'error'); }
 }
+
+// pvTest 抽取一次连通测试的展示文案, 表单按钮与列表按钮共用。
+function pvTestReport(name, r) {
+  const r2 = r || {};
+  const detail = r2.error ? String(r2.error).slice(0, 200) : String(r2.body || '').slice(0, 200);
+  const ok = r2.status === 200;
+  return { ok, text: name + ' · HTTP ' + (r2.status || '?') + ' · ' + detail };
+}
+
 async function testProvider() {
   const name = _('pvName').value.trim();
   if (!name) { toast('请先填写 Provider 名', 'error'); return; }
-  toast('连通测试中...', 'success');
+  const box = _('pvResult');
+  if (box) box.innerHTML = '<div class="hint" style="margin:0">连通测试中…（请求会按当前出口模式发出）</div>';
   try {
     const d = await api('POST', '/providers/test', { name, model: _('pvTestModel').value.trim() });
-    const r = (d.data) || {};
-    const detail = r.error ? String(r.error).slice(0, 160) : String(r.body || '').slice(0, 160);
-    toast('HTTP ' + (r.status || '?') + ' · ' + detail, r.status === 200 ? 'success' : 'error');
+    const rep = pvTestReport(name, d.data);
+    if (box) box.innerHTML = '<div class="hint" style="margin:0;color:' + (rep.ok ? 'var(--accent2)' : 'var(--danger)') + '">' + esc(rep.text) + '</div>';
+    toast(rep.text, rep.ok ? 'success' : 'error', 8000);
+  } catch (e) {
+    if (box) box.innerHTML = '<div class="hint" style="margin:0;color:var(--danger)">' + esc(e.message) + '</div>';
+    toast('测试失败: ' + e.message, 'error');
+  }
+}
+
+async function testProviderByName(name) {
+  toast('连通测试中…', 'info');
+  try {
+    const d = await api('POST', '/providers/test', { name });
+    const rep = pvTestReport(name, d.data);
+    toast(rep.text, rep.ok ? 'success' : 'error', 9000);
   } catch (e) { toast('测试失败: ' + e.message, 'error'); }
 }
+
 async function refreshProviderCatalog() {
   const name = _('pvName').value.trim();
   try {
@@ -1387,19 +1607,42 @@ async function refreshOcModels() {
   } catch (e) { toast('同步失败: ' + e.message, 'error'); }
 }
 
+// 统计表渲染: 三个框分别展示 总量 / 按上游 / 按模型, 口径都是全部上游。
+const STAT_HEAD = '<table><thead><tr><th style="text-align:left">口径</th><th>请求数</th><th>输入 tokens</th><th>输出 tokens</th><th>合计 tokens</th><th>压缩消耗</th><th>限流命中</th></tr></thead><tbody>';
+function statRow(label, e) {
+  const o = e || {};
+  const pt = o.promptTokens || 0, ct = o.completionTokens || 0;
+  return '<tr><td style="text-align:left">' + esc(label) + '</td><td>' + fmtNum(o.requests || 0) + '</td><td>' + fmtNum(pt) +
+    '</td><td>' + fmtNum(ct) + '</td><td><strong>' + fmtNum(pt + ct) + '</strong></td><td>' + fmtNum(o.compaction || 0) +
+    '</td><td>' + fmtNum(o.rateLimited || 0) + '</td></tr>';
+}
+function statBreakdown(byKey, note) {
+  const keys = Object.keys(byKey || {});
+  if (!keys.length) return '<div class="empty" style="padding:12px">暂无数据</div>';
+  // 按合计 token 降序: 谁消耗多谁在前面
+  keys.sort((a, b) => {
+    const ea = byKey[a] || {}, eb = byKey[b] || {};
+    return ((eb.promptTokens || 0) + (eb.completionTokens || 0)) - ((ea.promptTokens || 0) + (ea.completionTokens || 0));
+  });
+  const rows = keys.map(k => {
+    const e = byKey[k] || {};
+    const pt = e.promptTokens || 0, ct = e.completionTokens || 0;
+    return '<tr><td style="text-align:left;font-family:monospace">' + esc(k) + '</td><td>' + fmtNum(e.requests || 0) +
+      '</td><td>' + fmtNum(pt) + '</td><td>' + fmtNum(ct) + '</td><td><strong>' + fmtNum(pt + ct) + '</strong></td></tr>';
+  }).join('');
+  return '<table><thead><tr><th style="text-align:left">' + esc(note || '名称') + '</th><th>请求数</th><th>输入 tokens</th><th>输出 tokens</th><th>合计</th></tr></thead><tbody>' +
+    rows + '</tbody></table>';
+}
+
 async function loadOcStats() {
   try {
     const d = await api('GET', '/opencode/stats');
     const t = d.data.today || {}, s = d.data.total || {};
-    _('ocStatsBox').innerHTML = '<table><thead><tr><th style="text-align:left"></th><th>请求数</th><th>输入 tokens</th><th>输出 tokens</th><th>压缩消耗</th><th>限流命中</th></tr></thead><tbody>' +
-      '<tr><td style="text-align:left">今日</td><td>' + (t.requests || 0) + '</td><td>' + (t.promptTokens || 0) + '</td><td>' + (t.completionTokens || 0) + '</td><td>' + (t.compaction || 0) + '</td><td>' + (t.rateLimited || 0) + '</td></tr>' +
-      '<tr><td style="text-align:left">累计</td><td>' + (s.requests || 0) + '</td><td>' + (s.promptTokens || 0) + '</td><td>' + (s.completionTokens || 0) + '</td><td>' + (s.compaction || 0) + '</td><td>' + (s.rateLimited || 0) + '</td></tr>' +
-      '</tbody></table>';
-    const bm = t.byModel || {};
-    const rows = Object.keys(bm).map(k => '<tr><td style="text-align:left;font-family:monospace">' + esc(k) + '</td><td>' + bm[k].requests + '</td><td>' + bm[k].promptTokens + '</td><td>' + bm[k].completionTokens + '</td></tr>').join('');
-    _('ocModelStatsBox').innerHTML = '<div style="font-size:13px;font-weight:600;margin-bottom:6px">按模型分布（今日）</div>' +
-      '<div class="table-wrap"><table><thead><tr><th style="text-align:left">模型</th><th>请求数</th><th>输入 tokens</th><th>输出 tokens</th></tr></thead><tbody>' +
-      (rows || '<tr><td colspan="4" style="text-align:left;color:var(--text2)">暂无数据</td></tr>') + '</tbody></table></div>';
+    _('statTotalsBox').innerHTML = STAT_HEAD +
+      statRow('今日', t) + statRow('累计', s) + '</tbody></table>' +
+      '<div class="hint" style="margin-top:8px">覆盖全部上游: Cline 账号池 / opencode / ClinePass / 通用 Provider。上游返回 usage 时精确，否则按请求体估算。</div>';
+    _('statUpstreamBox').innerHTML = statBreakdown(t.byUpstream, '上游');
+    _('statModelBox').innerHTML = statBreakdown(t.byModel, '模型');
   } catch (e) { /* ignore */ }
 }
 
@@ -1409,6 +1652,8 @@ loadAccounts();
 loadKeys();
 loadModels();
 loadConfig();
+loadOcConfig();
+loadProviders();
 setInterval(() => { loadStats(); }, 10000);
 setInterval(() => { loadOcStats(); }, 15000);
 setInterval(() => { if (_('tab-logs').style.display !== 'none') loadLogs(); }, 8000);

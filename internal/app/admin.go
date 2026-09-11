@@ -4,11 +4,13 @@ import (
 	"cline-go-proxy/internal/cline"
 	"cline-go-proxy/internal/kit"
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
 	"log"
 	"net/http"
+	"os"
 	"strings"
 	"sync"
 	"time"
@@ -67,6 +69,7 @@ func registerAdminRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("/admin/api/models/refresh", corsHandler(handleAdminModelsRefresh))
 	mux.HandleFunc("/admin/api/config", corsHandler(handleAdminConfig))
 	mux.HandleFunc("/admin/api/config/update", corsHandler(handleAdminUpdateConfig))
+	mux.HandleFunc("/admin/api/config/headers/sync", corsHandler(handleAdminHeadersSync))
 	mux.HandleFunc("/admin/api/opencode/config", corsHandler(handleZenConfig))
 	mux.HandleFunc("/admin/api/opencode/config/update", corsHandler(handleZenConfigUpdate))
 	mux.HandleFunc("/admin/api/opencode/nodes", corsHandler(handleZenNodes))
@@ -801,13 +804,18 @@ func formatDuration(d time.Duration) string {
 
 // Global proxy config (mutable via API)
 var (
-	proxyConfig   = defaultProxyConfig()
+	proxyConfig   = loadProxyConfig()
 	proxyConfigMu sync.Mutex
 )
 
 type proxyConfigData struct {
 	Strategy string            `json:"strategy"`
 	Headers  map[string]string `json:"headers"`
+	// HeadersAuto 打开后由后台定期对齐官方 Cline CLI 的版本类请求头。
+	HeadersAuto bool `json:"headersAuto"`
+	// HeadersSyncedAt / HeadersAutoVersion 最近一次自动对齐的结果(展示用)。
+	HeadersSyncedAt    int64  `json:"headersSyncedAt,omitempty"`
+	HeadersAutoVersion string `json:"headersAutoVersion,omitempty"`
 }
 
 func defaultProxyConfig() *proxyConfigData {
@@ -827,6 +835,40 @@ func defaultProxyConfig() *proxyConfigData {
 	}
 }
 
+func proxyConfigFile() string { return kit.ResolveDataPath(".proxy-config.json") }
+
+// loadProxyConfig 读取持久化的客户端配置, 缺失或损坏时退回默认值。
+// 面板上改过的请求头必须跨重启保留, 否则每次重启都会悄悄回到内置默认值。
+func loadProxyConfig() *proxyConfigData {
+	cfg := defaultProxyConfig()
+	data, err := os.ReadFile(proxyConfigFile())
+	if err != nil {
+		return cfg
+	}
+	if err := json.Unmarshal(data, cfg); err != nil {
+		log.Printf("proxy config parse failed: %v", err)
+	}
+	if cfg.Headers == nil {
+		cfg.Headers = map[string]string{}
+	}
+	if cfg.Strategy == "" {
+		cfg.Strategy = "round_robin"
+	}
+	return cfg
+}
+
+func saveProxyConfig() {
+	proxyConfigMu.Lock()
+	data, err := json.MarshalIndent(proxyConfig, "", "  ")
+	proxyConfigMu.Unlock()
+	if err != nil {
+		return
+	}
+	if err := os.WriteFile(proxyConfigFile(), data, 0600); err != nil {
+		log.Printf("proxy config save failed: %v", err)
+	}
+}
+
 func getProxyConfig() *proxyConfigData {
 	proxyConfigMu.Lock()
 	defer proxyConfigMu.Unlock()
@@ -835,8 +877,9 @@ func getProxyConfig() *proxyConfigData {
 
 func setProxyConfig(c *proxyConfigData) {
 	proxyConfigMu.Lock()
-	defer proxyConfigMu.Unlock()
 	proxyConfig = c
+	proxyConfigMu.Unlock()
+	saveProxyConfig()
 }
 
 // GET /admin/api/keys
@@ -901,11 +944,22 @@ func handleAdminConfig(w http.ResponseWriter, r *http.Request) {
 	}
 	writeAPI(w, http.StatusOK, apiResponse{Success: true, Data: map[string]any{
 		"address":      address,
+		// listenAddr 是真实绑定地址(可能是 0.0.0.0), apiBase 是客户端应使用的本机入口。
+		"listenAddr":   proxyListenAddress,
+		"apiBase":      localOrigin(),
 		"strategy":     cfg.Strategy,
 		"version":      "go-1.1",
 		"poolPath":     poolPath,
 		"defaultModel": getDefaultModel(),
 		"headers":      cfg.Headers,
+		"headersAuto":  cfg.HeadersAuto,
+		"headersSync": map[string]any{
+			"auto":      cfg.HeadersAuto,
+			"syncedAt":  cfg.HeadersSyncedAt,
+			"version":   cfg.HeadersAutoVersion,
+			"source":    clineRegistrySources[0],
+			"intervalM": int(headersAutoSyncInterval / time.Minute),
+		},
 	}})
 }
 
@@ -926,6 +980,7 @@ func handleAdminUpdateConfig(w http.ResponseWriter, r *http.Request) {
 		Strategy     string            `json:"strategy"`
 		Headers      map[string]string `json:"headers"`
 		DefaultModel string            `json:"defaultModel"`
+		HeadersAuto  *bool             `json:"headersAuto"`
 	}
 	if err := json.Unmarshal(body, &req); err != nil {
 		writeAPI(w, http.StatusBadRequest, apiResponse{Error: "invalid JSON"})
@@ -947,9 +1002,20 @@ func handleAdminUpdateConfig(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if req.Headers != nil {
+		// 面板以「整表替换」提交: 先清掉已删除的键, 否则被删掉的头会一直残留。
+		next := make(map[string]string, len(req.Headers))
 		for k, v := range req.Headers {
-			cfg.Headers[k] = v
+			if strings.TrimSpace(k) == "" {
+				continue
+			}
+			next[strings.TrimSpace(k)] = v
 		}
+		cfg.Headers = next
+		changed = true
+	}
+
+	if req.HeadersAuto != nil {
+		cfg.HeadersAuto = *req.HeadersAuto
 		changed = true
 	}
 
@@ -973,7 +1039,30 @@ func handleAdminUpdateConfig(w http.ResponseWriter, r *http.Request) {
 	writeAPI(w, http.StatusOK, apiResponse{Success: true, Data: map[string]any{
 		"strategy":     cfg.Strategy,
 		"headers":      cfg.Headers,
+		"headersAuto":  cfg.HeadersAuto,
 		"defaultModel": defaultModel,
+	}})
+}
+
+// POST /admin/api/config/headers/sync — 对齐官方 Cline CLI 的请求头版本
+func handleAdminHeadersSync(w http.ResponseWriter, r *http.Request) {
+	if r.Method != "POST" {
+		writeAPI(w, http.StatusMethodNotAllowed, apiResponse{Error: "method not allowed"})
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), headersSyncTimeout*2)
+	defer cancel()
+	headers, info, err := syncOfficialHeaders(ctx)
+	if err != nil {
+		writeAPI(w, http.StatusBadGateway, apiResponse{Error: "无法获取官方版本: " + err.Error()})
+		return
+	}
+	writeAPI(w, http.StatusOK, apiResponse{Success: true, Data: map[string]any{
+		"headers": headers,
+		"cli":     info.CLI,
+		"core":    info.Core,
+		"source":  info.Source,
+		"version": versionLabel(info),
 	}})
 }
 

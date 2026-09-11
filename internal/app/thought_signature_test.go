@@ -130,32 +130,23 @@ func TestProviderNeedsThoughtSignatures(t *testing.T) {
 	}
 }
 
-func TestProviderProxiedClientVsThoughtSignatures(t *testing.T) {
-	// 名为 gemini 但走镜像 URL: 需要签名, 但出口不是 Google。
+func TestProviderSharesTheGatewayExitClient(t *testing.T) {
+	// Provider 的出口必须与 cline 池 / opencode 完全一致: 同一个 HTTP 客户端,
+	// 也就是同一套 出口模式(直连/节点) + 代理策略 + 节点健康过滤。
+	// 早期给 Provider 单独配直连客户端, 让节点池对它彻底失效。
 	setTestProvider(t, "gemini", providerConfig{BaseURL: "https://gemini-mirror.example.com/v1", APIKey: "k"})
-	gemini := providerByName("gemini")
-	if !providerNeedsThoughtSignatures(gemini) {
+	if !providerNeedsThoughtSignatures(providerByName("gemini")) {
 		t.Fatal("provider named gemini must need signatures")
 	}
-	if providerUsesProxiedClient(gemini) {
-		t.Fatal("mirror-hosted gemini must not use the proxied client")
-	}
-	// 非 gemini 名字但命中 generativelanguage 域名: 两者都为真。
 	setTestProvider(t, "custom", providerConfig{BaseURL: "https://generativelanguage.googleapis.com/v1beta/openai", APIKey: "k"})
-	custom := providerByName("custom")
-	if !providerNeedsThoughtSignatures(custom) {
+	if !providerNeedsThoughtSignatures(providerByName("custom")) {
 		t.Fatal("generativelanguage base url must need signatures")
 	}
-	if !providerUsesProxiedClient(custom) {
-		t.Fatal("generativelanguage base url must use the proxied client")
-	}
-	// 两者都不是: 都为假。
 	setTestProvider(t, "openrouter", providerConfig{BaseURL: "https://openrouter.ai/api/v1", APIKey: "k"})
-	openrouter := providerByName("openrouter")
-	if providerNeedsThoughtSignatures(openrouter) {
+	if providerNeedsThoughtSignatures(providerByName("openrouter")) {
 		t.Fatal("openrouter must not need signatures")
 	}
-	if providerUsesProxiedClient(openrouter) {
-		t.Fatal("openrouter must not use the proxied client")
+	if providerExitClient() != getZenHTTPClient() {
+		t.Fatal("provider requests must reuse the gateway exit client")
 	}
 }

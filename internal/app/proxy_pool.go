@@ -101,10 +101,29 @@ func nodeDialable(p string) bool {
 	return nodeLocalAddr(p) != ""
 }
 
+// ============ 全局出口模式 ============
+//
+// 出口模式作用于整个网关: zen(cline 池 / opencode / 通用 Provider) 的所有上游
+// 请求与订阅抓取共用同一个出口决策。direct = 全部直连; proxy = 全部走
+// 节点列表里的代理/节点出口(pickZenProxy 内部仍会跳过冷却与不可达节点)。
+
+const (
+	exitModeDirect = "direct"
+	exitModeProxy  = "proxy"
+)
+
+// exitModeDirectNow 当前是否为直连模式。
+func exitModeDirectNow() bool {
+	return getZenConfig().ExitMode == exitModeDirect
+}
+
 // pickZenProxy 按策略选择代理,返回 (代理URL, 索引);无代理返回 ("", -1)。
 // 跳过冷却中或未就绪的节点;全部不可用时返回直连。
 // 每次调用递增计数,保证 round_robin 顺序与日志索引一致。
 func pickZenProxy() (string, int) {
+	if exitModeDirectNow() {
+		return "", -1
+	}
 	list := effectiveProxyList()
 	n := len(list)
 	if n == 0 {

@@ -24,7 +24,8 @@ func handleZenConfig(w http.ResponseWriter, r *http.Request) {
 		"baseURLs":        zenBaseURLList(cfg),
 		"proxies":         cfg.Proxies,
 		"subs":            cfg.Subs,
-		"subsViaProxy":    cfg.SubsViaProxy,
+		"exitMode":        cfg.ExitMode,
+		"subsRefreshMins": cfg.SubsRefreshMins,
 		"proxyStrategy":   cfg.ProxyStrategy,
 		"maxConcurrency":  cfg.MaxConcurrency,
 		"retries":         cfg.Retries,
@@ -66,7 +67,8 @@ func handleZenConfigUpdate(w http.ResponseWriter, r *http.Request) {
 		BaseURLs        []string `json:"baseURLs"`
 		Proxies         []string `json:"proxies"`
 		Subs            []string `json:"subs"`
-		SubsViaProxy    *bool    `json:"subsViaProxy"`
+		ExitMode        *string  `json:"exitMode"`
+		SubsRefreshMins *int     `json:"subsRefreshMins"`
 		ProxyStrategy   *string  `json:"proxyStrategy"`
 		MaxConcurrency  *int     `json:"maxConcurrency"`
 		Retries         *int     `json:"retries"`
@@ -92,7 +94,8 @@ func handleZenConfigUpdate(w http.ResponseWriter, r *http.Request) {
 		BaseURLs:        cur.BaseURLs,
 		Proxies:         cur.Proxies,
 		Subs:            cur.Subs,
-		SubsViaProxy:    cur.SubsViaProxy,
+		ExitMode:        cur.ExitMode,
+		SubsRefreshMins: cur.SubsRefreshMins,
 		ProxyStrategy:   cur.ProxyStrategy,
 		MaxConcurrency:  cur.MaxConcurrency,
 		Retries:         cur.Retries,
@@ -100,6 +103,7 @@ func handleZenConfigUpdate(w http.ResponseWriter, r *http.Request) {
 		FailoverCount:   cur.FailoverCount,
 		FailoverMinutes: cur.FailoverMinutes,
 		Compaction:      cur.Compaction,
+		Providers:       cur.Providers,
 	}
 	if patch.Enabled != nil {
 		next.Enabled = *patch.Enabled
@@ -152,8 +156,20 @@ func handleZenConfigUpdate(w http.ResponseWriter, r *http.Request) {
 		}
 		next.Subs = cleaned
 	}
-	if patch.SubsViaProxy != nil {
-		next.SubsViaProxy = *patch.SubsViaProxy
+	if patch.ExitMode != nil && *patch.ExitMode != "" {
+		if *patch.ExitMode != exitModeDirect && *patch.ExitMode != exitModeProxy {
+			writeAPI(w, http.StatusBadRequest, apiResponse{Error: "出口模式无效（需 direct 或 proxy）"})
+			return
+		}
+		next.ExitMode = *patch.ExitMode
+	}
+	if patch.SubsRefreshMins != nil {
+		mins := *patch.SubsRefreshMins
+		if mins < subRefreshMinMins || mins > subRefreshMaxMins {
+			writeAPI(w, http.StatusBadRequest, apiResponse{Error: fmt.Sprintf("订阅刷新间隔需在 %d~%d 分钟之间", subRefreshMinMins, subRefreshMaxMins)})
+			return
+		}
+		next.SubsRefreshMins = mins
 	}
 	if patch.ProxyStrategy != nil && *patch.ProxyStrategy != "" {
 		next.ProxyStrategy = *patch.ProxyStrategy
@@ -192,11 +208,11 @@ func handleZenConfigUpdate(w http.ResponseWriter, r *http.Request) {
 		}
 		next.Compaction = base
 	}
-	subsChanged := (patch.Subs != nil && !strSliceEqual(patch.Subs, cur.Subs)) ||
-		(patch.SubsViaProxy != nil && *patch.SubsViaProxy != cur.SubsViaProxy)
+	// 订阅增删, 或出口模式切换(抓取路径随之改变)都重新抓取; 空列表会清空订阅节点
+	exitChanged := patch.ExitMode != nil && *patch.ExitMode != cur.ExitMode
+	subsChanged := (patch.Subs != nil && !strSliceEqual(patch.Subs, cur.Subs)) || exitChanged
 	setZenConfig(next)
 	if subsChanged {
-		// 增删订阅或切换抓取方式都重新抓取; 空列表会清空订阅节点
 		go resolveSubscriptions(next.Subs)
 	}
 	writeAPI(w, http.StatusOK, apiResponse{Success: true, Data: getZenConfig()})

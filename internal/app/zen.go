@@ -210,8 +210,9 @@ type zenConfigData struct {
 	BaseURLs        []string                  `json:"baseURLs"`        // 全部端点: 主端点 + CDN 镜像, 重试时轮换
 	Proxies         []string                  `json:"proxies"`         // http(s)/socks5 代理与节点链接,轮询出口
 	Subs            []string                  `json:"subs,omitempty"`  // 订阅链接, 定期抓取展开为节点并入池
-	SubsViaProxy    bool                      `json:"subsViaProxy"`    // 订阅抓取走代理出口(默认直连, 失败自动退回直连)
 	ProxyStrategy   string                    `json:"proxyStrategy"`   // round_robin / random / fill
+	ExitMode        string                    `json:"exitMode"`        // direct / proxy: 全网关统一出口
+	SubsRefreshMins int                       `json:"subsRefreshMinutes"` // 订阅刷新间隔(分钟), 默认 30
 	MaxConcurrency  int                       `json:"maxConcurrency"`  // zen 上游最大并发,防 worker 瞬时超限,默认 8
 	Retries         int                       `json:"retries"`         // 限流/网络错误重试次数,默认 3
 	Failover        bool                      `json:"failover"`        // zen 连续失败后故障转移到 cline 账号池,默认 true
@@ -266,6 +267,8 @@ func defaultZenConfig() *zenConfigData {
 		BaseURL:         zenAPIBase,
 		BaseURLs:        defaultZenBaseURLs(),
 		ProxyStrategy:   "round_robin",
+		ExitMode:        exitModeProxy,
+		SubsRefreshMins: defaultSubsRefreshMins,
 		MaxConcurrency:  8,
 		Retries:         3,
 		Failover:        true,
@@ -407,6 +410,18 @@ func loadZenConfig() *zenConfigData {
 	// 旧配置迁移: 只有 baseURL 没有 baseURLs 时,按默认端点表填充(官方 + 镜像)
 	if len(cfg.BaseURLs) == 0 {
 		cfg.BaseURLs = defaultZenBaseURLs()
+	}
+	// 旧配置迁移: 出口模式与订阅刷新间隔后加, 缺失时回填默认值。
+	// 出口模式默认走节点: 与 zens/cline 渠道既有行为一致(池为空时天然退回直连)。
+	if cfg.ExitMode != exitModeDirect && cfg.ExitMode != exitModeProxy {
+		cfg.ExitMode = exitModeProxy
+	}
+	if cfg.SubsRefreshMins <= 0 {
+		cfg.SubsRefreshMins = defaultSubsRefreshMins
+	}
+	// 旧配置迁移: 通用 Provider 里 Google 的手填字段统一收归代码推导。
+	for name, pc := range cfg.Providers {
+		cfg.Providers[name] = normalizeProviderConfig(pc)
 	}
 	return cfg
 }

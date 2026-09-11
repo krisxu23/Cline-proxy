@@ -75,6 +75,7 @@ func StartProxy(host string, port int) error {
 	startModelsRefresher()
 	startZenModelsRefresher()
 	startProviderRefresher()
+	startHeadersAutoSync()
 	initRegionModels()
 	startNodeHealthLoop()
 	syncNodeBox()
@@ -281,6 +282,18 @@ func StartProxy(host string, port int) error {
 		// Override system prompt from override.md for OpenAI format
 		applyOverride(params)
 
+		// cline 池路由也要记账: 面板的「全部 token」包含这一路,
+		// 否则只看得到 opencode 的消耗。
+		tracker := newZenStatsTracker(zenStatsRecord{
+			TS:           time.Now().UnixMilli(),
+			Upstream:     upstreamCline,
+			Model:        model,
+			Stream:       isStream,
+			PromptTokens: estimateJSON(params),
+		})
+		status := http.StatusOK
+		defer func() { tracker.finish(status < 400, status) }()
+
 		upstreamStream := isStream
 		if !isStream {
 			model := getDefaultModel()
@@ -296,14 +309,20 @@ func StartProxy(host string, port int) error {
 		resp, acc, err := callClineAPIFailover(params, upstreamStream)
 		if err != nil {
 			log.Printf("  api error: %v", err)
+			status = http.StatusInternalServerError
 			writeJSON(w, http.StatusInternalServerError, map[string]any{
 				"error": map[string]string{"message": err.Error(), "type": "api_error"},
 			})
 			return
 		}
 		defer resp.Body.Close()
+		status = resp.StatusCode
 
-		usageFn := accountUsageFn(acc, params)
+		baseUsage := accountUsageFn(acc, params)
+		usageFn := func(u map[string]any) {
+			baseUsage(u)
+			tracker.observeUsage(u)
+		}
 
 		if isStream {
 			handleStreamResponseWithUsage(w, resp, usageFn)
@@ -469,7 +488,7 @@ func handleZenChat(w http.ResponseWriter, r *http.Request, params map[string]any
 	isStream, _ := params["stream"].(bool)
 	tracker := newZenStatsTracker(zenStatsRecord{
 		TS:           time.Now().UnixMilli(),
-		Upstream:     "zen",
+		Upstream:     upstreamZen,
 		Model:        zm.ID,
 		Stream:       isStream,
 		PromptTokens: estimateJSON(params),
@@ -1687,7 +1706,7 @@ func handleZenAnthropic(w http.ResponseWriter, r *http.Request, req anthropicReq
 	isStream := req.Stream
 	tracker := newZenStatsTracker(zenStatsRecord{
 		TS:           time.Now().UnixMilli(),
-		Upstream:     "zen",
+		Upstream:     upstreamZen,
 		Model:        zm.ID,
 		Stream:       isStream,
 		PromptTokens: estimateJSON(openAIReq),

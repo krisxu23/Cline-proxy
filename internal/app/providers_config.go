@@ -2,6 +2,7 @@ package app
 
 import (
 	"fmt"
+	"net/url"
 	"os"
 	"regexp"
 	"sort"
@@ -17,11 +18,15 @@ type providerHeaderSpec struct {
 }
 
 // providerConfig 一个通用 OpenAI 兼容上游的配置。
+//
+// 面板只要求 Provider 名 + Base URL + API Key 三项即可自动拉取模型目录;
+// 其余字段都有默认值, 且 Google 的路径/鉴权方言由代码推导, 不需要用户填。
 type providerConfig struct {
 	BaseURL         string                        `json:"baseUrl"`
 	APIKey          string                        `json:"apiKey"`
 	Catalog         bool                          `json:"catalog"`       // 拉取 /models 目录
 	Pricing         bool                          `json:"pricing"`       // 目录含价格, 按价格判定免费
+	AllModels       bool                          `json:"allModels"`     // 目录中的聊天模型全部可用
 	ProbeFreeTier   bool                          `json:"probeFreeTier"` // 无价格目录时用最小请求探测(第3期 discovery)
 	ChatPath        string                        `json:"chatPath,omitempty"`
 	ModelsPath      string                        `json:"modelsPath,omitempty"`
@@ -47,6 +52,112 @@ func (c providerConfig) modelsPath() string {
 		return c.ModelsPath
 	}
 	return "/models"
+}
+
+// ============ Google Gemini 特例(写死在代码里) ============
+//
+// Google AI Studio 只需要填 https://generativelanguage.googleapis.com 与 key,
+// 其余约定由这里统一补齐, 面板上不再暴露 Models URL / Models Key 头:
+//   - 端点: 一律归一到 OpenAI 兼容前缀 /v1beta/openai(官方同时提供原生方言,
+//     但网关只需要一种, 免去用户自己拼路径出错 —— 例如 /v1beta/model 少个 s)。
+//   - 鉴权: OpenAI 兼容路径认 Authorization: Bearer, 原生路径认 x-goog-api-key,
+//     两种同时发送, 因此两种形态的 key 都能直接用。
+//   - 目录: /models 返回 OpenAI 形状(id 形如 models/gemini-3.8-flash), 发布时
+//     去掉 models/ 前缀, 上游收到的模型名与用户输入一致。
+
+const (
+	googleAPIHost    = "generativelanguage.googleapis.com"
+	googleOpenAIPath = "/v1beta/openai"
+	googleKeyHeader  = "x-goog-api-key"
+)
+
+// isGoogleProvider Base URL 是否指向 Google Gemini。
+func isGoogleProvider(c providerConfig) bool {
+	return strings.Contains(strings.ToLower(c.BaseURL), googleAPIHost)
+}
+
+// googleOpenAIBase 把任意 Gemini Base URL 归一到 OpenAI 兼容前缀。
+func googleOpenAIBase(base string) string {
+	base = strings.TrimRight(strings.TrimSpace(base), "/")
+	u, err := url.Parse(base)
+	if err != nil || u.Host == "" {
+		return base + googleOpenAIPath
+	}
+	path := strings.ToLower(u.Path)
+	if strings.Contains(path, "/openai") {
+		return base
+	}
+	// /v1beta、/v1beta/models、/v1beta/model 等都归一到 /v1beta/openai
+	if strings.HasPrefix(path, "/v1beta") || path == "" || path == "/" {
+		return u.Scheme + "://" + u.Host + googleOpenAIPath
+	}
+	return base + googleOpenAIPath
+}
+
+// googleNativeCatalogURL Google 原生目录地址(带 x-goog-api-key 与 pageToken 分页)。
+func googleNativeCatalogURL(c providerConfig) string {
+	u, err := url.Parse(strings.TrimRight(strings.TrimSpace(c.BaseURL), "/"))
+	if err != nil || u.Host == "" {
+		return strings.TrimRight(c.BaseURL, "/") + "/v1beta/models"
+	}
+	return u.Scheme + "://" + u.Host + "/v1beta/models"
+}
+
+// chatEndpoint 本次请求要打到上游的完整地址。
+func (c providerConfig) chatEndpoint() string {
+	base := strings.TrimRight(strings.TrimSpace(c.BaseURL), "/")
+	if isGoogleProvider(c) {
+		base = googleOpenAIBase(base)
+	}
+	return base + c.chatPath()
+}
+
+// customModelsURL 用户显式配置的目录地址; Google 上不存在的路径直接忽略。
+func (c providerConfig) customModelsURL() string {
+	if c.ModelsURL == "" {
+		return ""
+	}
+	// 旧配置里出现过 /v1beta/model(漏了 s)这类地址, 命中即放弃, 回落到代码推导。
+	if isGoogleProvider(c) && !strings.Contains(strings.ToLower(c.ModelsURL), "/models") {
+		return ""
+	}
+	return c.ModelsURL
+}
+
+// googleUsesBearer 只有 Google 的 OpenAI 兼容方言认 Bearer。
+//
+// 原生方言(/v1beta/models)收到 Bearer 会直接回 401
+// "API keys are not supported by this API. Expected OAuth2 access token ...",
+// 把真正的失败原因整个盖掉 —— 实测在不受支持的地区访问时,
+// 真实响应是 400 "User location is not supported for the API use",
+// 但多发一个 Bearer 就只剩 401, 让人误以为是 key 的问题。
+func googleUsesBearer(target string) bool {
+	return strings.Contains(strings.ToLower(target), "/openai")
+}
+
+// applyAuth 写入该 provider 需要的鉴权头。
+// target 是本次请求的完整地址: 同一个 Google key 在两种方言下鉴权方式不同,
+// 必须按目标路径择一, 否则原生路径上的 Bearer 会被拒并掩盖真实错误。
+func (c providerConfig) applyAuth(target string, set func(key, value string)) {
+	if c.APIKey == "" {
+		return
+	}
+	if isGoogleProvider(c) {
+		set(googleKeyHeader, c.APIKey)
+		if googleUsesBearer(target) {
+			set("Authorization", "Bearer "+c.APIKey)
+		}
+		return
+	}
+	set("Authorization", "Bearer "+c.APIKey)
+}
+
+// stripProviderModelPrefix Google 目录里的 id 带 models/ 前缀, 发布时去掉。
+func (c providerConfig) stripProviderModelPrefix(id string) string {
+	if !isGoogleProvider(c) {
+		return id
+	}
+	return strings.TrimPrefix(id, "models/")
 }
 
 // freeSet 白名单集合
@@ -172,6 +283,23 @@ func providerNames() []string {
 	zenConfigMu.Unlock()
 	sort.Strings(names)
 	return names
+}
+
+// normalizeProviderConfig 落地前的归一化。目前只有 Google 需要:
+// 目录默认开启(用户只填地址和 key 就该自动拉到模型列表), 目录地址与鉴权头
+// 一律由代码推导, 因此把历史配置里手填的这两个字段清掉, 免得旧值继续生效。
+func normalizeProviderConfig(c providerConfig) providerConfig {
+	if !isGoogleProvider(c) {
+		return c
+	}
+	c.Catalog = true
+	c.ModelsURL = ""
+	c.ModelsKeyHeader = ""
+	if !c.AllModels && !c.Pricing && len(c.FreeModels) == 0 {
+		// 既没白名单也没价格策略: 目录里的聊天模型全部可用
+		c.AllModels = true
+	}
+	return c
 }
 
 // validateProviderConfig 校验 provider 配置。

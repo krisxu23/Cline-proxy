@@ -71,7 +71,8 @@ func catalogLookup(cat, slugs map[string]*catalogModel, modelID string) *catalog
 	return slugs[slug]
 }
 
-// evalProviderFree 免费判定三模式(纯函数):
+// evalProviderFree 免费判定四模式(纯函数):
+//   - catalog+allModels: 目录里的聊天模型全部可用(通用 Provider 的默认形态)
 //   - catalog+pricing: 目录按价格判定 isZeroCost && isChatModel
 //   - 白名单: freeModels 命中; 目录已加载时还需目录中仍存在
 //   - 永久拒绝缓存命中 → false
@@ -81,6 +82,15 @@ func evalProviderFree(cfg providerConfig, cat, slugs map[string]*catalogModel, r
 	}
 	if _, bad := rejected[modelID]; bad {
 		return false
+	}
+	if cfg.Catalog && cfg.AllModels {
+		if len(cat) == 0 {
+			// 目录尚未拉到(或该上游不提供 /models): 退回白名单, 保住手填的模型名,
+			// 避免首次连接或上游无目录时全部模型被判死。
+			return cfg.freeSet()[modelID]
+		}
+		m := catalogLookup(cat, slugs, modelID)
+		return m != nil && isChatModel(m)
 	}
 	if cfg.Catalog && cfg.Pricing {
 		if len(cat) == 0 {
@@ -223,29 +233,50 @@ func normalizeCatalogPayload(payload []byte) catalogPage {
 }
 
 func catalogURL(cfg providerConfig) string {
-	if cfg.ModelsURL != "" {
-		return cfg.ModelsURL
+	if custom := cfg.customModelsURL(); custom != "" {
+		return custom
+	}
+	if isGoogleProvider(cfg) {
+		return googleOpenAIBase(cfg.BaseURL) + cfg.modelsPath()
 	}
 	return strings.TrimRight(cfg.BaseURL, "/") + cfg.modelsPath()
 }
 
-func catalogHeaders(cfg providerConfig) map[string]string {
+// catalogHeaders 目录请求的鉴权头。
+// 默认 Bearer; 显式配了 ModelsKeyHeader 时该头替代 Bearer(历史行为)。
+// Google 例外: OpenAI 兼容目录认 Bearer, 原生目录认 x-goog-api-key,
+// 按 target 路径择一发送 —— 原生目录上多发一个 Bearer 会被回 401,
+// 反而盖住真实原因(地区不受支持等)。
+func catalogHeaders(cfg providerConfig, target string) map[string]string {
 	if cfg.APIKey == "" {
 		return nil
 	}
-	if cfg.ModelsKeyHeader != "" {
+	google := isGoogleProvider(cfg)
+	if cfg.ModelsKeyHeader != "" && !google {
 		return map[string]string{cfg.ModelsKeyHeader: cfg.APIKey}
 	}
-	return map[string]string{"Authorization": "Bearer " + cfg.APIKey}
+	out := map[string]string{}
+	if cfg.ModelsKeyHeader != "" {
+		out[cfg.ModelsKeyHeader] = cfg.APIKey
+	}
+	cfg.applyAuth(target, func(k, v string) { out[k] = v })
+	return out
 }
 
-func (p *modelProvider) fetchCatalogPage(ctx context.Context, cfg providerConfig, pageToken string) (catalogPage, error) {
-	u, err := url.Parse(catalogURL(cfg))
+// nativeCatalogParams 该目录地址是否使用 Google 原生分页参数。
+// 自定义目录地址(尤其 Google 原生 /v1beta/models)才带 pageSize;
+// OpenAI 兼容端点忽略未知查询参数, 但没必要无谓地加。
+func nativeCatalogParams(rawURL string) bool {
+	return !strings.Contains(strings.ToLower(rawURL), "/openai")
+}
+
+func (p *modelProvider) fetchCatalogPage(ctx context.Context, cfg providerConfig, rawURL, pageToken string) (catalogPage, error) {
+	u, err := url.Parse(rawURL)
 	if err != nil {
 		return catalogPage{}, err
 	}
 	q := u.Query()
-	if cfg.ModelsURL != "" {
+	if nativeCatalogParams(rawURL) {
 		q.Set("pageSize", providerCatalogPageSize)
 	}
 	if pageToken != "" {
@@ -257,10 +288,10 @@ func (p *modelProvider) fetchCatalogPage(ctx context.Context, cfg providerConfig
 	if err != nil {
 		return catalogPage{}, err
 	}
-	for k, v := range catalogHeaders(cfg) {
+	for k, v := range catalogHeaders(cfg, u.String()) {
 		req.Header.Set(k, v)
 	}
-	resp, err := providerDirectClient.Do(req)
+	resp, err := providerExitClient().Do(req)
 	if err != nil {
 		return catalogPage{}, err
 	}
@@ -278,6 +309,24 @@ func (p *modelProvider) fetchCatalogPage(ctx context.Context, cfg providerConfig
 		return catalogPage{}, fmt.Errorf("unrecognised catalog response shape")
 	}
 	return page, nil
+}
+
+// fetchCatalogPages 逐页拉取一个目录地址直到取完。
+func (p *modelProvider) fetchCatalogPages(ctx context.Context, cfg providerConfig, rawURL string) ([]*catalogModel, error) {
+	var listed []*catalogModel
+	pageToken := ""
+	for page := 0; page < providerCatalogMaxPages; page++ {
+		pg, err := p.fetchCatalogPage(ctx, cfg, rawURL, pageToken)
+		if err != nil {
+			return nil, err
+		}
+		listed = append(listed, pg.models...)
+		pageToken = pg.nextPageToken
+		if pageToken == "" {
+			break
+		}
+	}
+	return listed, nil
 }
 
 // refreshCatalog 拉取并重建目录; force 强制刷新, 否则受 15 分钟间隔限制。
@@ -299,21 +348,33 @@ func (p *modelProvider) refreshCatalog(ctx context.Context, force bool) error {
 	ctx, cancel := context.WithTimeout(ctx, providerCatalogTimeout)
 	defer cancel()
 
-	var listed []*catalogModel
-	pageToken := ""
-	for page := 0; page < providerCatalogMaxPages; page++ {
-		pg, err := p.fetchCatalogPage(ctx, cfg, pageToken)
-		if err != nil {
-			p.mu.Lock()
-			p.catalogErr = err.Error()
-			p.mu.Unlock()
-			return err
+	// Google 有两套目录方言: OpenAI 兼容 /v1beta/openai/models(OpenAI 形状)与
+	// 原生 /v1beta/models(带 pageToken 分页)。默认打兼容端点, 不被支持时退回原生,
+	// 两种形状 normalizeCatalogPayload 都能解析 —— 因此 Base URL 怎么填都能拉到模型。
+	urls := []string{catalogURL(cfg)}
+	if isGoogleProvider(cfg) {
+		if native := googleNativeCatalogURL(cfg); native != urls[0] {
+			urls = append(urls, native)
 		}
-		listed = append(listed, pg.models...)
-		pageToken = pg.nextPageToken
-		if pageToken == "" {
+	}
+	var (
+		listed  []*catalogModel
+		lastErr error
+	)
+	for _, cu := range urls {
+		listed, lastErr = p.fetchCatalogPages(ctx, cfg, cu)
+		if lastErr == nil {
 			break
 		}
+		if len(urls) > 1 {
+			log.Printf("  providers: %s catalog via %s failed (%v), trying the next endpoint", p.name, cu, lastErr)
+		}
+	}
+	if lastErr != nil {
+		p.mu.Lock()
+		p.catalogErr = lastErr.Error()
+		p.mu.Unlock()
+		return lastErr
 	}
 	if len(listed) == 0 {
 		err := fmt.Errorf("catalog response listed no models")
@@ -325,6 +386,12 @@ func (p *modelProvider) refreshCatalog(ctx context.Context, force bool) error {
 	cat := make(map[string]*catalogModel, len(listed))
 	slugs := make(map[string]*catalogModel, len(listed))
 	for _, m := range listed {
+		// Google 目录条目带 models/ 前缀, 在入口处统一剥掉:
+		// 之后查找/发布/回传上游都用同一个名字, 不会出现 models/gemini-... 这种前缀。
+		m.ID = cfg.stripProviderModelPrefix(m.ID)
+		if m.ID == "" {
+			continue
+		}
 		cat[m.ID] = m
 		slug := normalizeModelSlug(m.ID)
 		if slug != "" {
@@ -352,13 +419,26 @@ func (p *modelProvider) freeModelIDs() []catalogModel {
 	p.mu.Unlock()
 
 	var candidates []catalogModel
-	if cfg.Catalog && cfg.Pricing {
+	switch {
+	case cfg.Catalog && cfg.AllModels:
+		// 目录里的聊天模型全部可用; 目录为空时退回白名单。
+		for _, m := range cat {
+			if isChatModel(m) {
+				candidates = append(candidates, *m)
+			}
+		}
+		if len(candidates) == 0 {
+			for id := range cfg.freeSet() {
+				candidates = append(candidates, catalogModel{ID: id})
+			}
+		}
+	case cfg.Catalog && cfg.Pricing:
 		for _, m := range cat {
 			if isZeroCost(m) && isChatModel(m) {
 				candidates = append(candidates, *m)
 			}
 		}
-	} else {
+	default:
 		for id := range cfg.freeSet() {
 			candidates = append(candidates, catalogModel{ID: id})
 		}

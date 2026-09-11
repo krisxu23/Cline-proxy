@@ -25,11 +25,25 @@ func handleProvidersConfig(w http.ResponseWriter, r *http.Request) {
 		if p != nil {
 			runtime = p.catalogStatus()
 		}
+		// 已发布的模型列表: 面板的「模型列表」页要按 Provider 分组展示,
+		// 单独一次请求就能拿到, 不必再暴露一个"列模型"的接口。
+		models := []map[string]any{}
+		if p != nil {
+			for _, m := range p.freeModelIDs() {
+				models = append(models, map[string]any{
+					"id":      name + ":" + m.ID,
+					"model":   m.ID,
+					"context": m.ContextLength,
+					"output":  m.MaxOutput,
+				})
+			}
+		}
 		providers[name] = map[string]any{
 			"baseUrl":         cfg.BaseURL,
 			"apiKey":          cfg.APIKey,
 			"catalog":         cfg.Catalog,
 			"pricing":         cfg.Pricing,
+			"allModels":       cfg.AllModels,
 			"probeFreeTier":   cfg.ProbeFreeTier,
 			"chatPath":        cfg.ChatPath,
 			"modelsPath":      cfg.ModelsPath,
@@ -38,6 +52,10 @@ func handleProvidersConfig(w http.ResponseWriter, r *http.Request) {
 			"headers":         cfg.Headers,
 			"freeModels":      cfg.FreeModels,
 			"runtime":         runtime,
+			"models":          models,
+			"google":          isGoogleProvider(cfg),
+			"chatEndpoint":    cfg.chatEndpoint(),
+			"catalogEndpoint": catalogURL(cfg),
 		}
 	}
 	writeAPI(w, http.StatusOK, apiResponse{Success: true, Data: map[string]any{"providers": providers}})
@@ -89,11 +107,12 @@ func handleProvidersUpdate(w http.ResponseWriter, r *http.Request) {
 		writeAPI(w, http.StatusBadRequest, apiResponse{Error: err.Error()})
 		return
 	}
+	next := normalizeProviderConfig(*req.Provider)
 	mutateProvidersConfig(func(cfg *zenConfigData) {
 		if cfg.Providers == nil {
 			cfg.Providers = map[string]providerConfig{}
 		}
-		cfg.Providers[req.Name] = *req.Provider
+		cfg.Providers[req.Name] = next
 	})
 	// 丢弃旧的运行时状态: 目录 / 永久剔除集合 / slug 表都来自旧设置,
 	// 保留会让改动后的 provider 继续对外发布旧端点的模型, 并让连通测试

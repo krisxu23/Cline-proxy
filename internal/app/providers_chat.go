@@ -17,25 +17,44 @@ import (
 const (
 	providerAttemptTimeout   = 180 * time.Second
 	providerResponseMaxBytes = 64 << 20
+	// providerExitRetries 网络错误时换出口重试次数(共 1 + N 次拨号)。
+	providerExitRetries = 2
+	// providerExitCooldown 网络错误后该出口的冷却时长。短冷却即可:
+	// 目的是让轮询跳过"对这个上游不通"的节点, 而不是长期禁用可用节点。
+	providerExitCooldown = 2 * time.Minute
 )
 
-// providerDirectClient 直连上游(默认用于非 Gemini provider)。
-var providerDirectClient = &http.Client{
-	Transport: &http.Transport{
-		MaxIdleConns:        100,
-		MaxIdleConnsPerHost: 10,
-		IdleConnTimeout:     90 * time.Second,
-	},
+// rotateProviderExit 冷却刚失败的那个出口, 并记录一次换出口重试。
+// 直连模式下池内没有可选出口, 调用方不会走到这里。
+func rotateProviderExit(provider, reason string, attempt int) {
+	if idx := lastZenProxyIdx(); idx >= 0 {
+		cooldownZenProxy(idx, providerExitCooldown)
+	}
+	log.Printf("  providers: %s %s, retry %d/%d on the next exit", provider, reason, attempt, providerExitRetries)
 }
 
-// providerProxiedClient 走系统代理(用于需要海外出口的 Gemini)。
-var providerProxiedClient = &http.Client{
-	Transport: &http.Transport{
-		MaxIdleConns:        100,
-		MaxIdleConnsPerHost: 10,
-		IdleConnTimeout:     90 * time.Second,
-		Proxy:               http.ProxyFromEnvironment,
-	},
+// isExitRegionRejected 上游按"出口所在地区"拒绝服务。
+//
+// 实测: 从不受支持的地区直连 Google, 目录与对话接口都回
+// 400 FAILED_PRECONDITION "User location is not supported for the API use."。
+// 这类失败与"这个节点到该上游不通"同源 —— 换一个地区的出口即可成功,
+// 因此要和网络错误一样触发换出口, 而不是把 400 原样透传给调用方。
+func isExitRegionRejected(status int, body []byte) bool {
+	if status != http.StatusBadRequest && status != http.StatusForbidden {
+		return false
+	}
+	low := strings.ToLower(string(body))
+	return strings.Contains(low, "location is not supported") ||
+		strings.Contains(low, "user location")
+}
+
+// providerExitClient 所有通用 Provider 的上游请求都经此客户端发出。
+// 它复用 zen 上游的传输层, 因此与 cline 池 / opencode 共用同一条出口链路:
+// 出口模式(直连 / 节点) + 代理策略 + 节点连通性/冷却/地区能力全部一致生效。
+// 早期实现给 Provider 单独配了直连客户端, 于是节点池对它完全不生效 ——
+// 这正是「节点测试绿色、Provider 却 502/超时」的原因。
+func providerExitClient() *http.Client {
+	return getZenHTTPClient()
 }
 
 // providerError 上游错误(状态码 + 截断响应体)。
@@ -123,10 +142,10 @@ func (p *modelProvider) Chat(ctx context.Context, params map[string]any, stream 
 	if needsSig {
 		injectThoughtSignatures(params, p.sigCache)
 	}
-	client := providerDirectClient
-	if providerUsesProxiedClient(p) {
-		client = providerProxiedClient
-	}
+	client := providerExitClient()
+	// 把模型写进请求上下文: 拨号层据此为地区受限模型挑选已验证的节点出口,
+	// 与 opencode 渠道同一套选路规则。
+	ctx = context.WithValue(ctx, ctxKeyZenModel, p.name+":"+model)
 	if !stream {
 		var cancel context.CancelFunc
 		ctx, cancel = context.WithTimeout(ctx, providerAttemptTimeout)
@@ -144,32 +163,68 @@ func (p *modelProvider) Chat(ctx context.Context, params map[string]any, stream 
 		if err != nil {
 			return nil, fmt.Errorf("marshal provider body: %w", err)
 		}
-		u := strings.TrimRight(cfg.BaseURL, "/") + cfg.chatPath()
-		req, err := http.NewRequestWithContext(ctx, "POST", u, bytes.NewReader(payload))
-		if err != nil {
-			return nil, err
-		}
-		req.Header.Set("Content-Type", "application/json")
-		req.Header.Set("Authorization", "Bearer "+cfg.APIKey)
 		origin := localOrigin()
-		for k, spec := range cfg.Headers {
-			if v := cfg.resolveHeader(spec, origin); v != "" {
-				req.Header.Set(k, v)
+		// 新请求要重建 body, 并重新取一次出口: 因此逐次构造而不是复用 req。
+		send := func() (*http.Response, error) {
+			req, rerr := http.NewRequestWithContext(ctx, "POST", cfg.chatEndpoint(), bytes.NewReader(payload))
+			if rerr != nil {
+				return nil, rerr
 			}
+			req.Header.Set("Content-Type", "application/json")
+			cfg.applyAuth(req.URL.String(), req.Header.Set)
+			for k, spec := range cfg.Headers {
+				if v := cfg.resolveHeader(spec, origin); v != "" {
+					req.Header.Set(k, v)
+				}
+			}
+			return client.Do(req)
 		}
 
-		resp, err := client.Do(req)
-		if err != nil {
-			return nil, err
+		// 两种失败都可能只是"这个出口不行", 而不是"这个上游不行", 因此统一按出口轮换:
+		//   - 网络错误: 所选出口到该上游不通;
+		//   - 地区拒绝: 出口所在地区被上游拒服务(Google 的 location not supported)。
+		// 与 zen 渠道同一套自愈逻辑 —— 否则池里一个不合适的节点会被反复选中。
+		var (
+			resp *http.Response
+			body []byte
+		)
+		for exitRetries := 0; ; {
+			r, sendErr := send()
+			if sendErr != nil {
+				// 直连模式没有第二个出口可换, 重复拨号只是白等一轮超时。
+				if exitModeDirectNow() || exitRetries >= providerExitRetries {
+					return nil, sendErr
+				}
+				exitRetries++
+				rotateProviderExit(p.name, fmt.Sprintf("network error (%v)", sendErr), exitRetries)
+				continue
+			}
+			resp = r
+			if resp.StatusCode == http.StatusOK {
+				return p.finishResponse(resp, stream, needsSig)
+			}
+			body, _ = io.ReadAll(io.LimitReader(resp.Body, 64<<10))
+			resp.Body.Close()
+			if exitRetries < providerExitRetries && !exitModeDirectNow() &&
+				isExitRegionRejected(resp.StatusCode, body) {
+				exitRetries++
+				rotateProviderExit(p.name, "exit region rejected: "+kit.Truncate(string(body), 160), exitRetries)
+				continue
+			}
+			break
 		}
-		if resp.StatusCode == http.StatusOK {
-			return p.finishResponse(resp, stream, needsSig)
-		}
-		body, _ := io.ReadAll(io.LimitReader(resp.Body, 64<<10))
-		resp.Body.Close()
 		if needsSig && attempt < attempts && isMissingThoughtSignatureError(resp.StatusCode, string(body)) {
 			log.Printf("  providers: %s rejected a thought-signature, replaying with the skip sentinel", p.name)
 			markAllSignaturesSkipped(params)
+			continue
+		}
+		// Gemini 的 OpenAI 兼容层既接受裸模型名, 也接受带 models/ 前缀的名字。
+		// 裸名被拒时补一次前缀形式, 免得用户为了一个命名约定去翻文档。
+		if isGoogleProvider(cfg) && resp.StatusCode == http.StatusNotFound && !strings.HasPrefix(model, "models/") {
+			log.Printf("  providers: %s rejected model %q as-is, retrying with the models/ prefix", p.name, model)
+			params["model"] = "models/" + model
+			model = "models/" + model
+			attempts++
 			continue
 		}
 		p.recordRejection(model, resp.StatusCode, body)
@@ -280,9 +335,21 @@ func handleProviderChat(w http.ResponseWriter, r *http.Request, params map[strin
 
 	isStream, _ := params["stream"].(bool)
 	params["model"] = pm
+	// 通用 Provider 也计入统计: 上游按 provider/<名> 归组, 模型记为 <名>:<模型>,
+	// 这样「按上游」能看出是哪个 Provider 在消耗 token。
+	tracker := newZenStatsTracker(zenStatsRecord{
+		TS:           time.Now().UnixMilli(),
+		Upstream:     providerUpstream(name),
+		Model:        model,
+		Stream:       isStream,
+		PromptTokens: estimateJSON(params),
+	})
+	status := http.StatusOK
+	defer func() { tracker.finish(status < 400, status) }()
+
 	resp, err := p.Chat(r.Context(), params, isStream)
 	if err != nil {
-		status := providerErrorStatus(err)
+		status = providerErrorStatus(err)
 		log.Printf("  provider api error (%s): %v", name, err)
 		writeJSON(w, status, map[string]any{
 			"error": map[string]string{"message": err.Error(), "type": "api_error"},
@@ -290,7 +357,8 @@ func handleProviderChat(w http.ResponseWriter, r *http.Request, params map[strin
 		return
 	}
 	defer resp.Body.Close()
-	usageFn := func(map[string]any) {}
+	status = resp.StatusCode
+	usageFn := func(u map[string]any) { tracker.observeUsage(u) }
 	if isStream {
 		handleStreamResponseWithUsage(w, resp, usageFn)
 		return

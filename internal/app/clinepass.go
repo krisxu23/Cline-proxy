@@ -27,7 +27,7 @@ func handleClinePassChat(w http.ResponseWriter, r *http.Request, params map[stri
 	req := paramsToChatRequest(params, model, isStream)
 	tracker := newZenStatsTracker(zenStatsRecord{
 		TS:           nowMillis(),
-		Upstream:     "clinepass",
+		Upstream:     upstreamClinePass,
 		Model:        model,
 		Stream:       isStream,
 		PromptTokens: estimateJSON(params),
@@ -68,7 +68,7 @@ func handleClinePassAnthropic(w http.ResponseWriter, r *http.Request, req anthro
 	creq := paramsToChatRequest(openAIReq, req.Model, isStream)
 	tracker := newZenStatsTracker(zenStatsRecord{
 		TS:           nowMillis(),
-		Upstream:     "clinepass",
+		Upstream:     upstreamClinePass,
 		Model:        req.Model,
 		Stream:       isStream,
 		PromptTokens: estimateJSON(openAIReq),
@@ -124,7 +124,7 @@ func handleClinePassResponses(w http.ResponseWriter, r *http.Request, params, ch
 	creq := paramsToChatRequest(chat, model, isStream)
 	tracker := newZenStatsTracker(zenStatsRecord{
 		TS:           nowMillis(),
-		Upstream:     "clinepass",
+		Upstream:     upstreamClinePass,
 		Model:        model,
 		Stream:       isStream,
 		PromptTokens: estimateJSON(chat),

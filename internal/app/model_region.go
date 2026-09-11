@@ -211,6 +211,9 @@ func probeNodeModel(key, modelID string) bool {
 // pickZenProxyForModel 选择出口: 地区受限模型只从通过该模型校验的节点中轮询,
 // 其余模型沿用常规轮询。无合规节点时返回直连("", -1), 由上游给出真实原因。
 func pickZenProxyForModel(modelID string) (string, int) {
+	if exitModeDirectNow() {
+		return "", -1
+	}
 	if !isRegionRestrictedModel(modelID) {
 		return pickZenProxy()
 	}
