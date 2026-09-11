@@ -80,6 +80,10 @@ func registerAdminRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("/admin/api/zen/models", corsHandler(handleZenModels))
 	mux.HandleFunc("/admin/api/zen/models/refresh", corsHandler(handleZenModelsRefresh))
 	mux.HandleFunc("/admin/api/zen/stats", corsHandler(handleZenStats))
+	mux.HandleFunc("/admin/api/providers", corsHandler(handleProvidersConfig))
+	mux.HandleFunc("/admin/api/providers/update", corsHandler(handleProvidersUpdate))
+	mux.HandleFunc("/admin/api/providers/refresh", corsHandler(handleProvidersRefresh))
+	mux.HandleFunc("/admin/api/providers/test", corsHandler(handleProvidersTest))
 	// ClinePass 订阅池管理
 	registerClinePassAdminRoutes(mux)
 	mux.HandleFunc("/admin/zen/", func(w http.ResponseWriter, r *http.Request) {
