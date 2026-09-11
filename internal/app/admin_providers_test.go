@@ -98,6 +98,31 @@ func TestAdminProvidersRemoveClearsRuntimeEntry(t *testing.T) {
 	}
 }
 
+// 改动 provider 设置必须丢弃按旧设置建立的运行时条目, 否则目录与连通测试会继续用旧端点。
+func TestAdminProvidersUpdateClearsRuntimeEntry(t *testing.T) {
+	setTestProvider(t, "editprov", providerConfig{BaseURL: "https://old.example/v1", APIKey: "k1"})
+	before := providerByName("editprov")
+	if before == nil {
+		t.Fatal("provider must resolve after set")
+	}
+
+	req := httptest.NewRequest("POST", "/admin/api/providers/update", strings.NewReader(
+		`{"name":"editprov","provider":{"baseUrl":"https://new.example/v1","apiKey":"k1"}}`))
+	w := httptest.NewRecorder()
+	handleProvidersUpdate(w, req)
+	if w.Code != 200 {
+		t.Fatalf("update status: %d body=%s", w.Code, w.Body.String())
+	}
+
+	after := providerByName("editprov")
+	if after == nil {
+		t.Fatal("provider must resolve after update")
+	}
+	if after == before {
+		t.Fatal("update must drop the runtime entry built from the previous settings")
+	}
+}
+
 // 刷新在后台执行: 未知名字同步拒绝, 已知名字立即返回 started。
 func TestAdminProvidersRefreshStartsAsync(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
