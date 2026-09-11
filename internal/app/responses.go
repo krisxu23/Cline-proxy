@@ -452,6 +452,19 @@ func handleResponses(w http.ResponseWriter, r *http.Request) {
 	chatModel, _ := chat["model"].(string)
 	chatModel = stripDisplayPrefix(chatModel)
 	chat["model"] = chatModel
+	// 候选链: 路由别名(如 free-best)展开成有序候选, 逐站 failover。
+	if chain, matched, errMsg := resolveRouteChain(chatModel); matched {
+		if errMsg != "" {
+			writeJSON(w, http.StatusBadRequest, map[string]any{
+				"error": map[string]string{"message": errMsg, "type": "invalid_request_error"},
+			})
+			return
+		}
+		setRouteHeader(w, "chain", chatModel, "")
+		handleChainedChatAs(w, r, chat, chain, chatModel, chainTarget{Shape: shapeResponses})
+		return
+	}
+
 	route := routeModel(chatModel)
 	if route == "reject" {
 		writeJSON(w, http.StatusBadRequest, map[string]any{

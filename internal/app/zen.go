@@ -220,6 +220,8 @@ type zenConfigData struct {
 	FailoverMinutes int                       `json:"failoverMinutes"` // 故障转移窗口(分钟),默认 5
 	Compaction      zenCompactConfig          `json:"compaction"`
 	Providers       map[string]providerConfig `json:"providers,omitempty"` // 通用 OpenAI 兼容上游
+	Routes          map[string][]string       `json:"routes,omitempty"`    // 路由别名 -> 有序候选链(如 free-best)
+	CooldownMs      map[string]int64          `json:"cooldownMs,omitempty"` // 候选层冷却时长覆盖(按错误类别)
 }
 
 // zenEndpointMirrors 官方源之外的 CDN 镜像端点(实测镜像透传官方完整路径,须带 /v1)。
@@ -642,11 +644,10 @@ func (e *zenUpstreamError) Error() string {
 
 // zenErrorStatus 上游 4xx 按原状态返回(如 403 RegionError 地域限制),
 // 网络错误与上游 5xx 统一 502。
+// 判定逻辑已泛化到 upstreamErrorStatus(候选链上的每一站共用同一套规则),
+// 这里保留原名以免改动全部既有调用点。
 func zenErrorStatus(err error) int {
-	if up, ok := err.(*zenUpstreamError); ok && up.Status >= 400 && up.Status < 500 {
-		return up.Status
-	}
-	return http.StatusBadGateway
+	return upstreamErrorStatus(err)
 }
 
 // markZenFailOnStatus 仅上游级故障计入熔断: 5xx/408/429 代表上游不可用;

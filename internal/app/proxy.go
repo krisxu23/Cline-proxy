@@ -248,6 +248,21 @@ func StartProxy(host string, port int) error {
 			return
 		}
 
+		// 候选链: 路由别名(如 free-best)展开成有序候选, 逐站 failover。
+		// 必须排在下面 routeModel 分支之前 —— 别名本身不是任何一个上游的模型,
+		// 交给单个上游只会得到 400。
+		if chain, matched, errMsg := resolveRouteChain(model); matched {
+			if errMsg != "" {
+				writeJSON(w, http.StatusBadRequest, map[string]any{
+					"error": map[string]string{"message": errMsg, "type": "invalid_request_error"},
+				})
+				return
+			}
+			setRouteHeader(w, "chain", model, "")
+			handleChainedChat(w, r, params, chain, model)
+			return
+		}
+
 		// zen 免费模型路由: zen 上游匿名可用,不依赖 Cline 账号,
 		// 同样须在账号池守卫之前分流。
 		if route := routeModel(model); route == "zen" {
@@ -1573,6 +1588,20 @@ func handleAnthropicMessages(w http.ResponseWriter, r *http.Request) {
 	openAIReq["model"] = req.Model
 
 	log.Printf("  anthropic: model=%s stream=%v msgs=%d", req.Model, req.Stream, len(req.Messages))
+
+	// 候选链: 路由别名(如 free-best)展开成有序候选, 逐站 failover。
+	// openAIReq 已是转换后的 OpenAI 形状, 胜出那一站的响应再转回 Anthropic。
+	if chain, matched, errMsg := resolveRouteChain(req.Model); matched {
+		if errMsg != "" {
+			writeJSON(w, http.StatusBadRequest, map[string]any{
+				"error": map[string]string{"message": errMsg, "type": "invalid_request_error"},
+			})
+			return
+		}
+		setRouteHeader(w, "chain", req.Model, "")
+		handleChainedChatAs(w, r, openAIReq, chain, req.Model, chainTarget{Shape: shapeAnthropic, ToolSchemas: toolSchemas})
+		return
+	}
 
 	// zen / clinepass 免费模型路由
 	if route := routeModel(req.Model); route == "zen" {

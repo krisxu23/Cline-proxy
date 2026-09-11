@@ -22,3 +22,7 @@ override.md
 # Local debug tool (kept locally, not uploaded)
 capture.go
 capture-logs/
+
+# 本地构建备份
+*.bak-*
+cline-proxy-test.exe*
