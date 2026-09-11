@@ -657,7 +657,7 @@ function switchTab(name) {
   if (name === 'dashboard') { loadStats(); loadOcStats(); }
   if (name === 'accounts') { loadAccounts(); loadOcConfig(); }
   if (name === 'models') { loadModels(); loadOcModels(); }
-  if (name === 'settings') { loadKeys(); loadConfig(); loadOcConfig(); loadOcNodes(); }
+  if (name === 'settings') { loadKeys(); loadConfig(); loadOcConfig(); loadOcNodes(); loadProviders(); }
   if (name === 'logs') loadLogs();
 }
 
