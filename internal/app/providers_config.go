@@ -131,13 +131,22 @@ func newModelProvider(name string) *modelProvider {
 	}
 }
 
+// providerConfigFor 锁内读取单个 provider 配置; ok=false 表示未声明。
+// 必须经此入口读取: Providers 是 map, 与 mutateProvidersConfig 的写入并发时
+// 直接读取会触发 Go 不可恢复的 "concurrent map read and map write"。
+func providerConfigFor(name string) (providerConfig, bool) {
+	zenConfigMu.Lock()
+	defer zenConfigMu.Unlock()
+	if zenConfig == nil {
+		return providerConfig{}, false
+	}
+	pc, ok := zenConfig.Providers[name]
+	return pc, ok
+}
+
 // providerByName 按名取运行时状态; 配置中不存在则返回 nil。
 func providerByName(name string) *modelProvider {
-	cfg := getZenConfig()
-	if cfg == nil {
-		return nil
-	}
-	if _, ok := cfg.Providers[name]; !ok {
+	if _, ok := providerConfigFor(name); !ok {
 		return nil
 	}
 	providerRTMu.Lock()
@@ -152,14 +161,15 @@ func providerByName(name string) *modelProvider {
 
 // providerNames 配置中已声明的 provider 名(排序)。
 func providerNames() []string {
-	cfg := getZenConfig()
-	if cfg == nil {
-		return nil
+	zenConfigMu.Lock()
+	var names []string
+	if zenConfig != nil {
+		names = make([]string, 0, len(zenConfig.Providers))
+		for n := range zenConfig.Providers {
+			names = append(names, n)
+		}
 	}
-	names := make([]string, 0, len(cfg.Providers))
-	for n := range cfg.Providers {
-		names = append(names, n)
-	}
+	zenConfigMu.Unlock()
 	sort.Strings(names)
 	return names
 }
