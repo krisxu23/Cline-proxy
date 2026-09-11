@@ -802,7 +802,10 @@ import (
 )
 
 const (
-	providerCatalogRefresh  = 15 * time.Minute
+	providerCatalogRefresh = 15 * time.Minute
+	// providerCatalogRetryMs 请求路径刷新失败后的重试间隔(1 分钟):
+	// 目录为空的 provider 可以较快重试, 又不会被每个请求反复打上游。
+	providerCatalogRetryMs  = int64(time.Minute / time.Millisecond)
 	providerCatalogMaxPages = 10
 	providerCatalogPageSize = "1000"
 	providerCatalogTimeout  = 90 * time.Second
@@ -2562,14 +2565,15 @@ func handleProviderChat(w http.ResponseWriter, r *http.Request, params map[strin
 	// 否则该 provider 会一直 400 到后台刷新跑完为止。
 	if cfg.Catalog {
 		p.mu.Lock()
-		// 只按目录是否为空判断: 一次失败的刷新会写入 catalogErr,
-		// 若把它也算作"已尝试过", 该 provider 会一直 400 到下一个后台周期。
-		need := len(p.catalog) == 0
+		// 目录为空时按短退避强制刷新。后台周期用的 15 分钟间隔不能直接用在请求路径上:
+		// refreshCatalog 见到 attemptedAt/catalogErr 就会跳过, 沿用间隔会让该 provider
+		// 一直 400 到下一个后台周期。
+		need := len(p.catalog) == 0 && time.Now().UnixMilli()-p.attemptedAt >= providerCatalogRetryMs
 		p.mu.Unlock()
 		if need {
 			ctx, cancel := context.WithTimeout(r.Context(), providerCatalogTimeout)
-			if err := p.refreshCatalog(ctx, false); err != nil {
-				log.Printf("  providers: initial catalog refresh (%s) failed: %v", name, err)
+			if err := p.refreshCatalog(ctx, true); err != nil {
+				log.Printf("  providers: request-path catalog refresh (%s) failed: %v", name, err)
 			}
 			cancel()
 		}
