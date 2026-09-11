@@ -52,6 +52,7 @@ func StartProxy(host string, port int) error {
 		host = "0.0.0.0"
 	}
 	initLogFile()
+	setListenOrigin(fmt.Sprintf("http://127.0.0.1:%d", port))
 
 	p := loadPool()
 	activeCount := 0
@@ -73,6 +74,7 @@ func StartProxy(host string, port int) error {
 
 	startModelsRefresher()
 	startZenModelsRefresher()
+	startProviderRefresher()
 	initRegionModels()
 	startNodeHealthLoop()
 	syncNodeBox()
@@ -190,6 +192,8 @@ func StartProxy(host string, port int) error {
 				"output":   m.Output,
 			})
 		}
+		// 合并通用 provider 免费模型
+		data = append(data, providerModelList()...)
 		writeJSON(w, http.StatusOK, map[string]any{"object": "list", "data": data})
 	})
 	mux.HandleFunc("/v1/models", modelsHandler)
@@ -233,6 +237,13 @@ func StartProxy(host string, port int) error {
 		if strings.HasPrefix(strings.TrimSpace(model), "cline-pass/") {
 			setRouteHeader(w, "cline-pass", model, "")
 			handleClinePassChat(w, r, params, isStream)
+			return
+		}
+
+		// 通用 provider: "provider:model" 前缀直选, 不依赖 Cline 账号
+		if name, _, ok := parseProviderModel(model); ok {
+			setRouteHeader(w, name, model, "")
+			handleProviderChat(w, r, params, name)
 			return
 		}
 
