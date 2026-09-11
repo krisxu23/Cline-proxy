@@ -1505,13 +1505,11 @@ func isMissingThoughtSignatureError(status int, message string) bool {
 	return status == 400 && missingSignatureRe.MatchString(message)
 }
 
-// providerNeedsThoughtSignatures 仅 Gemini(按名或 generativelanguage 域名)需要。
-func providerNeedsThoughtSignatures(p *modelProvider) bool {
+// providerIsGoogleGenerativeLanguage provider 是否指向 Google Gemini 原生端点。
+// 端点判定只保留这一份, 供签名与代理两条路径共用, 避免两处副本各自漂移。
+func providerIsGoogleGenerativeLanguage(p *modelProvider) bool {
 	if p == nil {
 		return false
-	}
-	if p.name == "gemini" {
-		return true
 	}
 	cfg, ok := providerConfigFor(p.name)
 	if !ok {
@@ -1520,16 +1518,20 @@ func providerNeedsThoughtSignatures(p *modelProvider) bool {
 	return strings.Contains(strings.ToLower(cfg.BaseURL), "generativelanguage.googleapis.com")
 }
 
-// providerUsesProxiedClient 需要海外出口的 provider(generativelanguage)走系统代理。
-func providerUsesProxiedClient(p *modelProvider) bool {
+// providerNeedsThoughtSignatures 仅 Gemini(按名或 generativelanguage 域名)需要。
+func providerNeedsThoughtSignatures(p *modelProvider) bool {
 	if p == nil {
 		return false
 	}
-	cfg, ok := providerConfigFor(p.name)
-	if !ok {
-		return false
+	if p.name == "gemini" {
+		return true
 	}
-	return strings.Contains(strings.ToLower(cfg.BaseURL), "generativelanguage.googleapis.com")
+	return providerIsGoogleGenerativeLanguage(p)
+}
+
+// providerUsesProxiedClient 需要海外出口的 provider(generativelanguage)走系统代理。
+func providerUsesProxiedClient(p *modelProvider) bool {
+	return providerIsGoogleGenerativeLanguage(p)
 }
 
 type sigSlot struct {
