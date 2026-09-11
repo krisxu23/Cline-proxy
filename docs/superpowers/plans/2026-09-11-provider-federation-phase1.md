@@ -2227,7 +2227,9 @@ func TestProviderChatRemembersSignatureFromResponse(t *testing.T) {
 }
 
 func TestSSETapReaderSplitsLines(t *testing.T) {
-	body := io.NopCloser(&chunkReader{chunks: []string{"data: a\n", "data: b", "\n"}})
+	// 分片按行边界切分, 末片是 SSE 的事件分隔空行(单独一个换行),
+	// 因此 onLine 会收到一个空字符串行。
+	body := io.NopCloser(&chunkReader{chunks: []string{"data: a\n", "data: b\n", "\n"}})
 	var lines []string
 	tap := &sseTapReader{rc: body, onLine: func(l string) { lines = append(lines, l) }}
 	io.ReadAll(tap)
