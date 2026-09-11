@@ -1690,6 +1690,41 @@ func TestParseQuotaFailureDailyExhausted(t *testing.T) {
 	}
 }
 
+func TestParseQuotaFailureRealGoogleMetric(t *testing.T) {
+	// 真实 Google 429 的形态: message 与 quotaMetric 都是 snake_case 的 dotted
+	// 指标, quotaId 才是 CamelCase 的窗口标识。两者都必须被解析出来,
+	// 否则每日限额提取会静默失效。
+	payload := map[string]any{
+		"error": map[string]any{
+			"message": "Quota exceeded for metric: generativelanguage.googleapis.com/generate_content_free_tier_requests, limit: 20, model: gemini-3.8-flash",
+			"details": []any{
+				map[string]any{
+					"@type": "type.googleapis.com/google.rpc.QuotaFailure",
+					"violations": []any{
+						map[string]any{
+							"quotaMetric": "generativelanguage.googleapis.com/generate_content_free_tier_requests",
+							"quotaId":     "GenerateRequestsPerDayPerProjectPerModel-FreeTier",
+						},
+					},
+				},
+			},
+		},
+	}
+	qf := parseQuotaFailure(payload)
+	if qf == nil {
+		t.Fatal("real google payload must parse")
+	}
+	if qf.NoFreeTier {
+		t.Fatal("free tier exists")
+	}
+	if qf.ExhaustedWindow != "day" {
+		t.Fatalf("window: %q", qf.ExhaustedWindow)
+	}
+	if qf.DailyRequestLimit == nil || *qf.DailyRequestLimit != 20 {
+		t.Fatalf("daily limit: %+v", qf.DailyRequestLimit)
+	}
+}
+
 func TestParseQuotaFailureNoFreeTier(t *testing.T) {
 	payload := quotaPayload(
 		"Quota exceeded for metric: GenerateRequestsPerDayPerProjectPerModel-FreeTier, limit: 0",
@@ -1782,9 +1817,12 @@ type geminiQuotaFailure struct {
 }
 
 var (
-	quotaLineRe     = regexp.MustCompile(`(?i)Quota exceeded for metric:\s*([^,]+),\s*limit:\s*(\d+)`)
-	freeTierMetricRe = regexp.MustCompile(`(?i)free_tier`)
-	requestMetricRe  = regexp.MustCompile(`(?i)_requests$`)
+	quotaLineRe = regexp.MustCompile(`(?i)Quota exceeded for metric:\s*([^,]+),\s*limit:\s*(\d+)`)
+	// 指标名两种拼写都要认: Google 的 quotaMetric 是 snake_case 的 dotted 指标
+	// (generativelanguage.googleapis.com/generate_content_free_tier_requests),
+	// 而 quotaId 与部分回包是 CamelCase(...-FreeTier / ...RequestsPerDay...)。
+	freeTierMetricRe = regexp.MustCompile(`(?i)free[_]?tier`)
+	requestMetricRe  = regexp.MustCompile(`(?i)_requests$|requests?[_-]?per[_-]?day`)
 	retryInRe        = regexp.MustCompile(`(?i)retry in ([\d.]+)s`)
 	noLongerRe       = regexp.MustCompile(`(?i)no longer available`)
 	interactionsRe   = regexp.MustCompile(`(?i)only supports .*Interactions API`)
