@@ -1,6 +1,12 @@
 package app
 
-import "testing"
+import (
+	"context"
+	"encoding/json"
+	"net/http"
+	"net/http/httptest"
+	"testing"
+)
 
 // setTestProvider 在测试内挂一个 provider 配置, 结束时清理配置与运行时状态。
 func setTestProvider(t *testing.T, name string, pc providerConfig) {
@@ -188,5 +194,148 @@ func TestEvalProviderFree(t *testing.T) {
 	// 永久拒绝
 	if evalProviderFree(cfg, cat, nil, map[string]string{"z-ai/glm-5.3:free": "withdrawn"}, "z-ai/glm-5.3:free") {
 		t.Fatal("permanently rejected model must not be free")
+	}
+}
+
+func TestNormalizeCatalogPayloadOpenAI(t *testing.T) {
+	payload := []byte(`{"data":[
+		{"id":"m1","created":1,"context_length":8000,"pricing":{"prompt":"0","completion":"0"},"architecture":{"output_modalities":["text"]}},
+		{"id":"m2","pricing":{"prompt":"0.000001","completion":"0.000002"}}
+	]}`)
+	page := normalizeCatalogPayload(payload)
+	if page.shape != "openai" || len(page.models) != 2 {
+		t.Fatalf("openai shape: %+v", page)
+	}
+	if !page.models[0].PricesKnown || page.models[0].PromptPrice != 0 || page.models[0].ContextLength != 8000 {
+		t.Fatalf("openai model parse: %+v", page.models[0])
+	}
+	if page.models[1].PromptPrice != 0.000001 {
+		t.Fatalf("price parse: %+v", page.models[1])
+	}
+}
+
+func TestNormalizeCatalogPayloadGoogle(t *testing.T) {
+	payload := []byte(`{"models":[{
+		"name":"models/gemini-3.8-flash","displayName":"Gemini 3.8",
+		"inputTokenLimit":1000,"outputTokenLimit":2000,
+		"supportedGenerationMethods":["generateContent","embedContent"]
+	}],"nextPageToken":"p2"}`)
+	page := normalizeCatalogPayload(payload)
+	if page.shape != "google" || len(page.models) != 1 || page.nextPageToken != "p2" {
+		t.Fatalf("google shape: %+v", page)
+	}
+	m := page.models[0]
+	if m.ID != "gemini-3.8-flash" || m.Name != "Gemini 3.8" || m.ContextLength != 1000 || m.MaxOutput != 2000 {
+		t.Fatalf("google model parse: %+v", m)
+	}
+	if m.ChatCapable == nil || !*m.ChatCapable {
+		t.Fatalf("generateContent must mark chat capability: %+v", m.ChatCapable)
+	}
+	// 仅 embedContent 的模型不可聊天
+	payload2 := []byte(`{"models":[{"name":"models/embed","supportedGenerationMethods":["embedContent"]}]}`)
+	p2 := normalizeCatalogPayload(payload2)
+	if len(p2.models) != 1 || p2.models[0].ChatCapable == nil || *p2.models[0].ChatCapable {
+		t.Fatalf("embedding model must not be chat capable: %+v", p2.models)
+	}
+}
+
+func TestNormalizeCatalogPayloadUnknown(t *testing.T) {
+	if got := normalizeCatalogPayload([]byte(`{"foo":1}`)); got.shape != "unknown" {
+		t.Fatalf("unknown shape: %+v", got)
+	}
+	if got := normalizeCatalogPayload([]byte(`not json`)); got.shape != "unknown" {
+		t.Fatalf("invalid json shape: %+v", got)
+	}
+}
+
+func TestRefreshCatalogPricingMode(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/models" {
+			t.Errorf("catalog path: %s", r.URL.Path)
+		}
+		if got := r.Header.Get("Authorization"); got != "Bearer k" {
+			t.Errorf("catalog auth: %q", got)
+		}
+		json.NewEncoder(w).Encode(map[string]any{"data": []map[string]any{
+			{"id": "free-a", "pricing": map[string]any{"prompt": "0", "completion": "0"}},
+			{"id": "paid", "pricing": map[string]any{"prompt": "1", "completion": "1"}},
+		}})
+	}))
+	defer srv.Close()
+
+	setTestProvider(t, "t", providerConfig{BaseURL: srv.URL, APIKey: "k", Catalog: true, Pricing: true})
+	p := providerByName("t")
+	if err := p.refreshCatalog(context.Background(), true); err != nil {
+		t.Fatal(err)
+	}
+	if !p.isFree("free-a") {
+		t.Fatal("zero-cost catalog model must be free")
+	}
+	if p.isFree("paid") {
+		t.Fatal("paid catalog model must not be free")
+	}
+	ids := p.freeModelIDs()
+	if len(ids) != 1 || ids[0].ID != "free-a" {
+		t.Fatalf("freeModelIDs: %+v", ids)
+	}
+}
+
+func TestRefreshCatalogGoogleKeyHeader(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if got := r.Header.Get("x-goog-api-key"); got != "gk" {
+			t.Errorf("models key header: %q", got)
+		}
+		if got := r.Header.Get("Authorization"); got != "" {
+			t.Errorf("Bearer must not be used when modelsKeyHeader is set: %q", got)
+		}
+		json.NewEncoder(w).Encode(map[string]any{"models": []map[string]any{
+			{"name": "models/g1", "supportedGenerationMethods": []string{"generateContent"}},
+		}})
+	}))
+	defer srv.Close()
+
+	setTestProvider(t, "g", providerConfig{
+		BaseURL: srv.URL, APIKey: "gk", Catalog: true,
+		ModelsURL: srv.URL + "/models", ModelsKeyHeader: "x-goog-api-key",
+	})
+	p := providerByName("g")
+	if err := p.refreshCatalog(context.Background(), true); err != nil {
+		t.Fatal(err)
+	}
+	if p.catalogEntry("g1") == nil {
+		t.Fatalf("google catalog entry missing: %+v", p.catalog)
+	}
+}
+
+func TestRefreshCatalogErrorRecorded(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusUnauthorized)
+		w.Write([]byte(`{"error":"bad key"}`))
+	}))
+	defer srv.Close()
+	setTestProvider(t, "bad", providerConfig{BaseURL: srv.URL, APIKey: "k", Catalog: true, Pricing: true})
+	p := providerByName("bad")
+	if err := p.refreshCatalog(context.Background(), true); err == nil {
+		t.Fatal("catalog failure must return an error")
+	}
+	st := p.catalogStatus()
+	if st["error"] == "" {
+		t.Fatalf("catalog error must be recorded: %+v", st)
+	}
+}
+
+func TestProviderModelList(t *testing.T) {
+	setTestProvider(t, "bai", providerConfig{BaseURL: "https://x", APIKey: "k", FreeModels: []string{"glm-5.3-flash", "mimo-v2.5"}})
+	setTestProvider(t, "nokey", providerConfig{BaseURL: "https://y", FreeModels: []string{"whatever"}})
+	list := providerModelList()
+	seen := map[string]bool{}
+	for _, m := range list {
+		seen[m["id"].(string)] = true
+	}
+	if !seen["bai:glm-5.3-flash"] || !seen["bai:mimo-v2.5"] {
+		t.Fatalf("provider models must be prefixed: %+v", seen)
+	}
+	if seen["nokey:whatever"] {
+		t.Fatal("provider without key must be excluded")
 	}
 }
