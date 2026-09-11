@@ -204,20 +204,21 @@ type zenCompactConfig struct {
 }
 
 type zenConfigData struct {
-	Enabled         bool             `json:"enabled"`
-	Key             string           `json:"key"`
-	BaseURL         string           `json:"baseURL"`         // 主端点(兼容旧配置字段)
-	BaseURLs        []string         `json:"baseURLs"`        // 全部端点: 主端点 + CDN 镜像, 重试时轮换
-	Proxies         []string         `json:"proxies"`         // http(s)/socks5 代理与节点链接,轮询出口
-	Subs            []string         `json:"subs,omitempty"`  // 订阅链接, 定期抓取展开为节点并入池
-	SubsViaProxy    bool             `json:"subsViaProxy"`    // 订阅抓取走代理出口(默认直连, 失败自动退回直连)
-	ProxyStrategy   string           `json:"proxyStrategy"`   // round_robin / random / fill
-	MaxConcurrency  int              `json:"maxConcurrency"`  // zen 上游最大并发,防 worker 瞬时超限,默认 8
-	Retries         int              `json:"retries"`         // 限流/网络错误重试次数,默认 3
-	Failover        bool             `json:"failover"`        // zen 连续失败后故障转移到 cline 账号池,默认 true
-	FailoverCount   int              `json:"failoverCount"`   // 触发故障转移的连续失败次数,默认 3
-	FailoverMinutes int              `json:"failoverMinutes"` // 故障转移窗口(分钟),默认 5
-	Compaction      zenCompactConfig `json:"compaction"`
+	Enabled         bool                      `json:"enabled"`
+	Key             string                    `json:"key"`
+	BaseURL         string                    `json:"baseURL"`         // 主端点(兼容旧配置字段)
+	BaseURLs        []string                  `json:"baseURLs"`        // 全部端点: 主端点 + CDN 镜像, 重试时轮换
+	Proxies         []string                  `json:"proxies"`         // http(s)/socks5 代理与节点链接,轮询出口
+	Subs            []string                  `json:"subs,omitempty"`  // 订阅链接, 定期抓取展开为节点并入池
+	SubsViaProxy    bool                      `json:"subsViaProxy"`    // 订阅抓取走代理出口(默认直连, 失败自动退回直连)
+	ProxyStrategy   string                    `json:"proxyStrategy"`   // round_robin / random / fill
+	MaxConcurrency  int                       `json:"maxConcurrency"`  // zen 上游最大并发,防 worker 瞬时超限,默认 8
+	Retries         int                       `json:"retries"`         // 限流/网络错误重试次数,默认 3
+	Failover        bool                      `json:"failover"`        // zen 连续失败后故障转移到 cline 账号池,默认 true
+	FailoverCount   int                       `json:"failoverCount"`   // 触发故障转移的连续失败次数,默认 3
+	FailoverMinutes int                       `json:"failoverMinutes"` // 故障转移窗口(分钟),默认 5
+	Compaction      zenCompactConfig          `json:"compaction"`
+	Providers       map[string]providerConfig `json:"providers,omitempty"` // 通用 OpenAI 兼容上游
 }
 
 // zenEndpointMirrors 官方源之外的 CDN 镜像端点(实测镜像透传官方完整路径,须带 /v1)。
