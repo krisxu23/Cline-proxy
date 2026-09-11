@@ -86,11 +86,39 @@ func chainErrorStatusBody(err error) (int, []byte) {
 	return 0, nil
 }
 
-// freeBestAlias 默认的"挑一个能用的免费模型"别名。
-const freeBestAlias = "free-best"
+// defaultAutoRouterAlias 自动路由的默认模型名。
+// 用户可以改成任何自己喜欢的名字(配置 router.alias), 页面上的"自动路由模型名"就是它。
+const defaultAutoRouterAlias = "auto-router"
+
+// legacyFreeBestAlias 早于可配置别名的名字。保留识别, 已有配置继续可用。
+const legacyFreeBestAlias = "free-best"
 
 // clinePoolPlaceholder cline 池占位: 具体用哪个模型由池内轮询决定。
 const clinePoolPlaceholder = "*"
+
+// zenRouterConfig 自动路由配置。
+type zenRouterConfig struct {
+	Alias string `json:"alias"` // 自动路由模型名, 默认 auto-router
+	// Providers 参与自动路由的供应商名。它同时是页面上的勾选状态:
+	// 用户勾了哪些供应商, 页面就列出哪些供应商的模型供进一步勾选。
+	Providers []string `json:"providers,omitempty"`
+}
+
+// autoRouterAlias 当前生效的自动路由模型名。
+func autoRouterAlias() string {
+	if cfg := getZenConfig(); cfg != nil {
+		if a := strings.TrimSpace(cfg.Router.Alias); a != "" {
+			return a
+		}
+	}
+	return defaultAutoRouterAlias
+}
+
+// isAutoRouterAlias 该模型名是否是自动路由别名(含历史名)。
+func isAutoRouterAlias(id string) bool {
+	id = strings.TrimSpace(id)
+	return id != "" && (id == autoRouterAlias() || id == legacyFreeBestAlias)
+}
 
 // resolveRouteChain 解析候选链。
 //
@@ -104,22 +132,25 @@ func resolveRouteChain(model string) (cands []routeCandidate, matched bool, errM
 	}
 	cfg := getZenConfig()
 
+	// 显式配置的候选链优先(自动路由别名自己配过的那一条也在这里命中)。
+	// 空列表不算显式配置: 页面允许"一个模型都不勾", 语义是回落到默认链,
+	// 而不是让别名彻底失效。
 	if cfg != nil {
-		if list, ok := cfg.Routes[id]; ok {
+		if list, ok := cfg.Routes[id]; ok && len(list) > 0 {
 			return appendChainTail(expandRouteList(id, list)), true, ""
 		}
 	}
-	if id != freeBestAlias {
+	if !isAutoRouterAlias(id) {
 		return nil, false, ""
 	}
 
-	// routes 段没显式配这个别名 -> 用默认链: 已配置 provider 的免费模型。
-	chain := defaultFreeBestChain()
+	// 没有显式候选 -> 默认链: 已配置 provider 的免费模型。
+	chain := defaultAutoRouterChain()
 	chain = appendChainTail(chain)
 	if len(chain) == 0 {
 		return nil, true, fmt.Sprintf(
-			"route %q has no candidates: no provider with an API key is configured, "+
-				"and the routes.%s list is empty", id, id)
+			"model %q has no candidates: no provider with an API key is configured, "+
+				"and no model has been selected for it", id)
 	}
 	return chain, true, ""
 }
@@ -184,12 +215,12 @@ func expandRouteList(alias string, list []string) []routeCandidate {
 	return out
 }
 
-// defaultFreeBestChain 默认链: 已配置 provider 的全部免费模型。
+// defaultAutoRouterChain 默认链: 已配置 provider 的全部免费模型。
 //
 // 顺序取 provider 名的字典序 —— 配置里 providers 是 map, 本身没有声明顺序,
 // 用字典序保证每次展开结果一致(否则同一请求两次可能命中不同站点)。
 // 之后由调度层按各自可用性跳过。
-func defaultFreeBestChain() []routeCandidate {
+func defaultAutoRouterChain() []routeCandidate {
 	var out []routeCandidate
 	for _, name := range providerNames() {
 		cfg, ok := providerConfigFor(name)
@@ -270,22 +301,37 @@ func describeRouteChain(alias string) map[string]any {
 	return out
 }
 
-// routeAliasNames 配置里已声明的路由别名(排序), 面板用来列出可选别名。
+// routeAliasNames 可用作模型名的路由别名。
+// 自动路由别名排最前(它是用户实际要填的那个), 其余按字典序。
 func routeAliasNames() []string {
-	cfg := getZenConfig()
-	if cfg == nil {
-		return []string{freeBestAlias}
+	seen := map[string]bool{}
+	out := make([]string, 0, 4)
+	add := func(s string) {
+		s = strings.TrimSpace(s)
+		if s == "" || seen[s] {
+			return
+		}
+		seen[s] = true
+		out = append(out, s)
 	}
-	seen := map[string]bool{freeBestAlias: true}
-	for k := range cfg.Routes {
-		if k != "" {
-			seen[k] = true
+
+	primary := autoRouterAlias()
+	add(primary)
+
+	rest := make([]string, 0, 4)
+	if primary != legacyFreeBestAlias {
+		rest = append(rest, legacyFreeBestAlias)
+	}
+	if cfg := getZenConfig(); cfg != nil {
+		for k := range cfg.Routes {
+			if k != primary {
+				rest = append(rest, k)
+			}
 		}
 	}
-	out := make([]string, 0, len(seen))
-	for k := range seen {
-		out = append(out, k)
+	sort.Strings(rest)
+	for _, s := range rest {
+		add(s)
 	}
-	sort.Strings(out)
 	return out
 }

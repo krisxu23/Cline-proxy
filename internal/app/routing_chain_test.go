@@ -64,12 +64,12 @@ func TestResolveRouteChainConfiguredAlias(t *testing.T) {
 	}
 }
 
-// 一个 provider 都没配时, free-best 必须给出明确错误而不是静默回退。
-func TestResolveRouteChainFreeBestWithoutProviders(t *testing.T) {
+// 一个 provider 都没配时, 自动路由别名必须给出明确错误而不是静默回退。
+func TestResolveRouteChainAutoRouterWithoutProviders(t *testing.T) {
 	withTestConfig(t, &zenConfigData{})
-	cands, matched, errMsg := resolveRouteChain(freeBestAlias)
+	cands, matched, errMsg := resolveRouteChain(defaultAutoRouterAlias)
 	if !matched {
-		t.Fatal("free-best must be recognised as a route")
+		t.Fatal("the auto-router alias must be recognised as a route")
 	}
 	if len(cands) != 0 {
 		t.Fatalf("expected no candidates, got %+v", cands)
@@ -79,8 +79,8 @@ func TestResolveRouteChainFreeBestWithoutProviders(t *testing.T) {
 	}
 }
 
-// 默认链按 provider + 模型名排序展开, 顺序必须可复现。
-func TestResolveRouteChainFreeBestFromWhitelist(t *testing.T) {
+// 未显式勾选模型时, 默认链按 provider + 模型名排序展开, 顺序必须可复现。
+func TestResolveRouteChainAutoRouterFromWhitelist(t *testing.T) {
 	withTestConfig(t, &zenConfigData{
 		Providers: map[string]providerConfig{
 			"bai": {BaseURL: "https://api.b.ai/v1", APIKey: "sk-x",
@@ -90,7 +90,7 @@ func TestResolveRouteChainFreeBestFromWhitelist(t *testing.T) {
 				FreeModels: []string{"should-not-appear"}},
 		},
 	})
-	cands, matched, errMsg := resolveRouteChain(freeBestAlias)
+	cands, matched, errMsg := resolveRouteChain(defaultAutoRouterAlias)
 	if !matched || errMsg != "" {
 		t.Fatalf("matched=%v errMsg=%q", matched, errMsg)
 	}
@@ -137,7 +137,7 @@ func TestCandidateSkip(t *testing.T) {
 // 面板展示: 每站带出可用性说明, 便于看出为什么没被选中。
 func TestDescribeRouteChain(t *testing.T) {
 	withTestConfig(t, &zenConfigData{
-		Routes: map[string][]string{"free-best": {"bai:m1", "ghost:m2"}},
+		Routes: map[string][]string{"auto-router": {"bai:m1", "ghost:m2"}},
 		Providers: map[string]providerConfig{
 			"bai": {BaseURL: "https://api.b.ai/v1", APIKey: "sk-x"},
 		},
@@ -145,7 +145,7 @@ func TestDescribeRouteChain(t *testing.T) {
 	resetCandidateState()
 	defer resetCandidateState()
 
-	d := describeRouteChain(freeBestAlias)
+	d := describeRouteChain(defaultAutoRouterAlias)
 	if d["error"] != "" {
 		t.Fatalf("unexpected error: %v", d["error"])
 	}

@@ -197,6 +197,7 @@ body:not([data-theme="dark"]) .theme-toggle .dark-label{display:none}
 <div class="nav-item active" data-tab="dashboard"><span class="nav-ico">📊</span> 仪表盘</div>
 <div class="nav-item" data-tab="accounts"><span class="nav-ico">👤</span> 账号管理</div>
 <div class="nav-item" data-tab="models"><span class="nav-ico">🧠</span> 模型列表</div>
+<div class="nav-item" data-tab="router"><span class="nav-ico">🔀</span> 自动路由</div>
 <div class="nav-item" data-tab="settings"><span class="nav-ico">⚙️</span> 设置</div>
 <div class="nav-item" data-tab="logs"><span class="nav-ico">📜</span> 请求日志</div>
 <div class="sidebar-footer">
@@ -430,6 +431,135 @@ body:not([data-theme="dark"]) .theme-toggle .dark-label{display:none}
 </div>
 </div>
 
+<div id="tab-router" class="tab-panel" style="display:none">
+<h2>🔀 自动路由</h2>
+
+<div class="section">
+  <div class="section-title">🏷️ 自动路由模型名</div>
+  <div class="section-body">
+    <p class="hint" style="margin:0 0 14px">
+      客户端把 <strong style="color:var(--text)">模型名</strong>填成下面这个名字，网关就会从你勾选的模型里按顺序逐个尝试：
+      某一站失败就按错误类型冷却它、换下一站，全链失败才返回最后一站的错误。
+    </p>
+    <div class="form-row">
+      <div class="field"><label>模型名（可自定义）</label>
+        <input id="arAlias" placeholder="auto-router" oninput="renderRouterExample()">
+      </div>
+      <div class="field"><label>客户端调用示例</label>
+        <input id="arExample" readonly onclick="this.select()" style="font-family:'JetBrains Mono',Consolas,monospace">
+      </div>
+    </div>
+  </div>
+</div>
+
+<div class="section">
+  <div class="section-title">🏭 网关已加入的供应商
+    <span style="margin-left:auto;display:flex;gap:8px">
+      <button type="button" class="btn btn-sm" onclick="routerSelectAll(true)">全选</button>
+      <button type="button" class="btn btn-sm" onclick="routerSelectAll(false)">全不选</button>
+      <button type="button" class="btn btn-sm" onclick="refreshRouterCatalogs()">🔄 刷新全部目录</button>
+    </span>
+  </div>
+  <div class="section-body">
+    <p class="hint" style="margin:0 0 12px">
+      下面是网关探测到的全部供应商。勾选要参与自动路由的供应商，其模型会出现在下一节供逐项勾选。
+    </p>
+    <div id="arProviderList" style="display:flex;flex-direction:column;gap:8px">加载中...</div>
+  </div>
+</div>
+
+<div class="section">
+  <div class="section-title">🧩 参与自动路由的模型</div>
+  <div class="section-body">
+    <p class="hint" style="margin:0 0 12px">
+      只有勾选的模型会参与。若一个都不勾，自动路由会回落到「全部供应商的全部免费模型」。
+    </p>
+    <div id="arModelList">加载中...</div>
+    <div class="hint" id="arSelectionWarn" style="margin-top:8px;font-size:12px;color:var(--text3)"></div>
+  </div>
+</div>
+
+<div class="section">
+  <div class="section-title">💾 保存与校验</div>
+  <div class="section-body">
+    <div class="form-actions">
+      <button class="btn btn-primary" onclick="saveRouter()">💾 保存设置</button>
+      <button class="btn" onclick="validateRouter()">🔍 校验勾选</button>
+      <button class="btn" onclick="loadRouter()">↺ 放弃改动</button>
+    </div>
+    <div id="arResult" style="margin-top:10px"></div>
+  </div>
+</div>
+
+<div class="section">
+  <div class="section-title">📈 当前实际顺序</div>
+  <div class="section-body">
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th style="width:180px">路由别名</th><th>当前实际顺序</th></tr></thead>
+        <tbody id="arChainBody"><tr><td colspan="2" class="empty">加载中...</td></tr></tbody>
+      </table>
+    </div>
+    <div class="hint" style="margin-top:6px;font-size:12px;color:var(--text3)">
+      带删除线的站当前不可用（鼠标悬停看原因），会被自动跳过。
+    </div>
+  </div>
+</div>
+
+<div class="section">
+  <div class="section-title">📊 今日用量</div>
+  <div class="section-body">
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th style="width:220px">候选</th><th style="width:90px">请求</th><th style="width:70px">成功</th><th style="width:70px">失败</th><th>限额</th></tr></thead>
+        <tbody id="arUsageBody"><tr><td colspan="5" class="empty">加载中...</td></tr></tbody>
+      </table>
+    </div>
+    <div class="hint" id="arUsageInfo" style="margin-top:6px;font-size:12px;color:var(--text3)"></div>
+  </div>
+</div>
+
+<div class="section">
+  <div class="section-title">🌱 自动发现免费模型
+    <span style="margin-left:auto;display:flex;gap:8px">
+      <button type="button" class="btn btn-sm" onclick="routerMaintenance('cooling')">解除全部冷却</button>
+      <button type="button" class="btn btn-sm" onclick="routerMaintenance('permanent')">清空永久剔除</button>
+    </span>
+  </div>
+  <div class="section-body">
+    <div class="form-row">
+      <div class="field"><label>自动发现</label>
+        <select id="discEnabled" onchange="saveDiscovery()">
+          <option value="false">关闭</option>
+          <option value="true">开启（定期拉取并试跑）</option>
+        </select>
+      </div>
+      <div class="field"><label>发现源（已加入的供应商）</label>
+        <select id="discProvider" onchange="saveDiscovery()"></select>
+      </div>
+    </div>
+    <div class="form-row">
+      <div class="field"><label>间隔（小时）</label>
+        <input id="discIntervalH" type="number" min="1" placeholder="48" onchange="saveDiscovery()">
+      </div>
+      <div class="field"><label>每轮最多试跑</label>
+        <input id="discMaxPerRun" type="number" min="1" placeholder="8" onchange="saveDiscovery()">
+      </div>
+    </div>
+    <div class="hint" id="discInfo" style="font-size:12px;color:var(--text3)"></div>
+
+    <div class="form-row" style="margin-top:14px">
+      <div class="field"><label>冷却中的候选</label>
+        <div id="arCoolingBox" style="border:1px solid var(--border);border-radius:10px;background:rgba(2,6,23,.3);min-height:42px"></div>
+      </div>
+      <div class="field"><label>永久剔除的候选</label>
+        <div id="arPermBox" style="border:1px solid var(--border);border-radius:10px;background:rgba(2,6,23,.3);min-height:42px;max-height:220px;overflow-y:auto"></div>
+      </div>
+    </div>
+  </div>
+</div>
+</div>
+
 <div id="tab-settings" class="tab-panel" style="display:none">
 <h2>⚙️ 设置</h2>
 
@@ -559,64 +689,6 @@ body:not([data-theme="dark"]) .theme-toggle .dark-label{display:none}
     </div>
     <div id="pvResult" style="margin-top:10px"></div>
     <div id="pvList" style="margin-top:10px;border:1px solid var(--border);border-radius:10px;background:rgba(2,6,23,.3)"></div>
-  </div>
-</div>
-
-<div class="section">
-  <div class="section-title">🔀 路由链与用量
-    <span style="margin-left:auto;display:flex;gap:8px">
-      <button type="button" class="btn btn-sm" onclick="loadRouting()">🔄 刷新</button>
-      <button type="button" class="btn btn-sm" onclick="clearCandidateCooling()">解除全部冷却</button>
-      <button type="button" class="btn btn-sm" onclick="clearCandidatePermanent()">清空永久剔除</button>
-    </span>
-  </div>
-  <div class="section-body">
-    <p class="hint" style="margin:0 0 14px">
-      把 <code>free-best</code> 之类的别名作为模型名请求，网关会按下面的顺序逐站尝试，
-      某一站失败就按错误类别冷却它并跳到下一站；全链失败才返回最后一站的错误。
-      手动配置的条目永远排在最前，自动发现的模型只追加在尾部。
-    </p>
-
-    <div class="form-row">
-      <div class="field"><label>自动发现免费模型</label>
-        <select id="discEnabled" onchange="saveDiscovery()">
-          <option value="false">关闭</option>
-          <option value="true">开启（定期拉取并试跑）</option>
-        </select>
-      </div>
-      <div class="field"><label>发现源 / 间隔</label>
-        <div style="display:flex;gap:8px">
-          <input id="discProvider" placeholder="openrouter" style="flex:1" onchange="saveDiscovery()">
-          <input id="discIntervalH" type="number" min="1" placeholder="48" title="发现间隔（小时）" style="width:96px;flex:none" onchange="saveDiscovery()">
-          <span style="align-self:center;font-size:12px;color:var(--text3);flex:none">小时</span>
-        </div>
-      </div>
-    </div>
-    <div class="hint" id="discInfo" style="margin:-6px 0 14px;font-size:12px;color:var(--text3)"></div>
-
-    <div class="table-wrap" style="margin-bottom:14px">
-      <table>
-        <thead><tr><th style="width:160px">路由别名</th><th>当前实际顺序</th></tr></thead>
-        <tbody id="routeChainBody"><tr><td colspan="2" class="empty">加载中...</td></tr></tbody>
-      </table>
-    </div>
-
-    <div class="table-wrap" style="margin-bottom:14px">
-      <table>
-        <thead><tr><th style="width:220px">今日用量</th><th style="width:90px">请求</th><th style="width:70px">成功</th><th style="width:70px">失败</th><th>限额</th></tr></thead>
-        <tbody id="usageBody"><tr><td colspan="5" class="empty">加载中...</td></tr></tbody>
-      </table>
-    </div>
-    <div class="hint" id="usageInfo" style="margin:-6px 0 14px;font-size:12px;color:var(--text3)"></div>
-
-    <div class="form-row">
-      <div class="field"><label>候选层冷却中</label>
-        <div id="coolingBox" style="border:1px solid var(--border);border-radius:10px;background:rgba(2,6,23,.3);min-height:42px"></div>
-      </div>
-      <div class="field"><label>永久剔除</label>
-        <div id="permanentBox" style="border:1px solid var(--border);border-radius:10px;background:rgba(2,6,23,.3);min-height:42px;max-height:220px;overflow-y:auto"></div>
-      </div>
-    </div>
   </div>
 </div>
 
@@ -768,7 +840,8 @@ function switchTab(name) {
   if (name === 'dashboard') { loadStats(); loadOcStats(); loadConfig(); loadOcConfig(); }
   if (name === 'accounts') { loadAccounts(); loadConfig(); }
   if (name === 'models') { loadModels(); loadOcModels(); loadProviders(); }
-  if (name === 'settings') { loadKeys(); loadConfig(); loadOcConfig(); loadOcNodes(); loadProviders(); loadRouting(); }
+  if (name === 'router') { loadRouter(); }
+  if (name === 'settings') { loadKeys(); loadConfig(); loadOcConfig(); loadOcNodes(); loadProviders(); }
   if (name === 'logs') loadLogs();
 }
 
@@ -1593,14 +1666,7 @@ async function saveProvider() {
   } catch (e) { toast('保存失败: ' + e.message, 'error'); }
 }
 
-// ========== 路由链与用量 ==========
-
-// escHtml 面板里有多处要拼用户可控字符串(别名/上游名/模型名/错误文本), 统一转义。
-function escHtml(s) {
-  return String(s == null ? '' : s)
-    .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
-    .replace(/"/g, '&quot;');
-}
+// ========== 自动路由 ==========
 
 // fmtRemain 冷却剩余时间的可读形式。
 function fmtRemain(ms) {
@@ -1610,124 +1676,333 @@ function fmtRemain(ms) {
   return s + 's';
 }
 
-// routingData 缓存一次 GET /routing 的结果, 供保存时回传未编辑的字段。
-let routingData = null;
+// routerData 最近一次 GET /router 的结果, 保存时回传未编辑的字段要靠它。
+let routerData = null;
+let routerProviders = new Set(); // 勾选的供应商名
+let routerModels = new Set();    // 勾选的 "provider:model"
 
-async function loadRouting() {
+async function loadRouter() {
   try {
-    routingData = await api('GET', '/routing');
-    renderRouting(routingData);
-  } catch (e) {
-    // 老版本后端没有这个接口时静默跳过, 不影响面板其余部分
-  }
+    const d = await api('GET', '/router');
+    routerData = d.data || {};
+  } catch (e) { return; }
+  // 用服务端返回的勾选状态初始化本地选择
+  routerProviders = new Set();
+  routerModels = new Set();
+  (routerData.providers || []).forEach(p => {
+    if (p.selected) routerProviders.add(p.name);
+    (p.models || []).forEach(m => {
+      if (m.selected) routerModels.add(p.name + ':' + m.id);
+    });
+  });
+  renderRouter();
 }
 
-function renderRouting(d) {
-  d = d || {};
-  const disc = d.discovery || {};
-  const dc = disc.config || {};
-  if (_('discEnabled')) _('discEnabled').value = dc.enabled ? 'true' : 'false';
-  if (_('discProvider')) _('discProvider').value = dc.provider || 'openrouter';
-  if (_('discIntervalH')) {
-    const h = Math.round((dc.intervalMs || 0) / 3600000);
-    _('discIntervalH').value = h > 0 ? h : 48;
-  }
-  if (_('discInfo')) {
-    _('discInfo').textContent = dc.enabled
-      ? '已收录 ' + (disc.discovered || 0) + ' 个自动发现的模型；每轮最多试跑 ' + (dc.maxPerRun || 8) + ' 个。'
-      : '当前为关闭状态：不会自动发现新模型，链尾只用手动配置的候选。';
-  }
+function renderRouter() {
+  const d = routerData || {};
+  if (_('arAlias')) _('arAlias').value = d.alias || d.defaultAlias || 'auto-router';
+  renderRouterExample();
 
-  // 路由别名 -> 当前实际顺序, 被跳过的站打删除线并用 title 说明原因
-  const rb = _('routeChainBody');
-  if (rb) {
-    const routes = d.routes || [];
-    if (!routes.length) {
-      rb.innerHTML = '<tr><td colspan="2" class="empty">还没有路由别名</td></tr>';
+  // ---- 供应商勾选 ----
+  const pl = _('arProviderList');
+  if (pl) {
+    const provs = d.providers || [];
+    if (!provs.length) {
+      pl.innerHTML = '<div class="empty" style="padding:12px">网关里还没有加入任何供应商：'
+        + '请先到「设置 → 🔌 通用 Provider」添加一个</div>';
     } else {
-      rb.innerHTML = routes.map(rt => {
-        if (rt.error) {
-          return '<tr><td><code>' + escHtml(rt.alias) + '</code></td><td style="color:var(--text3)">' + escHtml(rt.error) + '</td></tr>';
-        }
-        const hops = (rt.hops || []).map((h, i) => {
-          const label = (i + 1) + '. <code>' + escHtml(h.upstream) + ':' + escHtml(h.model) + '</code>';
-          return h.skip
-            ? '<span class="model-tag" style="opacity:.55;text-decoration:line-through" title="' + escHtml(h.skip) + '">' + label + '</span>'
-            : '<span class="model-tag">' + label + '</span>';
-        }).join(' <span style="color:var(--text3)">→</span> ');
-        return '<tr><td><code>' + escHtml(rt.alias) + '</code></td><td>' +
-          (hops || '<span style="color:var(--text3)">无候选：先配置一个 provider</span>') + '</td></tr>';
+      pl.innerHTML = provs.map(p => {
+        const models = p.models || [];
+        const chosen = routerProviders.has(p.name);
+        const picked = models.filter(m => routerModels.has(p.name + ':' + m.id)).length;
+        const bad = [];
+        if (!p.configured) bad.push('缺 API Key');
+        if (!models.length) bad.push('无可用模型');
+        const meta = [];
+        if (p.google) meta.push('Google');
+        meta.push(models.length + ' 个可用模型');
+        if (chosen) meta.push('已选 ' + picked + ' 个');
+        return '<label style="display:flex;align-items:center;gap:10px;padding:9px 12px;'
+          + 'border:1px solid var(--border);border-radius:10px;background:rgba(2,6,23,.3);cursor:pointer">'
+          + '<input type="checkbox" data-prov="' + esc(p.name) + '"' + (chosen ? ' checked' : '') + '>'
+          + '<span style="flex:1"><strong>' + esc(p.name) + '</strong>'
+          + '<span style="color:var(--text3);font-size:12px;margin-left:10px">' + esc(meta.join(' · ')) + '</span>'
+          + (bad.length ? '<span style="color:#f87171;font-size:12px;margin-left:10px">' + esc(bad.join('，')) + '</span>' : '')
+          + '</span></label>';
       }).join('');
     }
   }
 
-  // 今日用量
-  const ub = _('usageBody');
+  // ---- 模型勾选: 只列已勾选供应商的模型 ----
+  const ml = _('arModelList');
+  if (ml) {
+    const chosen = (d.providers || []).filter(p => routerProviders.has(p.name));
+    if (!chosen.length) {
+      ml.innerHTML = '<div class="empty" style="padding:12px">先在上面勾选供应商，这里会列出它们的模型</div>';
+    } else {
+      ml.innerHTML = chosen.map(p => {
+        const models = p.models || [];
+        const picked = models.filter(m => routerModels.has(p.name + ':' + m.id)).length;
+        const rows = models.map(m => {
+          const key = p.name + ':' + m.id;
+          const ctx = m.context ? (' · ' + Math.round(m.context / 1000) + 'k 上下文') : '';
+          return '<label style="display:flex;align-items:center;gap:8px;padding:5px 10px;font-size:12.5px;cursor:pointer">'
+            + '<input type="checkbox" data-key="' + esc(key) + '"' + (routerModels.has(key) ? ' checked' : '') + '>'
+            + '<code>' + esc(m.id) + '</code><span style="color:var(--text3)">' + esc(ctx) + '</span></label>';
+        }).join('') || '<div style="padding:8px 10px;color:var(--text3);font-size:12px">该供应商暂无可用模型（先点上面的「刷新全部目录」）</div>';
+        return '<div style="margin-bottom:10px;border:1px solid var(--border);border-radius:10px;overflow:hidden">'
+          + '<div style="padding:8px 12px;display:flex;align-items:center;gap:8px;background:rgba(148,163,184,.05);font-size:13px">'
+          + '<strong>' + esc(p.name) + '</strong>'
+          + '<span style="color:var(--text3);font-weight:normal">已选 ' + picked + ' / ' + models.length + '</span>'
+          + '<span style="margin-left:auto;display:flex;gap:6px">'
+          + '<button type="button" class="btn btn-sm" data-prov-all="' + esc(p.name) + '">全选</button>'
+          + '<button type="button" class="btn btn-sm" data-prov-none="' + esc(p.name) + '">全不选</button>'
+          + '</span></div><div style="padding:4px 6px">' + rows + '</div></div>';
+      }).join('');
+    }
+  }
+  if (_('arSelectionWarn')) {
+    _('arSelectionWarn').textContent = routerModels.size
+      ? '已选 ' + routerModels.size + ' 个模型参与自动路由'
+      : '未勾选任何模型：保存后自动路由会回落为「全部供应商的全部免费模型」';
+  }
+
+  renderRouterChain(d);
+  renderRouterUsage(d);
+  renderRouterCooling(d);
+  renderRouterDiscovery(d);
+}
+
+// 勾选交互统一走事件委托: 供应商名与模型 id 里可能带 / : . 等字符,
+// 拼进内联 onclick 很容易被引号打断, 用 data-* 属性 + 委托最稳妥。
+document.addEventListener('change', e => {
+  const el = e.target;
+  if (!el || el.tagName !== 'INPUT' || el.type !== 'checkbox') return;
+  if (el.dataset && el.dataset.prov) toggleProvider(el.dataset.prov, el.checked);
+  else if (el.dataset && el.dataset.key) toggleModel(el.dataset.key, el.checked);
+});
+document.addEventListener('click', e => {
+  const el = e.target;
+  if (!el || !el.dataset) return;
+  if (el.dataset.provAll) routerSelectProviderModels(el.dataset.provAll, true);
+  else if (el.dataset.provNone) routerSelectProviderModels(el.dataset.provNone, false);
+});
+
+function toggleProvider(name, on) {
+  if (on) {
+    routerProviders.add(name);
+  } else {
+    routerProviders.delete(name);
+    // 取消供应商时一并取消它名下已选的模型, 否则会出现"勾了模型却没勾供应商"的矛盾状态
+    const p = ((routerData.providers) || []).find(x => x.name === name);
+    ((p && p.models) || []).forEach(m => routerModels.delete(name + ':' + m.id));
+  }
+  renderRouter();
+}
+
+function toggleModel(key, on) {
+  if (on) routerModels.add(key); else routerModels.delete(key);
+  renderRouter();
+}
+
+function routerSelectProviderModels(name, on) {
+  const p = ((routerData.providers) || []).find(x => x.name === name);
+  ((p && p.models) || []).forEach(m => {
+    const key = name + ':' + m.id;
+    if (on) routerModels.add(key); else routerModels.delete(key);
+  });
+  renderRouter();
+}
+
+function routerSelectAll(on) {
+  routerProviders = new Set();
+  routerModels = new Set();
+  if (on) {
+    (routerData.providers || []).forEach(p => {
+      if (!p.configured) return; // 缺 key 的选了也只会被跳过
+      routerProviders.add(p.name);
+      (p.models || []).forEach(m => routerModels.add(p.name + ':' + m.id));
+    });
+  }
+  renderRouter();
+}
+
+function renderRouterExample() {
+  if (!_('arExample')) return;
+  const alias = (_('arAlias').value || '').trim() || 'auto-router';
+  const base = (_('dashApiBase') && _('dashApiBase').value) || window.location.origin;
+  _('arExample').value = base + '/v1/chat/completions  ·  "model": "' + alias + '"';
+}
+
+function routerSelectionBody() {
+  return {
+    alias: (_('arAlias').value || '').trim(),
+    providers: Array.from(routerProviders),
+    models: Array.from(routerModels),
+  };
+}
+
+async function saveRouter() {
+  try {
+    const d = await api('POST', '/router/save', routerSelectionBody());
+    const r = d.data || {};
+    const probs = r.problems || [];
+    showRouterResult(probs.length ? 'warn' : 'ok',
+      '已保存：模型名 ' + (r.alias || '') + '，参与模型 ' + (r.models || 0) + ' 个', probs);
+    toast('已保存自动路由设置', 'success');
+    loadRouter();
+  } catch (e) { showRouterResult('error', '保存失败：' + e.message, []); }
+}
+
+async function validateRouter() {
+  try {
+    const d = await api('POST', '/router/validate', routerSelectionBody());
+    const r = d.data || {};
+    const probs = r.problems || [];
+    showRouterResult(probs.length ? 'warn' : 'ok',
+      probs.length ? '校验发现 ' + probs.length + ' 个问题' : ('校验通过：' + (r.models || 0) + ' 个模型都会参与自动路由'),
+      probs);
+  } catch (e) { showRouterResult('error', '校验失败：' + e.message, []); }
+}
+
+function showRouterResult(kind, msg, problems) {
+  const el = _('arResult');
+  if (!el) return;
+  const color = kind === 'ok' ? '#4ade80' : (kind === 'warn' ? '#fbbf24' : '#f87171');
+  el.innerHTML = '<div style="padding:10px 12px;border-radius:10px;border:1px solid ' + color
+    + ';background:rgba(2,6,23,.35);font-size:13px;color:' + color + '">' + esc(msg) + '</div>'
+    + (problems && problems.length
+      ? '<ul style="margin:8px 0 0 18px;font-size:12.5px;color:var(--text2)">'
+        + problems.map(p => '<li>' + esc(p) + '</li>').join('') + '</ul>'
+      : '');
+}
+
+async function refreshRouterCatalogs() {
+  try {
+    await api('POST', '/router/refresh', {});
+    toast('已触发目录刷新，稍后自动重载', 'success');
+    setTimeout(loadRouter, 4000);
+    setTimeout(loadRouter, 10000);
+  } catch (e) { toast('刷新失败：' + e.message, 'error'); }
+}
+
+async function routerMaintenance(kind) {
+  const body = kind === 'cooling' ? { clearCooling: true } : { clearPermanent: true };
+  if (kind === 'permanent' && !confirm('确认清空永久剔除列表？之前被判死的候选会重新参与自动路由。')) return;
+  try {
+    await api('POST', '/router/maintenance', body);
+    toast(kind === 'cooling' ? '已解除全部冷却' : '已清空永久剔除', 'success');
+    loadRouter();
+  } catch (e) { toast('操作失败：' + e.message, 'error'); }
+}
+
+// ---- 诊断区块 ----
+
+function renderRouterChain(d) {
+  const body = _('arChainBody');
+  if (!body) return;
+  const routes = d.aliases || [];
+  if (!routes.length) {
+    body.innerHTML = '<tr><td colspan="2" class="empty">暂无路由别名</td></tr>';
+    return;
+  }
+  const main = d.chain || {};
+  let html = '';
+  if (main.error) {
+    html = '<tr><td><code>' + esc(main.alias || '') + '</code></td><td style="color:var(--text3)">' + esc(main.error) + '</td></tr>';
+  } else {
+    const hops = (main.hops || []).map((h, i) => {
+      const label = (i + 1) + '. <code>' + esc(h.upstream) + ':' + esc(h.model) + '</code>';
+      return h.skip
+        ? '<span class="model-tag" style="opacity:.55;text-decoration:line-through" title="' + esc(h.skip) + '">' + label + '</span>'
+        : '<span class="model-tag">' + label + '</span>';
+    }).join(' <span style="color:var(--text3)">→</span> ');
+    html = '<tr><td><code>' + esc(main.alias || '') + '</code></td><td>'
+      + (hops || '<span style="color:var(--text3)">无候选：先勾选供应商与模型</span>') + '</td></tr>';
+  }
+  const others = routes.filter(a => a !== (main.alias || ''));
+  others.forEach(a => {
+    html += '<tr><td><code>' + esc(a) + '</code></td><td style="color:var(--text3)">其他别名（未在自动路由页配置）</td></tr>';
+  });
+  body.innerHTML = html;
+}
+
+function renderRouterUsage(d) {
+  const body = _('arUsageBody');
   const usage = d.usage || {};
   const rows = usage.rows || [];
-  if (ub) {
-    ub.innerHTML = rows.length
+  if (body) {
+    body.innerHTML = rows.length
       ? rows.map(r => {
           const limit = r.limit ? (r.limit + '（剩 ' + r.remaining + '）') : '<span style="color:var(--text3)">不限</span>';
-          return '<tr><td><code>' + escHtml(r.key) + '</code></td><td>' + r.req + '</td><td>' + r.ok +
-            '</td><td>' + (r.fail ? '<span style="color:#f87171">' + r.fail + '</span>' : '0') + '</td><td>' + limit + '</td></tr>';
+          return '<tr><td><code>' + esc(r.key) + '</code></td><td>' + r.req + '</td><td>' + r.ok
+            + '</td><td>' + (r.fail ? '<span style="color:#f87171">' + r.fail + '</span>' : '0') + '</td><td>' + limit + '</td></tr>';
         }).join('')
       : '<tr><td colspan="5" class="empty">今天还没有调用记录</td></tr>';
   }
-  if (_('usageInfo')) {
-    _('usageInfo').textContent = '日界时区 ' + (usage.timezone || '') + '；保留 ' + (usage.retention || 7) +
-      ' 天；账本文件 ' + (d.usagePath || '');
+  if (_('arUsageInfo')) {
+    _('arUsageInfo').textContent = '日界时区 ' + (usage.timezone || '') + '；保留 ' + (usage.retention || 7)
+      + ' 天；账本文件 ' + (d.usagePath || '');
   }
+}
 
-  // 冷却中
-  const cb = _('coolingBox');
-  if (cb) {
+function renderRouterCooling(d) {
+  const box = _('arCoolingBox');
+  if (box) {
     const cool = d.cooling || [];
-    cb.innerHTML = cool.length
-      ? cool.map(c => '<div style="padding:6px 10px;border-bottom:1px solid var(--border);font-size:12px">' +
-          '<code>' + escHtml(c.key) + '</code> · ' + escHtml(c.class) + ' · 剩 ' + fmtRemain(c.remainMs) + '</div>').join('')
+    box.innerHTML = cool.length
+      ? cool.map(c => '<div style="padding:6px 10px;border-bottom:1px solid var(--border);font-size:12px">'
+        + '<code>' + esc(c.key) + '</code> · ' + esc(c.class) + ' · 剩 ' + fmtRemain(c.remainMs) + '</div>').join('')
       : '<div style="padding:8px 10px;font-size:12px;color:var(--text3)">暂无冷却中的候选</div>';
   }
-
-  // 永久剔除
-  const pb = _('permanentBox');
+  const pb = _('arPermBox');
   if (pb) {
     const perm = d.permanent || [];
     pb.innerHTML = perm.length
-      ? perm.map(p => '<div style="padding:6px 10px;border-bottom:1px solid var(--border);font-size:12px">' +
-          '<code>' + escHtml(p.key) + '</code><div style="color:var(--text3);margin-top:2px">' + escHtml(p.reason) + '</div></div>').join('')
+      ? perm.map(p => '<div style="padding:6px 10px;border-bottom:1px solid var(--border);font-size:12px">'
+        + '<code>' + esc(p.key) + '</code><div style="color:var(--text3);margin-top:2px">' + esc(p.reason) + '</div></div>').join('')
       : '<div style="padding:8px 10px;font-size:12px;color:var(--text3)">暂无永久剔除</div>';
   }
 }
 
+function renderRouterDiscovery(d) {
+  const disc = d.discovery || {};
+  const dc = disc.config || {};
+  const provs = (d.providers || []).map(p => p.name);
+  if (_('discProvider')) {
+    // 发现源只能从"已加入的供应商"里选, 不允许手填
+    const cur = dc.provider || '';
+    _('discProvider').innerHTML = provs.map(n =>
+      '<option value="' + esc(n) + '"' + (n === cur ? ' selected' : '') + '>' + esc(n) + '</option>').join('')
+      || '<option value="">（还没有供应商）</option>';
+    if (cur && provs.indexOf(cur) < 0) _('discProvider').value = '';
+  }
+  if (_('discEnabled')) _('discEnabled').value = dc.enabled ? 'true' : 'false';
+  if (_('discIntervalH')) {
+    const h = Math.round((dc.intervalMs || 0) / 3600000);
+    _('discIntervalH').value = h > 0 ? h : 48;
+  }
+  if (_('discMaxPerRun')) _('discMaxPerRun').value = dc.maxPerRun || 8;
+  if (_('discInfo')) {
+    _('discInfo').textContent = dc.enabled
+      ? ('已收录 ' + (disc.discovered || 0) + ' 个自动发现的模型，会追加在自动路由的末尾；文件 ' + (disc.path || ''))
+      : '当前为关闭状态：不会自动发现新模型，自动路由只用手动勾选的候选。';
+  }
+}
+
 async function saveDiscovery() {
-  const cfg = Object.assign({}, (routingData && routingData.discovery && routingData.discovery.config) || {});
+  const cfg = Object.assign({}, ((routerData && routerData.discovery) || {}).config || {});
   cfg.enabled = _('discEnabled').value === 'true';
-  cfg.provider = (_('discProvider').value || '').trim() || 'openrouter';
+  cfg.provider = _('discProvider').value || cfg.provider || '';
   const h = parseInt(_('discIntervalH').value, 10);
   cfg.intervalMs = (h > 0 ? h : 48) * 3600000;
+  const n = parseInt(_('discMaxPerRun').value, 10);
+  cfg.maxPerRun = n > 0 ? n : 8;
   try {
-    await api('POST', '/routing/update', { discovery: cfg });
+    await api('POST', '/router/discovery', cfg);
     toast('已保存自动发现设置', 'success');
-    loadRouting();
-  } catch (e) { toast('保存失败: ' + e.message, 'error'); }
-}
-
-async function clearCandidateCooling() {
-  try {
-    await api('POST', '/routing/update', { clearCooling: true });
-    toast('已解除全部候选冷却', 'success');
-    loadRouting();
-  } catch (e) { toast('操作失败: ' + e.message, 'error'); }
-}
-
-async function clearCandidatePermanent() {
-  if (!confirm('确认清空永久剔除列表？之前被判死的候选会重新参与候选链。')) return;
-  try {
-    await api('POST', '/routing/update', { clearPermanent: true });
-    toast('已清空永久剔除', 'success');
-    loadRouting();
-  } catch (e) { toast('操作失败: ' + e.message, 'error'); }
+    loadRouter();
+  } catch (e) { toast('保存失败：' + e.message, 'error'); }
 }
 
 async function delProvider(n) {
