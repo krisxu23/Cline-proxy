@@ -324,6 +324,34 @@ func TestRefreshCatalogErrorRecorded(t *testing.T) {
 	}
 }
 
+func TestFreeModelIDsMatchesIsFree(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		json.NewEncoder(w).Encode(map[string]any{"data": []map[string]any{
+			{"id": "free-a", "pricing": map[string]any{"prompt": "0", "completion": "0"}},
+		}})
+	}))
+	defer srv.Close()
+
+	setTestProvider(t, "tr", providerConfig{BaseURL: srv.URL, APIKey: "k", Catalog: true, Pricing: true})
+	p := providerByName("tr")
+	if err := p.refreshCatalog(context.Background(), true); err != nil {
+		t.Fatal(err)
+	}
+	if !p.isFree("free-a") {
+		t.Fatal("zero-cost catalog model must be free before rejection")
+	}
+	p.mu.Lock()
+	p.rejected = map[string]string{"free-a": "withdrawn"}
+	p.mu.Unlock()
+
+	if p.isFree("free-a") {
+		t.Fatal("permanently rejected model must not be free")
+	}
+	if ids := p.freeModelIDs(); len(ids) != 0 {
+		t.Fatalf("freeModelIDs must not publish a permanently rejected model: %+v", ids)
+	}
+}
+
 func TestProviderModelList(t *testing.T) {
 	setTestProvider(t, "bai", providerConfig{BaseURL: "https://x", APIKey: "k", FreeModels: []string{"glm-5.3-flash", "mimo-v2.5"}})
 	setTestProvider(t, "nokey", providerConfig{BaseURL: "https://y", FreeModels: []string{"whatever"}})
