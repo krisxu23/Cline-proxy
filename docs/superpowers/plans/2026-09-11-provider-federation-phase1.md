@@ -3110,13 +3110,21 @@ async function refreshProviderCatalog() {
 }
 ```
 
-- [ ] **Step 3: 页面初始化时加载**
+- [ ] **Step 3: 设置页两条入口都要加载**
 
-在 `internal/app/admin_html.go` 中定位页面初始化流程里首次调用 `loadOcNodes()` 的位置（与 `loadOcConfig()` 等并列的初始化区），在其后加一行：
+设置页有两条进入路径：导航项点击，以及仪表盘快捷操作调用的 `switchTab('settings')`。
+两者都必须触发 `loadProviders()` —— 只挂一条会让面板在另一条路径下为空；而 `pvData` 为空时
+`saveProvider` 的 round-trip 会退化成整体替换，把未编辑字段清掉。
+
+先定位现有设置加载器（`loadOcConfig()` / `loadOcNodes()`）被调用的全部位置，把
+`loadProviders();` 按同样的方式补到每一条设置页入口上；若两条路径会在同一次点击里同时执行，
+避免重复请求：
 
 ```javascript
   loadProviders();
 ```
+
+<!-- 原计划只指向 loadOcNodes() 的首个调用点，实测漏掉了 switchTab 入口；此处按行为要求改写。 -->
 
 - [ ] **Step 4: 编译验证**
 
