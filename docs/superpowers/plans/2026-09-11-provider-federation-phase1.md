@@ -2996,6 +2996,12 @@ git commit -m "feat: expose provider configuration through the admin api"
       </div>
     </div>
     <div class="form-row">
+      <div class="field"><label>Models URL（Google 原生目录用；留空则用 Base URL + /models）</label>
+        <input type="text" id="pvModelsUrl" placeholder="https://generativelanguage.googleapis.com/v1beta/models"></div>
+      <div class="field"><label>Models Key 头（Google 用 x-goog-api-key）</label>
+        <input type="text" id="pvModelsKeyHeader" placeholder="x-goog-api-key"></div>
+    </div>
+    <div class="form-row">
       <div class="field"><label>免费模型白名单（每行一个）</label>
         <textarea id="pvFree" rows="4" placeholder="gemini-3.8-flash&#10;glm-5.3-flash"></textarea></div>
       <div class="field"><label>连通测试模型（留空用第一个免费模型）</label>
@@ -3050,21 +3056,29 @@ function editProvider(n) {
   _('pvKey').value = p.apiKey || '';
   _('pvCatalog').value = String(!!p.catalog);
   _('pvPricing').value = String(!!p.pricing);
+  _('pvModelsUrl').value = p.modelsUrl || '';
+  _('pvModelsKeyHeader').value = p.modelsKeyHeader || '';
   _('pvFree').value = (p.freeModels || []).join('\n');
   toast('已载入 ' + n + ', 修改后点保存', 'success');
 }
 async function saveProvider() {
   const name = _('pvName').value.trim();
   if (!name) { toast('请填写 Provider 名', 'error'); return; }
+  // 后端按整体替换处理 provider: 表单未编辑的字段(headers、chatPath 等)
+  // 必须原样回传, 否则保存会把它们清掉, 已配好的 provider 会静默失真。
+  const existing = Object.assign({}, pvData[name] || {});
+  delete existing.runtime;
   const body = {
     name,
-    provider: {
+    provider: Object.assign(existing, {
       baseUrl: _('pvBaseUrl').value.trim(),
       apiKey: _('pvKey').value.trim(),
       catalog: _('pvCatalog').value === 'true',
       pricing: _('pvPricing').value === 'true',
+      modelsUrl: _('pvModelsUrl').value.trim(),
+      modelsKeyHeader: _('pvModelsKeyHeader').value.trim(),
       freeModels: _('pvFree').value.split('\n').map(s => s.trim()).filter(Boolean),
-    },
+    }),
   };
   try { await api('POST', '/admin/api/providers/update', body); toast('已保存 ' + name, 'success'); loadProviders(); }
   catch (e) { toast('保存失败: ' + e.message, 'error'); }
