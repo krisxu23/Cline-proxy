@@ -656,7 +656,7 @@ body:not([data-theme="dark"]) .theme-toggle .dark-label{display:none}
     </div>
     <div class="form-row">
       <div class="field"><label>代理冷却</label>
-        <div id="ocCooldownBox" style="border:1px solid var(--border);border-radius:10px;background:rgba(2,6,23,.3);min-height:42px"></div>
+        <div id="ocCooldownBox" style="max-height:190px;overflow-y:auto;border:1px solid var(--border);border-radius:10px;background:rgba(2,6,23,.3);min-height:42px"></div>
       </div>
     </div>
     <div class="form-actions"><button class="btn btn-primary" onclick="saveOcConfig()">💾 保存出口配置</button></div>
