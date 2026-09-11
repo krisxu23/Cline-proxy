@@ -6,6 +6,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 )
 
@@ -193,7 +194,9 @@ func TestProviderChatRemembersSignatureFromResponse(t *testing.T) {
 }
 
 func TestSSETapReaderSplitsLines(t *testing.T) {
-	body := io.NopCloser(&chunkReader{chunks: []string{"data: a\n", "data: b\n", "\n"}})
+	// 中间分片故意不带换行: 跨 chunk 的行重组必须由 pending 缓冲完成;
+	// 末片携带空行事件分隔符, 断言第三行为空字符串。
+	body := io.NopCloser(&chunkReader{chunks: []string{"data: a\n", "data: b", "\n\n"}})
 	var lines []string
 	tap := &sseTapReader{rc: body, onLine: func(l string) { lines = append(lines, l) }}
 	io.ReadAll(tap)
@@ -206,6 +209,80 @@ func TestSSETapReaderSplitsLines(t *testing.T) {
 		if lines[i] != want[i] {
 			t.Fatalf("line %d: %q want %q", i, lines[i], want[i])
 		}
+	}
+}
+
+func TestProviderChatNonStreamBodyFullyRead(t *testing.T) {
+	// 非流式响应必须在 Chat 内部读完: 请求上下文控制整个响应生命周期,
+	// 返回后 defer cancel 会截断未读完的 body(超过传输层缓冲的部分丢失)。
+	big := strings.Repeat("x", 200<<10)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		json.NewEncoder(w).Encode(map[string]any{
+			"choices": []any{map[string]any{"message": map[string]any{"role": "assistant", "content": big}}},
+		})
+	}))
+	defer srv.Close()
+	setTestProvider(t, "big", providerConfig{BaseURL: srv.URL, APIKey: "k", FreeModels: []string{"m1"}})
+	p := providerByName("big")
+	resp, err := p.Chat(context.Background(), map[string]any{"model": "m1", "messages": []any{}}, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("body read must not fail after Chat returns: %v", err)
+	}
+	if !strings.Contains(string(body), big) {
+		t.Fatalf("body was truncated: got %d bytes", len(body))
+	}
+	var payload map[string]any
+	if err := json.Unmarshal(body, &payload); err != nil {
+		t.Fatalf("body must be complete JSON: %v", err)
+	}
+}
+
+func TestHandleProviderChatRejectsPaidModel(t *testing.T) {
+	setTestProvider(t, "bai", providerConfig{BaseURL: "https://x", APIKey: "k", FreeModels: []string{"free-one"}})
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest("POST", "/chat/completions", nil)
+	handleProviderChat(rec, req, map[string]any{"model": "bai:paid-one", "messages": []any{}}, "bai")
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("paid model must be rejected: %d", rec.Code)
+	}
+}
+
+func TestHandleProviderChatRejectsKeylessProvider(t *testing.T) {
+	setTestProvider(t, "nokey", providerConfig{BaseURL: "https://x", FreeModels: []string{"m"}})
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest("POST", "/chat/completions", nil)
+	handleProviderChat(rec, req, map[string]any{"model": "nokey:m", "messages": []any{}}, "nokey")
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("keyless provider must be 503: %d", rec.Code)
+	}
+}
+
+func TestHandleProviderChatRefreshesCatalogBeforeGate(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/models" {
+			json.NewEncoder(w).Encode(map[string]any{"data": []map[string]any{
+				{"id": "cat-free", "pricing": map[string]any{"prompt": "0", "completion": "0"}},
+			}})
+			return
+		}
+		w.Write([]byte(`{"choices":[{"message":{"content":"ok"}}]}`))
+	}))
+	defer srv.Close()
+	setTestProvider(t, "cat", providerConfig{BaseURL: srv.URL, APIKey: "k", Catalog: true, Pricing: true})
+	p := providerByName("cat")
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest("POST", "/chat/completions", nil)
+	handleProviderChat(rec, req, map[string]any{"model": "cat:cat-free", "messages": []any{}}, "cat")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("first request must refresh the catalog and pass the gate: %d body=%s", rec.Code, rec.Body.String())
+	}
+	if len(p.catalog) == 0 {
+		t.Fatal("catalog should be populated by the first request")
 	}
 }
 

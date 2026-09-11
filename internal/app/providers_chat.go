@@ -14,7 +14,10 @@ import (
 	"cline-go-proxy/internal/kit"
 )
 
-const providerAttemptTimeout = 180 * time.Second
+const (
+	providerAttemptTimeout   = 180 * time.Second
+	providerResponseMaxBytes = 64 << 20
+)
 
 // providerDirectClient 直连上游(默认用于非 Gemini provider)。
 var providerDirectClient = &http.Client{
@@ -158,22 +161,30 @@ func (p *modelProvider) Chat(ctx context.Context, params map[string]any, stream 
 		p.recordRejection(model, resp.StatusCode, body)
 		return nil, &providerError{Provider: p.name, Status: resp.StatusCode, Body: string(body)}
 	}
-	if needsSig {
-		if stream {
-			ext := newSignatureStreamExtractor(p.sigCache)
-			resp.Body = &sseTapReader{rc: resp.Body, onLine: func(line string) { ext.push(line) }}
-		} else {
-			body, readErr := io.ReadAll(io.LimitReader(resp.Body, 64<<20))
-			resp.Body.Close()
-			if readErr != nil {
-				return nil, readErr
-			}
+	if !stream {
+		// 非流式: 必须在超时上下文内读完整个响应体再返回。
+		// 返回即触发上面的 defer cancel, 而请求上下文控制整个响应生命周期,
+		// 未读完的 body 会被 "context canceled" 提前截断(客户端表现为 500 parse_error)。
+		body, readErr := io.ReadAll(io.LimitReader(resp.Body, providerResponseMaxBytes+1))
+		resp.Body.Close()
+		if readErr != nil {
+			return nil, readErr
+		}
+		if len(body) > providerResponseMaxBytes {
+			return nil, fmt.Errorf("provider %s: response exceeds %d bytes", p.name, providerResponseMaxBytes)
+		}
+		if needsSig {
 			var parsed map[string]any
 			if json.Unmarshal(body, &parsed) == nil {
 				rememberSignaturesFromPayload(parsed, p.sigCache)
 			}
-			resp.Body = io.NopCloser(bytes.NewReader(body))
 		}
+		resp.Body = io.NopCloser(bytes.NewReader(body))
+		return resp, nil
+	}
+	if needsSig {
+		ext := newSignatureStreamExtractor(p.sigCache)
+		resp.Body = &sseTapReader{rc: resp.Body, onLine: func(line string) { ext.push(line) }}
 	}
 	return resp, nil
 }
@@ -221,17 +232,10 @@ func handleProviderChat(w http.ResponseWriter, r *http.Request, params map[strin
 	}
 	model, _ := params["model"].(string)
 	pm := strings.TrimPrefix(model, name+":")
-	if !p.isFree(pm) {
-		writeJSON(w, http.StatusBadRequest, map[string]any{
-			"error": map[string]string{
-				"message": fmt.Sprintf("model %q is not a free model on provider %q", model, name),
-				"type":    "invalid_request_error",
-			},
-		})
-		return
-	}
 
-	// 目录型 provider 首次请求前同步刷新一次, 之后由后台循环维护
+	// 目录型 provider 首次请求前同步刷新一次, 之后由后台循环维护。
+	// 必须排在免费判定之前: 定价目录为空时 isFree 必然为 false,
+	// 否则该 provider 会一直 400 到后台刷新跑完为止。
 	if cfg.Catalog {
 		p.mu.Lock()
 		need := len(p.catalog) == 0 && p.catalogErr == ""
@@ -243,6 +247,16 @@ func handleProviderChat(w http.ResponseWriter, r *http.Request, params map[strin
 			}
 			cancel()
 		}
+	}
+
+	if !p.isFree(pm) {
+		writeJSON(w, http.StatusBadRequest, map[string]any{
+			"error": map[string]string{
+				"message": fmt.Sprintf("model %q is not a free model on provider %q", model, name),
+				"type":    "invalid_request_error",
+			},
+		})
+		return
 	}
 
 	isStream, _ := params["stream"].(bool)

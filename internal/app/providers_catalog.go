@@ -425,12 +425,10 @@ func (p *modelProvider) catalogStatus() map[string]any {
 	}
 }
 
-// startProviderRefresher 每 15 分钟刷新一次启用 catalog 的 provider。
+// startProviderRefresher 启动时立即刷新一次, 之后每 15 分钟刷新一次启用 catalog 的 provider。
 func startProviderRefresher() {
 	go func() {
-		t := time.NewTicker(providerCatalogRefresh)
-		defer t.Stop()
-		for range t.C {
+		refreshOnce := func() {
 			for _, name := range providerNames() {
 				p := providerByName(name)
 				pc, ok := providerConfigFor(name)
@@ -443,6 +441,12 @@ func startProviderRefresher() {
 				}
 				cancel()
 			}
+		}
+		refreshOnce()
+		t := time.NewTicker(providerCatalogRefresh)
+		defer t.Stop()
+		for range t.C {
+			refreshOnce()
 		}
 	}()
 }
