@@ -106,7 +106,7 @@ func resolveRouteChain(model string) (cands []routeCandidate, matched bool, errM
 
 	if cfg != nil {
 		if list, ok := cfg.Routes[id]; ok {
-			return expandRouteList(id, list), true, ""
+			return appendChainTail(expandRouteList(id, list)), true, ""
 		}
 	}
 	if id != freeBestAlias {
@@ -115,12 +115,37 @@ func resolveRouteChain(model string) (cands []routeCandidate, matched bool, errM
 
 	// routes 段没显式配这个别名 -> 用默认链: 已配置 provider 的免费模型。
 	chain := defaultFreeBestChain()
+	chain = appendChainTail(chain)
 	if len(chain) == 0 {
 		return nil, true, fmt.Sprintf(
 			"route %q has no candidates: no provider with an API key is configured, "+
 				"and the routes.%s list is empty", id, id)
 	}
 	return chain, true, ""
+}
+
+// appendChainTail 把 discovery 收录的模型接到候选链尾部。
+//
+// 手动配置的条目永远在前且顺序不变 —— 发现的结果只是补充, 不能插队;
+// 同一个 upstream:model 已在前面的站点里出现时也不再重复追加。
+func appendChainTail(manual []routeCandidate) []routeCandidate {
+	tail := discoveredCandidates()
+	if len(tail) == 0 {
+		return manual
+	}
+	seen := make(map[string]bool, len(manual)+len(tail))
+	for _, c := range manual {
+		seen[c.String()] = true
+	}
+	out := manual
+	for _, c := range tail {
+		if seen[c.String()] {
+			continue
+		}
+		seen[c.String()] = true
+		out = append(out, c)
+	}
+	return out
 }
 
 // expandRouteList 把配置里的一串条目展开成候选。
@@ -186,10 +211,14 @@ func defaultFreeBestChain() []routeCandidate {
 }
 
 // candidateSkip 候选当前是否应跳过; 返回原因(空串 = 可用)。
-// 跳过条件: 候选层冷却中 / 永久剔除 / 上游未配置 / 无可用账号 / 非免费 zen 模型。
+// 跳过条件: 候选层冷却中 / 永久剔除 / 当日配额已尽 / 上游未配置 /
+// 无可用账号 / 非免费 zen 模型。
 func candidateSkip(c routeCandidate) string {
 	if why := candidateSkipReason(c.Upstream, c.Model); why != "" {
 		return why
+	}
+	if usageLimitReached(candidateKey(c.Upstream, c.Model)) {
+		return "当日配额已尽"
 	}
 	switch c.Upstream {
 	case upstreamZen:

@@ -222,6 +222,8 @@ type zenConfigData struct {
 	Providers       map[string]providerConfig `json:"providers,omitempty"` // 通用 OpenAI 兼容上游
 	Routes          map[string][]string       `json:"routes,omitempty"`    // 路由别名 -> 有序候选链(如 free-best)
 	CooldownMs      map[string]int64          `json:"cooldownMs,omitempty"` // 候选层冷却时长覆盖(按错误类别)
+	Usage           zenUsageConfig            `json:"usage"`               // 每日配额账本
+	Discovery       zenDiscoveryConfig        `json:"discovery"`           // 免费模型自动发现
 }
 
 // zenEndpointMirrors 官方源之外的 CDN 镜像端点(实测镜像透传官方完整路径,须带 /v1)。

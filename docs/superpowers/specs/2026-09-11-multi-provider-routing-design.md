@@ -242,3 +242,33 @@ type Upstream interface {
    `provider:model` 前缀直选。交付即可手动挂四家 key 并直选模型。
 2. **第 2 期**：统一候选链 + `free-best` 别名 + 候选层分级冷却 + upstreamError 泛化。
 3. **第 3 期**：配额账本 + discovery（含评估试跑）+ UI 用量面板。
+
+---
+
+## 8. 交付状态
+
+三期均已交付。
+
+| 期 | 落地位置 | 状态 |
+|---|---|---|
+| 1 | `providers_config.go` / `providers_catalog.go` / `providers_chat.go` / `admin_providers.go` | 已交付 |
+| 2 | `routing_chain.go`（候选解析与 `free-best`）、`routing_dispatch.go`（逐站 failover）、`cooldown.go`（候选层分级冷却） | 已交付 |
+| 3 | `usage.go`（每日配额账本）、`discovery.go`（自动发现与评估试跑）、`admin_routing.go` + 面板「🔀 路由链与用量」 | 已交付 |
+
+实现说明（与本文档的差异，均为落地时的取舍）：
+
+- **时区**：单 exe 分发无法假设系统装有 zoneinfo，故内嵌 `time/tzdata`
+  （见 `tzdata.go`）。Gemini 重置点用 `America/Los_Angeles`，账本日界用配置时区，
+  两者仍是相互独立的时区。
+- **默认链顺序**：`providers` 与 `freeModels` 在配置里分别是 map 与切片。
+  provider 名取字典序、同 provider 内模型取模型名字典序展开，保证同一请求
+  每次展开结果一致；白名单的书写顺序在上游已被 `freeModelIDs` 按名排序覆盖。
+- **failover 时机**：候选链在拿到 `*http.Response` 并判定状态码（非流式还会
+  校验响应确实带 content）之后才写响应。因此客户端只会看到胜出那一站的输出，
+  不存在"已输出一部分再换站"的破损响应，流式也天然满足"首字节前 failover"。
+- **`providerError` 归类**：通用 Provider 的 `Chat` 把非 200 直接返回为错误而非
+  响应，故候选链必须从错误对象里取状态码，否则限流/下架会被误判为超时。
+- **`usageWeight`**：解释为发现模型的排名窗口（天）——窗口内请求数越多越靠前。
+- **`probeFreeTier`**：字段已落地，但试跑逻辑由 discovery 承担（第 3 期），
+  未额外实现"对白名单模型逐个探测"的独立路径。
+

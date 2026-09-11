@@ -563,6 +563,64 @@ body:not([data-theme="dark"]) .theme-toggle .dark-label{display:none}
 </div>
 
 <div class="section">
+  <div class="section-title">🔀 路由链与用量
+    <span style="margin-left:auto;display:flex;gap:8px">
+      <button type="button" class="btn btn-sm" onclick="loadRouting()">🔄 刷新</button>
+      <button type="button" class="btn btn-sm" onclick="clearCandidateCooling()">解除全部冷却</button>
+      <button type="button" class="btn btn-sm" onclick="clearCandidatePermanent()">清空永久剔除</button>
+    </span>
+  </div>
+  <div class="section-body">
+    <p class="hint" style="margin:0 0 14px">
+      把 <code>free-best</code> 之类的别名作为模型名请求，网关会按下面的顺序逐站尝试，
+      某一站失败就按错误类别冷却它并跳到下一站；全链失败才返回最后一站的错误。
+      手动配置的条目永远排在最前，自动发现的模型只追加在尾部。
+    </p>
+
+    <div class="form-row">
+      <div class="field"><label>自动发现免费模型</label>
+        <select id="discEnabled" onchange="saveDiscovery()">
+          <option value="false">关闭</option>
+          <option value="true">开启（定期拉取并试跑）</option>
+        </select>
+      </div>
+      <div class="field"><label>发现源 / 间隔</label>
+        <div style="display:flex;gap:8px">
+          <input id="discProvider" placeholder="openrouter" style="flex:1" onchange="saveDiscovery()">
+          <input id="discIntervalH" type="number" min="1" placeholder="48" title="发现间隔（小时）" style="width:96px;flex:none" onchange="saveDiscovery()">
+          <span style="align-self:center;font-size:12px;color:var(--text3);flex:none">小时</span>
+        </div>
+      </div>
+    </div>
+    <div class="hint" id="discInfo" style="margin:-6px 0 14px;font-size:12px;color:var(--text3)"></div>
+
+    <div class="table-wrap" style="margin-bottom:14px">
+      <table>
+        <thead><tr><th style="width:160px">路由别名</th><th>当前实际顺序</th></tr></thead>
+        <tbody id="routeChainBody"><tr><td colspan="2" class="empty">加载中...</td></tr></tbody>
+      </table>
+    </div>
+
+    <div class="table-wrap" style="margin-bottom:14px">
+      <table>
+        <thead><tr><th style="width:220px">今日用量</th><th style="width:90px">请求</th><th style="width:70px">成功</th><th style="width:70px">失败</th><th>限额</th></tr></thead>
+        <tbody id="usageBody"><tr><td colspan="5" class="empty">加载中...</td></tr></tbody>
+      </table>
+    </div>
+    <div class="hint" id="usageInfo" style="margin:-6px 0 14px;font-size:12px;color:var(--text3)"></div>
+
+    <div class="form-row">
+      <div class="field"><label>候选层冷却中</label>
+        <div id="coolingBox" style="border:1px solid var(--border);border-radius:10px;background:rgba(2,6,23,.3);min-height:42px"></div>
+      </div>
+      <div class="field"><label>永久剔除</label>
+        <div id="permanentBox" style="border:1px solid var(--border);border-radius:10px;background:rgba(2,6,23,.3);min-height:42px;max-height:220px;overflow-y:auto"></div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<div class="section">
   <div class="section-title">🛡️ 限流防御</div>
   <div class="section-body">
     <div class="form-row">
@@ -710,7 +768,7 @@ function switchTab(name) {
   if (name === 'dashboard') { loadStats(); loadOcStats(); loadConfig(); loadOcConfig(); }
   if (name === 'accounts') { loadAccounts(); loadConfig(); }
   if (name === 'models') { loadModels(); loadOcModels(); loadProviders(); }
-  if (name === 'settings') { loadKeys(); loadConfig(); loadOcConfig(); loadOcNodes(); loadProviders(); }
+  if (name === 'settings') { loadKeys(); loadConfig(); loadOcConfig(); loadOcNodes(); loadProviders(); loadRouting(); }
   if (name === 'logs') loadLogs();
 }
 
@@ -1533,6 +1591,143 @@ async function saveProvider() {
       setTimeout(loadProviders, 10000);
     } catch (e2) { /* 目录拉取失败会显示在 provider 行上 */ }
   } catch (e) { toast('保存失败: ' + e.message, 'error'); }
+}
+
+// ========== 路由链与用量 ==========
+
+// escHtml 面板里有多处要拼用户可控字符串(别名/上游名/模型名/错误文本), 统一转义。
+function escHtml(s) {
+  return String(s == null ? '' : s)
+    .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;');
+}
+
+// fmtRemain 冷却剩余时间的可读形式。
+function fmtRemain(ms) {
+  const s = Math.max(0, Math.round(ms / 1000));
+  if (s >= 3600) return Math.floor(s / 3600) + 'h' + Math.floor((s % 3600) / 60) + 'm';
+  if (s >= 60) return Math.floor(s / 60) + 'm' + (s % 60) + 's';
+  return s + 's';
+}
+
+// routingData 缓存一次 GET /routing 的结果, 供保存时回传未编辑的字段。
+let routingData = null;
+
+async function loadRouting() {
+  try {
+    routingData = await api('GET', '/routing');
+    renderRouting(routingData);
+  } catch (e) {
+    // 老版本后端没有这个接口时静默跳过, 不影响面板其余部分
+  }
+}
+
+function renderRouting(d) {
+  d = d || {};
+  const disc = d.discovery || {};
+  const dc = disc.config || {};
+  if (_('discEnabled')) _('discEnabled').value = dc.enabled ? 'true' : 'false';
+  if (_('discProvider')) _('discProvider').value = dc.provider || 'openrouter';
+  if (_('discIntervalH')) {
+    const h = Math.round((dc.intervalMs || 0) / 3600000);
+    _('discIntervalH').value = h > 0 ? h : 48;
+  }
+  if (_('discInfo')) {
+    _('discInfo').textContent = dc.enabled
+      ? '已收录 ' + (disc.discovered || 0) + ' 个自动发现的模型；每轮最多试跑 ' + (dc.maxPerRun || 8) + ' 个。'
+      : '当前为关闭状态：不会自动发现新模型，链尾只用手动配置的候选。';
+  }
+
+  // 路由别名 -> 当前实际顺序, 被跳过的站打删除线并用 title 说明原因
+  const rb = _('routeChainBody');
+  if (rb) {
+    const routes = d.routes || [];
+    if (!routes.length) {
+      rb.innerHTML = '<tr><td colspan="2" class="empty">还没有路由别名</td></tr>';
+    } else {
+      rb.innerHTML = routes.map(rt => {
+        if (rt.error) {
+          return '<tr><td><code>' + escHtml(rt.alias) + '</code></td><td style="color:var(--text3)">' + escHtml(rt.error) + '</td></tr>';
+        }
+        const hops = (rt.hops || []).map((h, i) => {
+          const label = (i + 1) + '. <code>' + escHtml(h.upstream) + ':' + escHtml(h.model) + '</code>';
+          return h.skip
+            ? '<span class="model-tag" style="opacity:.55;text-decoration:line-through" title="' + escHtml(h.skip) + '">' + label + '</span>'
+            : '<span class="model-tag">' + label + '</span>';
+        }).join(' <span style="color:var(--text3)">→</span> ');
+        return '<tr><td><code>' + escHtml(rt.alias) + '</code></td><td>' +
+          (hops || '<span style="color:var(--text3)">无候选：先配置一个 provider</span>') + '</td></tr>';
+      }).join('');
+    }
+  }
+
+  // 今日用量
+  const ub = _('usageBody');
+  const usage = d.usage || {};
+  const rows = usage.rows || [];
+  if (ub) {
+    ub.innerHTML = rows.length
+      ? rows.map(r => {
+          const limit = r.limit ? (r.limit + '（剩 ' + r.remaining + '）') : '<span style="color:var(--text3)">不限</span>';
+          return '<tr><td><code>' + escHtml(r.key) + '</code></td><td>' + r.req + '</td><td>' + r.ok +
+            '</td><td>' + (r.fail ? '<span style="color:#f87171">' + r.fail + '</span>' : '0') + '</td><td>' + limit + '</td></tr>';
+        }).join('')
+      : '<tr><td colspan="5" class="empty">今天还没有调用记录</td></tr>';
+  }
+  if (_('usageInfo')) {
+    _('usageInfo').textContent = '日界时区 ' + (usage.timezone || '') + '；保留 ' + (usage.retention || 7) +
+      ' 天；账本文件 ' + (d.usagePath || '');
+  }
+
+  // 冷却中
+  const cb = _('coolingBox');
+  if (cb) {
+    const cool = d.cooling || [];
+    cb.innerHTML = cool.length
+      ? cool.map(c => '<div style="padding:6px 10px;border-bottom:1px solid var(--border);font-size:12px">' +
+          '<code>' + escHtml(c.key) + '</code> · ' + escHtml(c.class) + ' · 剩 ' + fmtRemain(c.remainMs) + '</div>').join('')
+      : '<div style="padding:8px 10px;font-size:12px;color:var(--text3)">暂无冷却中的候选</div>';
+  }
+
+  // 永久剔除
+  const pb = _('permanentBox');
+  if (pb) {
+    const perm = d.permanent || [];
+    pb.innerHTML = perm.length
+      ? perm.map(p => '<div style="padding:6px 10px;border-bottom:1px solid var(--border);font-size:12px">' +
+          '<code>' + escHtml(p.key) + '</code><div style="color:var(--text3);margin-top:2px">' + escHtml(p.reason) + '</div></div>').join('')
+      : '<div style="padding:8px 10px;font-size:12px;color:var(--text3)">暂无永久剔除</div>';
+  }
+}
+
+async function saveDiscovery() {
+  const cfg = Object.assign({}, (routingData && routingData.discovery && routingData.discovery.config) || {});
+  cfg.enabled = _('discEnabled').value === 'true';
+  cfg.provider = (_('discProvider').value || '').trim() || 'openrouter';
+  const h = parseInt(_('discIntervalH').value, 10);
+  cfg.intervalMs = (h > 0 ? h : 48) * 3600000;
+  try {
+    await api('POST', '/routing/update', { discovery: cfg });
+    toast('已保存自动发现设置', 'success');
+    loadRouting();
+  } catch (e) { toast('保存失败: ' + e.message, 'error'); }
+}
+
+async function clearCandidateCooling() {
+  try {
+    await api('POST', '/routing/update', { clearCooling: true });
+    toast('已解除全部候选冷却', 'success');
+    loadRouting();
+  } catch (e) { toast('操作失败: ' + e.message, 'error'); }
+}
+
+async function clearCandidatePermanent() {
+  if (!confirm('确认清空永久剔除列表？之前被判死的候选会重新参与候选链。')) return;
+  try {
+    await api('POST', '/routing/update', { clearPermanent: true });
+    toast('已清空永久剔除', 'success');
+    loadRouting();
+  } catch (e) { toast('操作失败: ' + e.message, 'error'); }
 }
 
 async function delProvider(n) {

@@ -75,6 +75,7 @@ func handleChainedChatAs(w http.ResponseWriter, r *http.Request, params map[stri
 			class, reason := classifyCandidateFailure(status, body)
 			lastErr, lastStatus = err, upstreamErrorStatus(err)
 			applyCandidateFailure(cand, class, reason, body)
+			recordUsageForCandidate(cand, false)
 			log.Printf("  chain: %s 失败(%s), 换下一站: %v", cand.String(), class, err)
 			continue
 		}
@@ -89,12 +90,14 @@ func handleChainedChatAs(w http.ResponseWriter, r *http.Request, params map[stri
 					lastErr = fmt.Errorf("%s: reading response: %v", cand.String(), rerr)
 					lastStatus = http.StatusBadGateway
 					markCandidateCooldown(cand.Upstream, cand.Model, classTimeout, "读取响应失败")
+					recordUsageForCandidate(cand, false)
 					continue
 				}
 				if !chatBodyHasContent(body) {
 					lastErr = fmt.Errorf("%s: HTTP 200 with no usable content", cand.String())
 					lastStatus = http.StatusBadGateway
 					markCandidateCooldown(cand.Upstream, cand.Model, classEmpty, "200 但无内容")
+					recordUsageForCandidate(cand, false)
 					log.Printf("  chain: %s 返回 200 但无内容, 换下一站", cand.String())
 					continue
 				}
@@ -108,6 +111,7 @@ func handleChainedChatAs(w http.ResponseWriter, r *http.Request, params map[stri
 				setRouteHeader(w, chainUpstreamLabel(cand), model, chainFailoverHeader)
 				writeChainNonStream(w, body, tgt, tracker)
 				tracker.finish(true, http.StatusOK)
+				recordUsageForCandidate(cand, true)
 				logChainResult(cand, tried, skipped)
 				return
 			}
@@ -134,6 +138,7 @@ func handleChainedChatAs(w http.ResponseWriter, r *http.Request, params map[stri
 				handleStreamResponseWithUsage(w, resp, tracker.observeUsage)
 			}
 			tracker.finish(resp.StatusCode < 400, resp.StatusCode)
+			recordUsageForCandidate(cand, true)
 			logChainResult(cand, tried, skipped)
 			return
 		}
@@ -146,6 +151,7 @@ func handleChainedChatAs(w http.ResponseWriter, r *http.Request, params map[stri
 
 		class, reason := classifyCandidateFailure(resp.StatusCode, body)
 		applyCandidateFailure(cand, class, reason, body)
+		recordUsageForCandidate(cand, false)
 		log.Printf("  chain: %s HTTP %d(%s), 换下一站", cand.String(), resp.StatusCode, class)
 	}
 
@@ -224,6 +230,12 @@ func quotaDayExhausted(body []byte) bool {
 //   - quotaDay : 当日免费额度耗尽 -> 冷却到提供方时区的日界;
 //   - 其余类别 : 按配置或默认时长冷却。
 func applyCandidateFailure(cand routeCandidate, class, reason string, body []byte) {
+	key := candidateKey(cand.Upstream, cand.Model)
+	// Gemini 的回包里带了"每日限额"就回填账本: 之后到量即跳过,
+	// 不必等到真的撞一次 429 才知道用完。
+	if qf := parseQuotaFailure(jsonObject(body)); qf != nil && qf.DailyRequestLimit != nil {
+		autoFillDailyLimit(key, *qf.DailyRequestLimit)
+	}
 	switch {
 	case class == classPermanent:
 		markCandidatePermanent(cand.Upstream, cand.Model, reason)

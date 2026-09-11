@@ -76,6 +76,8 @@ func StartProxy(host string, port int) error {
 	startZenModelsRefresher()
 	startProviderRefresher()
 	startHeadersAutoSync()
+	startUsageLedger()
+	startDiscovery()
 	initRegionModels()
 	startNodeHealthLoop()
 	syncNodeBox()
