@@ -498,7 +498,7 @@ import (
 	"strings"
 )
 
-// 注: catalogModel 结构体已由 Task 1 在 providers_config.go 中声明, 此处不要重复声明。
+// 注: catalogModel 结构体声明在 providers_config.go, 此处不要重复声明。
 
 // isZeroCost 明确标价 0 的模型。
 func isZeroCost(m *catalogModel) bool {
@@ -1367,8 +1367,8 @@ import (
 // skipThoughtSignature Google 文档化的跳过哨兵: 历史未经过本进程时使用。
 const skipThoughtSignature = "skip_thought_signature_validator"
 
-// 注: thoughtSignatureCache 结构体与 newThoughtSignatureCache 已由 Task 1 在
-// providers_config.go 中声明, 本文件只实现其方法, 不要重复声明类型。
+// 注: thoughtSignatureCache 结构体与 newThoughtSignatureCache 声明在
+// providers_config.go, 本文件只实现其方法, 不要重复声明类型。
 
 func (c *thoughtSignatureCache) remember(id, sig string) {
 	id = strings.TrimSpace(id)
@@ -1498,6 +1498,29 @@ func injectThoughtSignatures(body map[string]any, cache *thoughtSignatureCache) 
 				sig = skipThoughtSignature
 			}
 			writeThoughtSignature(call, sig)
+		}
+	}
+}
+
+// markAllSignaturesSkipped 把历史工具调用的签名统一替换为跳过哨兵,
+// 用于上游拒绝了缓存签名后的重放。
+func markAllSignaturesSkipped(body map[string]any) {
+	if body == nil {
+		return
+	}
+	messages, _ := body["messages"].([]any)
+	for _, m := range messages {
+		msg, _ := m.(map[string]any)
+		if msg == nil || msg["role"] != "assistant" {
+			continue
+		}
+		calls, _ := msg["tool_calls"].([]any)
+		for _, cc := range calls {
+			call, _ := cc.(map[string]any)
+			if call == nil {
+				continue
+			}
+			writeThoughtSignature(call, skipThoughtSignature)
 		}
 	}
 }
@@ -1867,7 +1890,11 @@ func parseQuotaFailure(payload map[string]any) *geminiQuotaFailure {
 		Limit  int
 	}
 	for _, m := range quotaLineRe.FindAllStringSubmatch(message, -1) {
-		limit, _ := strconv.Atoi(m[2])
+		limit, err := strconv.Atoi(m[2])
+		if err != nil {
+			// 解析失败就跳过这条指标: 归零会被下游读成"该模型无免费层"(永久剔除)。
+			continue
+		}
 		parsed = append(parsed, struct {
 			Metric string
 			Limit  int
@@ -1895,7 +1922,10 @@ func parseQuotaFailure(payload map[string]any) *geminiQuotaFailure {
 		}
 		if strings.HasSuffix(probe.Type, "QuotaFailure") {
 			for _, v := range probe.Violations {
-				violationsByMetric[v.QuotaMetric] = append(violationsByMetric[v.QuotaMetric], v.QuotaID)
+				// 两侧都去空白, 否则 message 与 quotaMetric 的键名对不上,
+				// aligned 落假, 每日限额会被静默丢弃。
+				metric := strings.TrimSpace(v.QuotaMetric)
+				violationsByMetric[metric] = append(violationsByMetric[metric], v.QuotaID)
 			}
 			continue
 		}
@@ -2398,47 +2428,66 @@ func (p *modelProvider) Chat(ctx context.Context, params map[string]any, stream 
 	if needsSig {
 		injectThoughtSignatures(params, p.sigCache)
 	}
-	payload, err := json.Marshal(params)
-	if err != nil {
-		return nil, fmt.Errorf("marshal provider body: %w", err)
-	}
-	u := strings.TrimRight(cfg.BaseURL, "/") + cfg.chatPath()
-	req, err := http.NewRequestWithContext(ctx, "POST", u, bytes.NewReader(payload))
-	if err != nil {
-		return nil, err
-	}
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Authorization", "Bearer "+cfg.APIKey)
-	origin := localOrigin()
-	for k, spec := range cfg.Headers {
-		if v := cfg.resolveHeader(spec, origin); v != "" {
-			req.Header.Set(k, v)
-		}
-	}
-
 	client := providerDirectClient
 	if providerUsesProxiedClient(p) {
 		client = providerProxiedClient
 	}
 	if !stream {
-		ctx, cancel := context.WithTimeout(ctx, providerAttemptTimeout)
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, providerAttemptTimeout)
 		defer cancel()
-		req = req.WithContext(ctx)
 	}
 
-	resp, err := client.Do(req)
-	if err != nil {
-		return nil, err
+	// Gemini 会拒绝缓存里失效的签名(400)。此时用跳过哨兵重放一次,
+	// 否则同一段会话会一直失败到该缓存项被淘汰为止。
+	attempts := 1
+	if needsSig {
+		attempts = 2
 	}
-	if resp.StatusCode != http.StatusOK {
+	for attempt := 1; attempt <= attempts; attempt++ {
+		payload, err := json.Marshal(params)
+		if err != nil {
+			return nil, fmt.Errorf("marshal provider body: %w", err)
+		}
+		u := strings.TrimRight(cfg.BaseURL, "/") + cfg.chatPath()
+		req, err := http.NewRequestWithContext(ctx, "POST", u, bytes.NewReader(payload))
+		if err != nil {
+			return nil, err
+		}
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("Authorization", "Bearer "+cfg.APIKey)
+		origin := localOrigin()
+		for k, spec := range cfg.Headers {
+			if v := cfg.resolveHeader(spec, origin); v != "" {
+				req.Header.Set(k, v)
+			}
+		}
+
+		resp, err := client.Do(req)
+		if err != nil {
+			return nil, err
+		}
+		if resp.StatusCode == http.StatusOK {
+			return p.finishResponse(resp, stream, needsSig)
+		}
 		body, _ := io.ReadAll(io.LimitReader(resp.Body, 64<<10))
 		resp.Body.Close()
+		if needsSig && attempt < attempts && isMissingThoughtSignatureError(resp.StatusCode, string(body)) {
+			log.Printf("  providers: %s rejected a thought-signature, replaying with the skip sentinel", p.name)
+			markAllSignaturesSkipped(params)
+			continue
+		}
 		p.recordRejection(model, resp.StatusCode, body)
 		return nil, &providerError{Provider: p.name, Status: resp.StatusCode, Body: string(body)}
 	}
+	return nil, fmt.Errorf("provider %s: no attempt completed", p.name)
+}
+
+// finishResponse 收尾成功响应: 非流式必须在超时上下文内读完整个响应体,
+// 流式则为 Gemini 挂上签名提取。
+func (p *modelProvider) finishResponse(resp *http.Response, stream, needsSig bool) (*http.Response, error) {
 	if !stream {
-		// 非流式: 必须在超时上下文内读完整个响应体再返回。
-		// 返回即触发上面的 defer cancel, 而请求上下文控制整个响应生命周期,
+		// 返回即触发调用方的 defer cancel, 而请求上下文控制整个响应生命周期,
 		// 未读完的 body 会被 "context canceled" 提前截断(客户端表现为 500 parse_error)。
 		body, readErr := io.ReadAll(io.LimitReader(resp.Body, providerResponseMaxBytes+1))
 		resp.Body.Close()
@@ -2513,7 +2562,9 @@ func handleProviderChat(w http.ResponseWriter, r *http.Request, params map[strin
 	// 否则该 provider 会一直 400 到后台刷新跑完为止。
 	if cfg.Catalog {
 		p.mu.Lock()
-		need := len(p.catalog) == 0 && p.catalogErr == ""
+		// 只按目录是否为空判断: 一次失败的刷新会写入 catalogErr,
+		// 若把它也算作"已尝试过", 该 provider 会一直 400 到下一个后台周期。
+		need := len(p.catalog) == 0
 		p.mu.Unlock()
 		if need {
 			ctx, cancel := context.WithTimeout(r.Context(), providerCatalogTimeout)
@@ -3025,7 +3076,7 @@ git commit -m "feat: expose provider configuration through the admin api"
 let pvData = {};
 async function loadProviders() {
   try {
-    const d = await api('GET', '/admin/api/providers');
+    const d = await api('GET', '/providers');
     pvData = (d.data && d.data.providers) || {};
     const names = Object.keys(pvData);
     if (!names.length) {
@@ -3044,8 +3095,8 @@ async function loadProviders() {
         '<span style="flex:none;min-width:92px;font-family:monospace;color:var(--text3)">' + esc(n) + '</span>' +
         '<span style="flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">' + esc(p.baseUrl || '') + '</span>' +
         '<span style="flex:none;font-size:11px;color:var(--text3)">' + st + '</span>' +
-        '<button type="button" class="btn" style="padding:2px 8px;font-size:11px" onclick="editProvider(\'' + esc(n) + '\')">编辑</button>' +
-        '<button type="button" class="btn" style="padding:2px 8px;font-size:11px;color:#f87171" onclick="delProvider(\'' + esc(n) + '\')">删除</button></div>';
+        '<button type="button" class="btn" style="padding:2px 8px;font-size:11px" onclick="editProvider(\'' + esc(n).replace(/\'/g, "\\\\'") + '\')">编辑</button>' +
+        '<button type="button" class="btn" style="padding:2px 8px;font-size:11px;color:#f87171" onclick="delProvider(\'' + esc(n).replace(/\'/g, "\\\\'") + '\')">删除</button></div>';
     }).join('');
   } catch (e) { _('pvList').textContent = '加载失败: ' + e.message; }
 }
@@ -3080,12 +3131,12 @@ async function saveProvider() {
       freeModels: _('pvFree').value.split('\n').map(s => s.trim()).filter(Boolean),
     }),
   };
-  try { await api('POST', '/admin/api/providers/update', body); toast('已保存 ' + name, 'success'); loadProviders(); }
+  try { await api('POST', '/providers/update', body); toast('已保存 ' + name, 'success'); loadProviders(); }
   catch (e) { toast('保存失败: ' + e.message, 'error'); }
 }
 async function delProvider(n) {
   if (!confirm('确认删除 provider ' + n + '?')) return;
-  try { await api('POST', '/admin/api/providers/update', { name: n, remove: true }); toast('已删除 ' + n, 'success'); loadProviders(); }
+  try { await api('POST', '/providers/update', { name: n, remove: true }); toast('已删除 ' + n, 'success'); loadProviders(); }
   catch (e) { toast('删除失败: ' + e.message, 'error'); }
 }
 async function testProvider() {
@@ -3093,7 +3144,7 @@ async function testProvider() {
   if (!name) { toast('请先填写 Provider 名', 'error'); return; }
   toast('连通测试中...', 'success');
   try {
-    const d = await api('POST', '/admin/api/providers/test', { name, model: _('pvTestModel').value.trim() });
+    const d = await api('POST', '/providers/test', { name, model: _('pvTestModel').value.trim() });
     const r = (d.data) || {};
     const detail = r.error ? String(r.error).slice(0, 160) : String(r.body || '').slice(0, 160);
     toast('HTTP ' + (r.status || '?') + ' · ' + detail, r.status === 200 ? 'success' : 'error');
@@ -3102,7 +3153,7 @@ async function testProvider() {
 async function refreshProviderCatalog() {
   const name = _('pvName').value.trim();
   try {
-    await api('POST', '/admin/api/providers/refresh', name ? { name } : {});
+    await api('POST', '/providers/refresh', name ? { name } : {});
     toast('目录刷新已启动', 'success');
     setTimeout(loadProviders, 3000);
     setTimeout(loadProviders, 12000);

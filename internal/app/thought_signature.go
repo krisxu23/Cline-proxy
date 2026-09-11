@@ -9,8 +9,8 @@ import (
 // skipThoughtSignature Google 文档化的跳过哨兵: 历史未经过本进程时使用。
 const skipThoughtSignature = "skip_thought_signature_validator"
 
-// 注: thoughtSignatureCache 结构体与 newThoughtSignatureCache 已由 Task 1 在
-// providers_config.go 中声明, 本文件只实现其方法, 不要重复声明类型。
+// 注: thoughtSignatureCache 结构体与 newThoughtSignatureCache 声明在
+// providers_config.go, 本文件只实现其方法, 不要重复声明类型。
 
 func (c *thoughtSignatureCache) remember(id, sig string) {
 	id = strings.TrimSpace(id)
@@ -140,6 +140,29 @@ func injectThoughtSignatures(body map[string]any, cache *thoughtSignatureCache) 
 				sig = skipThoughtSignature
 			}
 			writeThoughtSignature(call, sig)
+		}
+	}
+}
+
+// markAllSignaturesSkipped 把历史工具调用的签名统一替换为跳过哨兵,
+// 用于上游拒绝了缓存签名后的重放。
+func markAllSignaturesSkipped(body map[string]any) {
+	if body == nil {
+		return
+	}
+	messages, _ := body["messages"].([]any)
+	for _, m := range messages {
+		msg, _ := m.(map[string]any)
+		if msg == nil || msg["role"] != "assistant" {
+			continue
+		}
+		calls, _ := msg["tool_calls"].([]any)
+		for _, cc := range calls {
+			call, _ := cc.(map[string]any)
+			if call == nil {
+				continue
+			}
+			writeThoughtSignature(call, skipThoughtSignature)
 		}
 	}
 }

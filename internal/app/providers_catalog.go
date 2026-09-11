@@ -17,7 +17,7 @@ import (
 	"cline-go-proxy/internal/kit"
 )
 
-// 注: catalogModel 结构体已由 Task 1 在 providers_config.go 中声明, 此处不要重复声明。
+// 注: catalogModel 结构体声明在 providers_config.go, 此处不要重复声明。
 
 // isZeroCost 明确标价 0 的模型。
 func isZeroCost(m *catalogModel) bool {

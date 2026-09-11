@@ -63,7 +63,11 @@ func parseQuotaFailure(payload map[string]any) *geminiQuotaFailure {
 		Limit  int
 	}
 	for _, m := range quotaLineRe.FindAllStringSubmatch(message, -1) {
-		limit, _ := strconv.Atoi(m[2])
+		limit, err := strconv.Atoi(m[2])
+		if err != nil {
+			// 解析失败就跳过这条指标: 归零会被下游读成"该模型无免费层"(永久剔除)。
+			continue
+		}
 		parsed = append(parsed, struct {
 			Metric string
 			Limit  int
@@ -91,7 +95,10 @@ func parseQuotaFailure(payload map[string]any) *geminiQuotaFailure {
 		}
 		if strings.HasSuffix(probe.Type, "QuotaFailure") {
 			for _, v := range probe.Violations {
-				violationsByMetric[v.QuotaMetric] = append(violationsByMetric[v.QuotaMetric], v.QuotaID)
+				// 两侧都去空白, 否则 message 与 quotaMetric 的键名对不上,
+				// aligned 落假, 每日限额会被静默丢弃。
+				metric := strings.TrimSpace(v.QuotaMetric)
+				violationsByMetric[metric] = append(violationsByMetric[metric], v.QuotaID)
 			}
 			continue
 		}

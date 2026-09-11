@@ -1280,7 +1280,7 @@ async function saveOcConfig() {
 let pvData = {};
 async function loadProviders() {
   try {
-    const d = await api('GET', '/admin/api/providers');
+    const d = await api('GET', '/providers');
     pvData = (d.data && d.data.providers) || {};
     const names = Object.keys(pvData);
     if (!names.length) {
@@ -1299,8 +1299,8 @@ async function loadProviders() {
         '<span style="flex:none;min-width:92px;font-family:monospace;color:var(--text3)">' + esc(n) + '</span>' +
         '<span style="flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">' + esc(p.baseUrl || '') + '</span>' +
         '<span style="flex:none;font-size:11px;color:var(--text3)">' + st + '</span>' +
-        '<button type="button" class="btn" style="padding:2px 8px;font-size:11px" onclick="editProvider(\'' + esc(n) + '\')">编辑</button>' +
-        '<button type="button" class="btn" style="padding:2px 8px;font-size:11px;color:#f87171" onclick="delProvider(\'' + esc(n) + '\')">删除</button></div>';
+        '<button type="button" class="btn" style="padding:2px 8px;font-size:11px" onclick="editProvider(\'' + esc(n).replace(/'/g, "\\'") + '\')">编辑</button>' +
+        '<button type="button" class="btn" style="padding:2px 8px;font-size:11px;color:#f87171" onclick="delProvider(\'' + esc(n).replace(/'/g, "\\'") + '\')">删除</button></div>';
     }).join('');
   } catch (e) { _('pvList').textContent = '加载失败: ' + e.message; }
 }
@@ -1335,12 +1335,12 @@ async function saveProvider() {
       freeModels: _('pvFree').value.split('\n').map(s => s.trim()).filter(Boolean),
     }),
   };
-  try { await api('POST', '/admin/api/providers/update', body); toast('已保存 ' + name, 'success'); loadProviders(); }
+  try { await api('POST', '/providers/update', body); toast('已保存 ' + name, 'success'); loadProviders(); }
   catch (e) { toast('保存失败: ' + e.message, 'error'); }
 }
 async function delProvider(n) {
   if (!confirm('确认删除 provider ' + n + '?')) return;
-  try { await api('POST', '/admin/api/providers/update', { name: n, remove: true }); toast('已删除 ' + n, 'success'); loadProviders(); }
+  try { await api('POST', '/providers/update', { name: n, remove: true }); toast('已删除 ' + n, 'success'); loadProviders(); }
   catch (e) { toast('删除失败: ' + e.message, 'error'); }
 }
 async function testProvider() {
@@ -1348,7 +1348,7 @@ async function testProvider() {
   if (!name) { toast('请先填写 Provider 名', 'error'); return; }
   toast('连通测试中...', 'success');
   try {
-    const d = await api('POST', '/admin/api/providers/test', { name, model: _('pvTestModel').value.trim() });
+    const d = await api('POST', '/providers/test', { name, model: _('pvTestModel').value.trim() });
     const r = (d.data) || {};
     const detail = r.error ? String(r.error).slice(0, 160) : String(r.body || '').slice(0, 160);
     toast('HTTP ' + (r.status || '?') + ' · ' + detail, r.status === 200 ? 'success' : 'error');
@@ -1357,7 +1357,7 @@ async function testProvider() {
 async function refreshProviderCatalog() {
   const name = _('pvName').value.trim();
   try {
-    await api('POST', '/admin/api/providers/refresh', name ? { name } : {});
+    await api('POST', '/providers/refresh', name ? { name } : {});
     toast('目录刷新已启动', 'success');
     setTimeout(loadProviders, 3000);
     setTimeout(loadProviders, 12000);

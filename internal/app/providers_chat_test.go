@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 )
 
@@ -283,6 +284,71 @@ func TestHandleProviderChatRefreshesCatalogBeforeGate(t *testing.T) {
 	}
 	if len(p.catalog) == 0 {
 		t.Fatal("catalog should be populated by the first request")
+	}
+}
+
+func TestProviderChatReplaysOnRejectedSignature(t *testing.T) {
+	var mu sync.Mutex
+	requests := 0
+	var secondBody map[string]any
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		mu.Lock()
+		requests++
+		n := requests
+		if n >= 2 {
+			var parsed map[string]any
+			if json.Unmarshal(body, &parsed) == nil {
+				secondBody = parsed
+			}
+		}
+		mu.Unlock()
+		if n == 1 {
+			w.WriteHeader(http.StatusBadRequest)
+			w.Write([]byte(`{"error":{"message":"missing thought_signature for tool call"}}`))
+			return
+		}
+		w.Write([]byte(`{"choices":[]}`))
+	}))
+	defer srv.Close()
+
+	setTestProvider(t, "gemini", providerConfig{BaseURL: srv.URL, APIKey: "gk", FreeModels: []string{"g1"}})
+	p := providerByName("gemini")
+	params := map[string]any{
+		"model": "g1",
+		"messages": []any{
+			map[string]any{"role": "user", "content": "hi"},
+			map[string]any{"role": "assistant", "tool_calls": []any{
+				map[string]any{"id": "c1", "type": "function", "function": map[string]any{"name": "f", "arguments": "{}"}},
+			}},
+		},
+	}
+	resp, err := p.Chat(context.Background(), params, false)
+	if err != nil {
+		t.Fatalf("rejected signature must be replayed, got error: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status: %d", resp.StatusCode)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if requests != 2 {
+		t.Fatalf("stub must see exactly two requests, got %d", requests)
+	}
+	if secondBody == nil {
+		t.Fatal("second request body was not captured")
+	}
+	msgs, _ := secondBody["messages"].([]any)
+	if len(msgs) != 2 {
+		t.Fatalf("second request messages: %+v", msgs)
+	}
+	calls, _ := msgs[1].(map[string]any)["tool_calls"].([]any)
+	if len(calls) != 1 {
+		t.Fatalf("second request tool calls: %+v", calls)
+	}
+	if got := readThoughtSignature(calls[0].(map[string]any)); got != skipThoughtSignature {
+		t.Fatalf("replay must carry the skip sentinel: %q", got)
 	}
 }
 

@@ -123,47 +123,66 @@ func (p *modelProvider) Chat(ctx context.Context, params map[string]any, stream 
 	if needsSig {
 		injectThoughtSignatures(params, p.sigCache)
 	}
-	payload, err := json.Marshal(params)
-	if err != nil {
-		return nil, fmt.Errorf("marshal provider body: %w", err)
-	}
-	u := strings.TrimRight(cfg.BaseURL, "/") + cfg.chatPath()
-	req, err := http.NewRequestWithContext(ctx, "POST", u, bytes.NewReader(payload))
-	if err != nil {
-		return nil, err
-	}
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Authorization", "Bearer "+cfg.APIKey)
-	origin := localOrigin()
-	for k, spec := range cfg.Headers {
-		if v := cfg.resolveHeader(spec, origin); v != "" {
-			req.Header.Set(k, v)
-		}
-	}
-
 	client := providerDirectClient
 	if providerUsesProxiedClient(p) {
 		client = providerProxiedClient
 	}
 	if !stream {
-		ctx, cancel := context.WithTimeout(ctx, providerAttemptTimeout)
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, providerAttemptTimeout)
 		defer cancel()
-		req = req.WithContext(ctx)
 	}
 
-	resp, err := client.Do(req)
-	if err != nil {
-		return nil, err
+	// Gemini 会拒绝缓存里失效的签名(400)。此时用跳过哨兵重放一次,
+	// 否则同一段会话会一直失败到该缓存项被淘汰为止。
+	attempts := 1
+	if needsSig {
+		attempts = 2
 	}
-	if resp.StatusCode != http.StatusOK {
+	for attempt := 1; attempt <= attempts; attempt++ {
+		payload, err := json.Marshal(params)
+		if err != nil {
+			return nil, fmt.Errorf("marshal provider body: %w", err)
+		}
+		u := strings.TrimRight(cfg.BaseURL, "/") + cfg.chatPath()
+		req, err := http.NewRequestWithContext(ctx, "POST", u, bytes.NewReader(payload))
+		if err != nil {
+			return nil, err
+		}
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("Authorization", "Bearer "+cfg.APIKey)
+		origin := localOrigin()
+		for k, spec := range cfg.Headers {
+			if v := cfg.resolveHeader(spec, origin); v != "" {
+				req.Header.Set(k, v)
+			}
+		}
+
+		resp, err := client.Do(req)
+		if err != nil {
+			return nil, err
+		}
+		if resp.StatusCode == http.StatusOK {
+			return p.finishResponse(resp, stream, needsSig)
+		}
 		body, _ := io.ReadAll(io.LimitReader(resp.Body, 64<<10))
 		resp.Body.Close()
+		if needsSig && attempt < attempts && isMissingThoughtSignatureError(resp.StatusCode, string(body)) {
+			log.Printf("  providers: %s rejected a thought-signature, replaying with the skip sentinel", p.name)
+			markAllSignaturesSkipped(params)
+			continue
+		}
 		p.recordRejection(model, resp.StatusCode, body)
 		return nil, &providerError{Provider: p.name, Status: resp.StatusCode, Body: string(body)}
 	}
+	return nil, fmt.Errorf("provider %s: no attempt completed", p.name)
+}
+
+// finishResponse 收尾成功响应: 非流式必须在超时上下文内读完整个响应体,
+// 流式则为 Gemini 挂上签名提取。
+func (p *modelProvider) finishResponse(resp *http.Response, stream, needsSig bool) (*http.Response, error) {
 	if !stream {
-		// 非流式: 必须在超时上下文内读完整个响应体再返回。
-		// 返回即触发上面的 defer cancel, 而请求上下文控制整个响应生命周期,
+		// 返回即触发调用方的 defer cancel, 而请求上下文控制整个响应生命周期,
 		// 未读完的 body 会被 "context canceled" 提前截断(客户端表现为 500 parse_error)。
 		body, readErr := io.ReadAll(io.LimitReader(resp.Body, providerResponseMaxBytes+1))
 		resp.Body.Close()
@@ -238,7 +257,9 @@ func handleProviderChat(w http.ResponseWriter, r *http.Request, params map[strin
 	// 否则该 provider 会一直 400 到后台刷新跑完为止。
 	if cfg.Catalog {
 		p.mu.Lock()
-		need := len(p.catalog) == 0 && p.catalogErr == ""
+		// 只按目录是否为空判断: 一次失败的刷新会写入 catalogErr,
+		// 若把它也算作"已尝试过", 该 provider 会一直 400 到下一个后台周期。
+		need := len(p.catalog) == 0
 		p.mu.Unlock()
 		if need {
 			ctx, cancel := context.WithTimeout(r.Context(), providerCatalogTimeout)
