@@ -132,6 +132,10 @@ const (
 	providerCatalogMaxPages = 10
 	providerCatalogPageSize = "1000"
 	providerCatalogTimeout  = 90 * time.Second
+	// providerCatalogExitRetries 目录抓取的换出口重试预算。
+	// 节点池里对某个上游不通的节点可能不止一个, 目录刷新又是低频操作,
+	// 预算比对话路径(2)放宽到 4, 尽量把节点池走完一圈。
+	providerCatalogExitRetries = 4
 )
 
 // catalogPage 一次目录响应的归一化结果。
@@ -340,9 +344,11 @@ func (p *modelProvider) fetchCatalogPages(ctx context.Context, cfg providerConfi
 }
 
 // retryCatalogOnNextExit 目录抓取的换出口判定。网络错误或出口地区被拒时,
-// 冷却当前出口并返回 true 让调用方重试; 重试预算用尽返回 false。
+// 冷却当前出口并返回 true 让调用方重试; 预算用尽返回 false。
+// 预算比对话路径宽(4 次): 目录刷新是低频操作, 多走几个节点的代价可忽略,
+// 而节点池里"对这个上游不通"的节点往往不止一个。
 func (p *modelProvider) retryCatalogOnNextExit(ctx context.Context, cfg providerConfig, rawURL string, err error) bool {
-	if p.catalogExitRetries >= providerExitRetries {
+	if p.catalogExitRetries >= providerCatalogExitRetries {
 		return false
 	}
 	status, body := 0, []byte(nil)

@@ -822,18 +822,12 @@ function toast(msg, t, duration) {
 }
 
 // ========== 导航 ==========
+// 统一委托给 switchTab: 此前这里内联了一份面板切换逻辑且漏了 router 分支,
+// 导致点「自动路由」只切了面板、loadRouter 永远不执行, 页面一直停在"加载中"。
 document.querySelectorAll('.nav-item').forEach(el => {
   el.addEventListener('click', () => {
     if (el.classList.contains('active')) return;
-    document.querySelectorAll('.nav-item').forEach(e => e.classList.remove('active'));
-    el.classList.add('active');
-    document.querySelectorAll('.tab-panel').forEach(e => e.style.display = 'none');
-    _('tab-' + el.dataset.tab).style.display = 'block';
-    if (el.dataset.tab === 'dashboard') { loadStats(); loadOcStats(); loadConfig(); loadOcConfig(); }
-    if (el.dataset.tab === 'accounts') { loadAccounts(); loadConfig(); }
-    if (el.dataset.tab === 'models') { loadModels(); loadOcModels(); loadProviders(); }
-    if (el.dataset.tab === 'settings') { loadKeys(); loadConfig(); loadOcConfig(); loadOcNodes(); loadProviders(); }
-    if (el.dataset.tab === 'logs') loadLogs();
+    switchTab(el.dataset.tab);
   });
 });
 

@@ -52,9 +52,9 @@ func TestRetryCatalogOnNextExit(t *testing.T) {
 
 	t.Run("重试预算用尽后不再换", func(t *testing.T) {
 		p := newProvider()
-		for i := 0; i < providerExitRetries; i++ {
+		for i := 0; i < providerCatalogExitRetries; i++ {
 			if !p.retryCatalogOnNextExit(t.Context(), providerConfig{}, "https://x/models", errConnReset) {
-				t.Fatalf("rotation %d/%d must be allowed", i+1, providerExitRetries)
+				t.Fatalf("rotation %d/%d must be allowed", i+1, providerCatalogExitRetries)
 			}
 		}
 		if p.retryCatalogOnNextExit(t.Context(), providerConfig{}, "https://x/models", errConnReset) {
