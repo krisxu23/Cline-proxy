@@ -18,6 +18,7 @@
 - 现有测试（`./internal/app/`）必须全部保持通过。
 - 配置与运行时数据一律经 `kit.ResolveDataPath(...)` 落到 data 目录。
 - `.zen-config.json` 的 `providers` 是一个 map，且会被 admin 保存路径就地写入；读取它**只能**经 `providerConfigFor(name)`（锁内），直接读 `getZenConfig().Providers[...]` 会与写入并发触发 Go 不可恢复的 `concurrent map read and map write`。
+- provider 运行时状态里的 map（`catalog` / `slugs` / `rejected`）一律"锁内整体替换"，不得在锁内就地增删：`isFree` 与 `freeModelIDs` 只在锁内取 map 头部、解锁后才读取其**内容**，就地写入会与之并发触发同一个 fatal 的 map 读写竞争。
 - commit 信息只描述最终状态，不写"修复了 X"式叙述。
 - 工作目录：`D:\deepseek\Cline-proxy`。
 
@@ -2417,8 +2418,15 @@ func (p *modelProvider) recordRejection(model string, status int, body []byte) {
 	if reason == "" || strings.TrimSpace(model) == "" {
 		return
 	}
+	// 写时复制: isFree/freeModelIDs 在解锁后读取该 map 的内容, 就地插入
+	// 会与之并发触发 fatal 的 map 读写竞争, 因此整体替换而不是原地增删。
 	p.mu.Lock()
-	p.rejected[model] = reason
+	next := make(map[string]string, len(p.rejected)+1)
+	for k, v := range p.rejected {
+		next[k] = v
+	}
+	next[model] = reason
+	p.rejected = next
 	p.mu.Unlock()
 }
 
