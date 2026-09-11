@@ -342,6 +342,56 @@ go test -tags "with_quic,with_grpc,with_utls" ./...    # 单元测试
 
 测试覆盖协议转换、provider 目录与免费判定、Gemini 签名与配额解析、路由与冷却逻辑。不带构建标签运行时，涉及节点出站的用例会因缺协议栈而失败——这是标签要求的一部分，不是测试本身的问题。
 
+## 在国内无代理推送
+
+GitHub 的 HTTPS 端口在大陆经常不可达，但 **SSH 端口是通的** —— GitHub 官方还在
+443 端口提供 SSH 服务，而这个端口就是 HTTPS 端口，几乎不会被封。配上 SSH key 后，
+拉取与推送都不再依赖代理软件。
+
+本仓库的 `origin` 已指向 SSH over 443：
+
+```bash
+git remote -v
+# origin  ssh://git@ssh.github.com:443/<user>/<repo>.git (fetch)
+# origin  ssh://git@ssh.github.com:443/<user>/<repo>.git (push)
+```
+
+一台新机器上的完整设置：
+
+```bash
+# 1. 生成 key（已有可跳过）
+ssh-keygen -t ed25519 -C "your@email"
+
+# 2. 公钥粘贴到 GitHub → Settings → SSH and GPG keys → New SSH key
+cat ~/.ssh/id_ed25519.pub
+
+# 3. 验证（应回显 Hi <用户名>! You've successfully authenticated）
+ssh -T -p 443 git@ssh.github.com
+
+# 4. 切换 remote（fetch 与 push 都要改）
+git remote set-url        origin ssh://git@ssh.github.com:443/<user>/<repo>.git
+git remote set-url --push origin ssh://git@ssh.github.com:443/<user>/<repo>.git
+```
+
+想一次覆盖本机所有仓库，加一条全局重写即可：
+
+```bash
+git config --global url."ssh://git@ssh.github.com:443/".insteadOf "https://github.com/"
+```
+
+### 两个容易踩的坑
+
+- `git remote set-url` **只改 fetch**。若这个 remote 之前单独设过 push URL，
+  必须再执行一次 `set-url --push`；否则 `git remote -v` 里 push 一行仍是
+  `https://github.com/...`，推送照样要代理。排查时先看这一行。
+- 拉取慢时可以读加速镜像（本仓库保留了一个只读的 `mirror` remote）：
+
+  ```bash
+  git fetch mirror     # 读走镜像，写仍走 SSH
+  ```
+
+  这类镜像（如 `github.boki.moe`）只代理只读流量的居多，推送以 SSH 为准。
+
 ## 致谢
 
 - [YuJunZhiXue/Cline-proxy](https://github.com/YuJunZhiXue/Cline-proxy) — 项目基座
