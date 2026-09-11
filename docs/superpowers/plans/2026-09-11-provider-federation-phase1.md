@@ -1027,27 +1027,30 @@ func (p *modelProvider) refreshCatalog(ctx context.Context, force bool) error {
 }
 
 // freeModelIDs 该 provider 的免费模型列表。
+// 候选统一经 evalProviderFree 过滤: 该列表会对外发布(providerModelList),
+// 必须与 isFree 的判定一致, 缺 key 或已永久剔除的模型不得出现。
 func (p *modelProvider) freeModelIDs() []catalogModel {
 	cfg, _ := providerConfigFor(p.name)
 	p.mu.Lock()
 	cat, slugs, rejected := p.catalog, p.slugs, p.rejected
 	p.mu.Unlock()
-	var out []catalogModel
+
+	var candidates []catalogModel
 	if cfg.Catalog && cfg.Pricing {
 		for _, m := range cat {
 			if isZeroCost(m) && isChatModel(m) {
-				out = append(out, *m)
+				candidates = append(candidates, *m)
 			}
 		}
 	} else {
 		for id := range cfg.freeSet() {
-			if _, bad := rejected[id]; bad {
-				continue
-			}
-			if cfg.Catalog && len(cat) > 0 && catalogLookup(cat, slugs, id) == nil {
-				continue
-			}
-			out = append(out, catalogModel{ID: id})
+			candidates = append(candidates, catalogModel{ID: id})
+		}
+	}
+	out := make([]catalogModel, 0, len(candidates))
+	for _, m := range candidates {
+		if evalProviderFree(cfg, cat, slugs, rejected, m.ID) {
+			out = append(out, m)
 		}
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].ID < out[j].ID })
@@ -1169,7 +1172,7 @@ var providerProxiedClient = &http.Client{
 - [ ] **Step 5: 运行测试确认通过**
 
 Run: `cd D:\deepseek\Cline-proxy; & "C:\Go\bin\go.exe" test ./internal/app/ -run 'TestNormalizeCatalogPayload|TestRefreshCatalog|TestProviderModelList' -v`
-Expected: PASS（6 个测试）
+Expected: PASS（7 个测试）
 
 - [ ] **Step 6: 提交**
 
