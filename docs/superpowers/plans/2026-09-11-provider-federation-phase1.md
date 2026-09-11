@@ -17,6 +17,7 @@
 - 不引入任何新的第三方依赖，保持单 exe 分发。
 - 现有测试（`./internal/app/`）必须全部保持通过。
 - 配置与运行时数据一律经 `kit.ResolveDataPath(...)` 落到 data 目录。
+- `.zen-config.json` 的 `providers` 是一个 map，且会被 admin 保存路径就地写入；读取它**只能**经 `providerConfigFor(name)`（锁内），直接读 `getZenConfig().Providers[...]` 会与写入并发触发 Go 不可恢复的 `concurrent map read and map write`。
 - commit 信息只描述最终状态，不写"修复了 X"式叙述。
 - 工作目录：`D:\deepseek\Cline-proxy`。
 
@@ -36,6 +37,7 @@
   - `type providerConfig struct{ BaseURL, APIKey string; Catalog, Pricing, ProbeFreeTier bool; ChatPath, ModelsPath, ModelsURL, ModelsKeyHeader string; Headers map[string]providerHeaderSpec; FreeModels []string }`
   - `func (c providerConfig) chatPath() string` / `modelsPath() string` / `freeSet() map[string]bool`
   - `func (c providerConfig) resolveHeader(spec providerHeaderSpec, origin string) string`
+  - `func providerConfigFor(name string) (providerConfig, bool)`（锁内单条读取，唯一允许的 `Providers` 读入口）
   - `func providerByName(name string) *modelProvider`（配置中不存在返回 nil）
   - `func providerNames() []string`（排序）
   - `func validateProviderConfig(name string, c providerConfig) error`
@@ -262,13 +264,22 @@ func newModelProvider(name string) *modelProvider {
 	}
 }
 
+// providerConfigFor 锁内读取单个 provider 配置; ok=false 表示未声明。
+// 必须经此入口读取: Providers 是 map, 与 mutateProvidersConfig 的写入并发时
+// 直接读取会触发 Go 不可恢复的 "concurrent map read and map write"。
+func providerConfigFor(name string) (providerConfig, bool) {
+	zenConfigMu.Lock()
+	defer zenConfigMu.Unlock()
+	if zenConfig == nil {
+		return providerConfig{}, false
+	}
+	pc, ok := zenConfig.Providers[name]
+	return pc, ok
+}
+
 // providerByName 按名取运行时状态; 配置中不存在则返回 nil。
 func providerByName(name string) *modelProvider {
-	cfg := getZenConfig()
-	if cfg == nil {
-		return nil
-	}
-	if _, ok := cfg.Providers[name]; !ok {
+	if _, ok := providerConfigFor(name); !ok {
 		return nil
 	}
 	providerRTMu.Lock()
@@ -283,14 +294,15 @@ func providerByName(name string) *modelProvider {
 
 // providerNames 配置中已声明的 provider 名(排序)。
 func providerNames() []string {
-	cfg := getZenConfig()
-	if cfg == nil {
-		return nil
+	zenConfigMu.Lock()
+	var names []string
+	if zenConfig != nil {
+		names = make([]string, 0, len(zenConfig.Providers))
+		for n := range zenConfig.Providers {
+			names = append(names, n)
+		}
 	}
-	names := make([]string, 0, len(cfg.Providers))
-	for n := range cfg.Providers {
-		names = append(names, n)
-	}
+	zenConfigMu.Unlock()
 	sort.Strings(names)
 	return names
 }
@@ -485,20 +497,7 @@ import (
 	"strings"
 )
 
-// catalogModel 归一化后的模型目录条目。
-type catalogModel struct {
-	ID               string
-	Name             string
-	Tokenizer        string
-	ChatCapable      *bool // 目录明确声明则优先
-	OutputModalities []string
-	ContextLength    int
-	MaxOutput        int
-	Created          int64
-	PricesKnown      bool
-	PromptPrice      float64
-	CompletionPrice  float64
-}
+// 注: catalogModel 结构体已由 Task 1 在 providers_config.go 中声明, 此处不要重复声明。
 
 // isZeroCost 明确标价 0 的模型。
 func isZeroCost(m *catalogModel) bool {
@@ -580,7 +579,7 @@ func evalProviderFree(cfg providerConfig, cat, slugs map[string]*catalogModel, r
 }
 
 func (p *modelProvider) isFree(modelID string) bool {
-	cfg := getZenConfig().Providers[p.name]
+	cfg, _ := providerConfigFor(p.name)
 	p.mu.Lock()
 	cat, slugs, rejected := p.catalog, p.slugs, p.rejected
 	p.mu.Unlock()
@@ -966,7 +965,7 @@ func (p *modelProvider) fetchCatalogPage(ctx context.Context, cfg providerConfig
 
 // refreshCatalog 拉取并重建目录; force 强制刷新, 否则受 15 分钟间隔限制。
 func (p *modelProvider) refreshCatalog(ctx context.Context, force bool) error {
-	cfg := getZenConfig().Providers[p.name]
+	cfg, _ := providerConfigFor(p.name)
 	if !cfg.Catalog {
 		return nil
 	}
@@ -1028,7 +1027,7 @@ func (p *modelProvider) refreshCatalog(ctx context.Context, force bool) error {
 
 // freeModelIDs 该 provider 的免费模型列表。
 func (p *modelProvider) freeModelIDs() []catalogModel {
-	cfg := getZenConfig().Providers[p.name]
+	cfg, _ := providerConfigFor(p.name)
 	p.mu.Lock()
 	cat, slugs, rejected := p.catalog, p.slugs, p.rejected
 	p.mu.Unlock()
@@ -1062,7 +1061,7 @@ func providerModelList() []map[string]any {
 		if p == nil {
 			continue
 		}
-		cfg := getZenConfig().Providers[name]
+		cfg, _ := providerConfigFor(name)
 		if cfg.APIKey == "" {
 			continue
 		}
@@ -1087,7 +1086,7 @@ func providerModelList() []map[string]any {
 func (p *modelProvider) catalogStatus() map[string]any {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	cfg := getZenConfig().Providers[p.name]
+	cfg, _ := providerConfigFor(p.name)
 	freeCount, chatCount := 0, 0
 	for _, m := range p.catalog {
 		if isZeroCost(m) {
@@ -1117,7 +1116,8 @@ func startProviderRefresher() {
 		for range t.C {
 			for _, name := range providerNames() {
 				p := providerByName(name)
-				if p == nil || !getZenConfig().Providers[name].Catalog {
+				pc, ok := providerConfigFor(name)
+				if p == nil || !ok || !pc.Catalog {
 					continue
 				}
 				ctx, cancel := context.WithTimeout(context.Background(), providerCatalogTimeout)
@@ -1354,26 +1354,13 @@ import (
 	"encoding/json"
 	"regexp"
 	"strings"
-	"sync"
 )
 
 // skipThoughtSignature Google 文档化的跳过哨兵: 历史未经过本进程时使用。
 const skipThoughtSignature = "skip_thought_signature_validator"
 
-// thoughtSignatureCache 工具调用签名缓存(LRU)。
-type thoughtSignatureCache struct {
-	mu    sync.Mutex
-	m     map[string]string
-	order []string
-	max   int
-}
-
-func newThoughtSignatureCache(max int) *thoughtSignatureCache {
-	if max <= 0 {
-		max = 5000
-	}
-	return &thoughtSignatureCache{m: map[string]string{}, max: max}
-}
+// 注: thoughtSignatureCache 结构体与 newThoughtSignatureCache 已由 Task 1 在
+// providers_config.go 中声明, 本文件只实现其方法, 不要重复声明类型。
 
 func (c *thoughtSignatureCache) remember(id, sig string) {
 	id = strings.TrimSpace(id)
@@ -1522,7 +1509,7 @@ func providerNeedsThoughtSignatures(p *modelProvider) bool {
 	if p.name == "gemini" {
 		return true
 	}
-	cfg, ok := getZenConfig().Providers[p.name]
+	cfg, ok := providerConfigFor(p.name)
 	if !ok {
 		return false
 	}
@@ -1534,7 +1521,7 @@ func providerUsesProxiedClient(p *modelProvider) bool {
 	if p == nil {
 		return false
 	}
-	cfg, ok := getZenConfig().Providers[p.name]
+	cfg, ok := providerConfigFor(p.name)
 	if !ok {
 		return false
 	}
@@ -2344,7 +2331,7 @@ func (t *sseTapReader) Close() error {
 
 // Chat 转发 OpenAI 兼容请求到该 provider; 流式响应按 SSE 原样透传。
 func (p *modelProvider) Chat(ctx context.Context, params map[string]any, stream bool) (*http.Response, error) {
-	cfg := getZenConfig().Providers[p.name]
+	cfg, _ := providerConfigFor(p.name)
 	if cfg.APIKey == "" {
 		return nil, fmt.Errorf("provider %s is not configured", p.name)
 	}
@@ -2444,7 +2431,7 @@ func handleProviderChat(w http.ResponseWriter, r *http.Request, params map[strin
 		})
 		return
 	}
-	cfg := getZenConfig().Providers[name]
+	cfg, _ := providerConfigFor(name)
 	if cfg.APIKey == "" {
 		writeJSON(w, http.StatusServiceUnavailable, map[string]any{
 			"error": map[string]string{"message": fmt.Sprintf("provider %q has no api key", name), "type": "api_error"},
@@ -2692,7 +2679,7 @@ func handleProvidersConfig(w http.ResponseWriter, r *http.Request) {
 	}
 	providers := map[string]any{}
 	for _, name := range providerNames() {
-		cfg := getZenConfig().Providers[name]
+		cfg, _ := providerConfigFor(name)
 		p := providerByName(name)
 		runtime := map[string]any{"configured": cfg.APIKey != ""}
 		if p != nil {
@@ -2831,7 +2818,7 @@ func handleProvidersTest(w http.ResponseWriter, r *http.Request) {
 		writeAPI(w, http.StatusNotFound, apiResponse{Error: "unknown provider: " + req.Name})
 		return
 	}
-	cfg := getZenConfig().Providers[req.Name]
+	cfg, _ := providerConfigFor(req.Name)
 	if cfg.APIKey == "" {
 		writeAPI(w, http.StatusBadRequest, apiResponse{Error: "provider is not configured"})
 		return
