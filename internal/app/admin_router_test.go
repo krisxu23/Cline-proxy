@@ -57,8 +57,9 @@ func TestRouterSnapshotDetectsEveryProvider(t *testing.T) {
 		t.Fatalf("default alias must be %s, got %v", defaultAutoRouterAlias, d["alias"])
 	}
 	provs, _ := d["providers"].([]any)
-	if len(provs) != 3 {
-		t.Fatalf("all three providers must be detected, got %d", len(provs))
+	// 2 个内置上游(zen / cline) + 3 个通用 Provider
+	if len(provs) != 5 {
+		t.Fatalf("2 builtin upstreams + 3 providers must be detected, got %d", len(provs))
 	}
 
 	byName := map[string]map[string]any{}
@@ -68,6 +69,16 @@ func TestRouterSnapshotDetectsEveryProvider(t *testing.T) {
 	}
 	if byName["bai"] == nil || byName["nokey"] == nil || byName["gemini"] == nil {
 		t.Fatalf("providers missing: %v", byName)
+	}
+	// 内置上游必须被探测到: opencode(zen) 与 cline 账号池
+	if byName[upstreamZen] == nil || byName[upstreamCline] == nil {
+		t.Fatalf("builtin upstreams must be listed: %v", byName)
+	}
+	if byName[upstreamZen]["builtin"] != true || byName[upstreamCline]["builtin"] != true {
+		t.Fatal("zen and cline must be flagged as builtin")
+	}
+	if models, _ := byName[upstreamZen]["models"].([]any); len(models) == 0 {
+		t.Fatal("zen must list its free models")
 	}
 	if models, _ := byName["bai"]["models"].([]any); len(models) != 2 {
 		t.Fatalf("bai must list its 2 whitelist models, got %d", len(models))
@@ -88,6 +99,55 @@ func TestRouterSnapshotDetectsEveryProvider(t *testing.T) {
 	}
 	if !found {
 		t.Fatalf("unconfigured provider must be reported: %v", probs)
+	}
+}
+
+// 没保存过任何勾选时, 候选链表必须是空的 —— 不能把默认链或历史别名合成出来。
+func TestRouterSnapshotChainTableBlankBeforeFirstSave(t *testing.T) {
+	withTestConfig(t, &zenConfigData{
+		Providers: map[string]providerConfig{
+			"bai": {BaseURL: "https://api.b.ai/v1", APIKey: "sk-1",
+				FreeModels: []string{"glm-5.3-flash"}},
+		},
+	})
+	d := routerGet(t)
+	routes, _ := d["routes"].([]any)
+	if len(routes) != 0 {
+		t.Fatalf("chain table must be blank before the first save, got %v", routes)
+	}
+}
+
+// 保存后, 候选链表只列配置里真实存在的 routes 条目(含勾选的内置上游)。
+func TestRouterSnapshotChainTableListsSavedRoutes(t *testing.T) {
+	withTestConfig(t, &zenConfigData{
+		Providers: map[string]providerConfig{
+			"bai": {BaseURL: "https://api.b.ai/v1", APIKey: "sk-1",
+				FreeModels: []string{"glm-5.3-flash"}},
+		},
+	})
+	if code, data := routerPost(t, handleAdminRouterSave, "/admin/api/router/save",
+		`{"alias":"auto-router","providers":["zen","bai"],"models":["zen:mimo-v2.5-free","bai:glm-5.3-flash"]}`); code != http.StatusOK {
+		t.Fatalf("save status = %d (%v)", code, data)
+	}
+	d := routerGet(t)
+	routes, _ := d["routes"].([]any)
+	if len(routes) != 1 {
+		t.Fatalf("exactly the saved alias must be listed, got %v", routes)
+	}
+	r, _ := routes[0].(map[string]any)
+	if r["alias"] != defaultAutoRouterAlias {
+		t.Fatalf("alias mismatch: %v", r)
+	}
+	hops, _ := r["hops"].([]any)
+	if len(hops) != 2 {
+		t.Fatalf("both saved candidates must be listed: %v", hops)
+	}
+	// 历史别名没配置过就不能出现
+	for _, row := range routes {
+		rr, _ := row.(map[string]any)
+		if rr["alias"] == legacyFreeBestAlias {
+			t.Fatal("unconfigured legacy alias must not be synthesized")
+		}
 	}
 }
 

@@ -122,6 +122,8 @@ tbody tr:last-child td{border-bottom:none}
 
 /* ===== 表单 ===== */
 input,textarea,select{width:100%;padding:9px 13px;background:rgba(2,6,23,.4);border:1px solid var(--border);border-radius:var(--radius-sm);color:var(--text);font-size:13px;font-family:inherit;transition:.15s}
+/* 勾选框是原生小方块, 不吃上面的输入框宽度/背景 —— 否则会被拉满整行变成一大片灰 */
+input[type=checkbox],input[type=radio]{appearance:auto;-webkit-appearance:checkbox;width:15px;height:15px;min-width:0;padding:0;margin:0 2px 0 0;border:0;background:none;box-shadow:none;flex:none;accent-color:var(--accent);cursor:pointer;vertical-align:middle}
 [data-theme="light"] input,[data-theme="light"] textarea,[data-theme="light"] select{background:rgba(15,23,42,.03)}
 input::placeholder,textarea::placeholder{color:var(--text3)}
 input:focus,textarea:focus,select:focus{outline:none;border-color:var(--accent);box-shadow:0 0 0 3px rgba(34,211,238,.15)}
@@ -442,13 +444,17 @@ body:not([data-theme="dark"]) .theme-toggle .dark-label{display:none}
       某一站失败就按错误类型冷却它、换下一站，全链失败才返回最后一站的错误。
     </p>
     <div class="form-row">
-      <div class="field"><label>模型名（可自定义）</label>
-        <input id="arAlias" placeholder="auto-router" oninput="renderRouterExample()">
+      <div class="field" style="flex:1;min-width:260px"><label>模型名（可自定义）</label>
+        <div style="display:flex;gap:8px">
+          <input id="arAlias" placeholder="auto-router" oninput="renderRouterExample()">
+          <button type="button" class="btn btn-primary" style="width:auto;white-space:nowrap" onclick="saveRouter()">💾 保存</button>
+        </div>
       </div>
-      <div class="field"><label>客户端调用示例</label>
+      <div class="field" style="flex:1.4;min-width:300px"><label>客户端调用示例</label>
         <input id="arExample" readonly onclick="this.select()" style="font-family:'JetBrains Mono',Consolas,monospace">
       </div>
     </div>
+    <p class="hint" style="margin:0">改名后点「保存」即可：旧名字下的勾选会自动迁移到新名字，已发布给客户端的旧模型名仍然可用（兼容保留）。</p>
   </div>
 </div>
 
@@ -1708,26 +1714,29 @@ function renderRouter() {
   if (pl) {
     const provs = d.providers || [];
     if (!provs.length) {
-      pl.innerHTML = '<div class="empty" style="padding:12px">网关里还没有加入任何供应商：'
-        + '请先到「设置 → 🔌 通用 Provider」添加一个</div>';
+      pl.innerHTML = '<div class="empty" style="padding:12px">没有可用的上游</div>';
     } else {
       pl.innerHTML = provs.map(p => {
         const models = p.models || [];
         const chosen = routerProviders.has(p.name);
         const picked = models.filter(m => routerModels.has(p.name + ':' + m.id)).length;
         const bad = [];
-        if (!p.configured) bad.push('缺 API Key');
-        if (!models.length) bad.push('无可用模型');
+        if (p.name === 'cline' && !p.configured) bad.push('无可用账号');
+        if (p.name !== 'cline' && !p.configured) bad.push('缺 API Key');
         const meta = [];
+        if (p.builtin) meta.push('内置');
         if (p.google) meta.push('Google');
+        if (p.name === 'cline') meta.push('按账号轮询');
         meta.push(models.length + ' 个可用模型');
         if (chosen) meta.push('已选 ' + picked + ' 个');
         return '<label style="display:flex;align-items:center;gap:10px;padding:9px 12px;'
           + 'border:1px solid var(--border);border-radius:10px;background:rgba(2,6,23,.3);cursor:pointer">'
           + '<input type="checkbox" data-prov="' + esc(p.name) + '"' + (chosen ? ' checked' : '') + '>'
-          + '<span style="flex:1"><strong>' + esc(p.name) + '</strong>'
-          + '<span style="color:var(--text3);font-size:12px;margin-left:10px">' + esc(meta.join(' · ')) + '</span>'
-          + (bad.length ? '<span style="color:#f87171;font-size:12px;margin-left:10px">' + esc(bad.join('，')) + '</span>' : '')
+          + '<span style="flex:1;display:flex;align-items:center;gap:10px;min-width:0;flex-wrap:wrap">'
+          + '<strong>' + esc(p.display || p.name) + '</strong>'
+          + (p.builtin ? '<span class="model-tag" style="opacity:.8">内置上游</span>' : '')
+          + '<span style="color:var(--text3);font-size:12px">' + esc(meta.join(' · ')) + '</span>'
+          + (bad.length ? '<span style="color:#f87171;font-size:12px">' + esc(bad.join('，')) + '</span>' : '')
           + '</span></label>';
       }).join('');
     }
@@ -1745,14 +1754,16 @@ function renderRouter() {
         const picked = models.filter(m => routerModels.has(p.name + ':' + m.id)).length;
         const rows = models.map(m => {
           const key = p.name + ':' + m.id;
+          const label = m.id === '*' ? '账号池自动选模型' : m.id;
           const ctx = m.context ? (' · ' + Math.round(m.context / 1000) + 'k 上下文') : '';
           return '<label style="display:flex;align-items:center;gap:8px;padding:5px 10px;font-size:12.5px;cursor:pointer">'
             + '<input type="checkbox" data-key="' + esc(key) + '"' + (routerModels.has(key) ? ' checked' : '') + '>'
-            + '<code>' + esc(m.id) + '</code><span style="color:var(--text3)">' + esc(ctx) + '</span></label>';
+            + '<code>' + esc(label) + '</code><span style="color:var(--text3)">' + esc(ctx) + '</span></label>';
         }).join('') || '<div style="padding:8px 10px;color:var(--text3);font-size:12px">该供应商暂无可用模型（先点上面的「刷新全部目录」）</div>';
+        const pname = p.display || p.name;
         return '<div style="margin-bottom:10px;border:1px solid var(--border);border-radius:10px;overflow:hidden">'
           + '<div style="padding:8px 12px;display:flex;align-items:center;gap:8px;background:rgba(148,163,184,.05);font-size:13px">'
-          + '<strong>' + esc(p.name) + '</strong>'
+          + '<strong>' + esc(pname) + '</strong>'
           + '<span style="color:var(--text3);font-weight:normal">已选 ' + picked + ' / ' + models.length + '</span>'
           + '<span style="margin-left:auto;display:flex;gap:6px">'
           + '<button type="button" class="btn btn-sm" data-prov-all="' + esc(p.name) + '">全选</button>'
@@ -1901,30 +1912,24 @@ async function routerMaintenance(kind) {
 function renderRouterChain(d) {
   const body = _('arChainBody');
   if (!body) return;
-  const routes = d.aliases || [];
+  const routes = d.routes || [];
   if (!routes.length) {
-    body.innerHTML = '<tr><td colspan="2" class="empty">暂无路由别名</td></tr>';
+    body.innerHTML = '<tr><td colspan="2" class="empty">还没有保存过候选链 —— 在上面勾选模型并点「保存设置」后，这里会显示实际执行顺序</td></tr>';
     return;
   }
-  const main = d.chain || {};
-  let html = '';
-  if (main.error) {
-    html = '<tr><td><code>' + esc(main.alias || '') + '</code></td><td style="color:var(--text3)">' + esc(main.error) + '</td></tr>';
-  } else {
-    const hops = (main.hops || []).map((h, i) => {
+  body.innerHTML = routes.map(r => {
+    if (r.error) {
+      return '<tr><td><code>' + esc(r.alias || '') + '</code></td><td style="color:var(--text3)">' + esc(r.error) + '</td></tr>';
+    }
+    const hops = (r.hops || []).map((h, i) => {
       const label = (i + 1) + '. <code>' + esc(h.upstream) + ':' + esc(h.model) + '</code>';
       return h.skip
         ? '<span class="model-tag" style="opacity:.55;text-decoration:line-through" title="' + esc(h.skip) + '">' + label + '</span>'
         : '<span class="model-tag">' + label + '</span>';
     }).join(' <span style="color:var(--text3)">→</span> ');
-    html = '<tr><td><code>' + esc(main.alias || '') + '</code></td><td>'
-      + (hops || '<span style="color:var(--text3)">无候选：先勾选供应商与模型</span>') + '</td></tr>';
-  }
-  const others = routes.filter(a => a !== (main.alias || ''));
-  others.forEach(a => {
-    html += '<tr><td><code>' + esc(a) + '</code></td><td style="color:var(--text3)">其他别名（未在自动路由页配置）</td></tr>';
-  });
-  body.innerHTML = html;
+    return '<tr><td><code>' + esc(r.alias || '') + '</code></td><td>'
+      + (hops || '<span style="color:var(--text3)">无候选</span>') + '</td></tr>';
+  }).join('');
 }
 
 function renderRouterUsage(d) {
@@ -1968,14 +1973,14 @@ function renderRouterCooling(d) {
 function renderRouterDiscovery(d) {
   const disc = d.discovery || {};
   const dc = disc.config || {};
-  const provs = (d.providers || []).map(p => p.name);
+  const provs = (d.providers || []).filter(p => !p.builtin);
   if (_('discProvider')) {
-    // 发现源只能从"已加入的供应商"里选, 不允许手填
+    // 发现源只能从"已加入的通用 Provider"里选(内置上游没有目录), 不允许手填
     const cur = dc.provider || '';
-    _('discProvider').innerHTML = provs.map(n =>
-      '<option value="' + esc(n) + '"' + (n === cur ? ' selected' : '') + '>' + esc(n) + '</option>').join('')
-      || '<option value="">（还没有供应商）</option>';
-    if (cur && provs.indexOf(cur) < 0) _('discProvider').value = '';
+    _('discProvider').innerHTML = provs.map(p =>
+      '<option value="' + esc(p.name) + '"' + (p.name === cur ? ' selected' : '') + '>' + esc(p.display || p.name) + '</option>').join('')
+      || '<option value="">（还没有通用 Provider）</option>';
+    if (cur && provs.findIndex(p => p.name === cur) < 0) _('discProvider').value = '';
   }
   if (_('discEnabled')) _('discEnabled').value = dc.enabled ? 'true' : 'false';
   if (_('discIntervalH')) {

@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -104,6 +105,21 @@ func resolveZenFreeModel(id string) (*ZenModel, bool) {
 		return nil, false
 	}
 	return m, true
+}
+
+// zenFreeCatalog 当前全部免费 zen 模型(自动路由页勾选用), 按 ID 排序。
+func zenFreeCatalog() []ZenModel {
+	initZenModels()
+	zenModelsMu.RLock()
+	out := make([]ZenModel, 0, len(zenModels))
+	for _, m := range zenModels {
+		if isZenFreeModel(m) {
+			out = append(out, *m)
+		}
+	}
+	zenModelsMu.RUnlock()
+	sort.Slice(out, func(i, j int) bool { return out[i].ID < out[j].ID })
+	return out
 }
 
 // stripDisplayPrefix 去掉模型列表展示用前缀 "cline/", 仅当剩余部分

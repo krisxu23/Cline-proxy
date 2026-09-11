@@ -24,12 +24,17 @@ import (
 var routerAliasRe = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._/-]*$`)
 
 // routerSnapshot 组装页面需要的全部数据。
+//
+// 供应商树 = 内置上游(opencode zen / cline 账号池) + 通用 Provider。
+// 候选链表只展示配置里真实存在的 routes 条目 —— 没保存过就是空白,
+// 不再合成"默认链"或历史别名, 避免出现用户没配过却看到内容的情况。
 func routerSnapshot() map[string]any {
 	alias := autoRouterAlias()
 	cfg := getZenConfig()
 
 	selectedModels := map[string]bool{}
 	configuredProviders := map[string]bool{}
+	freshInstall := true // 从未保存过任何勾选
 	if cfg != nil {
 		for _, e := range cfg.Routes[alias] {
 			if e = strings.TrimSpace(e); e != "" {
@@ -41,11 +46,73 @@ func routerSnapshot() map[string]any {
 				configuredProviders[p] = true
 			}
 		}
+		freshInstall = len(selectedModels) == 0 && len(configuredProviders) == 0
 	}
 
-	providers := make([]map[string]any, 0, 8)
 	problems := []string{}
 	selectedCount := 0
+	providers := make([]map[string]any, 0, 8)
+
+	// addProvider 把一个上游(内置或通用 Provider)加进页面列表。
+	// models 元素: {id, context, output, selected}。
+	addProvider := func(name, display string, builtin, configured, google bool, models []map[string]any) {
+		chosen := configuredProviders[name]
+		if !chosen {
+			for _, m := range models {
+				if m["selected"].(bool) {
+					chosen = true
+					break
+				}
+			}
+			// 从未配置过任何选择时按默认链如实回显:
+			// zen 恒可用, cline 看账号池, 通用 Provider 看 API Key。
+			if freshInstall && configured {
+				chosen = true
+			}
+		}
+		for _, m := range models {
+			if m["selected"].(bool) {
+				selectedCount++
+			}
+		}
+		providers = append(providers, map[string]any{
+			"name":       name,
+			"display":    display,
+			"builtin":    builtin,
+			"configured": configured,
+			"google":     google,
+			"selected":   chosen,
+			"models":     models,
+		})
+	}
+
+	// 1) opencode(zen): seed 白名单保证至少有几个免费模型, 恒可用。
+	zenModels := make([]map[string]any, 0, 8)
+	for _, m := range zenFreeCatalog() {
+		key := candidateKey(upstreamZen, m.ID)
+		zenModels = append(zenModels, map[string]any{
+			"id":       m.ID,
+			"context":  m.Context,
+			"output":   m.Output,
+			"selected": selectedModels[key],
+		})
+	}
+	addProvider(upstreamZen, "opencode（zen 免费模型）", true, true, false, zenModels)
+
+	// 2) cline 账号池: 单个占位模型 "*", 具体模型由池内轮询决定。
+	clineOK := clinePoolReady()
+	if !clineOK {
+		problems = append(problems, "Cline 账号池还没有可用账号，请先到「账号管理」导入账号")
+	}
+	clineModels := []map[string]any{{
+		"id":       clinePoolPlaceholder,
+		"context":  0,
+		"output":   0,
+		"selected": selectedModels[candidateKey(upstreamCline, clinePoolPlaceholder)],
+	}}
+	addProvider(upstreamCline, "Cline 账号池（自动选账号与模型）", true, clineOK, false, clineModels)
+
+	// 3) 通用 Provider。
 	for _, name := range providerNames() {
 		pc, _ := providerConfigFor(name)
 		p := providerByName(name)
@@ -53,56 +120,36 @@ func routerSnapshot() map[string]any {
 		models := make([]map[string]any, 0, 8)
 		for _, m := range freeModelsFor(name, p) {
 			key := candidateKey(name, m.ID)
-			isSel := selectedModels[key]
-			if isSel {
-				selectedCount++
-			}
 			models = append(models, map[string]any{
 				"id":       m.ID,
 				"context":  m.ContextLength,
 				"output":   m.MaxOutput,
-				"selected": isSel,
+				"selected": selectedModels[key],
 			})
 		}
 
-		// 供应商是否勾中: 显式勾过, 或者它名下已有被选中的模型。
-		// 两者取并集 —— 老配置只写了 routes 没写 providers, 也要能正确回显。
-		isChosen := configuredProviders[name]
-		if !isChosen {
-			for _, m := range models {
-				if m["selected"].(bool) {
-					isChosen = true
-					break
-				}
-			}
-			// 从未配置过任何选择时默认全选: 此时默认链本来就会用上全部供应商,
-			// 页面直接如实展示, 用户只需取消不想要的。
-			if !isChosen && len(cfg.Routes[alias]) == 0 && len(cfg.Router.Providers) == 0 && pc.APIKey != "" {
-				isChosen = true
-			}
-		}
-
-		if pc.APIKey == "" {
+		configured := pc.APIKey != ""
+		if !configured {
 			problems = append(problems, fmt.Sprintf("供应商 %s 还没有填写 API Key，它的模型无法参与自动路由", name))
 		} else if len(models) == 0 {
 			problems = append(problems, fmt.Sprintf("供应商 %s 还没有拉取到可用模型，请在「设置 → 通用 Provider」点一次刷新目录", name))
 		}
 
-		providers = append(providers, map[string]any{
-			"name":       name,
-			"configured": pc.APIKey != "",
-			"google":     isGoogleProvider(pc),
-			"selected":   isChosen,
-			"models":     models,
-		})
+		addProvider(name, name, false, configured, isGoogleProvider(pc), models)
 	}
 
-	chainInfo := describeRouteChain(alias)
-	if alias != legacyFreeBestAlias {
-		if d := describeRouteChain(legacyFreeBestAlias); d["hops"] != nil {
-			if hops, _ := d["hops"].([]map[string]any); len(hops) > 0 {
-				chainInfo = d
+	// 候选链表: 只列配置里真实存在的 routes 条目。
+	routes := []map[string]any{}
+	if cfg != nil {
+		keys := make([]string, 0, len(cfg.Routes))
+		for k, list := range cfg.Routes {
+			if k != "" && len(list) > 0 {
+				keys = append(keys, k)
 			}
+		}
+		sort.Strings(keys)
+		for _, k := range keys {
+			routes = append(routes, describeRouteChain(k))
 		}
 	}
 
@@ -112,11 +159,10 @@ func routerSnapshot() map[string]any {
 
 	return map[string]any{
 		"alias":        alias,
-		"aliases":      routeAliasNames(),
 		"providers":    providers,
 		"selected":     selectedCount,
 		"problems":     problems,
-		"chain":        chainInfo,
+		"routes":       routes,
 		"cooling":      candidateCoolingSnapshot(),
 		"permanent":    permanentRejectionList(),
 		"usage":        usageSnapshot(),
@@ -209,13 +255,22 @@ func cleanSelection(providers, models []string) ([]string, []string) {
 func validateRouterSelection(sel routerSelectionRequest) []string {
 	problems := []string{}
 	for _, p := range sel.Providers {
-		pc, ok := providerConfigFor(p)
-		if !ok {
-			problems = append(problems, fmt.Sprintf("供应商 %s 已不存在，请重新勾选", p))
-			continue
-		}
-		if pc.APIKey == "" {
-			problems = append(problems, fmt.Sprintf("供应商 %s 没有 API Key，它的模型都会被跳过", p))
+		switch p {
+		case upstreamZen:
+			// 内置上游没有 provider 配置, 恒可参与
+		case upstreamCline:
+			if !clinePoolReady() {
+				problems = append(problems, "Cline 账号池还没有可用账号，它的候选会被跳过")
+			}
+		default:
+			pc, ok := providerConfigFor(p)
+			if !ok {
+				problems = append(problems, fmt.Sprintf("供应商 %s 已不存在，请重新勾选", p))
+				continue
+			}
+			if pc.APIKey == "" {
+				problems = append(problems, fmt.Sprintf("供应商 %s 没有 API Key，它的模型都会被跳过", p))
+			}
 		}
 	}
 	chosenProviders := map[string]bool{}
@@ -225,27 +280,40 @@ func validateRouterSelection(sel routerSelectionRequest) []string {
 	for _, m := range sel.Models {
 		up, model, ok := strings.Cut(m, ":")
 		if !ok || up == "" || model == "" {
-			problems = append(problems, fmt.Sprintf("%q 不是合法的 供应商:模型", m))
+			problems = append(problems, fmt.Sprintf("%q 不是合法的 上游:模型", m))
 			continue
 		}
 		if !chosenProviders[up] {
-			problems = append(problems, fmt.Sprintf("%s 属于未勾选的供应商 %s", m, up))
+			problems = append(problems, fmt.Sprintf("%s 属于未勾选的上游 %s", m, up))
 			continue
 		}
-		p := providerByName(up)
-		if p == nil {
-			problems = append(problems, fmt.Sprintf("供应商 %s 已不存在（%s）", up, m))
-			continue
-		}
-		found := false
-		for _, fm := range p.freeModelIDs() {
-			if fm.ID == model {
-				found = true
-				break
+		switch up {
+		case upstreamZen:
+			if model == clinePoolPlaceholder {
+				problems = append(problems, fmt.Sprintf("%q 不能作为 opencode 的模型名", model))
+			} else if _, ok := resolveZenFreeModel(model); !ok {
+				problems = append(problems, fmt.Sprintf("模型 %s 不是可用的 opencode 免费模型", m))
 			}
-		}
-		if !found {
-			problems = append(problems, fmt.Sprintf("模型 %s 不在 %s 当前可用列表里（可能已下架或目录未刷新）", model, up))
+		case upstreamCline:
+			if model != clinePoolPlaceholder {
+				problems = append(problems, fmt.Sprintf("cline 账号池只支持占位符 %q（%s）", clinePoolPlaceholder, m))
+			}
+		default:
+			p := providerByName(up)
+			if p == nil {
+				problems = append(problems, fmt.Sprintf("供应商 %s 已不存在（%s）", up, m))
+				continue
+			}
+			found := false
+			for _, fm := range p.freeModelIDs() {
+				if fm.ID == model {
+					found = true
+					break
+				}
+			}
+			if !found {
+				problems = append(problems, fmt.Sprintf("模型 %s 不在 %s 当前可用列表里（可能已下架或目录未刷新）", model, up))
+			}
 		}
 	}
 	return problems
