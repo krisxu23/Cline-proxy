@@ -2825,6 +2825,12 @@ func handleProvidersUpdate(w http.ResponseWriter, r *http.Request) {
 		}
 		cfg.Providers[req.Name] = *req.Provider
 	})
+	// 丢弃旧的运行时状态: 目录 / 永久剔除集合 / slug 表都来自旧设置,
+	// 保留会让改动后的 provider 继续对外发布旧端点的模型, 并让连通测试
+	// 选到一个新端点上并不存在的默认模型。下一次查找按新配置惰性重建。
+	providerRTMu.Lock()
+	delete(providerRT, req.Name)
+	providerRTMu.Unlock()
 	writeAPI(w, http.StatusOK, apiResponse{Success: true})
 }
 
