@@ -77,3 +77,13 @@ go test  -count=1 -tags "with_quic,with_grpc,with_utls" ./internal/...
 构建标签是硬要求：不带标签时 reality/QUIC 类节点会被剔除，相关用例会失败。
 给原生命令传输出路径要用 Windows 风格（`-o "D:/x/app.exe"`），Git Bash 的路径转换
 会把 `/d/x/app.exe` 交给 Windows 版 go，实际落到 `D:\d\x\app.exe`。
+
+**交付给用户运行的 Windows exe** 必须与 CI 同参（缺 `-H=windowsgui` 会带黑窗、
+缺 `-s -w` 体积大 17MB，均会被当成异常）：
+
+```bash
+CGO_ENABLED=0 go build -tags with_quic,with_grpc,with_utls \
+  -ldflags="-s -w -H=windowsgui" -o "D:/目标/cline-proxy.exe" .
+```
+
+windowsgui 下没有控制台，运行日志看 `data/cline-proxy.log` 或管理面板。
