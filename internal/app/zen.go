@@ -727,8 +727,10 @@ func syncZenModels() (int, error) {
 			return 0, err
 		}
 		req.Header.Set("Authorization", "Bearer "+cfg.Key)
-		client := &http.Client{Timeout: 25 * time.Second}
-		resp, err := client.Do(req)
+		// 走网关统一出口(与 zen 对话同一链路), 出口模式跟随全局直连/节点选择
+		ctx, cancel := context.WithTimeout(context.Background(), 25*time.Second)
+		resp, err := getZenHTTPClient().Do(req.WithContext(ctx))
+		cancel()
 		if err != nil {
 			lastErr = err
 			continue

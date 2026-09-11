@@ -298,7 +298,7 @@ func (p *modelProvider) fetchCatalogPage(ctx context.Context, cfg providerConfig
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(io.LimitReader(resp.Body, 2048))
-		return catalogPage{}, fmt.Errorf("catalog HTTP %d: %s", resp.StatusCode, kit.Truncate(string(body), 300))
+		return catalogPage{}, &catalogHTTPError{status: resp.StatusCode, body: string(body)}
 	}
 	payload, err := io.ReadAll(io.LimitReader(resp.Body, 8<<20))
 	if err != nil {
@@ -312,21 +312,66 @@ func (p *modelProvider) fetchCatalogPage(ctx context.Context, cfg providerConfig
 }
 
 // fetchCatalogPages 逐页拉取一个目录地址直到取完。
+//
+// 与对话请求同一套出口自愈: 网络错误或出口地区被拒时, 冷却刚失败的节点
+// 换下一个重试 —— 节点池里"对这个上游不通"的节点不该卡死目录抓取。
+// 直连模式没有第二个出口可换, 失败原样返回。
 func (p *modelProvider) fetchCatalogPages(ctx context.Context, cfg providerConfig, rawURL string) ([]*catalogModel, error) {
 	var listed []*catalogModel
 	pageToken := ""
 	for page := 0; page < providerCatalogMaxPages; page++ {
 		pg, err := p.fetchCatalogPage(ctx, cfg, rawURL, pageToken)
-		if err != nil {
-			return nil, err
+		if err == nil {
+			listed = append(listed, pg.models...)
+			pageToken = pg.nextPageToken
+			if pageToken == "" {
+				break
+			}
+			continue
 		}
-		listed = append(listed, pg.models...)
-		pageToken = pg.nextPageToken
-		if pageToken == "" {
-			break
+		// 第一页就碰上出口问题才有换节点的意义: 后续页失败多半是上游本身,
+		// 此时整页重试也拿不到完整目录。
+		if page == 0 && !exitModeDirectNow() && p.retryCatalogOnNextExit(ctx, cfg, rawURL, err) {
+			return p.fetchCatalogPages(ctx, cfg, rawURL)
 		}
+		return nil, err
 	}
 	return listed, nil
+}
+
+// retryCatalogOnNextExit 目录抓取的换出口判定。网络错误或出口地区被拒时,
+// 冷却当前出口并返回 true 让调用方重试; 重试预算用尽返回 false。
+func (p *modelProvider) retryCatalogOnNextExit(ctx context.Context, cfg providerConfig, rawURL string, err error) bool {
+	if p.catalogExitRetries >= providerExitRetries {
+		return false
+	}
+	status, body := 0, []byte(nil)
+	if pe, ok := err.(*providerError); ok {
+		status, body = pe.Status, []byte(pe.Body)
+	} else if ce, ok := err.(*catalogHTTPError); ok {
+		status, body = ce.status, []byte(ce.body)
+	}
+	regionRejected := status != 0 && isExitRegionRejected(status, body)
+	if status != 0 && !regionRejected {
+		return false // HTTP 层错误(4xx/5xx)换节点无意义, 只有连接层/地区拒绝才换
+	}
+	p.catalogExitRetries++
+	reason := fmt.Sprintf("network error (%v)", err)
+	if regionRejected {
+		reason = fmt.Sprintf("exit region rejected: %s", kit.Truncate(string(body), 160))
+	}
+	rotateProviderExit(p.name, "catalog "+reason, p.catalogExitRetries)
+	return true
+}
+
+// catalogHTTPError 把 fetchCatalogPage 的非 200 带结构化状态码, 供换出口判定。
+type catalogHTTPError struct {
+	status int
+	body   string
+}
+
+func (e *catalogHTTPError) Error() string {
+	return fmt.Sprintf("catalog HTTP %d: %s", e.status, kit.Truncate(e.body, 300))
 }
 
 // refreshCatalog 拉取并重建目录; force 强制刷新, 否则受 15 分钟间隔限制。
@@ -343,6 +388,7 @@ func (p *modelProvider) refreshCatalog(ctx context.Context, force bool) error {
 		return nil
 	}
 	p.attemptedAt = now
+	p.catalogExitRetries = 0
 	p.mu.Unlock()
 
 	ctx, cancel := context.WithTimeout(ctx, providerCatalogTimeout)

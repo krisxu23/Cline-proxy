@@ -224,14 +224,15 @@ var (
 type modelProvider struct {
 	name string
 
-	mu          sync.Mutex
-	catalog     map[string]*catalogModel
-	slugs       map[string]*catalogModel
-	fetchedAt   int64 // unix ms
-	attemptedAt int64
-	catalogErr  string
-	rejected    map[string]string // modelID -> 永久拒绝原因
-	sigCache    *thoughtSignatureCache
+	mu                sync.Mutex
+	catalog           map[string]*catalogModel
+	slugs             map[string]*catalogModel
+	fetchedAt         int64 // unix ms
+	attemptedAt       int64
+	catalogErr        string
+	catalogExitRetries int // 本次目录刷新已用的换出口重试
+	rejected          map[string]string // modelID -> 永久拒绝原因
+	sigCache          *thoughtSignatureCache
 }
 
 func newModelProvider(name string) *modelProvider {

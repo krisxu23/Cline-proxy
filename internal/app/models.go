@@ -2,6 +2,7 @@ package app
 
 import (
 	"cline-go-proxy/internal/cline"
+	"context"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -112,8 +113,11 @@ func syncRecommendedModels() (int, error) {
 	req.Header = clineHeaders(token, "")
 	req.Header.Set("X-Task-ID", fmt.Sprintf("sess_sync_%d", time.Now().UnixMilli()))
 
-	client := &http.Client{Timeout: modelsSyncTimeout}
-	resp, err := client.Do(req)
+	// 走网关统一出口: 出口模式选节点时经节点出去, 直连模式才直连。
+	ctx, cancel := context.WithTimeout(context.Background(), modelsSyncTimeout)
+	defer cancel()
+	req = req.WithContext(ctx)
+	resp, err := getZenHTTPClient().Do(req)
 	if err != nil {
 		return 0, err
 	}
