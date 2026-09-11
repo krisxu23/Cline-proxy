@@ -467,6 +467,49 @@ body:not([data-theme="dark"]) .theme-toggle .dark-label{display:none}
 </div>
 
 <div class="section">
+  <div class="section-title">🔌 通用 Provider（OpenAI 兼容上游）</div>
+  <div class="section-body">
+    <div class="form-row">
+      <div class="field"><label>Provider 名</label><input type="text" id="pvName" placeholder="openrouter / gemini / tokenrouter / bai"></div>
+      <div class="field"><label>Base URL</label><input type="text" id="pvBaseUrl" placeholder="https://openrouter.ai/api/v1"></div>
+    </div>
+    <div class="form-row">
+      <div class="field"><label>API Key</label><input type="password" id="pvKey" placeholder="sk-..."></div>
+      <div class="field"><label>目录 / 免费判定</label>
+        <div style="display:flex;gap:8px">
+          <select id="pvCatalog" style="flex:1">
+            <option value="false">不拉目录（白名单）</option>
+            <option value="true">拉取 /models 目录</option>
+          </select>
+          <select id="pvPricing" style="flex:1">
+            <option value="false">按白名单判定免费</option>
+            <option value="true">按目录价格判定免费</option>
+          </select>
+        </div>
+      </div>
+    </div>
+    <div class="form-row">
+      <div class="field"><label>Models URL（Google 原生目录用；留空则用 Base URL + /models）</label>
+        <input type="text" id="pvModelsUrl" placeholder="https://generativelanguage.googleapis.com/v1beta/models"></div>
+      <div class="field"><label>Models Key 头（Google 用 x-goog-api-key）</label>
+        <input type="text" id="pvModelsKeyHeader" placeholder="x-goog-api-key"></div>
+    </div>
+    <div class="form-row">
+      <div class="field"><label>免费模型白名单（每行一个）</label>
+        <textarea id="pvFree" rows="4" placeholder="gemini-3.8-flash&#10;glm-5.3-flash"></textarea></div>
+      <div class="field"><label>连通测试模型（留空用第一个免费模型）</label>
+        <input type="text" id="pvTestModel" placeholder="z-ai/glm-5.3:free"></div>
+    </div>
+    <div class="form-actions">
+      <button class="btn btn-primary" onclick="saveProvider()">💾 保存 Provider</button>
+      <button class="btn" onclick="testProvider()">🔍 连通测试</button>
+      <button class="btn" onclick="refreshProviderCatalog()">🔄 刷新目录</button>
+    </div>
+    <div id="pvList" style="margin-top:10px;border:1px solid var(--border);border-radius:10px;background:rgba(2,6,23,.3)"></div>
+  </div>
+</div>
+
+<div class="section">
   <div class="section-title">🛡️ 限流防御</div>
   <div class="section-body">
     <div class="form-row">
@@ -600,7 +643,7 @@ document.querySelectorAll('.nav-item').forEach(el => {
     if (el.dataset.tab === 'dashboard') { loadStats(); loadOcStats(); }
     if (el.dataset.tab === 'accounts') { loadAccounts(); loadOcConfig(); }
     if (el.dataset.tab === 'models') { loadModels(); loadOcModels(); }
-    if (el.dataset.tab === 'settings') { loadKeys(); loadConfig(); loadOcConfig(); loadOcNodes(); }
+    if (el.dataset.tab === 'settings') { loadKeys(); loadConfig(); loadOcConfig(); loadOcNodes(); loadProviders(); }
     if (el.dataset.tab === 'logs') loadLogs();
   });
 });
@@ -1232,6 +1275,93 @@ async function saveOcConfig() {
     toast('opencode 配置已保存', 'success');
     loadOcConfig();
   } catch (e) { toast('保存失败: ' + e.message, 'error'); }
+}
+
+let pvData = {};
+async function loadProviders() {
+  try {
+    const d = await api('GET', '/admin/api/providers');
+    pvData = (d.data && d.data.providers) || {};
+    const names = Object.keys(pvData);
+    if (!names.length) {
+      _('pvList').innerHTML = '<div style="padding:10px 12px;font-size:12px;color:var(--text3)">暂无 provider, 填上方表单添加</div>';
+      return;
+    }
+    _('pvList').innerHTML = names.map(n => {
+      const p = pvData[n] || {}, rt = p.runtime || {};
+      let st;
+      if (!rt.configured) { st = '未配置 key'; }
+      else if (rt.error) { st = '❌ ' + esc(rt.error); }
+      else if (p.catalog) { st = '目录 ' + (rt.catalogSize || 0) + ' · 免费 ' + (rt.freeCount || 0) + ' · 可聊 ' + (rt.chatCount || 0); }
+      else { st = '白名单 ' + ((p.freeModels || []).length) + ' 个'; }
+      if (rt.rejected) { st += ' · 剔除 ' + rt.rejected; }
+      return '<div style="display:flex;align-items:center;gap:9px;padding:6px 12px;font-size:12.5px;border-bottom:1px solid rgba(148,163,184,.07)">' +
+        '<span style="flex:none;min-width:92px;font-family:monospace;color:var(--text3)">' + esc(n) + '</span>' +
+        '<span style="flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">' + esc(p.baseUrl || '') + '</span>' +
+        '<span style="flex:none;font-size:11px;color:var(--text3)">' + st + '</span>' +
+        '<button type="button" class="btn" style="padding:2px 8px;font-size:11px" onclick="editProvider(\'' + esc(n) + '\')">编辑</button>' +
+        '<button type="button" class="btn" style="padding:2px 8px;font-size:11px;color:#f87171" onclick="delProvider(\'' + esc(n) + '\')">删除</button></div>';
+    }).join('');
+  } catch (e) { _('pvList').textContent = '加载失败: ' + e.message; }
+}
+function editProvider(n) {
+  const p = pvData[n] || {};
+  _('pvName').value = n;
+  _('pvBaseUrl').value = p.baseUrl || '';
+  _('pvKey').value = p.apiKey || '';
+  _('pvCatalog').value = String(!!p.catalog);
+  _('pvPricing').value = String(!!p.pricing);
+  _('pvModelsUrl').value = p.modelsUrl || '';
+  _('pvModelsKeyHeader').value = p.modelsKeyHeader || '';
+  _('pvFree').value = (p.freeModels || []).join('\n');
+  toast('已载入 ' + n + ', 修改后点保存', 'success');
+}
+async function saveProvider() {
+  const name = _('pvName').value.trim();
+  if (!name) { toast('请填写 Provider 名', 'error'); return; }
+  // 后端按整体替换处理 provider: 表单未编辑的字段(headers、chatPath 等)
+  // 必须原样回传, 否则保存会把它们清掉, 已配好的 provider 会静默失真。
+  const existing = Object.assign({}, pvData[name] || {});
+  delete existing.runtime;
+  const body = {
+    name,
+    provider: Object.assign(existing, {
+      baseUrl: _('pvBaseUrl').value.trim(),
+      apiKey: _('pvKey').value.trim(),
+      catalog: _('pvCatalog').value === 'true',
+      pricing: _('pvPricing').value === 'true',
+      modelsUrl: _('pvModelsUrl').value.trim(),
+      modelsKeyHeader: _('pvModelsKeyHeader').value.trim(),
+      freeModels: _('pvFree').value.split('\n').map(s => s.trim()).filter(Boolean),
+    }),
+  };
+  try { await api('POST', '/admin/api/providers/update', body); toast('已保存 ' + name, 'success'); loadProviders(); }
+  catch (e) { toast('保存失败: ' + e.message, 'error'); }
+}
+async function delProvider(n) {
+  if (!confirm('确认删除 provider ' + n + '?')) return;
+  try { await api('POST', '/admin/api/providers/update', { name: n, remove: true }); toast('已删除 ' + n, 'success'); loadProviders(); }
+  catch (e) { toast('删除失败: ' + e.message, 'error'); }
+}
+async function testProvider() {
+  const name = _('pvName').value.trim();
+  if (!name) { toast('请先填写 Provider 名', 'error'); return; }
+  toast('连通测试中...', 'success');
+  try {
+    const d = await api('POST', '/admin/api/providers/test', { name, model: _('pvTestModel').value.trim() });
+    const r = (d.data) || {};
+    const detail = r.error ? String(r.error).slice(0, 160) : String(r.body || '').slice(0, 160);
+    toast('HTTP ' + (r.status || '?') + ' · ' + detail, r.status === 200 ? 'success' : 'error');
+  } catch (e) { toast('测试失败: ' + e.message, 'error'); }
+}
+async function refreshProviderCatalog() {
+  const name = _('pvName').value.trim();
+  try {
+    await api('POST', '/admin/api/providers/refresh', name ? { name } : {});
+    toast('目录刷新已启动', 'success');
+    setTimeout(loadProviders, 3000);
+    setTimeout(loadProviders, 12000);
+  } catch (e) { toast('刷新失败: ' + e.message, 'error'); }
 }
 
 async function loadOcModels() {
