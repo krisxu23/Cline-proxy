@@ -115,7 +115,10 @@ func (p *modelProvider) catalogEntry(modelID string) *catalogModel {
 }
 
 const (
-	providerCatalogRefresh  = 15 * time.Minute
+	providerCatalogRefresh = 15 * time.Minute
+	// providerCatalogRetryMs 请求路径刷新失败后的重试间隔(1 分钟):
+	// 目录为空的 provider 可以较快重试, 又不会被每个请求反复打上游。
+	providerCatalogRetryMs  = int64(time.Minute / time.Millisecond)
 	providerCatalogMaxPages = 10
 	providerCatalogPageSize = "1000"
 	providerCatalogTimeout  = 90 * time.Second

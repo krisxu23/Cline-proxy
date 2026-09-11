@@ -9,6 +9,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 )
 
 func TestParseProviderModel(t *testing.T) {
@@ -284,6 +285,73 @@ func TestHandleProviderChatRefreshesCatalogBeforeGate(t *testing.T) {
 	}
 	if len(p.catalog) == 0 {
 		t.Fatal("catalog should be populated by the first request")
+	}
+}
+
+func TestHandleProviderChatCatalogRefreshBacksOffAndRecovers(t *testing.T) {
+	var mu sync.Mutex
+	modelCalls := 0
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/models" {
+			mu.Lock()
+			modelCalls++
+			n := modelCalls
+			mu.Unlock()
+			if n == 1 {
+				w.WriteHeader(http.StatusInternalServerError)
+				w.Write([]byte(`{"error":{"message":"upstream hiccup"}}`))
+				return
+			}
+			json.NewEncoder(w).Encode(map[string]any{"data": []map[string]any{
+				{"id": "cat-free", "pricing": map[string]any{"prompt": "0", "completion": "0"}},
+			}})
+			return
+		}
+		w.Write([]byte(`{"choices":[{"message":{"content":"ok"}}]}`))
+	}))
+	defer srv.Close()
+	setTestProvider(t, "catretry", providerConfig{BaseURL: srv.URL, APIKey: "k", Catalog: true, Pricing: true})
+	p := providerByName("catretry")
+
+	calls := func() int {
+		mu.Lock()
+		defer mu.Unlock()
+		return modelCalls
+	}
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest("POST", "/chat/completions", nil)
+	handleProviderChat(rec, req, map[string]any{"model": "catretry:cat-free", "messages": []any{}}, "catretry")
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("failed refresh must leave the gate closed: %d body=%s", rec.Code, rec.Body.String())
+	}
+	if calls() != 1 {
+		t.Fatalf("first request must attempt the catalog fetch, got %d", calls())
+	}
+
+	// 失败尝试的 attemptedAt 仍然很近: 请求路径必须退避, 不能每个请求都打上游。
+	rec = httptest.NewRecorder()
+	req = httptest.NewRequest("POST", "/chat/completions", nil)
+	handleProviderChat(rec, req, map[string]any{"model": "catretry:cat-free", "messages": []any{}}, "catretry")
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("backoff window must not refresh: %d body=%s", rec.Code, rec.Body.String())
+	}
+	if calls() != 1 {
+		t.Fatalf("second request must back off, catalog fetched %d times", calls())
+	}
+
+	// 退避窗口过去后必须重试并恢复。
+	p.mu.Lock()
+	p.attemptedAt = time.Now().UnixMilli() - providerCatalogRetryMs - 1000
+	p.mu.Unlock()
+	rec = httptest.NewRecorder()
+	req = httptest.NewRequest("POST", "/chat/completions", nil)
+	handleProviderChat(rec, req, map[string]any{"model": "catretry:cat-free", "messages": []any{}}, "catretry")
+	if calls() != 2 {
+		t.Fatalf("retry past the backoff window must fetch again, got %d", calls())
+	}
+	if rec.Code != http.StatusOK {
+		t.Fatalf("recovery retry must pass the gate: %d body=%s", rec.Code, rec.Body.String())
 	}
 }
 
