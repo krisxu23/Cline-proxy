@@ -17,9 +17,12 @@ type geminiQuotaFailure struct {
 }
 
 var (
-	quotaLineRe      = regexp.MustCompile(`(?i)Quota exceeded for metric:\s*([^,]+),\s*limit:\s*(\d+)`)
-	freeTierMetricRe = regexp.MustCompile(`(?i)free.?tier`)
-	requestMetricRe  = regexp.MustCompile(`(?i)requests?[_-]?per[_-]?day`)
+	quotaLineRe = regexp.MustCompile(`(?i)Quota exceeded for metric:\s*([^,]+),\s*limit:\s*(\d+)`)
+	// 指标名两种拼写都要认: Google 的 quotaMetric 是 snake_case 的 dotted 指标
+	// (generativelanguage.googleapis.com/generate_content_free_tier_requests),
+	// 而 quotaId 与部分回包是 CamelCase(...-FreeTier / ...RequestsPerDay...)。
+	freeTierMetricRe = regexp.MustCompile(`(?i)free[_]?tier`)
+	requestMetricRe  = regexp.MustCompile(`(?i)_requests$|requests?[_-]?per[_-]?day`)
 	retryInRe        = regexp.MustCompile(`(?i)retry in ([\d.]+)s`)
 	noLongerRe       = regexp.MustCompile(`(?i)no longer available`)
 	interactionsRe   = regexp.MustCompile(`(?i)only supports .*Interactions API`)

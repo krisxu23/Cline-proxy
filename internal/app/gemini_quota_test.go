@@ -82,6 +82,41 @@ func TestParseQuotaFailureNonQuota(t *testing.T) {
 	}
 }
 
+func TestParseQuotaFailureRealGoogleMetric(t *testing.T) {
+	// 真实 Google 429 的形态: message 与 quotaMetric 都是 snake_case 的 dotted
+	// 指标, quotaId 才是 CamelCase 的窗口标识。两者都必须被解析出来,
+	// 否则每日限额提取会静默失效。
+	payload := map[string]any{
+		"error": map[string]any{
+			"message": "Quota exceeded for metric: generativelanguage.googleapis.com/generate_content_free_tier_requests, limit: 20, model: gemini-3.8-flash",
+			"details": []any{
+				map[string]any{
+					"@type": "type.googleapis.com/google.rpc.QuotaFailure",
+					"violations": []any{
+						map[string]any{
+							"quotaMetric": "generativelanguage.googleapis.com/generate_content_free_tier_requests",
+							"quotaId":     "GenerateRequestsPerDayPerProjectPerModel-FreeTier",
+						},
+					},
+				},
+			},
+		},
+	}
+	qf := parseQuotaFailure(payload)
+	if qf == nil {
+		t.Fatal("real google payload must parse")
+	}
+	if qf.NoFreeTier {
+		t.Fatal("free tier exists")
+	}
+	if qf.ExhaustedWindow != "day" {
+		t.Fatalf("window: %q", qf.ExhaustedWindow)
+	}
+	if qf.DailyRequestLimit == nil || *qf.DailyRequestLimit != 20 {
+		t.Fatalf("daily limit: %+v", qf.DailyRequestLimit)
+	}
+}
+
 func TestPermanentRejectionReason(t *testing.T) {
 	withdrawn := map[string]any{"error": map[string]any{"message": "model x is no longer available"}}
 	if got := permanentRejectionReason(404, withdrawn); got != "withdrawn upstream" {
