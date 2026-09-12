@@ -574,6 +574,7 @@ func callZenAPI(ctx context.Context, params map[string]any, stream bool) (*http.
 	}
 	delay := time.Second
 	rateLimited := 0
+	regionRetried := false // 地区拒绝最多主动换出口重试一次, 避免 hopeless 模型烧光重试
 
 	for attempt := 0; ; attempt++ {
 		// 端点轮换: 第 N 次尝试用第 N % len(baseURLs) 个端点,
@@ -624,7 +625,20 @@ func callZenAPI(ctx context.Context, params map[string]any, stream bool) (*http.
 		resp.Body.Close()
 		// 首次遇到地区限制时自动登记该模型, 并触发节点能力探测
 		if isRegionError(bodyBytes) {
-			markModelRegionRestricted(zenModelIDOf(params))
+			modelID := zenModelIDOf(params)
+			markModelRegionRestricted(modelID)
+			// 把这次真实使用的出口标记为"该模型地区不可用", 选路下一轮就会
+			// 避开它, 并换一个出口立即重试 —— 撞地区限制时原地重试只会再 403。
+			// 注意 via= 打印的是全局轮询位置, 不代表这条请求的真实出口。
+			actual := reqExitKey(ctx)
+			if key := nodeLocalKey(actual); key != "" && !regionRetried && attempt < retries {
+				setRegionNodeOK(modelID, key, false)
+				regionRetried = true
+				log.Printf("  zen: model %s region rejected via %s, 已标记该出口并换出口重试",
+					modelID, describeExitRaw(actual))
+				continue
+			}
+			log.Printf("  zen: model %s region rejected via %s", modelID, describeExitRaw(actual))
 		}
 
 		if isRateLimited(resp.StatusCode, bodyBytes) {
@@ -700,6 +714,20 @@ func describeZenProxy() string {
 		return fmt.Sprintf("node[%d]=%s", idx+1, nodeDisplayName(p))
 	}
 	return fmt.Sprintf("proxy[%d]=%s", idx+1, kit.Truncate(maskProxyURL(p), 60))
+}
+
+// describeExitRaw 展示某条请求真实使用的出口。
+// 与 describeZenProxy 不同: 那是全局轮询位置, 会把别的请求选的节点安在这条
+// 请求头上, 排查"明明走了节点为什么还 403"时极具误导性。
+func describeExitRaw(p string) string {
+	switch {
+	case p == "":
+		return "直连"
+	case isNodeLink(p):
+		return "节点: " + nodeDisplayName(p)
+	default:
+		return "代理: " + kit.Truncate(maskProxyURL(p), 60)
+	}
 }
 
 func zenModelList() []map[string]any {

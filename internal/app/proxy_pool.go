@@ -228,7 +228,19 @@ func zenHTTP2Transport() *http2.Transport {
 }
 
 // reqExit 单次请求实际使用的出口, 由日志中间件经 request context 收集
-type reqExit struct{ name string }
+type reqExit struct {
+	name string // 展示用
+	key  string // 原始出口标识(节点链接/代理 URL), 反馈环据此标记
+}
+
+// reqExitKey 拨号层实际使用的出口标识; 空串表示直连。
+func reqExitKey(ctx context.Context) string {
+	info, ok := ctx.Value(ctxKeyReqExit).(*reqExit)
+	if !ok {
+		return ""
+	}
+	return info.key
+}
 
 type ctxKeyReqExitType struct{}
 
@@ -240,6 +252,7 @@ func setReqExit(ctx context.Context, proxy string) {
 	if !ok {
 		return
 	}
+	info.key = proxy
 	switch {
 	case proxy == "":
 		info.name = "直连"

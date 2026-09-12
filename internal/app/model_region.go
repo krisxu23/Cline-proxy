@@ -152,6 +152,7 @@ func probeModelAllNodes(modelID string) {
 		return
 	}
 	var okCount int32
+	probed := int32(0)
 	sem := make(chan struct{}, 8)
 	var wg sync.WaitGroup
 	for _, k := range keys {
@@ -160,28 +161,39 @@ func probeModelAllNodes(modelID string) {
 			defer wg.Done()
 			sem <- struct{}{}
 			defer func() { <-sem }()
-			ok := probeNodeModel(key, modelID)
-			setRegionNodeOK(modelID, key, ok)
-			if ok {
+			regionOK, known := probeNodeModel(key, modelID)
+			if !known {
+				return // 拨号失败只是节点抖动, 不改写它的地区能力记录
+			}
+			setRegionNodeOK(modelID, key, regionOK)
+			atomic.AddInt32(&probed, 1)
+			if regionOK {
 				atomic.AddInt32(&okCount, 1)
 			}
 		}(k)
 	}
 	wg.Wait()
-	log.Printf("  zen: model %s region probe done, %d/%d nodes usable",
-		modelID, atomic.LoadInt32(&okCount), len(keys))
+	log.Printf("  zen: model %s region probe done, %d/%d 确认可用 (%d/%d 拿到结果)",
+		modelID, atomic.LoadInt32(&okCount), len(keys), atomic.LoadInt32(&probed), len(keys))
 }
 
-// probeNodeModel 经单个节点出口向上游发最小请求, 判断该出口地区是否被该模型接受。
-// 仅 200 视为可用; 其余(含 403 RegionError)一律记为不可用, 保持保守。
-func probeNodeModel(key, modelID string) bool {
+// probeNodeModel 经单个节点出口向上游发最小请求, 判断该出口的地区是否被该模型接受。
+//
+// 判据是"有没有被地区拒绝", 而不是"是否 200": 429 限流 / 402 额度 / 5xx 都
+// 说明请求已经抵达模型接口且地区被放行。此前只认 200, 8 并发探测自己撞出
+// 上游限流, 144 个节点全被误标为不可用 —— 选路无候选后退回直连,
+// 大陆 IP 对这类模型必然 403, 这正是"走了节点还报 RegionError"的真相。
+//
+// 返回 (regionOK, known): known=false 表示连结果都没拿到(拨号失败),
+// 节点可能只是抖动, 此时不应更新它的地区能力记录。
+func probeNodeModel(key, modelID string) (regionOK, known bool) {
 	local := nodeLocalAddr(key)
 	if local == "" {
-		return false
+		return false, false
 	}
 	proxyURL, err := url.Parse(local)
 	if err != nil {
-		return false
+		return false, false
 	}
 	payload, err := json.Marshal(map[string]any{
 		"model":      modelID,
@@ -190,11 +202,11 @@ func probeNodeModel(key, modelID string) bool {
 		"stream":     false,
 	})
 	if err != nil {
-		return false
+		return false, false
 	}
 	req, err := http.NewRequest("POST", zenAPIBase+"/chat/completions", bytes.NewReader(payload))
 	if err != nil {
-		return false
+		return false, false
 	}
 	cfg := getZenConfig()
 	sess, user, ua := kit.FreshZenIdentity()
@@ -215,18 +227,32 @@ func probeNodeModel(key, modelID string) bool {
 	}
 	resp, err := client.Do(req)
 	if err != nil {
-		return false
+		return false, false
 	}
 	defer resp.Body.Close()
-	if resp.StatusCode == http.StatusOK {
-		return true
-	}
-	io.Copy(io.Discard, io.LimitReader(resp.Body, 4096))
-	return false
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+	return classifyRegionProbe(resp.StatusCode, string(body))
 }
 
-// pickZenProxyForModel 选择出口: 地区受限模型只从通过该模型校验的节点中轮询,
-// 其余模型沿用常规轮询。无合规节点时返回直连("", -1), 由上游给出真实原因。
+// classifyRegionProbe 按响应判定出口的地区能力(独立出来便于单测)。
+func classifyRegionProbe(status int, body string) (regionOK, known bool) {
+	if status == http.StatusForbidden && isRegionError(body) {
+		return false, true // 明确的地区拒绝
+	}
+	if status == 0 {
+		return false, false
+	}
+	// 任何其他 HTTP 响应都证明"请求抵达了模型接口且地区被放行"
+	return true, true
+}
+
+// pickZenProxyForModel 选择出口: 地区受限模型优先从"未被探测出地区拒绝"的
+// 节点中轮询, 其余模型沿用常规轮询。
+//
+// 注意方向: 只有"已探测确认被拒"才排除, 没有探测数据照样参与 —— 未探测
+// 不等于不可用, 否则刚启动/探测未完成时必然无候选。全部节点都确认被拒时
+// 退回常规轮询而不是直连: 对大陆禁售模型, 直连是 100% 失败,
+// 任何一个节点都比它强。
 func pickZenProxyForModel(modelID string) (string, int) {
 	if exitModeDirectNow() {
 		return "", -1
@@ -252,12 +278,13 @@ func pickZenProxyForModel(modelID string) (string, int) {
 		if !zenProxyAvailable(i) || !nodeDialable(p) || !nodeUsable(p) || !supported(p) {
 			continue
 		}
-		if ok, known := regionNodeUsable(modelID, nodeLocalKey(p)); known && ok {
-			cand = append(cand, i)
+		if ok, known := regionNodeUsable(modelID, nodeLocalKey(p)); known && !ok {
+			continue // 已探测确认该出口地区被该模型拒绝
 		}
+		cand = append(cand, i)
 	}
 	if len(cand) == 0 {
-		return "", -1
+		return pickZenProxyWhere(supported)
 	}
 	idx := cand[int(zenProxyCount.Add(1)-1)%len(cand)]
 	return list[idx], idx
