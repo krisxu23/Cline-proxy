@@ -1635,7 +1635,7 @@ function pvSearchInput(n, el) {
 // 行内模型管理(ai-gateway 式: 加/管/看在同一处): 搜索 + 逐个启用勾。
 function renderPvModelBlock(n, p) {
   const q = ((window.pvModelQ || {})[n] || '').toLowerCase();
-  const all = p.catalogModels && p.catalogModels.length ? p.catalogModels : (p.models || []).map(m => ({ id: m.model || String(m.id).split(':').slice(1).join(':'), disabled: false }));
+  const all = p.catalogModels && p.catalogModels.length ? p.catalogModels : ((p.modelEntries && p.modelEntries.length) ? p.modelEntries.map(e => ({ id: e.id, disabled: !e.enabled })) : (p.models || []).map(m => ({ id: m.model || String(m.id).split(':').slice(1).join(':'), disabled: false })));
   const models = all.filter(m => !q || String(m.id).toLowerCase().indexOf(q) >= 0);
   const rows = models.map(m => {
     const disp = n + ':' + m.id;
@@ -1674,7 +1674,13 @@ async function toggleProviderModel(box) {
   try {
     await api('POST', '/providers/update', { name, provider: existing });
     toast((box.checked ? '已启用 ' : '已剔除 ') + name + ':' + id, 'success');
-    loadProviders();
+    // 乐观更新本地态后直接重绘, 不整页重拉: 服务端保存会丢弃运行时目录
+    // (防旧端点), 重拉回来目录为空导致整表消失, 要等下一次刷新才恢复。
+    const merged = Array.from(entries, ([mid, enabled]) => ({ id: mid, enabled }));
+    p.modelEntries = merged;
+    (p.catalogModels || []).forEach(m => { if (m.id === id) m.disabled = !box.checked; });
+    renderProviderList();
+    try { await api('POST', '/providers/refresh', { name }); setTimeout(loadProviders, 8000); } catch (e2) { /* 目录回来后自动对齐 */ }
   } catch (e) { toast('保存失败: ' + e.message, 'error'); box.checked = !box.checked; }
 }
 
