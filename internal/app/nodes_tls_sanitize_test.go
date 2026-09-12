@@ -20,6 +20,19 @@ func TestSanitizeOutboundTLS(t *testing.T) {
 			wantTLS: false,
 		},
 		{
+			// 线上故障: 订阅下发的 anytls 出站整个缺 tls 块, sing-box 报
+			// "initialize outbound[0]: TLS required" 被整条剔除 —— 而代理软件
+			// 默认启用 TLS 能连。anytls 必须有 TLS, 缺块时按 server 补默认块。
+			name:    "anytls 缺 tls 块: 按 server 补默认块",
+			in:      map[string]any{"type": "anytls", "server": "a.com", "server_port": 443, "password": "x"},
+			wantTLS: true, wantEna: true,
+		},
+		{
+			name:    "anytls 缺 tls 块且无 server: 不补(照样无效)",
+			in:      map[string]any{"type": "anytls", "server_port": 443},
+			wantTLS: false,
+		},
+		{
 			name:    "tls 为 nil: 不动且不 panic",
 			in:      map[string]any{"type": "vless", "tls": nil},
 			wantTLS: false,
@@ -120,5 +133,22 @@ func TestCatalogExitBudgetBounded(t *testing.T) {
 	}
 	if got > catalogExitMaxRotations {
 		t.Fatalf("预算 %d 超过硬上限 %d", got, catalogExitMaxRotations)
+	}
+}
+
+// anytls 缺 tls 块: 补块的 server_name 必须取 server 本身, 且补完后
+// validateOutboundEntry 不得再报 "TLS required" 把节点剔除。
+func TestAnytlsMissingTLSDefaults(t *testing.T) {
+	ob := map[string]any{"type": "anytls", "server": "a.com", "server_port": 443, "password": "x"}
+	sanitizeOutboundTLS(ob)
+	blk, ok := ob["tls"].(map[string]any)
+	if !ok {
+		t.Fatal("anytls 缺 tls 块时必须补默认块")
+	}
+	if blk["enabled"] != true || blk["server_name"] != "a.com" {
+		t.Fatalf("默认块错误: %#v", blk)
+	}
+	if err := validateOutboundEntry(ob); err != nil {
+		t.Fatalf("补块后仍被判无效: %v", err)
 	}
 }

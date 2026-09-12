@@ -208,6 +208,18 @@ func syncNodeBox() {
 func sanitizeOutboundTLS(ob map[string]any) {
 	raw, ok := ob["tls"]
 	if !ok {
+		// anytls 在 sing-box 里强制要求 TLS, 缺块直接 "TLS required" 整条剔除;
+		// 订阅下发的 raw JSON 经常缺这块(代理软件默认启用所以能连), 按 server 补默认块。
+		// ponytail: 仅 anytls(线上实锤), tuic/hy2 等若出现同类剔除再加。
+		if typ, _ := ob["type"].(string); typ == "anytls" {
+			if server, _ := ob["server"].(string); server != "" {
+				ob["tls"] = map[string]any{
+					"enabled":     true,
+					"server_name": server,
+					"utls":        map[string]any{"enabled": true, "fingerprint": "chrome"},
+				}
+			}
+		}
 		return
 	}
 	if raw == nil {
@@ -453,6 +465,9 @@ func validateOutboundEntry(ob map[string]any) error {
 			entry[k] = v
 		}
 	}
+	// 按实际运行形态校验: buildNodeParts 落盘前必经 sanitize, 这里先对副本做同样的事,
+	// 否则"校验时剔除、运行时能跑"(或反过来), 两边结论打架。
+	sanitizeOutboundTLS(entry)
 	dnsCfg, resolverTag := buildNodeDNS(getZenConfig())
 	boxCfg := map[string]any{
 		"log":       map[string]any{"disabled": true},
