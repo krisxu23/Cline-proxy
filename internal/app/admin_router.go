@@ -359,8 +359,8 @@ func handleAdminRouterSave(w http.ResponseWriter, r *http.Request) {
 	})
 
 	writeAPI(w, http.StatusOK, apiResponse{Success: true, Data: map[string]any{
-		"alias":   alias,
-		"models":  len(sel.Models),
+		"alias":    alias,
+		"models":   len(sel.Models),
 		"problems": validateRouterSelection(sel),
 	}})
 }

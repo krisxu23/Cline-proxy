@@ -17,8 +17,8 @@ import (
 // and are exposed through thin adapters; clinepass is fully owned by the
 // providers package (key pool + cooldown + RawChat for protocol reuse).
 type gateway struct {
-	Router      *providers.Router
-	ClinePass   *providers.ClinePassProvider
+	Router    *providers.Router
+	ClinePass *providers.ClinePassProvider
 }
 
 var (

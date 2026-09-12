@@ -27,11 +27,11 @@ func TestStatsAggregateByUpstreamAndModel(t *testing.T) {
 		t.Fatalf("total tokens = %d", got)
 	}
 	want := map[string]int64{
-		upstreamZen:                  3,
-		upstreamCline:                1,
-		upstreamClinePass:            1,
-		providerUpstream("gemini"):   1,
-		providerUpstream("bai"):      1,
+		upstreamZen:                3,
+		upstreamCline:              1,
+		upstreamClinePass:          1,
+		providerUpstream("gemini"): 1,
+		providerUpstream("bai"):    1,
 	}
 	if len(agg.ByUpstream) != len(want) {
 		t.Fatalf("byUpstream keys = %v", agg.ByUpstream)

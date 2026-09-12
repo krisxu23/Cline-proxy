@@ -202,25 +202,26 @@ func refreshSubsLoop(subs []string) {
 }
 
 // fetchSubscription 抓取单个订阅。
-// 出口跟随全局出口模式: 节点模式先经节点出口(订阅地址被墙时的唯一出路),
-// 失败自动退回直连 —— 可用性优先, 不因为出口抖动就丢掉整份订阅。
+//
+// 出口跟随全局出口模式(统一走网关出口客户端): 代理模式经节点, 直连模式经
+// sing-box 的 direct 出站。原先这里在节点失败后"退回直连"——那是一处隐式
+// 绕开模式的旁路, 现在统一交给出口决策: 只有当确实没有可用节点时, 才由
+// 兜底开关决定是否直连(是否经 sing-box 的 direct 出站)。
 func fetchSubscription(u string) ([]any, error) {
-	if !exitModeDirectNow() && len(effectiveProxyList()) > 0 {
-		body, err := doFetch(u, getZenHTTPClient())
-		if err == nil {
-			return parseSubContent(string(body))
-		}
-		log.Printf("  订阅 %s 经节点出口抓取失败(%v), 退回直连", u, err)
-	}
-	body, err := doFetch(u, &http.Client{Timeout: 25 * time.Second})
+	ctx, cancel := context.WithTimeout(context.Background(), subsFetchTimeout)
+	defer cancel()
+	body, err := doFetch(ctx, u, getZenHTTPClient())
 	if err != nil {
 		return nil, err
 	}
 	return parseSubContent(string(body))
 }
 
-func doFetch(u string, client *http.Client) ([]byte, error) {
-	req, err := http.NewRequestWithContext(context.Background(), http.MethodGet, u, nil)
+// subsFetchTimeout 单次订阅抓取的整体超时。
+const subsFetchTimeout = 60 * time.Second
+
+func doFetch(ctx context.Context, u string, client *http.Client) ([]byte, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -501,7 +502,7 @@ func clashToOutbound(m map[string]any, i int) (map[string]any, error) {
 		return nil, fmt.Errorf("不支持的类型 %q", typ)
 	}
 	return ob, nil
-}// clashTLS Clash 节点的 TLS 相关字段 → sing-box tls 块
+} // clashTLS Clash 节点的 TLS 相关字段 → sing-box tls 块
 func clashTLS(m map[string]any, server, typ string) map[string]any {
 	b, _ := m["tls"].(bool)
 	reality, _ := m["reality-opts"].(map[string]any)
@@ -523,7 +524,7 @@ func clashTLS(m map[string]any, server, typ string) map[string]any {
 	}
 	if reality != nil {
 		tls["reality"] = map[string]any{
-			"enabled": true,
+			"enabled":    true,
 			"public_key": yStrOr(reality["public-key"], ""),
 			"short_id":   yStrOr(reality["short-id"], ""),
 		}

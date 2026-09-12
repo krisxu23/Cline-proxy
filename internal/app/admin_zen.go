@@ -27,6 +27,7 @@ func handleZenConfig(w http.ResponseWriter, r *http.Request) {
 		"exitMode":        cfg.ExitMode,
 		"dnsMode":         cfg.DNSMode,
 		"dnsCustom":       cfg.DNSCustomDNS,
+		"rescueDirect":    rescueDirectEnabled(),
 		"subsRefreshMins": cfg.SubsRefreshMins,
 		"proxyStrategy":   cfg.ProxyStrategy,
 		"maxConcurrency":  cfg.MaxConcurrency,
@@ -72,6 +73,7 @@ func handleZenConfigUpdate(w http.ResponseWriter, r *http.Request) {
 		ExitMode        *string  `json:"exitMode"`
 		DNSMode         *string  `json:"dnsMode"`
 		DNSCustom       *string  `json:"dnsCustom"`
+		RescueDirect    *bool    `json:"rescueDirect"`
 		SubsRefreshMins *int     `json:"subsRefreshMins"`
 		ProxyStrategy   *string  `json:"proxyStrategy"`
 		MaxConcurrency  *int     `json:"maxConcurrency"`
@@ -231,6 +233,10 @@ func handleZenConfigUpdate(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 		next.DNSCustomDNS = custom
+	}
+	if patch.RescueDirect != nil {
+		v := *patch.RescueDirect
+		next.RescueDirect = &v
 	}
 	// 订阅增删, 或出口模式切换(抓取路径随之改变)都重新抓取; 空列表会清空订阅节点
 	exitChanged := patch.ExitMode != nil && *patch.ExitMode != cur.ExitMode

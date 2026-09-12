@@ -32,7 +32,23 @@ var (
 	nodeBox       *box.Box
 	nodePorts     map[string]int // 节点链接(去 # 名称) -> 本地 mixed 端口
 	nodePortsKeys string         // 当前运行实例对应的链接集合, 用于配置变化比对
+	catchAllPort  int            // 常驻 catch-all 入站的本地端口(0 = 未就绪)
 )
+
+// catchAllInTag 常驻兜底入站: 让"任何非节点直选"的网络行为也经 sing-box 出去。
+// 它的 route.final 是 direct, 因此出口模式为直连时, 流量依然在 sing-box 内部
+// 走 direct 出站(而不是绕开 sing-box 用 Go 原生拨号)。
+const catchAllInTag = "in-catchall"
+
+// catchAllLocalAddr catch-all 入站的 SOCKS5 地址; 未就绪返回空串。
+func catchAllLocalAddr() string {
+	nodeMu.Lock()
+	defer nodeMu.Unlock()
+	if catchAllPort == 0 {
+		return ""
+	}
+	return fmt.Sprintf("127.0.0.1:%d", catchAllPort)
+}
 
 var nodeSchemes = map[string]bool{
 	"vmess": true, "vless": true, "trojan": true,
@@ -99,7 +115,10 @@ func syncNodeBox() {
 	}
 	sort.Strings(keys)
 	joined := strings.Join(keys, "|")
-	if joined == nodePortsKeys {
+	// 链接集合没变且实例已在, 无需重建。注意必须同时判断实例存在:
+	// 零节点启动时 joined 与初值都是空串, 但实例还没建, 要建出只含
+	// catch-all 的实例(直连模式也要经过 sing-box)。
+	if joined == nodePortsKeys && nodeBox != nil {
 		return
 	}
 
@@ -108,62 +127,22 @@ func syncNodeBox() {
 		nodeBox = nil
 		nodePorts = nil
 		nodePortsKeys = ""
-	}
-	if len(entries) == 0 {
-		return
+		catchAllPort = 0
 	}
 
 	var inbounds, outbounds, rules []map[string]any
-	ports := map[string]int{}
-	for i, e := range entries {
-		var ob map[string]any
-		var key string
-		var port int
-		var err error
-		switch v := e.(type) {
-		case string:
-			port, err = freeLocalPort()
-			if err != nil {
-				log.Printf("  node %d: 分配本地端口失败: %v", i+1, err)
-				continue
-			}
-			ob, err = nodeOutbound(v, fmt.Sprintf("out-%d", i))
-			if err != nil {
-				log.Printf("  node %d: 解析失败已跳过: %v", i+1, err)
-				continue
-			}
-			key = nodeLocalKey(v)
-		case map[string]any:
-			port, err = freeLocalPort()
-			if err != nil {
-				log.Printf("  node %d: 分配本地端口失败: %v", i+1, err)
-				continue
-			}
-			cp := map[string]any{"tag": fmt.Sprintf("out-%d", i)}
-			for k, val := range v {
-				if k != "tag" {
-					cp[k] = val
-				}
-			}
-			ob = cp
-			key = subEntryKey(v)
-		default:
-			continue
-		}
-		tag := ob["tag"].(string)
-		inbounds = append(inbounds, map[string]any{
-			"type": "mixed", "tag": fmt.Sprintf("in-%d", i),
-			"listen": "127.0.0.1", "listen_port": port,
-		})
-		outbounds = append(outbounds, ob)
-		rules = append(rules, map[string]any{
-			"action": "route", "inbound": []string{fmt.Sprintf("in-%d", i)}, "outbound": tag,
-		})
-		ports[key] = port
-	}
 	ports, inbounds, outbounds, rules, hasMap := buildNodeParts(entries)
-	if len(outbounds) == 0 {
-		return
+
+	// 常驻 catch-all 入站: 与节点数量无关, 保证"只要网关联网就经过 sing-box"。
+	// 零节点时也建实例 —— 直连模式下流量仍走 sing-box 的 direct 出站。
+	if cp, err := freeLocalPort(); err == nil {
+		catchAllPort = cp
+		inbounds = append(inbounds, map[string]any{
+			"type": "mixed", "tag": catchAllInTag,
+			"listen": "127.0.0.1", "listen_port": cp,
+		})
+	} else {
+		log.Printf("  nodes: catch-all 入站端口分配失败: %v", err)
 	}
 	outbounds = append(outbounds, map[string]any{"type": "direct", "tag": "direct"})
 
@@ -175,6 +154,13 @@ func syncNodeBox() {
 		log.Printf("  nodes: 全量构建失败(%v), 退回仅手动节点重建", err)
 		var p2, inb2, outb2, rules2, _ = buildNodeParts(stringEntries(entries))
 		if len(outb2) > 0 {
+			// 退回重建同样要保留 catch-all, 否则"全部经 sing-box"在这条路径上失效
+			if catchAllPort != 0 {
+				inb2 = append(inb2, map[string]any{
+					"type": "mixed", "tag": catchAllInTag,
+					"listen": "127.0.0.1", "listen_port": catchAllPort,
+				})
+			}
 			outb2 = append(outb2, map[string]any{"type": "direct", "tag": "direct"})
 			if inst2, err2 := startNodeInstance(ctx, inb2, outb2, rules2); err2 == nil {
 				instance, ports, err = inst2, p2, nil

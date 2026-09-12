@@ -311,10 +311,13 @@ func (p *modelProvider) fetchCatalogPage(ctx context.Context, cfg providerConfig
 	return page, nil
 }
 
-// catalogDirectClient 直连兜底客户端: 不经过出口链路, 专供"节点全部失败后
-// 最后试一次直连"使用。直连模式本身已经是直连, 不会走到这里。
-func catalogDirectClient() *http.Client {
-	return &http.Client{Timeout: providerCatalogTimeout}
+// catalogFallbackClient 目录抓取的兜底客户端。
+//
+// 走网关统一出口: 代理模式经节点(节点池全试一遍仍失败时, 由出口决策按
+// "节点全挂兜底"开关决定是否直连), 直连模式经 sing-box 的 direct 出站。
+// 原先这里是"强制直连"的旁路, 会绕过出口模式, 现已收回统一决策。
+func catalogFallbackClient() *http.Client {
+	return getZenHTTPClient()
 }
 
 // fetchCatalogPages 逐页拉取一个目录地址直到取完。第一页带出口轮换与直连兜底
@@ -357,10 +360,12 @@ func (p *modelProvider) fetchFirstCatalogPage(ctx context.Context, cfg providerC
 	}
 	// 直连兜底: 只在真的走过节点出口后才有意义 —— 池里没有出口时,
 	// 出口客户端本身就是直连, 再试一次纯属浪费。
+	// 兜底尝试: 同样走网关出口(跟随模式) —— 代理模式下若确实无可用节点,
+	// 由出口决策按"节点全挂兜底"开关决定是否直连。
 	if !p.catalogDirectTried && len(effectiveProxyList()) > 0 {
 		p.catalogDirectTried = true
-		log.Printf("  providers: %s 目录经节点全部失败, 用直连兜底再试一次", p.name)
-		cl := catalogDirectClient()
+		log.Printf("  providers: %s 目录经节点全部失败, 走出口兜底再试一次", p.name)
+		cl := catalogFallbackClient()
 		pg, derr := p.fetchCatalogPage(ctx, cfg, rawURL, "", cl)
 		if derr == nil {
 			return pg, cl, nil

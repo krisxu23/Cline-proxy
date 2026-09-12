@@ -35,8 +35,8 @@ func TestHeadersFromVersions(t *testing.T) {
 // 官方字段以官方值为准, 用户自己追加的头不能被抹掉。
 func TestMergeOfficialHeadersKeepsCustomEntries(t *testing.T) {
 	cur := map[string]string{
-		"X-CLIENT-VERSION": "3.0.50",     // 过期版本
-		"X-MY-TRACE":       "keep-me",    // 用户自定义
+		"X-CLIENT-VERSION": "3.0.50",  // 过期版本
+		"X-MY-TRACE":       "keep-me", // 用户自定义
 		"User-Agent":       "Cline/1.0.0",
 	}
 	merged := mergeOfficialHeaders(cur, map[string]string{

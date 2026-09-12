@@ -631,6 +631,17 @@ body:not([data-theme="dark"]) .theme-toggle .dark-label{display:none}
         </select>
       </div>
     </div>
+      <div class="field"><label>节点全挂时</label>
+        <select id="ocRescue">
+          <option value="true">允许直连兜底（推荐，经 sing-box 的 direct 出站）</option>
+          <option value="false">严格走节点（一个可用节点都没有就直接失败）</option>
+        </select>
+      </div>
+    </div>
+    <p class="hint" style="margin:0 0 14px;font-size:12px;color:var(--text3)">
+      出口模式作用于整个网关：<strong style="color:var(--text)">直连模式下流量依然经过 sing-box</strong>（走它的 direct 出站），
+      因此所有联网行为都统一在 sing-box 里 —— 只有 sing-box 实例起不来时才会回退 Go 原生拨号保命（日志会标注）。
+    </p>
     <div class="form-row">
       <div class="field"><label>DNS 解析</label>
         <select id="ocDnsMode">
@@ -1397,6 +1408,7 @@ async function loadOcConfig() {
     _('ocExitMode').value = c.exitMode === 'direct' ? 'direct' : 'proxy';
     if (_('ocDnsMode')) _('ocDnsMode').value = c.dnsMode || 'doh-ali';
     if (_('ocDnsCustom')) _('ocDnsCustom').value = c.dnsCustom || '';
+    if (_('ocRescue')) _('ocRescue').value = (c.rescueDirect === false) ? 'false' : 'true';
     _('ocSubRefresh').value = c.subsRefreshMins || 30;
     if (_('dashExitMode')) _('dashExitMode').value = (c.exitMode === 'direct') ? '直连（不走节点）' : '节点出口（走节点列表）';
     loadOcNodes();
@@ -1523,6 +1535,7 @@ async function saveOcConfig() {
     exitMode: _('ocExitMode').value,
     dnsMode: _('ocDnsMode') ? _('ocDnsMode').value : 'doh-ali',
     dnsCustom: _('ocDnsCustom') ? _('ocDnsCustom').value.trim() : '',
+    rescueDirect: _('ocRescue') ? _('ocRescue').value === 'true' : true,
     subsRefreshMins: refresh,
     proxyStrategy: _('ocStrategy').value,
     maxConcurrency: parseInt(_('ocMaxConc').value) || 8,

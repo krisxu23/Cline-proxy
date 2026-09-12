@@ -7,6 +7,7 @@ import (
 	"encoding/base64"
 	"fmt"
 	"io"
+	"log"
 	"net"
 	"net/http"
 	"net/url"
@@ -258,15 +259,48 @@ func describeEffectiveExit() string {
 	}
 }
 
+// zenDialContext 网关全部出站的唯一拨号入口。
+//
+// 出口策略(B 方案: 模式跟随):
+//   - 代理模式且存在可用节点 -> 拨该节点的本地入站(候选链按错误类型换节点靠它);
+//   - 其余情况(直连模式 / 代理模式但节点全不可用) -> 拨常驻 catch-all 入站,
+//     由 sing-box 内部决定出网方式 —— 直连模式下走 direct 出站, 因此**即使
+//     直连, 流量依然经过 sing-box**, 而不是绕开它用 Go 原生拨号;
+//   - catch-all 也不可用(实例未就绪) -> 回退 Go 原生拨号保命, 并显式记日志,
+//     避免"sing-box 起不来 = 整个网关断网"。
 func zenDialContext(ctx context.Context, network, addr string) (net.Conn, error) {
 	modelID, _ := ctx.Value(ctxKeyZenModel).(string)
 	p, _ := pickZenProxyForModel(modelID)
 	setReqExit(ctx, p)
-	if p == "" {
-		d := &net.Dialer{Timeout: 30 * time.Second, KeepAlive: 30 * time.Second}
-		return d.DialContext(ctx, network, addr)
+	if p != "" {
+		return dialViaProxy(ctx, p, network, addr)
 	}
-	return dialViaProxy(ctx, p, network, addr)
+
+	// 代理模式但一个可用节点都没有: 是否允许直连兜底由配置决定。
+	if !exitModeDirectNow() && !rescueDirectEnabled() {
+		return nil, fmt.Errorf("没有可用节点，且已禁用直连兜底")
+	}
+	if local := catchAllLocalAddr(); local != "" {
+		u := &url.URL{Scheme: "socks5", Host: local}
+		conn, err := dialSOCKS5(ctx, u, network, addr)
+		if err == nil {
+			return conn, nil
+		}
+		log.Printf("  exit: catch-all 拨号失败(%v), 回退 Go 原生直连", err)
+	}
+	// 保命路径: sing-box 实例不可用时不能让整个网关失去联网能力。
+	d := &net.Dialer{Timeout: 30 * time.Second, KeepAlive: 30 * time.Second}
+	return d.DialContext(ctx, network, addr)
+}
+
+// rescueDirectEnabled 节点全部不可用时是否允许直连兜底(缺省 true)。
+// 用指针区分"未设置"与"显式关闭": 旧配置文件没有这个字段, 不能因此变成禁用。
+func rescueDirectEnabled() bool {
+	cfg := getZenConfig()
+	if cfg == nil || cfg.RescueDirect == nil {
+		return true
+	}
+	return *cfg.RescueDirect
 }
 
 // dialViaProxy 统一拨号:http/https 走 CONNECT,socks5 走 SOCKS5 握手,

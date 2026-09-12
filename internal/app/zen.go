@@ -222,20 +222,21 @@ type zenCompactConfig struct {
 type zenConfigData struct {
 	Enabled         bool                      `json:"enabled"`
 	Key             string                    `json:"key"`
-	BaseURL         string                    `json:"baseURL"`             // 主端点(兼容旧配置字段)
-	BaseURLs        []string                  `json:"baseURLs"`            // 全部端点: 主端点 + CDN 镜像, 重试时轮换
-	Proxies         []string                  `json:"proxies"`             // http(s)/socks5 代理与节点链接,轮询出口
-	Subs            []string                  `json:"subs,omitempty"`      // 订阅链接, 定期抓取展开为节点并入池
-	ProxyStrategy   string                    `json:"proxyStrategy"`       // round_robin / random / fill
-	ExitMode        string                    `json:"exitMode"`            // direct / proxy: 全网关统一出口
-	DNSMode         string                    `json:"dnsMode,omitempty"`   // system / doh-ali / doh-cf / custom
-	DNSCustomDNS    string                    `json:"dnsCustom,omitempty"` // DNSMode=custom 时的 DoH 地址
-	SubsRefreshMins int                       `json:"subsRefreshMinutes"`  // 订阅刷新间隔(分钟), 默认 30
-	MaxConcurrency  int                       `json:"maxConcurrency"`      // zen 上游最大并发,防 worker 瞬时超限,默认 8
-	Retries         int                       `json:"retries"`             // 限流/网络错误重试次数,默认 3
-	Failover        bool                      `json:"failover"`            // zen 连续失败后故障转移到 cline 账号池,默认 true
-	FailoverCount   int                       `json:"failoverCount"`       // 触发故障转移的连续失败次数,默认 3
-	FailoverMinutes int                       `json:"failoverMinutes"`     // 故障转移窗口(分钟),默认 5
+	BaseURL         string                    `json:"baseURL"`                // 主端点(兼容旧配置字段)
+	BaseURLs        []string                  `json:"baseURLs"`               // 全部端点: 主端点 + CDN 镜像, 重试时轮换
+	Proxies         []string                  `json:"proxies"`                // http(s)/socks5 代理与节点链接,轮询出口
+	Subs            []string                  `json:"subs,omitempty"`         // 订阅链接, 定期抓取展开为节点并入池
+	ProxyStrategy   string                    `json:"proxyStrategy"`          // round_robin / random / fill
+	ExitMode        string                    `json:"exitMode"`               // direct / proxy: 全网关统一出口
+	DNSMode         string                    `json:"dnsMode,omitempty"`      // system / doh-ali / doh-cf / custom
+	DNSCustomDNS    string                    `json:"dnsCustom,omitempty"`    // DNSMode=custom 时的 DoH 地址
+	RescueDirect    *bool                     `json:"rescueDirect,omitempty"` // 节点全不可用时允许直连兜底; 缺省(含旧配置)视为 true
+	SubsRefreshMins int                       `json:"subsRefreshMinutes"`     // 订阅刷新间隔(分钟), 默认 30
+	MaxConcurrency  int                       `json:"maxConcurrency"`         // zen 上游最大并发,防 worker 瞬时超限,默认 8
+	Retries         int                       `json:"retries"`                // 限流/网络错误重试次数,默认 3
+	Failover        bool                      `json:"failover"`               // zen 连续失败后故障转移到 cline 账号池,默认 true
+	FailoverCount   int                       `json:"failoverCount"`          // 触发故障转移的连续失败次数,默认 3
+	FailoverMinutes int                       `json:"failoverMinutes"`        // 故障转移窗口(分钟),默认 5
 	Compaction      zenCompactConfig          `json:"compaction"`
 	Providers       map[string]providerConfig `json:"providers,omitempty"`  // 通用 OpenAI 兼容上游
 	Routes          map[string][]string       `json:"routes,omitempty"`     // 路由别名 -> 有序候选链(如 free-best)
@@ -284,6 +285,7 @@ func zenBaseURLList(cfg *zenConfigData) []string {
 }
 
 func defaultZenConfig() *zenConfigData {
+	rescue := true
 	return &zenConfigData{
 		Enabled:         true,
 		Key:             "public",
@@ -291,6 +293,8 @@ func defaultZenConfig() *zenConfigData {
 		BaseURLs:        defaultZenBaseURLs(),
 		ProxyStrategy:   "round_robin",
 		ExitMode:        exitModeProxy,
+		DNSMode:         defaultDNSMode,
+		RescueDirect:    &rescue,
 		SubsRefreshMins: defaultSubsRefreshMins,
 		MaxConcurrency:  8,
 		Retries:         3,

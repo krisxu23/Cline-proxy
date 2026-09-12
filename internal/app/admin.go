@@ -1,9 +1,9 @@
 package app
 
 import (
+	"bytes"
 	"cline-go-proxy/internal/cline"
 	"cline-go-proxy/internal/kit"
-	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -34,10 +34,10 @@ type oauthSessionState struct {
 }
 
 type apiResponse struct {
-	Success bool        `json:"success"`
-	Data    any         `json:"data,omitempty"`
-	Error   string      `json:"error,omitempty"`
-	Message string      `json:"message,omitempty"`
+	Success bool   `json:"success"`
+	Data    any    `json:"data,omitempty"`
+	Error   string `json:"error,omitempty"`
+	Message string `json:"message,omitempty"`
 }
 
 func writeAPI(w http.ResponseWriter, status int, resp apiResponse) {
@@ -120,9 +120,9 @@ func handleAdminAccounts(w http.ResponseWriter, r *http.Request) {
 	writeAPI(w, http.StatusOK, apiResponse{
 		Success: true,
 		Data: map[string]any{
-			"accounts":   accounts,
-			"total":      len(accounts),
-			"poolIndex":  loadPool().CurrentIdx,
+			"accounts":  accounts,
+			"total":     len(accounts),
+			"poolIndex": loadPool().CurrentIdx,
 		},
 	})
 }
@@ -696,18 +696,23 @@ func testAccount(acc *Account) (map[string]any, string) {
 		}, "error"
 	}
 	req.Header = clineHeaders(token, sessionID)
+	// 账号探测也走网关统一出口: 否则在节点模式下会拿"直连结果"去判断账号好坏,
+	// 结论与实际调用路径不一致。
+	probeCtx, probeCancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer probeCancel()
+	req = req.WithContext(probeCtx)
 
-	resp, err := kit.HTTPClient.Do(req)
+	resp, err := getZenHTTPClient().Do(req)
 	if err != nil {
 		// 网络错误：5 分钟短冷却
 		markAccountCooldown(acc, "network error: "+err.Error(), 5*time.Minute)
 		return map[string]any{
-			"accountId": acc.AccountID,
-			"email":     acc.Email,
-			"status":    "cooldown",
-			"reason":    acc.LastReason,
+			"accountId":     acc.AccountID,
+			"email":         acc.Email,
+			"status":        "cooldown",
+			"reason":        acc.LastReason,
 			"cooldownUntil": acc.CooldownUntil.Format("2006-01-02 15:04:05"),
-			"remaining": formatDuration(time.Until(acc.CooldownUntil)),
+			"remaining":     formatDuration(time.Until(acc.CooldownUntil)),
 		}, "cooldown"
 	}
 	defer resp.Body.Close()
@@ -949,7 +954,7 @@ func handleAdminConfig(w http.ResponseWriter, r *http.Request) {
 		address = proxyListenAddress
 	}
 	writeAPI(w, http.StatusOK, apiResponse{Success: true, Data: map[string]any{
-		"address":      address,
+		"address": address,
 		// listenAddr 是真实绑定地址(可能是 0.0.0.0), apiBase 是客户端应使用的本机入口。
 		"listenAddr":   proxyListenAddress,
 		"apiBase":      localOrigin(),

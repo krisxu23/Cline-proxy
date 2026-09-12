@@ -48,14 +48,14 @@ func providerUpstream(name string) string {
 }
 
 type zenStatsAgg struct {
-	Date        string                     `json:"date"`
-	Requests    int64                      `json:"requests"`
-	PromptTok   int64                      `json:"promptTokens"`
-	CompleteTok int64                      `json:"completionTokens"`
-	Compaction  int64                      `json:"compactionTokens"`
-	RateLimited int64                      `json:"rateLimited"` // 限流命中次数
-	ByModel     map[string]*zenStatsModel  `json:"byModel"`
-	ByUpstream  map[string]*zenStatsModel  `json:"byUpstream"`
+	Date        string                    `json:"date"`
+	Requests    int64                     `json:"requests"`
+	PromptTok   int64                     `json:"promptTokens"`
+	CompleteTok int64                     `json:"completionTokens"`
+	Compaction  int64                     `json:"compactionTokens"`
+	RateLimited int64                     `json:"rateLimited"` // 限流命中次数
+	ByModel     map[string]*zenStatsModel `json:"byModel"`
+	ByUpstream  map[string]*zenStatsModel `json:"byUpstream"`
 }
 
 type zenStatsModel struct {

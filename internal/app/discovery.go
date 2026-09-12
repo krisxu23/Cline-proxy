@@ -87,7 +87,7 @@ type rejectedDiscovery struct {
 }
 
 type discoveredFile struct {
-	Models   []discoveredModel  `json:"models"`
+	Models   []discoveredModel   `json:"models"`
 	Rejected []rejectedDiscovery `json:"rejected,omitempty"`
 }
 

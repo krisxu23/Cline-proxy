@@ -198,10 +198,10 @@ func candidateCoolingSnapshot() []map[string]any {
 			continue
 		}
 		out = append(out, map[string]any{
-			"key":        k,
-			"class":      c.class,
-			"reason":     c.reason,
-			"remainMs":   c.until - now,
+			"key":         k,
+			"class":       c.class,
+			"reason":      c.reason,
+			"remainMs":    c.until - now,
 			"untilUnixMs": c.until,
 		})
 	}

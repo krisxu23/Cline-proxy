@@ -55,12 +55,12 @@ func trayIcon() []byte {
 	// 打包 ICO: ICONDIR + ICONDIRENTRY + BITMAPINFOHEADER + XOR + AND 掩码
 	andMask := make([]byte, size/8*size) // 4 字节/行 × 32 行, alpha 已带透明度, 掩码全 0
 	bmp := make([]byte, 0, 40+len(px)+len(andMask))
-	bmp = appendU16LE(bmp, 40)          // biSize
-	bmp = appendU32LE(bmp, size)        // biWidth
-	bmp = appendU32LE(bmp, size*2)      // biHeight (XOR+AND)
-	bmp = appendU16LE(bmp, 1)           // biPlanes
-	bmp = appendU16LE(bmp, 32)          // biBitCount
-	bmp = appendU32LE(bmp, 0)           // biCompression
+	bmp = appendU16LE(bmp, 40)     // biSize
+	bmp = appendU32LE(bmp, size)   // biWidth
+	bmp = appendU32LE(bmp, size*2) // biHeight (XOR+AND)
+	bmp = appendU16LE(bmp, 1)      // biPlanes
+	bmp = appendU16LE(bmp, 32)     // biBitCount
+	bmp = appendU32LE(bmp, 0)      // biCompression
 	bmp = appendU32LE(bmp, uint32(len(px)+len(andMask)))
 	bmp = appendU32LE(bmp, 0, 0, 0, 0) // biXPels, biYPels, biClrUsed, biClrImportant
 	bmp = append(bmp, px...)
