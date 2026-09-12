@@ -122,6 +122,12 @@ func exitModeDirectNow() bool {
 // 跳过冷却中或未就绪的节点;全部不可用时返回直连。
 // 每次调用递增计数,保证 round_robin 顺序与日志索引一致。
 func pickZenProxy() (string, int) {
+	return pickZenProxyWhere(nil)
+}
+
+// pickZenProxyWhere 在 pickZenProxy 的基础上追加一个候选过滤条件。
+// extra 为 nil 时等价于原行为; 上游可达性过滤(上游对出口地区有要求时)走这里。
+func pickZenProxyWhere(extra func(p string) bool) (string, int) {
 	if exitModeDirectNow() {
 		return "", -1
 	}
@@ -137,14 +143,20 @@ func pickZenProxy() (string, int) {
 	case "fill":
 		idx = 0
 	}
-	// 冷却/未就绪/已检测不可达的出口跳过: 线性探测下一个可用代理
+	// 冷却/未就绪/已检测不可达/该上游不可达的出口跳过: 线性探测下一个可用代理
 	for i := 0; i < n; i++ {
-		if zenProxyAvailable(idx) && nodeDialable(list[idx]) && nodeUsable(list[idx]) {
+		if zenProxyAvailable(idx) && nodeDialable(list[idx]) && nodeUsable(list[idx]) &&
+			(extra == nil || extra(list[idx])) {
 			break
 		}
 		idx = (idx + 1) % n
 	}
 	if !nodeDialable(list[idx]) {
+		return "", -1
+	}
+	if extra != nil && !extra(list[idx]) {
+		// 池里没有一个节点满足该上游的要求: 不要退而求其次乱拨, 交给上层决定
+		// (让出口决策走 catch-all / 兜底), 否则会被误认为"该上游可用"。
 		return "", -1
 	}
 	return list[idx], idx

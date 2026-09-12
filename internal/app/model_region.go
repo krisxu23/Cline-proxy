@@ -214,8 +214,17 @@ func pickZenProxyForModel(modelID string) (string, int) {
 	if exitModeDirectNow() {
 		return "", -1
 	}
+	// 上游可达性: 已探测出"该节点到该上游不通"时跳过它 —— 这正是
+	// "节点全绿但某个 Provider 502"的成因, 不该继续把请求交给它。
+	upstream := upstreamOfModel(modelID)
+	supported := func(p string) bool {
+		if upstream == "" {
+			return true
+		}
+		return nodeSupportsUpstream(upstream, nodeLocalKey(p))
+	}
 	if !isRegionRestrictedModel(modelID) {
-		return pickZenProxy()
+		return pickZenProxyWhere(supported)
 	}
 	list := effectiveProxyList()
 	if len(list) == 0 {
@@ -223,7 +232,7 @@ func pickZenProxyForModel(modelID string) (string, int) {
 	}
 	cand := make([]int, 0, len(list))
 	for i, p := range list {
-		if !zenProxyAvailable(i) || !nodeDialable(p) || !nodeUsable(p) {
+		if !zenProxyAvailable(i) || !nodeDialable(p) || !nodeUsable(p) || !supported(p) {
 			continue
 		}
 		if ok, known := regionNodeUsable(modelID, nodeLocalKey(p)); known && ok {

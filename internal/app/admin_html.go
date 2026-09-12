@@ -1498,14 +1498,20 @@ async function loadOcNodes() {
     const regionN = list.filter(n => (n.regions || []).length).length;
     _('ocNodesBox').innerHTML = list.map(n => {
       const regions = (n.regions || []).map(r => r.replace(/-free$/, ''));
+      const ups = n.upstreams || {};
+      const upNames = Object.keys(ups);
+      const upOk = upNames.filter(u => ups[u]);
+      const upBad = upNames.filter(u => !ups[u]);
       return '<div style="display:flex;align-items:center;gap:9px;padding:5px 12px;font-size:12.5px;border-bottom:1px solid rgba(148,163,184,.07)">' +
       '<span style="flex:none">' + icon(n) + '</span>' +
       '<span style="flex:none;min-width:58px;color:var(--text3);font-family:monospace">' + esc(n.type) + '</span>' +
       '<span style="flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">' + esc(n.name) + '</span>' +
+      (upOk.length ? '<span style="flex:none;font-size:10.5px;color:#16a34a;border:1px solid currentColor;border-radius:4px;padding:0 5px" title="已探测: 该出口到这些上游可达">✓ ' + esc(upOk.join(',')) + '</span>' : '') +
+      (upBad.length ? '<span style="flex:none;font-size:10.5px;color:#f87171;border:1px solid currentColor;border-radius:4px;padding:0 5px" title="已探测: 该出口到这些上游不通(选节点时会跳过)">✕ ' + esc(upBad.join(',')) + '</span>' : '') +
       (regions.length ? '<span style="flex:none;font-size:10.5px;color:#16a34a;border:1px solid currentColor;border-radius:4px;padding:0 5px" title="该出口已验证可用于地区受限模型">🌍 ' + esc(regions.join(',')) + '</span>' : '') +
       '<span style="flex:none;font-size:11px;color:var(--text3)">' + n.source + '</span></div>';
     }).join('') +
-    '<div style="padding:6px 12px;font-size:11px;color:var(--text3)">共 ' + list.length + ' 个出口 · 🟢 可达 ' + okN + ' · 🔴 不可达 ' + failN + ' · ⚪ 未检测 ' + unkN + ' · 🌍 可用于地区受限模型 ' + regionN + '（连通 = 经节点真实连接 opencode/cline 上游）</div>';
+    '<div style="padding:6px 12px;font-size:11px;color:var(--text3)">共 ' + list.length + ' 个出口 · 🟢 可达 ' + okN + ' · 🔴 不可达 ' + failN + ' · ⚪ 未检测 ' + unkN + ' · 🌍 可用于地区受限模型 ' + regionN + '<br>✓/✕ 是该出口到各上游的可达性(逐节点 TLS 握手探测, 按上游名); ✕ 的节点在请求该上游时会被自动跳过</div>';
   } catch (e) { _('ocNodesBox').textContent = '加载失败: ' + e.message; }
 }
 
