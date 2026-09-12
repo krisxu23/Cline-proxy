@@ -2,6 +2,7 @@ package app
 
 import (
 	"fmt"
+	"math/rand"
 	"net/url"
 	"os"
 	"regexp"
@@ -205,7 +206,7 @@ func (c providerConfig) applyAuthWithKey(target, key string, set func(key, value
 	set("Authorization", "Bearer "+key)
 }
 
-// enabledAPIKeys 可轮换的 key 列表(配置顺序): 健康在前、被冷却的沉底。
+// enabledAPIKeys 可轮换的 key 列表: 健康打散在前、被冷却的沉底。
 // 只看显式开关, 不依赖 legacy 单 key 是否回填 —— 只有 APIKeys 列表的
 // provider 同样视为已配置。
 func enabledAPIKeys(cfg providerConfig, provider string) []string {
@@ -220,15 +221,8 @@ func enabledAPIKeys(cfg providerConfig, provider string) []string {
 			head = append(head, e.Key)
 		}
 	}
+	rand.Shuffle(len(head), func(i, j int) { head[i], head[j] = head[j], head[i] })
 	return append(head, tail...)
-}
-
-// isKeyDemoted 该 key 是否因连续失败被冷却(与 recordKeyResult 同阈值)。
-func isKeyDemoted(provider, key string) bool {
-	keyHealthMu.Lock()
-	defer keyHealthMu.Unlock()
-	st := keyHealth[provider][key]
-	return st != nil && st.failures >= keyFailThreshold && time.Now().UnixMilli()-st.demotedAt < keyCooldownMs
 }
 
 // stripProviderModelPrefix Google 目录里的 id 带 models/ 前缀, 发布时去掉。

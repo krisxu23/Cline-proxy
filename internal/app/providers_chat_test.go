@@ -429,12 +429,15 @@ type chunkReader struct {
 func TestChatRotatesKeysOnFailure(t *testing.T) {
 	var mu sync.Mutex
 	seen := []string{}
+	n := 0
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		auth := r.Header.Get("Authorization")
 		mu.Lock()
 		seen = append(seen, auth)
+		n++
+		first := n == 1
 		mu.Unlock()
-		if auth == "Bearer bad" {
+		if first {
 			w.WriteHeader(500)
 			w.Write([]byte(`{"error":"boom"}`))
 			return
@@ -458,9 +461,33 @@ func TestChatRotatesKeysOnFailure(t *testing.T) {
 	}
 	mu.Lock()
 	defer mu.Unlock()
-	if len(seen) != 2 || seen[0] != "Bearer bad" || seen[1] != "Bearer good" {
-		t.Fatalf("must try bad then good: %#v", seen)
+	if len(seen) != 2 {
+		t.Fatalf("both keys must be tried (healthy order shuffled): %#v", seen)
 	}
+	got := map[string]bool{seen[0]: true, seen[1]: true}
+	if !got["Bearer bad"] || !got["Bearer good"] {
+		t.Fatalf("bad must be tried and good must succeed: %#v", seen)
+	}
+}
+
+func TestEnabledAPIKeysDemotedSortsLast(t *testing.T) {
+	resetKeyHealthState()
+	for i := 0; i < 5; i++ {
+		recordKeyResult("rkd", "bad", 500, false)
+	}
+	if !isKeyDemoted("rkd", "bad") {
+		t.Fatal("bad must be demoted after 5 failures")
+	}
+	if isKeyDemoted("rkd", "good") {
+		t.Fatal("never-observed key must not be demoted")
+	}
+	cfg := providerConfig{BaseURL: "https://x",
+		APIKeys: []providerAPIKey{{Key: "bad", Enabled: true}, {Key: "good", Enabled: true}}}
+	keys := enabledAPIKeys(cfg, "rkd")
+	if len(keys) != 2 || keys[1] != "bad" {
+		t.Fatalf("demoted key must sort last: %#v", keys)
+	}
+	resetKeyHealthState()
 }
 
 func TestApplyAuthAnthropic(t *testing.T) {

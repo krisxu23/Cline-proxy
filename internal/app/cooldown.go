@@ -327,6 +327,15 @@ func pickHealthyKeys(provider string) []string {
 	return out
 }
 
+// isKeyDemoted reports whether the key is currently cooled down after
+// consecutive failures (single source of the threshold; see recordKeyResult).
+func isKeyDemoted(provider, key string) bool {
+	keyHealthMu.Lock()
+	defer keyHealthMu.Unlock()
+	st := keyHealth[provider][key]
+	return st != nil && st.failures >= keyFailThreshold && time.Now().UnixMilli()-st.demotedAt < keyCooldownMs
+}
+
 func resetKeyHealthState() {
 	keyHealthMu.Lock()
 	keyHealth = map[string]map[string]*keyHealthState{}
