@@ -276,9 +276,8 @@ var keyHealthMu sync.Mutex
 var keyHealth = map[string]map[string]*keyHealthState{}
 
 type keyHealthState struct {
-	failures   int
-	demotedAt  int64
-	lastFailed bool
+	failures  int
+	demotedAt int64
 }
 
 func recordKeyResult(provider, key string, status int, netErr bool) {
@@ -300,7 +299,6 @@ func recordKeyResult(provider, key string, status int, netErr bool) {
 	}
 	if fail {
 		st.failures++
-		st.lastFailed = true
 		if st.failures >= keyFailThreshold {
 			st.demotedAt = time.Now().UnixMilli()
 		}
@@ -309,42 +307,23 @@ func recordKeyResult(provider, key string, status int, netErr bool) {
 	}
 }
 
-func splitProviderKeys(s string) []string {
-	parts := strings.Split(s, ",")
-	out := make([]string, 0, len(parts))
-	for _, p := range parts {
-		if p = strings.TrimSpace(p); p != "" {
-			out = append(out, p)
-		}
-	}
-	return out
-}
-
+// pickHealthyKeys returns observed healthy keys for the provider (empty if
+// none observed). providerConfig.APIKey is a single key string today — there
+// is no established multi-key config format (clinepass keeps its own key-pool
+// file), so key sourcing arrives with provider-chat wiring; this stays
+// observed-map-only until then.
 func pickHealthyKeys(provider string) []string {
-	var cfgKeys []string
-	if cfg, ok := providerConfigFor(provider); ok {
-		cfgKeys = splitProviderKeys(cfg.APIKey)
-	}
 	now := time.Now().UnixMilli()
 	keyHealthMu.Lock()
 	defer keyHealthMu.Unlock()
-	if len(cfgKeys) == 0 {
-		for k, st := range keyHealth[provider] {
-			if st != nil && st.failures >= keyFailThreshold && now-st.demotedAt < keyCooldownMs {
-				continue
-			}
-			cfgKeys = append(cfgKeys, k)
-		}
-		sort.Strings(cfgKeys)
-		return cfgKeys
-	}
-	out := make([]string, 0, len(cfgKeys))
-	for _, k := range cfgKeys {
-		if st := keyHealth[provider][k]; st != nil && st.failures >= keyFailThreshold && now-st.demotedAt < keyCooldownMs {
+	var out []string
+	for k, st := range keyHealth[provider] {
+		if st != nil && st.failures >= keyFailThreshold && now-st.demotedAt < keyCooldownMs {
 			continue
 		}
 		out = append(out, k)
 	}
+	sort.Strings(out)
 	return out
 }
 
