@@ -572,6 +572,11 @@ func callZenAPI(ctx context.Context, params map[string]any, stream bool) (*http.
 	if retries <= 0 {
 		retries = 3
 	}
+	// 地区受限模型的失败大多是"节点到上游某条线路不通", 换节点就能成;
+	// 池子上百个节点时 3 次尝试命中率太低, 给它更宽的轮换预算。
+	if isRegionRestrictedModel(zenModelIDOf(params)) && retries < 6 {
+		retries = 6
+	}
 	delay := time.Second
 	rateLimited := 0
 	regionRetried := false // 地区拒绝最多主动换出口重试一次, 避免 hopeless 模型烧光重试
@@ -601,7 +606,19 @@ func callZenAPI(ctx context.Context, params map[string]any, stream bool) (*http.
 		log.Printf("  zen upstream: model=%s stream=%v msgs=%d via=%s endpoint=%s attempt=%d session=%s",
 			body["model"], stream, getMsgCount(params), describeZenProxy(), base, attempt+1, kit.Truncate(sess, 24))
 
-		resp, err := getZenHTTPClient().Do(req)
+		client := getZenHTTPClient()
+		// 地区受限模型绝不能吃共享连接池: 池里的 h2 连接是启动早期建立的
+		// (model sync 等任务在节点就绪前就发起了第一批请求, 当时走的是直连
+		// 的大陆 IP), 此后所有 zen 请求都复用这条连接, DialTLSContext 不会再
+		// 被调用 —— 按模型的出口选择被整个绕过, RegionError 403 就是这么来的
+		// (其他 zen 模型不限地区所以正常, 只有受限模型暴露)。
+		// 每次用全新传输真实拨号, 让 zenDialContext 现场选出口。
+		if isRegionRestrictedModel(zenModelIDOf(params)) {
+			fresh := *client
+			fresh.Transport = zenHTTP2Transport()
+			client = &fresh
+		}
+		resp, err := client.Do(req)
 		if err != nil {
 			// 网络错误: 当前出口短冷却, 避免重试再次命中同一失效节点
 			if idx := lastZenProxyIdx(); idx >= 0 {
@@ -665,6 +682,25 @@ func callZenAPI(ctx context.Context, params map[string]any, stream bool) (*http.
 			}
 			markZenFail()
 			return nil, rateLimited, &zenUpstreamError{Status: resp.StatusCode, Body: kit.Truncate(bodyBytes, 500)}
+		}
+
+		// 5xx: 冷却本次真实出口换下一个重试 —— 上游 500 常与出口线路相关
+		// (不同节点到上游的落地路径不同), 与网络错误同一套自愈逻辑。
+		if resp.StatusCode >= http.StatusInternalServerError && attempt < retries {
+			if key := reqExitKey(ctx); key != "" {
+				for i, p := range effectiveProxyList() {
+					if nodeLocalKey(p) == nodeLocalKey(key) {
+						cooldownZenProxy(i, 2*time.Minute)
+						break
+					}
+				}
+			}
+			log.Printf("  zen upstream %d via %s, retry %d/%d via next exit (next endpoint: %s)",
+				resp.StatusCode, describeExitRaw(reqExitKey(ctx)), attempt+1, retries,
+				baseURLs[(attempt+1)%len(baseURLs)])
+			time.Sleep(kit.WithRetryJitter(delay))
+			delay *= 2
+			continue
 		}
 
 		markZenFailOnStatus(resp.StatusCode)

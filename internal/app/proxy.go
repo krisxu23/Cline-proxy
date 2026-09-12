@@ -72,25 +72,29 @@ func StartProxy(host string, port int) error {
 
 	freePort(port)
 
+	// 出口基础设施必须先于一切网络任务就绪: 模型同步/目录刷新等启动即发起
+	// 请求, 若此时节点未就绪, 首批请求会走 catch-all 直连(大陆 IP), 而共享
+	// h2 传输池会把这条连接缓存下来给后续所有 zen 请求复用 —— 地区受限模型
+	// 便永远 403。
+	initRegionModels()
+	syncNodeBox()
+	loadSubCache()
+	if subs := getZenConfig().Subs; len(subs) > 0 {
+		go refreshSubsLoop(subs)
+	}
 	startModelsRefresher()
 	startZenModelsRefresher()
 	startProviderRefresher()
 	startHeadersAutoSync()
 	startUsageLedger()
 	startDiscovery()
-	initRegionModels()
 	startNodeHealthLoop()
-	syncNodeBox()
 
 	// Register proxy-aware HTTP client for ClinePass provider
 	providers.SetProxyDoer(func(req *http.Request) (*http.Response, error) {
 		return getZenHTTPClient().Do(req)
 	})
 
-	loadSubCache()
-	if subs := getZenConfig().Subs; len(subs) > 0 {
-		go refreshSubsLoop(subs)
-	}
 	initStats()
 	LoadRequestLogsFromFile()
 	go cleanupCompactStates()

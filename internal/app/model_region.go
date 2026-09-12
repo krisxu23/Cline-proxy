@@ -271,19 +271,35 @@ func pickZenProxyForModel(modelID string) (string, int) {
 	}
 	list := effectiveProxyList()
 	if len(list) == 0 {
+		log.Printf("  zen: 地区受限模型 %s 选路失败: 出口池为空, 回退直连", modelID)
 		return "", -1
 	}
+	var cooled, notDialable, notUsable, unsupported, regionBad int
 	cand := make([]int, 0, len(list))
 	for i, p := range list {
-		if !zenProxyAvailable(i) || !nodeDialable(p) || !nodeUsable(p) || !supported(p) {
+		switch {
+		case !zenProxyAvailable(i):
+			cooled++
+			continue
+		case !nodeDialable(p):
+			notDialable++
+			continue
+		case !nodeUsable(p):
+			notUsable++
+			continue
+		case !supported(p):
+			unsupported++
 			continue
 		}
 		if ok, known := regionNodeUsable(modelID, nodeLocalKey(p)); known && !ok {
-			continue // 已探测确认该出口地区被该模型拒绝
+			regionBad++ // 已探测确认该出口地区被该模型拒绝
+			continue
 		}
 		cand = append(cand, i)
 	}
 	if len(cand) == 0 {
+		log.Printf("  zen: 地区受限模型 %s 无候选(池 %d: 冷却 %d 未就绪 %d 不健康 %d 上游不通 %d 地区被拒 %d), 回退常规轮询",
+			modelID, len(list), cooled, notDialable, notUsable, unsupported, regionBad)
 		return pickZenProxyWhere(supported)
 	}
 	idx := cand[int(zenProxyCount.Add(1)-1)%len(cand)]
