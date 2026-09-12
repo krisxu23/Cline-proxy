@@ -160,6 +160,16 @@ func resolveSubscriptions(urls []string) {
 		merged = append(merged, nodes...)
 	}
 	subMu.Lock()
+	prevCount := len(subNodes)
+	if len(merged) == 0 && prevCount > 0 {
+		// 全部订阅本次都抓取失败: 保留上一次的节点与缓存。
+		// 出口池全靠订阅供给, 一次网络抖动不该把它清空 —— 否则面板上
+		// "暂无出口节点"、请求全部失败, 而空结果还会覆盖订阅缓存,
+		// 连重启都救不回来, 只能干等下一次刷新成功。
+		log.Printf("  订阅: %d 个订阅本次全部抓取失败, 保留原有 %d 个节点", len(clean), prevCount)
+		subMu.Unlock()
+		return
+	}
 	subNodes = merged
 	rebuildSubKeysLocked()
 	saveSubCacheLocked()
@@ -207,10 +217,24 @@ func refreshSubsLoop(subs []string) {
 // sing-box 的 direct 出站。原先这里在节点失败后"退回直连"——那是一处隐式
 // 绕开模式的旁路, 现在统一交给出口决策: 只有当确实没有可用节点时, 才由
 // 兜底开关决定是否直连(是否经 sing-box 的 direct 出站)。
+// fetchSubscription 抓取单个订阅。
+// 出口跟随全局出口模式(直连经 sing-box direct 出站, 代理经节点出站);
+// 抓取失败且打开了"节点全挂时直连兜底"时, 再用 Go 原生直连救一次 ——
+// 订阅是整个出口池的唯一来源, 它不能跟着出口一起死。
 func fetchSubscription(u string) ([]any, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), subsFetchTimeout)
 	defer cancel()
 	body, err := doFetch(ctx, u, getZenHTTPClient())
+	if err == nil {
+		return parseSubContent(string(body))
+	}
+	if !rescueDirectEnabled() {
+		return nil, err
+	}
+	log.Printf("  订阅 %s 经出口抓取失败(%v), 用直连兜底再试一次", u, err)
+	dctx, dcancel := context.WithTimeout(context.Background(), subsFetchTimeout)
+	defer dcancel()
+	body, err = doFetch(dctx, u, &http.Client{Timeout: subsFetchTimeout})
 	if err != nil {
 		return nil, err
 	}

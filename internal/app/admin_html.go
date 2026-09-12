@@ -677,7 +677,7 @@ body:not([data-theme="dark"]) .theme-toggle .dark-label{display:none}
     </div>
     <div class="form-row">
       <div class="field"><label style="display:flex;align-items:center;justify-content:space-between">节点列表
-        <button type="button" class="btn" style="padding:3px 10px;font-size:12px" onclick="refreshOcNodes()">连通检测</button></label>
+        <button type="button" id="ocCheckBtn" class="btn" style="padding:3px 10px;font-size:12px" onclick="refreshOcNodes()">连通检测</button></label>
         <div id="ocNodesBox" style="max-height:190px;overflow-y:auto;border:1px solid var(--border);border-radius:10px;background:var(--inset)"></div>
       </div>
     </div>
@@ -1514,7 +1514,8 @@ async function loadOcNodes() {
     const d = await api('GET', '/opencode/nodes');
     const list = d.data || [];
     if (!list.length) {
-      _('ocNodesBox').innerHTML = '<div style="padding:10px 12px;font-size:12px;color:var(--text3)">暂无出口节点, 在上方添加代理/节点链接或订阅</div>';
+      _('ocNodesBox').innerHTML = '<div style="padding:10px 12px;font-size:12px;color:var(--text3)">'
+        + (ocChecking ? '连通检测进行中, 完成后列表自动恢复…' : '暂无出口节点, 在上方添加代理/节点链接或订阅') + '</div>';
       return;
     }
     const okN = list.filter(n => n.health === 'ok').length;
@@ -1537,17 +1538,27 @@ async function loadOcNodes() {
       (regions.length ? '<span style="flex:none;font-size:10.5px;color:#16a34a;border:1px solid currentColor;border-radius:4px;padding:0 5px" title="该出口已验证可用于地区受限模型">🌍 ' + esc(regions.join(',')) + '</span>' : '') +
       '<span style="flex:none;font-size:11px;color:var(--text3)">' + n.source + '</span></div>';
     }).join('') +
-    '<div style="padding:6px 12px;font-size:11px;color:var(--text3)">共 ' + list.length + ' 个出口 · 🟢 可达 ' + okN + ' · 🔴 不可达 ' + failN + ' · ⚪ 未检测 ' + unkN + ' · 🌍 可用于地区受限模型 ' + regionN + '<br>✓/✕ 是该出口到各上游的可达性(逐节点 TLS 握手探测, 按上游名); ✕ 的节点在请求该上游时会被自动跳过</div>';
+    '<div style="padding:6px 12px;font-size:11px;color:var(--text3)">共 ' + list.length + ' 个出口 · 🟢 可达 ' + okN + ' · 🔴 不可达 ' + failN + ' · ⚪ 未检测 ' + unkN + ' · 🌍 可用于地区受限模型 ' + regionN + '<br>✓/✕ 是该出口到各上游的可达性(逐节点 TLS 握手探测, 按上游名); ✕ 的节点在请求该上游时会被自动跳过'
+      + (ocChecking ? '<br>🔍 连通检测进行中, 图标与计数将在检测完成后更新…' : '') + '</div>';
   } catch (e) { _('ocNodesBox').innerHTML = fail(e, 'loadOcNodes()'); }
 }
 
+let ocChecking = false;
 async function refreshOcNodes() {
-  try { await api('POST', '/opencode/nodes/check'); } catch (e) { /* ignore */ }
-  toast('连通检测已启动, 结果稍后自动刷新', 'success');
+  if (ocChecking) return;
+  ocChecking = true;
+  const btn = _('ocCheckBtn');
+  const old = btn ? btn.textContent : '';
+  if (btn) { btn.disabled = true; btn.textContent = '检测中…'; }
+  try { await api('POST', '/opencode/nodes/check'); toast('连通检测已启动, 结果将在 1~2 分钟内陆续刷新', 'success'); }
+  catch (e) { toast('连通检测启动失败: ' + e.message, 'error'); }
   await loadOcNodes();
-  setTimeout(loadOcNodes, 15000);
-  setTimeout(loadOcNodes, 35000);
-  setTimeout(loadOcNodes, 90000);
+  [15, 35, 60, 90].forEach(sec => setTimeout(loadOcNodes, sec * 1000));
+  setTimeout(() => {
+    ocChecking = false;
+    if (btn) { btn.disabled = false; btn.textContent = old || '连通检测'; }
+    loadOcNodes();
+  }, 95 * 1000);
 }
 
 async function saveOcConfig() {
