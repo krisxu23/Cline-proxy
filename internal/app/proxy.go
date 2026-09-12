@@ -278,7 +278,7 @@ func StartProxy(host string, port int) error {
 			return
 		} else if route == "reject" {
 			writeJSON(w, http.StatusBadRequest, map[string]any{
-				"error": map[string]string{"message": fmt.Sprintf("model %q is a paid zen model; only free zen models are proxied", model), "type": "invalid_request_error"},
+				"error": map[string]string{"message": zenRejectMessage(model), "type": "invalid_request_error"},
 			})
 			return
 		}
@@ -1616,7 +1616,7 @@ func handleAnthropicMessages(w http.ResponseWriter, r *http.Request) {
 		return
 	} else if route == "reject" {
 		writeJSON(w, http.StatusBadRequest, map[string]any{
-			"error": map[string]string{"message": fmt.Sprintf("model %q is a paid zen model; only free zen models are proxied", req.Model), "type": "invalid_request_error"},
+			"error": map[string]string{"message": zenRejectMessage(req.Model), "type": "invalid_request_error"},
 		})
 		return
 	}

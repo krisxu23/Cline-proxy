@@ -468,7 +468,7 @@ func handleResponses(w http.ResponseWriter, r *http.Request) {
 	route := routeModel(chatModel)
 	if route == "reject" {
 		writeJSON(w, http.StatusBadRequest, map[string]any{
-			"error": map[string]string{"message": fmt.Sprintf("model %q is a paid zen model; only free zen models are proxied", chatModel), "type": "invalid_request_error"},
+			"error": map[string]string{"message": zenRejectMessage(chatModel), "type": "invalid_request_error"},
 		})
 		return
 	}

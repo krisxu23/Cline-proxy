@@ -58,6 +58,17 @@ func initZenModels() {
 			zenAliases[a] = &cp
 		}
 	}
+	// 种子之后恢复上次同步到的模型: 目录同步失败(节点抖动)时,
+	// 用户正在使用的同步模型(如 muse-spark-*)不至于从目录里消失。
+	loadZenModelsCache()
+}
+
+// zenRejectMessage 统一解释 zen 模型被拒的真实原因。之前固定说 "paid zen
+// model", 但目录同步失败时已同步的模型也会暂时缺席(与付费无关), 误导排查。
+func zenRejectMessage(model string) string {
+	return fmt.Sprintf("model %q is not an available free zen model: it is not in the current zen catalog "+
+		"(either it requires a paid plan, or the zen catalog sync has not succeeded yet — "+
+		"it retries automatically; cached models stay available)", model)
 }
 
 // resolveZenModel 解析模型名到 zen 模型。支持 "zen/<id>"、"opencode/<id>"
@@ -859,14 +870,24 @@ func decodeZenModels(resp *http.Response) (int, error) {
 		}
 		added++
 	}
+	if added > 0 {
+		saveZenModelsCacheLocked()
+	}
 	return added, nil
 }
 
-// startZenModelsRefresher 定时同步 zen 模型列表(默认 10 分钟)
+// startZenModelsRefresher 定时同步 zen 模型列表(成功后每 10 分钟;
+// 启动后第一次成功之前每 1 分钟重试 —— 目录里的同步模型关系到
+// 用户正在使用的模型能否被解析, 不能让一次节点抖动卡 10 分钟)。
 func startZenModelsRefresher() {
 	go func() {
-		if _, err := syncZenModels(); err != nil {
-			log.Printf("zen model sync: failed (%v), using seed list", err)
+		for {
+			if _, err := syncZenModels(); err == nil {
+				break
+			} else {
+				log.Printf("zen model sync: failed (%v), retrying in 1m (seed + cached models in use)", err)
+			}
+			time.Sleep(time.Minute)
 		}
 		ticker := time.NewTicker(10 * time.Minute)
 		for range ticker.C {
