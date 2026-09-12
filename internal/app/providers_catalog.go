@@ -591,7 +591,38 @@ func (p *modelProvider) refreshCatalog(ctx context.Context, force bool) error {
 	p.fetchedAt = time.Now().UnixMilli()
 	p.catalogErr = ""
 	p.mu.Unlock()
+	p.maybeBackfillExplicitModels()
 	return nil
+}
+
+// maybeBackfillExplicitModels 首次成功刷新后把 legacy 判定快照为显式模型开关。
+// 已迁移 / 目录为空 / 快照为空时跳过(避免把空结果误固化)。
+func (p *modelProvider) maybeBackfillExplicitModels() {
+	cfg, ok := providerConfigFor(p.name)
+	if !ok || cfg.Migrated {
+		return
+	}
+	p.mu.Lock()
+	empty := len(p.catalog) == 0
+	p.mu.Unlock()
+	if empty {
+		return
+	}
+	ids := p.freeModelIDs()
+	if len(ids) == 0 {
+		return
+	}
+	entries := make([]providerModelEntry, 0, len(ids))
+	for _, m := range ids {
+		entries = append(entries, providerModelEntry{ID: m.ID, Enabled: true})
+	}
+	name := p.name
+	mutateProvidersConfig(func(cfg *zenConfigData) {
+		pc := cfg.Providers[name]
+		pc.Models = entries
+		pc.Migrated = true
+		cfg.Providers[name] = pc
+	})
 }
 
 // freeModelIDs 该 provider 的免费模型列表。

@@ -432,3 +432,21 @@ func TestExplicitModelsPrecedence(t *testing.T) {
 		t.Fatal("explicit disabled must not be free")
 	}
 }
+
+func TestMigrationBackfillOnRefresh(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		json.NewEncoder(w).Encode(map[string]any{"data": []map[string]any{
+			{"id": "m1"}, {"id": "m2"},
+		}})
+	}))
+	defer srv.Close()
+	setTestProvider(t, "mig", providerConfig{BaseURL: srv.URL, APIKey: "k", Catalog: true, FreeModels: []string{"m1"}})
+	p := providerByName("mig")
+	if err := p.refreshCatalog(context.Background(), true); err != nil {
+		t.Fatal(err)
+	}
+	cfg, _ := providerConfigFor("mig")
+	if !cfg.Migrated || len(cfg.Models) != 1 || cfg.Models[0].ID != "m1" {
+		t.Fatalf("must backfill whitelist into explicit models: %+v", cfg.Models)
+	}
+}
