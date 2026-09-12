@@ -177,6 +177,19 @@ func pickZenProxyWhere(extra func(p string) bool) (string, int) {
 	return list[idx], idx
 }
 
+// pickUnifiedExit 统一出口选择: 地区不再做全局特例, 按常规轮询选出口。
+// 空池/直连模式返回 ("", -1), 由 zenDialContext 按 rescueDirect 决定 fail-closed。
+func pickUnifiedExit(modelID string) (string, int) {
+	if exitModeDirectNow() {
+		return "", -1
+	}
+	p, idx := pickZenProxyWhere(func(q string) bool { return true })
+	if p != "" {
+		return p, idx
+	}
+	return "", -1
+}
+
 // nodeUsable 已检测为不可达的节点不再参与轮询, 未检测的按可用处理。
 // 连通检测结果需要这层过滤才生效: 否则轮询会持续撞上失效节点。
 func nodeUsable(p string) bool {
@@ -310,7 +323,7 @@ func describeEffectiveExit() string {
 //     避免"sing-box 起不来 = 整个网关断网"。
 func zenDialContext(ctx context.Context, network, addr string) (net.Conn, error) {
 	modelID, _ := ctx.Value(ctxKeyZenModel).(string)
-	p, _ := pickZenProxyForModel(modelID)
+	p, _ := pickUnifiedExit(modelID)
 	setReqExit(ctx, p)
 	if p != "" {
 		return dialViaProxy(ctx, p, network, addr)

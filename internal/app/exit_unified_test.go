@@ -124,6 +124,15 @@ func TestProxyModeNoNodeWithoutRescueFails(t *testing.T) {
 	}
 }
 
+// 代理模式 + 空池必须 fail-closed: 不能退回直连。
+func TestProxyModePoolEmptyFailsClosed(t *testing.T) {
+	no := false
+	withTestConfig(t, &zenConfigData{ExitMode: "proxy", RescueDirect: &no})
+	if p, _ := pickUnifiedExit("opencode/mimo-v2.5-free"); p != "" {
+		t.Fatalf("must not direct, got %q", p)
+	}
+}
+
 func truncateForTest(s string, n int) string {
 	if len(s) <= n {
 		return s
