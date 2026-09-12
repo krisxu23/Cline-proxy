@@ -39,6 +39,24 @@ type providerConfig struct {
 
 var providerIDRe = regexp.MustCompile(`^[a-z][a-z0-9_-]*$`)
 
+func normalizeModelID(id string) (string, string) {
+	id = strings.TrimSpace(id)
+	if strings.HasPrefix(id, "zen/") {
+		return "opencode", strings.TrimPrefix(id, "zen/")
+	}
+	if strings.HasPrefix(id, "cline-pass/") {
+		return "clinepass", strings.TrimPrefix(id, "cline-pass/")
+	}
+	if i := strings.Index(id, ":"); i > 0 && !strings.Contains(id[:i], "/") {
+		return id[:i], id[i+1:]
+	}
+	if i := strings.Index(id, "/"); i > 0 {
+		return id[:i], id[i+1:]
+	}
+	return "", id
+}
+func isBuiltinProvider(id string) bool { return id == "opencode" || id == "cline" || id == "clinepass" }
+
 // chatPath 默认 /chat/completions
 func (c providerConfig) chatPath() string {
 	if c.ChatPath != "" {
