@@ -5,6 +5,7 @@ import (
 	"crypto/tls"
 	"log"
 	"net/url"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -154,13 +155,25 @@ func probeUpstreamMatrixAsync() {
 		nodeUpstreamMu.Unlock()
 	}()
 
+	// 先把外层 map 与全部内层 map 建好再并发写。
+	// 原实现里外层 map 由主协程边循环边赋值, 而工作协程同时在读它 ——
+	// Go 对 map 的并发读写是 fatal error(不可 recover), 会直接打死进程。
+	names := make([]string, 0, len(targets))
+	for name := range targets {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	next := make(map[string]map[string]bool, len(names))
+	for _, name := range names {
+		next[name] = make(map[string]bool, len(exits))
+	}
+
 	sem := make(chan struct{}, nodeUpstreamProbeWorkers)
 	var wg sync.WaitGroup
 	var mu sync.Mutex
-	next := map[string]map[string]bool{}
 	okCount := 0
-	for upstream, host := range targets {
-		next[upstream] = map[string]bool{}
+	for _, upstream := range names {
+		host := targets[upstream]
 		for _, exit := range exits {
 			wg.Add(1)
 			go func(upstream, host, exit string) {

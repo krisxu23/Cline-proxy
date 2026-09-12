@@ -30,6 +30,9 @@ var (
 	regionModels = map[string]bool{}
 	// regionNodeOK modelID -> nodeKey -> 该出口地区是否被该模型接受
 	regionNodeOK = map[string]map[string]bool{}
+	// regionProbing 正在探测中的模型(防止重复触发把整池节点探两遍)
+	regionProbeMu sync.Mutex
+	regionProbing = map[string]bool{}
 )
 
 // regionRestrictedSeed 已知有地区限制的模型, 启动时即纳入能力探测。
@@ -124,7 +127,21 @@ func probeRegionModelsAsync() {
 }
 
 // probeModelAllNodes 对全部已就绪节点探测指定模型的地区可用性。
+// 同一模型同时只跑一轮: 连通的重复触发会让整池节点被重复探测。
 func probeModelAllNodes(modelID string) {
+	regionProbeMu.Lock()
+	if regionProbing[modelID] {
+		regionProbeMu.Unlock()
+		return
+	}
+	regionProbing[modelID] = true
+	regionProbeMu.Unlock()
+	defer func() {
+		regionProbeMu.Lock()
+		delete(regionProbing, modelID)
+		regionProbeMu.Unlock()
+	}()
+
 	nodeMu.Lock()
 	keys := make([]string, 0, len(nodePorts))
 	for k := range nodePorts {

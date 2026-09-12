@@ -884,13 +884,39 @@ document.querySelectorAll('#importTabs .tab').forEach(el => {
 });
 
 // ========== API 请求 ==========
-async function api(method, path, body) {
-  const opts = { method, headers: {} };
+async function api(method, path, body, timeoutMs) {
+  const ctl = new AbortController();
+  const timer = setTimeout(() => ctl.abort(), timeoutMs || 30000);
+  const opts = { method, headers: {}, signal: ctl.signal };
   if (body) { opts.headers['Content-Type'] = 'application/json'; opts.body = JSON.stringify(body); }
-  const res = await fetch(API + path, opts);
-  const data = await res.json();
-  if (!data.success && data.error) throw new Error(data.error);
-  return data;
+  try {
+    const res = await fetch(API + path, opts);
+    if (!res.ok) {
+      throw new Error(res.status === 502 || res.status === 503 || res.status === 504
+        ? 'HTTP ' + res.status + '：后端忙或已退出'
+        : 'HTTP ' + res.status);
+    }
+    const data = await res.json();
+    if (!data.success && data.error) throw new Error(data.error);
+    return data;
+  } catch (e) {
+    if (e.name === 'AbortError') throw new Error('请求超时：后端正忙（目录刷新/节点探测占用出口），稍后重试');
+    if (/Failed to fetch|NetworkError|load failed/i.test(e.message || '')) {
+      throw new Error('无法连接后端：网关进程可能已退出，检查 data/cline-proxy.log');
+    }
+    throw e;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+// fail 统一的加载失败占位: 显示真实原因并给一个重试按钮,
+// 而不是只留一句"加载失败"让人无从下手。
+function fail(e, retryExpr) {
+  const msg = (e && e.message) ? e.message : '加载失败';
+  return '<div class="empty" style="padding:14px;line-height:1.9">⚠️ ' + esc(msg)
+    + (retryExpr ? '<br><button class="btn btn-sm" style="margin-top:8px" onclick="' + retryExpr + '">重试</button>' : '')
+    + '</div>';
 }
 
 // ========== 仪表盘 ==========
@@ -1113,7 +1139,7 @@ async function loadKeys() {
         '<button class="btn btn-sm btn-danger" onclick="deleteKey(\'' + k + '\')">✕</button>' +
       '</div>'
     ).join('');
-  } catch (e) { _('keysList').innerHTML = '<div class="empty">加载失败</div>'; }
+  } catch (e) { _('keysList').innerHTML = fail(e, 'loadKeys()'); }
 }
 
 async function generateKey() {
@@ -1169,7 +1195,7 @@ async function loadLogs() {
     const logs = d.data.logs || [];
     const tbody = _('logsTableBody');
     if (!logs.length) { tbody.innerHTML = '<tr><td colspan="8" class="empty">暂无请求记录</td></tr>'; return; }
-    tbody.innerHTML = logs.map(l => {
+    const html = logs.map(l => {
       const t = l.time ? new Date(l.time).toLocaleString('zh-CN') : '-';
       const route = (ROUTE_LABEL[l.route] || l.route || '-') + (l.exit ? ' · ' + l.exit : '');
       const st = l.status || 0;
@@ -1184,7 +1210,8 @@ async function loadLogs() {
         '<td class="mono" style="font-size:11px">' + (l.durationMs != null ? l.durationMs + ' ms' : '-') + '</td>' +
       '</tr>';
     }).join('');
-  } catch (e) { tbody.innerHTML = '<tr><td colspan="8" class="empty">加载失败</td></tr>'; }
+    tbody.innerHTML = html;
+  } catch (e) { tbody.innerHTML = '<tr><td colspan="8">' + fail(e, 'loadLogs()') + '</td></tr>'; }
 }
 
 // ========== 导出账号 ==========
@@ -1319,7 +1346,7 @@ async function loadModels() {
         '<span style="font-size:11px;color:var(--text3);min-width:60px;text-align:right">' + synced + '</span>' +
         '</div>';
     }).join('');
-  } catch (e) { _('modelsList').textContent = '加载失败'; }
+  } catch (e) { _('modelsList').innerHTML = fail(e, 'loadModels()'); }
 }
 
 async function refreshModels() {
@@ -1512,7 +1539,7 @@ async function loadOcNodes() {
       '<span style="flex:none;font-size:11px;color:var(--text3)">' + n.source + '</span></div>';
     }).join('') +
     '<div style="padding:6px 12px;font-size:11px;color:var(--text3)">共 ' + list.length + ' 个出口 · 🟢 可达 ' + okN + ' · 🔴 不可达 ' + failN + ' · ⚪ 未检测 ' + unkN + ' · 🌍 可用于地区受限模型 ' + regionN + '<br>✓/✕ 是该出口到各上游的可达性(逐节点 TLS 握手探测, 按上游名); ✕ 的节点在请求该上游时会被自动跳过</div>';
-  } catch (e) { _('ocNodesBox').textContent = '加载失败: ' + e.message; }
+  } catch (e) { _('ocNodesBox').innerHTML = fail(e, 'loadOcNodes()'); }
 }
 
 async function refreshOcNodes() {
@@ -1571,7 +1598,7 @@ async function loadProviders() {
     pvData = (d.data && d.data.providers) || {};
     renderProviderList();
     renderProviderModels();
-  } catch (e) { _('pvList').textContent = '加载失败: ' + e.message; }
+  } catch (e) { _('pvList').innerHTML = fail(e, 'loadProviders()'); }
 }
 
 // providerMode 把三个开关还原成面板上的单一选择。
@@ -1725,7 +1752,13 @@ async function loadRouter() {
   try {
     const d = await api('GET', '/router');
     routerData = d.data || {};
-  } catch (e) { return; }
+  } catch (e) {
+    // 静默 return 会让页面永远停在"加载中"，看不出是后端问题还是没数据
+    const msg = fail(e, 'loadRouter()');
+    ['arProviderList', 'arModelList'].forEach(id => { if (_(id)) _(id).innerHTML = msg; });
+    if (_('arChainBody')) _('arChainBody').innerHTML = '<tr><td colspan="2">' + msg + '</td></tr>';
+    return;
+  }
   // 用服务端返回的勾选状态初始化本地选择
   routerProviders = new Set();
   routerModels = new Set();
@@ -2105,7 +2138,7 @@ async function loadOcModels() {
           '<td>' + m.context + '</td><td>' + m.output + '</td><td>' + m.source + '</td></tr>';
       }).join('') +
       '</tbody></table></div><div class="hint">共 ' + models.length + ' 个免费模型（每 10 分钟自动同步）</div>';
-  } catch (e) { _('ocModelsList').textContent = '加载失败'; }
+  } catch (e) { _('ocModelsList').innerHTML = fail(e, 'loadOcModels()'); }
 }
 
 async function refreshOcModels() {

@@ -25,12 +25,14 @@ const (
 )
 
 // rotateProviderExit 冷却刚失败的那个出口, 并记录一次换出口重试。
+// budget 是本轮允许的换出口次数(对话路径为 providerExitRetries, 目录路径为
+// 池内健康出口数), 打印出来才能一眼看出"还能换几个", 而不是永远显示分母 2。
 // 直连模式下池内没有可选出口, 调用方不会走到这里。
-func rotateProviderExit(provider, reason string, attempt int) {
+func rotateProviderExit(provider, reason string, attempt, budget int) {
 	if idx := lastZenProxyIdx(); idx >= 0 {
 		cooldownZenProxy(idx, providerExitCooldown)
 	}
-	log.Printf("  providers: %s %s, retry %d/%d on the next exit", provider, reason, attempt, providerExitRetries)
+	log.Printf("  providers: %s %s, retry %d/%d on the next exit", provider, reason, attempt, budget)
 }
 
 // isExitRegionRejected 上游按"出口所在地区"拒绝服务。
@@ -196,7 +198,7 @@ func (p *modelProvider) Chat(ctx context.Context, params map[string]any, stream 
 					return nil, sendErr
 				}
 				exitRetries++
-				rotateProviderExit(p.name, fmt.Sprintf("network error (%v)", sendErr), exitRetries)
+				rotateProviderExit(p.name, fmt.Sprintf("network error (%v)", sendErr), exitRetries, providerExitRetries)
 				continue
 			}
 			resp = r
@@ -208,7 +210,7 @@ func (p *modelProvider) Chat(ctx context.Context, params map[string]any, stream 
 			if exitRetries < providerExitRetries && !exitModeDirectNow() &&
 				isExitRegionRejected(resp.StatusCode, body) {
 				exitRetries++
-				rotateProviderExit(p.name, "exit region rejected: "+kit.Truncate(string(body), 160), exitRetries)
+				rotateProviderExit(p.name, "exit region rejected: "+kit.Truncate(string(body), 160), exitRetries, providerExitRetries)
 				continue
 			}
 			break

@@ -132,6 +132,19 @@ const (
 	providerCatalogMaxPages = 10
 	providerCatalogPageSize = "1000"
 	providerCatalogTimeout  = 90 * time.Second
+
+	// catalogExitMaxRotations 单次目录刷新的换出口次数硬上限。
+	// 预算本身 = 池内健康出口数, 这里只是兜底: 万一冷却没生效(例如出口无法
+	// 被冷却), 也不能让轮换无限进行。
+	catalogExitMaxRotations = 16
+	// catalogExitRotateMax 单次目录刷新的轮换总时长上限。
+	// 订阅池几十上百个节点时, 即便只挑健康的也可能试很久, 而这段时间里
+	// 管理面板与业务请求都要跟它抢出口。
+	catalogExitRotateMax = 30 * time.Second
+	// providerCatalogStartupDelay 启动后第一次目录刷新前的等待。
+	// 订阅解析 / 节点实例重建 / 连通检测都在启动瞬间发生, 目录刷新晚一点起步,
+	// 管理面板才不会刚打开就因出口被抢而"加载失败"。
+	providerCatalogStartupDelay = 30 * time.Second
 )
 
 // catalogPage 一次目录响应的归一化结果。
@@ -375,20 +388,55 @@ func (p *modelProvider) fetchFirstCatalogPage(ctx context.Context, cfg providerC
 	return catalogPage{}, nil, err
 }
 
-// catalogExitBudget 目录轮换预算 = 节点池里的出口数: 每个节点各试一次。
-// 池为空(理论上不会, 调用方已在直连模式短路)时给 1, 保证函数可终止。
+// catalogExitBudget 目录轮换预算 = 节点池里**健康**的出口数。
+//
+// 只数健康节点: 连通检测已判定不可达的节点, 每个都要白等一次超时才轮到下一个,
+// 订阅池几十上百个节点时会把一次目录刷新拖满 providerCatalogTimeout, 期间
+// 管理面板与业务请求全被拖慢 —— 这正是"页面加载失败 / 切页很卡"的成因之一。
+//
+// 冷却会逐步把失败出口移出可用集合, 所以这个预算本身就是递减的, 轮换必然收敛。
 func catalogExitBudget() int {
-	if n := len(effectiveProxyList()); n > 0 {
-		return n
+	list := effectiveProxyList()
+	if len(list) == 0 {
+		return 1
 	}
-	return 1
+	healthy, unknown := 0, 0
+	for i, p := range list {
+		if !zenProxyAvailable(i) || !nodeDialable(p) {
+			continue // 冷却中 / 本地入站没起来: 试了也是白等一次超时
+		}
+		switch healthOf(nodeLocalKey(p)) {
+		case "ok":
+			healthy++
+		case "fail":
+			// 连通检测明确判定不可达: 不占预算
+		default:
+			unknown++ // 还没探测过: 按"未探测即可用"处理, 不能当不可用
+		}
+	}
+	n := healthy
+	if n == 0 {
+		n = unknown
+	}
+	if n == 0 {
+		// 池里出口全在冷却或全部不可达: 别再空转, 让直连兜底尽快接手
+		return 1
+	}
+	if n > catalogExitMaxRotations {
+		return catalogExitMaxRotations
+	}
+	return n
 }
 
 // retryCatalogOnNextExit 目录抓取的换出口判定。网络错误或出口地区被拒时,
-// 冷却当前出口并返回 true 让调用方换下一个重试; 池里节点试完返回 false。
+// 冷却当前出口并返回 true 让调用方换下一个重试; 池里健康节点试完返回 false。
 // 普通 4xx/5xx 换节点无意义, 原样返回真实错误。
 func (p *modelProvider) retryCatalogOnNextExit(err error) bool {
 	if p.catalogExitRetries >= catalogExitBudget() {
+		return false
+	}
+	// 总时长上限: 预算再大也不让一次目录刷新长时间霸占出口
+	if !p.catalogExitAt.IsZero() && time.Since(p.catalogExitAt) > catalogExitRotateMax {
 		return false
 	}
 	status, body := 0, []byte(nil)
@@ -401,12 +449,15 @@ func (p *modelProvider) retryCatalogOnNextExit(err error) bool {
 	if status != 0 && !regionRejected {
 		return false // HTTP 层错误(4xx/5xx)换节点无意义, 只有连接层/地区拒绝才换
 	}
+	if p.catalogExitRetries == 0 {
+		p.catalogExitAt = time.Now()
+	}
 	p.catalogExitRetries++
 	reason := fmt.Sprintf("network error (%v)", err)
 	if regionRejected {
 		reason = fmt.Sprintf("exit region rejected: %s", kit.Truncate(string(body), 160))
 	}
-	rotateProviderExit(p.name, "catalog "+reason, p.catalogExitRetries)
+	rotateProviderExit(p.name, "catalog "+reason, p.catalogExitRetries, catalogExitBudget())
 	return true
 }
 
@@ -421,22 +472,38 @@ func (e *catalogHTTPError) Error() string {
 }
 
 // refreshCatalog 拉取并重建目录; force 强制刷新, 否则受 15 分钟间隔限制。
+//
+// 同一个 provider 同时只允许一次刷新在跑: 定时循环、面板手动刷新、请求路径
+// 的按需刷新、discovery 都可能并发触发, 而每次刷新都可能长时间轮换出口。
+// 重复触发时后到者直接返回(先到者会把结果写回), 否则出口池会被同一份目录
+// 的多个副本同时打爆 —— 这正是面板卡顿与"加载失败"的来源之一。
 func (p *modelProvider) refreshCatalog(ctx context.Context, force bool) error {
 	cfg, _ := providerConfigFor(p.name)
 	if !cfg.Catalog {
 		return nil
 	}
 	p.mu.Lock()
+	if p.catalogInflight {
+		p.mu.Unlock()
+		return nil
+	}
 	now := time.Now().UnixMilli()
 	if !force && now-p.attemptedAt < int64(providerCatalogRefresh/time.Millisecond) &&
 		(len(p.catalog) > 0 || p.catalogErr != "") {
 		p.mu.Unlock()
 		return nil
 	}
+	p.catalogInflight = true
 	p.attemptedAt = now
 	p.catalogExitRetries = 0
+	p.catalogExitAt = time.Time{}
 	p.catalogDirectTried = false
 	p.mu.Unlock()
+	defer func() {
+		p.mu.Lock()
+		p.catalogInflight = false
+		p.mu.Unlock()
+	}()
 
 	ctx, cancel := context.WithTimeout(ctx, providerCatalogTimeout)
 	defer cancel()
@@ -618,6 +685,9 @@ func startProviderRefresher() {
 				cancel()
 			}
 		}
+		// 启动后先让出资源: 订阅解析、节点实例重建、连通检测都在同一时刻发生,
+		// 若目录刷新同时开跑, 出口池会被三类任务一起抢, 面板刚打开就是"加载失败"。
+		time.Sleep(providerCatalogStartupDelay)
 		refreshOnce()
 		t := time.NewTicker(providerCatalogRefresh)
 		defer t.Stop()

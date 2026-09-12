@@ -9,6 +9,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"time"
 )
 
 // providerHeaderSpec 请求头规格: 值可来自环境变量, 或固定默认值; "${origin}" 运行时展开。
@@ -230,8 +231,10 @@ type modelProvider struct {
 	fetchedAt          int64 // unix ms
 	attemptedAt        int64
 	catalogErr         string
-	catalogExitRetries int               // 本次目录刷新已用的换出口次数(预算 = 节点池出口数)
+	catalogExitRetries int               // 本次目录刷新已用的换出口次数(预算 = 池内健康出口数)
+	catalogExitAt      time.Time         // 本次目录刷新开始轮换的时刻(用于总时长上限)
 	catalogDirectTried bool              // 本次目录刷新是否已用过直连兜底
+	catalogInflight    bool              // 是否已有一次目录刷新在跑(防并发重复刷新)
 	rejected           map[string]string // modelID -> 永久拒绝原因
 	sigCache           *thoughtSignatureCache
 }

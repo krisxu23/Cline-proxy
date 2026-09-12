@@ -182,15 +182,66 @@ func syncNodeBox() {
 	nodePorts = ports
 	nodePortsKeys = joined
 	log.Printf("  nodes: %d 个高级节点出口已就绪", len(ports))
-	go checkAllNodeHealth()
+	// 稍后再做连通检测: 上百个节点同时拨号会占满出口与 CPU, 让面板先可用。
+	// 在此之前 healthOf 返回 unknown, 出口照常参与轮询(未探测≠不可用)。
+	go func() {
+		time.Sleep(nodeStartupHealthDelay)
+		checkAllNodeHealth()
+	}()
+}
+
+// sanitizeOutboundTLS 修正出站里会让 sing-box 直接崩溃的 TLS 写法。
+//
+// sing-box v1.14.0 的 vless / trojan 出站是这么写的:
+//
+//	if options.TLS != nil {
+//	    outbound.tlsConfig, err = tls.NewClientWithOptions(...)  // Enabled=false 时返回 (nil, nil)
+//	    outbound.tlsDialer = tls.NewDialer(dialer, outbound.tlsConfig)  // 却无条件建 dialer
+//	}
+//
+// 于是"tls 对象存在但 enabled 不是 true"会构造出 config == nil 的 TLS dialer,
+// 第一条连接走到 sing/common/tls.ClientHandshake 就空指针 panic —— 进程直接死
+// (vmess 与各 transport 有 nil 保护, 不受影响; vless/trojan 没有)。
+//
+// 订阅方生成的 sing-box JSON 经常省略 enabled(只给 server_name / utls), 本意
+// 显然是启用 TLS, 所以补 enabled=true; 只有显式 false 才把整块删掉(等价语义)。
+func sanitizeOutboundTLS(ob map[string]any) {
+	raw, ok := ob["tls"]
+	if !ok {
+		return
+	}
+	if raw == nil {
+		// 显式 null: 删掉, 别在配置里留一个 "tls": null
+		delete(ob, "tls")
+		return
+	}
+	block, ok := raw.(map[string]any)
+	if !ok {
+		delete(ob, "tls")
+		return
+	}
+	if enabled, isBool := block["enabled"].(bool); isBool {
+		if !enabled {
+			delete(ob, "tls")
+		}
+		return
+	}
+	// 缺 enabled 字段(或类型不对): 按启用处理, 这是订阅的常见写法
+	block["enabled"] = true
 }
 
 // ===== 节点连通检测: 经节点出口向 opencode zen / cline 上游发起真实 TLS 连接 =====
-
 var (
-	nodeHealthMu sync.RWMutex
-	nodeHealth   = map[string]nodeHealthState{}
+	nodeHealthMu      sync.RWMutex
+	nodeHealth        = map[string]nodeHealthState{}
+	nodeHealthRunMu   sync.Mutex
+	nodeHealthRunning bool
 )
+
+// nodeStartupHealthDelay 启动后第一次连通检测前的等待。
+// 上百个节点同时做 TLS 握手会占满出口与 CPU, 面板在这期间会明显卡顿甚至超时,
+// 因此让节点先就绪、面板先可用, 再开始检测。
+const nodeStartupHealthDelay = 12 * time.Second
 
 type nodeHealthState struct {
 	Ok bool
@@ -235,8 +286,24 @@ func checkNodeHealth(key string) bool {
 	return false
 }
 
-// checkAllNodeHealth 并发检测全部节点出口(10 并发)
+// checkAllNodeHealth 并发检测全部节点出口(10 并发)。
+// 同时只允许一轮: 节点集合在启动阶段会被订阅解析触发多次重建, 每轮重建都会
+// 排一次检测, 不设防会让上百个节点的探测成倍重复, 把出口池与 CPU 一起打满
+// (面板的"加载失败"与卡顿就是被这种重复风暴拖出来的)。
 func checkAllNodeHealth() {
+	nodeHealthRunMu.Lock()
+	if nodeHealthRunning {
+		nodeHealthRunMu.Unlock()
+		return
+	}
+	nodeHealthRunning = true
+	nodeHealthRunMu.Unlock()
+	defer func() {
+		nodeHealthRunMu.Lock()
+		nodeHealthRunning = false
+		nodeHealthRunMu.Unlock()
+	}()
+
 	nodeMu.Lock()
 	keys := make([]string, 0, len(nodePorts))
 	for k := range nodePorts {
@@ -339,6 +406,7 @@ func buildNodeParts(entries []any) (ports map[string]int, inbounds, outbounds, r
 			continue
 		}
 		tag := ob["tag"].(string)
+		sanitizeOutboundTLS(ob)
 		inbounds = append(inbounds, map[string]any{
 			"type": "mixed", "tag": fmt.Sprintf("in-%d", i),
 			"listen": "127.0.0.1", "listen_port": port,

@@ -5,7 +5,8 @@ import (
 )
 
 // 目录抓取的换出口判定: 只有连接层错误与地区拒绝才换, 其余 HTTP 错误不换;
-// 预算 = 节点池出口数, 每个节点各试一次。
+// 预算 = 池内**健康且未冷却**的出口数(冷却会逐步把失败出口移出可用集合,
+// 因此轮换天然收敛), 另有 catalogExitMaxRotations 作为硬上限。
 func TestRetryCatalogOnNextExit(t *testing.T) {
 	withTestConfig(t, &zenConfigData{ExitMode: exitModeProxy})
 	newProvider := func() *modelProvider { return &modelProvider{name: "bai"} }
@@ -48,20 +49,24 @@ func TestRetryCatalogOnNextExit(t *testing.T) {
 		}
 	})
 
-	t.Run("预算等于节点池出口数", func(t *testing.T) {
+	t.Run("预算 = 池内可用出口数, 且轮换必然终止", func(t *testing.T) {
 		proxies := []string{"http://127.0.0.1:19001", "http://127.0.0.1:19002", "http://127.0.0.1:19003"}
 		withTestConfig(t, &zenConfigData{ExitMode: exitModeProxy, Proxies: proxies})
-		if got := catalogExitBudget(); got != len(proxies) {
-			t.Fatalf("budget must equal pool size %d, got %d", len(proxies), got)
+		budget := catalogExitBudget()
+		if budget < 1 || budget > len(proxies) {
+			t.Fatalf("预算 %d 应在 [1,%d] 内", budget, len(proxies))
 		}
 		p := newProvider()
-		for i := 0; i < len(proxies); i++ {
-			if !p.retryCatalogOnNextExit(errConnReset) {
-				t.Fatalf("rotation %d/%d must be allowed", i+1, len(proxies))
+		rotations := 0
+		// 预算与硬上限共同保证终止: 预算随冷却递减, 且绝不超过 catalogExitMaxRotations
+		for p.retryCatalogOnNextExit(errConnReset) {
+			rotations++
+			if rotations > catalogExitMaxRotations {
+				t.Fatalf("轮换未收敛: 已换 %d 次, 硬上限 %d", rotations, catalogExitMaxRotations)
 			}
 		}
-		if p.retryCatalogOnNextExit(errConnReset) {
-			t.Fatal("every node tried, must stop rotating")
+		if rotations == 0 {
+			t.Fatal("池里有可用出口时必须允许换一次")
 		}
 	})
 
