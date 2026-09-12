@@ -236,8 +236,11 @@ func quotaDayExhausted(body []byte) bool {
 //   - quotaDay : 当日免费额度耗尽 -> 冷却到提供方时区的日界;
 //   - 其余类别 : 按配置或默认时长冷却。
 func applyCandidateFailure(cand routeCandidate, class, reason string, body []byte) {
-	key := candidateKey(cand.Upstream, cand.Model)
-	// Gemini 的回包里带了"每日限额"就回填账本: 之后到量即跳过,
+	// 硬失败记入模型可用性门(429/4xx 不计): 连续挂掉的模型自动从列表与选路中摘除。
+	if class == classServerError || class == classTimeout || class == classEmpty {
+		recordZenModelResult(cand.Model, true)
+	}
+	key := candidateKey(cand.Upstream, cand.Model)	// Gemini 的回包里带了"每日限额"就回填账本: 之后到量即跳过,
 	// 不必等到真的撞一次 429 才知道用完。
 	if qf := parseQuotaFailure(jsonObject(body)); qf != nil && qf.DailyRequestLimit != nil {
 		autoFillDailyLimit(key, *qf.DailyRequestLimit)

@@ -109,10 +109,13 @@ func isZenFreeModel(m *ZenModel) bool {
 	return m.Source == "seed" || strings.HasSuffix(m.ID, "-free")
 }
 
-// resolveZenFreeModel 只解析免费 zen 模型
+// resolveZenFreeModel 只解析免费 zen 模型(连续硬失败被暂停的除外)。
 func resolveZenFreeModel(id string) (*ZenModel, bool) {
 	m, ok := resolveZenModel(id)
 	if !ok || !isZenFreeModel(m) {
+		return nil, false
+	}
+	if zenModelUnavailable(m.ID) {
 		return nil, false
 	}
 	return m, true
@@ -124,7 +127,7 @@ func zenFreeCatalog() []ZenModel {
 	zenModelsMu.RLock()
 	out := make([]ZenModel, 0, len(zenModels))
 	for _, m := range zenModels {
-		if isZenFreeModel(m) {
+		if isZenFreeModel(m) && !zenModelUnavailable(m.ID) {
 			out = append(out, *m)
 		}
 	}
@@ -649,10 +652,12 @@ func callZenAPI(ctx context.Context, params map[string]any, stream bool) (*http.
 					err, attempt+1, retries, baseURLs[(attempt+1)%len(baseURLs)])
 				continue
 			}
+			recordZenModelResult(zenModelIDOf(params), true)
 			return nil, rateLimited, fmt.Errorf("zen request: %w", err)
 		}
 		if resp.StatusCode == http.StatusOK {
 			markZenSuccess()
+			recordZenModelResult(zenModelIDOf(params), false)
 			return resp, rateLimited, nil
 		}
 
@@ -712,6 +717,9 @@ func callZenAPI(ctx context.Context, params map[string]any, stream bool) (*http.
 		}
 
 		markZenFailOnStatus(resp.StatusCode)
+		if resp.StatusCode >= http.StatusInternalServerError {
+			recordZenModelResult(zenModelIDOf(params), true)
+		}
 		return nil, rateLimited, &zenUpstreamError{Status: resp.StatusCode, Body: kit.Truncate(bodyBytes, 500)}
 	}
 }
@@ -779,7 +787,7 @@ func zenModelList() []map[string]any {
 	zenModelsMu.RLock()
 	out := make([]map[string]any, 0, len(zenModels))
 	for _, m := range zenModels {
-		if !isZenFreeModel(m) {
+		if !isZenFreeModel(m) || zenModelUnavailable(m.ID) {
 			continue
 		}
 		cp := *m

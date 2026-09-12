@@ -295,7 +295,7 @@ func handleZenModels(w http.ResponseWriter, r *http.Request) {
 	zenModelsMu.RLock()
 	models := make([]map[string]any, 0, len(zenModels))
 	for _, m := range zenModels {
-		if !isZenFreeModel(m) {
+		if !isZenFreeModel(m) || zenModelUnavailable(m.ID) {
 			continue
 		}
 		models = append(models, map[string]any{

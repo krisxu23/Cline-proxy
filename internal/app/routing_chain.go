@@ -257,6 +257,9 @@ func candidateSkip(c routeCandidate) string {
 			return "占位符不能用于 zen"
 		}
 		if _, ok := resolveZenFreeModel(c.Model); !ok {
+			if m, ok := resolveZenModel(c.Model); ok && isZenFreeModel(m) && zenModelUnavailable(m.ID) {
+				return "上游连续失败, 暂不可用"
+			}
 			return "非免费 zen 模型"
 		}
 		return ""
