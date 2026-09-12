@@ -419,3 +419,16 @@ func TestRefreshCatalogPricingFallsBackToWhitelist(t *testing.T) {
 		t.Fatalf("freeModelIDs: %+v", ids)
 	}
 }
+
+func TestExplicitModelsPrecedence(t *testing.T) {
+	setTestProvider(t, "ex", providerConfig{BaseURL: "https://x", APIKey: "k",
+		FreeModels: []string{"a", "b"},
+		Models:     []providerModelEntry{{ID: "a", Enabled: true}, {ID: "b", Enabled: false}}})
+	p := providerByName("ex")
+	if !p.isFree("a") {
+		t.Fatal("explicit enabled must be free")
+	}
+	if p.isFree("b") {
+		t.Fatal("explicit disabled must not be free")
+	}
+}

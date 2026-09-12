@@ -87,6 +87,9 @@ func evalProviderFree(cfg providerConfig, cat, slugs map[string]*catalogModel, r
 	if cfg.disabledSet()[modelID] {
 		return false
 	}
+	if explicit, ok := cfg.explicitModels(); ok {
+		return explicit[modelID]
+	}
 	if cfg.Catalog && cfg.AllModels {
 		if len(cat) == 0 {
 			// 目录尚未拉到(或该上游不提供 /models): 退回白名单, 保住手填的模型名,
@@ -599,6 +602,23 @@ func (p *modelProvider) freeModelIDs() []catalogModel {
 	p.mu.Lock()
 	cat, slugs, rejected := p.catalog, p.slugs, p.rejected
 	p.mu.Unlock()
+
+	if explicit, ok := cfg.explicitModels(); ok {
+		var candidates []catalogModel
+		for id, enabled := range explicit {
+			if enabled {
+				candidates = append(candidates, catalogModel{ID: id})
+			}
+		}
+		out := make([]catalogModel, 0, len(candidates))
+		for _, m := range candidates {
+			if evalProviderFree(cfg, cat, slugs, rejected, m.ID) {
+				out = append(out, m)
+			}
+		}
+		sort.Slice(out, func(i, j int) bool { return out[i].ID < out[j].ID })
+		return out
+	}
 
 	var candidates []catalogModel
 	switch {

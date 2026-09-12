@@ -18,6 +18,18 @@ type providerHeaderSpec struct {
 	Default string `json:"default,omitempty"`
 }
 
+// providerAPIKey 单个 API Key 的显式开关。
+type providerAPIKey struct {
+	Key     string `json:"key"`
+	Enabled bool   `json:"enabled"`
+}
+
+// providerModelEntry 单个模型的显式开关。
+type providerModelEntry struct {
+	ID      string `json:"id"`
+	Enabled bool   `json:"enabled"`
+}
+
 // providerConfig 一个通用 OpenAI 兼容上游的配置。
 //
 // 面板只要求 Provider 名 + Base URL + API Key 三项即可自动拉取模型目录;
@@ -37,6 +49,15 @@ type providerConfig struct {
 	FreeModels      []string                      `json:"freeModels,omitempty"`
 	// DisabledModels 面板勾选剔除的模型(优于一切免费判定)。空=全部启用。
 	DisabledModels []string `json:"disabledModels,omitempty"`
+	// DisplayName 面板展示名; APIType 上游方言("openai" 默认, "anthropic" 可选);
+	// Enabled 总开关(nil = true); APIKeys 显式 key 列表; Models 显式模型开关;
+	// Migrated 是否已从 legacy 字段回填。
+	DisplayName string               `json:"name,omitempty"`
+	APIType     string               `json:"apiType,omitempty"`
+	Enabled     *bool                `json:"enabled,omitempty"`
+	APIKeys     []providerAPIKey     `json:"apiKeys,omitempty"`
+	Models      []providerModelEntry `json:"models,omitempty"`
+	Migrated    bool                 `json:"migrated,omitempty"`
 }
 
 var providerIDRe = regexp.MustCompile(`^[a-z][a-z0-9_-]*$`)
@@ -181,6 +202,35 @@ func (c providerConfig) stripProviderModelPrefix(id string) string {
 	return strings.TrimPrefix(id, "models/")
 }
 
+// isEnabled 总开关(nil = true)。
+func (c providerConfig) isEnabled() bool { return c.Enabled == nil || *c.Enabled }
+
+// apiKeys 显式 key 列表; 为空时从 legacy 单 APIKey 回填 [{key,true}]。
+func (c providerConfig) apiKeys() []providerAPIKey {
+	if len(c.APIKeys) > 0 {
+		return c.APIKeys
+	}
+	if c.APIKey != "" {
+		return []providerAPIKey{{Key: c.APIKey, Enabled: true}}
+	}
+	return nil
+}
+
+// explicitModels 显式模型开关表; Models 为空时返回 (nil,false) 表示尚未迁移,
+// 调用方回退到 legacy 白名单/目录语义。
+func (c providerConfig) explicitModels() (map[string]bool, bool) {
+	if len(c.Models) == 0 {
+		return nil, false
+	}
+	m := make(map[string]bool, len(c.Models))
+	for _, e := range c.Models {
+		if id := strings.TrimSpace(e.ID); id != "" {
+			m[id] = e.Enabled
+		}
+	}
+	return m, true
+}
+
 // freeSet 白名单集合
 func (c providerConfig) freeSet() map[string]bool {
 	s := make(map[string]bool, len(c.FreeModels))
@@ -202,6 +252,7 @@ func (c providerConfig) disabledSet() map[string]bool {
 	}
 	return s
 }
+
 // resolveHeader 解析请求头; ${origin} 展开为本地网关地址。
 func (c providerConfig) resolveHeader(spec providerHeaderSpec, origin string) string {
 	if spec.Env != "" {
