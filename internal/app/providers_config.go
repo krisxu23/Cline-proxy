@@ -181,17 +181,54 @@ func googleUsesBearer(target string) bool {
 // target 是本次请求的完整地址: 同一个 Google key 在两种方言下鉴权方式不同,
 // 必须按目标路径择一, 否则原生路径上的 Bearer 会被拒并掩盖真实错误。
 func (c providerConfig) applyAuth(target string, set func(key, value string)) {
-	if c.APIKey == "" {
+	c.applyAuthWithKey(target, c.APIKey, set)
+}
+
+// applyAuthWithKey 按单 key 写入鉴权头(Chat 多 key 轮换逐 key 调用)。
+// APIType "anthropic" 走 x-api-key + 版本头, 否则沿用 Google 方言/Bearer。
+func (c providerConfig) applyAuthWithKey(target, key string, set func(key, value string)) {
+	if key == "" {
+		return
+	}
+	if c.APIType == "anthropic" {
+		set("x-api-key", key)
+		set("anthropic-version", "2023-06-01")
 		return
 	}
 	if isGoogleProvider(c) {
-		set(googleKeyHeader, c.APIKey)
+		set(googleKeyHeader, key)
 		if googleUsesBearer(target) {
-			set("Authorization", "Bearer "+c.APIKey)
+			set("Authorization", "Bearer "+key)
 		}
 		return
 	}
-	set("Authorization", "Bearer "+c.APIKey)
+	set("Authorization", "Bearer "+key)
+}
+
+// enabledAPIKeys 可轮换的 key 列表(配置顺序): 健康在前、被冷却的沉底。
+// 只看显式开关, 不依赖 legacy 单 key 是否回填 —— 只有 APIKeys 列表的
+// provider 同样视为已配置。
+func enabledAPIKeys(cfg providerConfig, provider string) []string {
+	var head, tail []string
+	for _, e := range cfg.apiKeys() {
+		if !e.Enabled || strings.TrimSpace(e.Key) == "" {
+			continue
+		}
+		if isKeyDemoted(provider, e.Key) {
+			tail = append(tail, e.Key)
+		} else {
+			head = append(head, e.Key)
+		}
+	}
+	return append(head, tail...)
+}
+
+// isKeyDemoted 该 key 是否因连续失败被冷却(与 recordKeyResult 同阈值)。
+func isKeyDemoted(provider, key string) bool {
+	keyHealthMu.Lock()
+	defer keyHealthMu.Unlock()
+	st := keyHealth[provider][key]
+	return st != nil && st.failures >= keyFailThreshold && time.Now().UnixMilli()-st.demotedAt < keyCooldownMs
 }
 
 // stripProviderModelPrefix Google 目录里的 id 带 models/ 前缀, 发布时去掉。

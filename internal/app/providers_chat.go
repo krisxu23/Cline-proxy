@@ -128,9 +128,13 @@ func (t *sseTapReader) Close() error {
 }
 
 // Chat 转发 OpenAI 兼容请求到该 provider; 流式响应按 SSE 原样透传。
+// 多 key 轮换: 外层逐 key, 内层沿用原有的签名重放/exit 重试逻辑;
+// 429 切下一个 key 且不记罚, 401/403/5xx 与网络错误记罚后换下一个,
+// 首个 200 即返回, 其余 4xx 直接透传(请求本身的问题, 换 key 无用)。
 func (p *modelProvider) Chat(ctx context.Context, params map[string]any, stream bool) (*http.Response, error) {
 	cfg, _ := providerConfigFor(p.name)
-	if cfg.APIKey == "" {
+	keys := enabledAPIKeys(cfg, p.name)
+	if len(keys) == 0 {
 		return nil, fmt.Errorf("provider %s is not configured", p.name)
 	}
 	if model, _ := params["model"].(string); model != "" {
@@ -138,7 +142,6 @@ func (p *modelProvider) Chat(ctx context.Context, params map[string]any, stream 
 			params["model"] = rest
 		}
 	}
-	model, _ := params["model"].(string)
 
 	needsSig := providerNeedsThoughtSignatures(p)
 	if needsSig {
@@ -147,12 +150,44 @@ func (p *modelProvider) Chat(ctx context.Context, params map[string]any, stream 
 	client := providerExitClient()
 	// 把模型写进请求上下文: 拨号层据此为地区受限模型挑选已验证的节点出口,
 	// 与 opencode 渠道同一套选路规则。
+	model, _ := params["model"].(string)
 	ctx = context.WithValue(ctx, ctxKeyZenModel, p.name+":"+model)
 	if !stream {
 		var cancel context.CancelFunc
 		ctx, cancel = context.WithTimeout(ctx, providerAttemptTimeout)
 		defer cancel()
 	}
+
+	var lastErr error
+	for i, key := range keys {
+		resp, err := p.chatWithKey(ctx, cfg, params, key, stream, needsSig, client)
+		if err == nil {
+			return resp, nil
+		}
+		if pe, ok := err.(*providerError); ok {
+			switch {
+			case pe.Status == http.StatusTooManyRequests:
+				lastErr = err
+			case pe.Status == http.StatusUnauthorized || pe.Status == http.StatusForbidden || pe.Status >= 500:
+				recordKeyResult(p.name, key, pe.Status, false)
+				lastErr = err
+			default:
+				return nil, err
+			}
+		} else {
+			recordKeyResult(p.name, key, 0, true)
+			lastErr = err
+		}
+		if i == len(keys)-1 {
+			return nil, lastErr
+		}
+	}
+	return nil, lastErr
+}
+
+// chatWithKey 单 key 的原有尝试逻辑: Gemini 签名重放 + models/ 前缀 + exit 轮换。
+func (p *modelProvider) chatWithKey(ctx context.Context, cfg providerConfig, params map[string]any, key string, stream, needsSig bool, client *http.Client) (*http.Response, error) {
+	model, _ := params["model"].(string)
 
 	// Gemini 会拒绝缓存里失效的签名(400)。此时用跳过哨兵重放一次,
 	// 否则同一段会话会一直失败到该缓存项被淘汰为止。
@@ -173,7 +208,7 @@ func (p *modelProvider) Chat(ctx context.Context, params map[string]any, stream 
 				return nil, rerr
 			}
 			req.Header.Set("Content-Type", "application/json")
-			cfg.applyAuth(req.URL.String(), req.Header.Set)
+			cfg.applyAuthWithKey(req.URL.String(), key, req.Header.Set)
 			for k, spec := range cfg.Headers {
 				if v := cfg.resolveHeader(spec, origin); v != "" {
 					req.Header.Set(k, v)
@@ -300,7 +335,7 @@ func handleProviderChat(w http.ResponseWriter, r *http.Request, params map[strin
 		return
 	}
 	cfg, _ := providerConfigFor(name)
-	if cfg.APIKey == "" {
+	if len(enabledAPIKeys(cfg, name)) == 0 {
 		writeJSON(w, http.StatusServiceUnavailable, map[string]any{
 			"error": map[string]string{"message": fmt.Sprintf("provider %q has no api key", name), "type": "api_error"},
 		})

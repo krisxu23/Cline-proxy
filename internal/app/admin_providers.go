@@ -21,7 +21,7 @@ func handleProvidersConfig(w http.ResponseWriter, r *http.Request) {
 	for _, name := range providerNames() {
 		cfg, _ := providerConfigFor(name)
 		p := providerByName(name)
-		runtime := map[string]any{"configured": cfg.APIKey != ""}
+		runtime := map[string]any{"configured": len(enabledAPIKeys(cfg, name)) > 0}
 		if p != nil {
 			runtime = p.catalogStatus()
 		}
@@ -188,7 +188,7 @@ func handleProvidersTest(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	cfg, _ := providerConfigFor(req.Name)
-	if cfg.APIKey == "" {
+	if len(enabledAPIKeys(cfg, req.Name)) == 0 {
 		writeAPI(w, http.StatusBadRequest, apiResponse{Error: "provider is not configured"})
 		return
 	}

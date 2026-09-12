@@ -426,6 +426,61 @@ type chunkReader struct {
 	i      int
 }
 
+func TestChatRotatesKeysOnFailure(t *testing.T) {
+	var mu sync.Mutex
+	seen := []string{}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		auth := r.Header.Get("Authorization")
+		mu.Lock()
+		seen = append(seen, auth)
+		mu.Unlock()
+		if auth == "Bearer bad" {
+			w.WriteHeader(500)
+			w.Write([]byte(`{"error":"boom"}`))
+			return
+		}
+		w.Write([]byte(`{"choices":[{"message":{"content":"ok"}}]}`))
+	}))
+	defer srv.Close()
+	resetKeyHealthState()
+	setTestProvider(t, "rk", providerConfig{BaseURL: srv.URL,
+		APIKeys: []providerAPIKey{{Key: "bad", Enabled: true}, {Key: "good", Enabled: true}}})
+	p := providerByName("rk")
+	params := map[string]any{"model": "m", "messages": []any{map[string]any{"role": "user", "content": "hi"}}, "max_tokens": 1}
+	resp, err := p.Chat(context.Background(), params, false)
+	if err != nil {
+		t.Fatalf("fallback key must eventually succeed: %v", err)
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+	if !strings.Contains(string(body), "ok") {
+		t.Fatalf("fallback body: %s", body)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if len(seen) != 2 || seen[0] != "Bearer bad" || seen[1] != "Bearer good" {
+		t.Fatalf("must try bad then good: %#v", seen)
+	}
+}
+
+func TestApplyAuthAnthropic(t *testing.T) {
+	cfg := providerConfig{BaseURL: "https://api.anthropic.com", APIType: "anthropic"}
+	got := map[string]string{}
+	cfg.applyAuthWithKey(cfg.BaseURL+"/v1/messages", "k-123", func(k, v string) { got[k] = v })
+	if got["x-api-key"] != "k-123" || got["anthropic-version"] != "2023-06-01" {
+		t.Fatalf("anthropic headers: %#v", got)
+	}
+	if _, ok := got["Authorization"]; ok {
+		t.Fatalf("anthropic must not send Bearer: %#v", got)
+	}
+	open := providerConfig{BaseURL: "https://x"}
+	got = map[string]string{}
+	open.applyAuthWithKey(open.BaseURL, "k-456", func(k, v string) { got[k] = v })
+	if got["Authorization"] != "Bearer k-456" {
+		t.Fatalf("openai headers: %#v", got)
+	}
+}
+
 func (c *chunkReader) Read(p []byte) (int, error) {
 	if c.i >= len(c.chunks) {
 		return 0, io.EOF
