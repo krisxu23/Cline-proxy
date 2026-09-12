@@ -286,6 +286,41 @@ func TestRouterValidateReportsSelectionProblems(t *testing.T) {
 	}
 }
 
+// 快照 configured 统一走 enabled-keys 门控: APIKeys-only 已配置, 禁用即未配置。
+func TestRouterSnapshotAPIKeysOnlyAndDisabled(t *testing.T) {
+	withTestConfig(t, &zenConfigData{
+		Providers: map[string]providerConfig{
+			"multi": {BaseURL: "https://x.example/v1",
+				APIKeys: []providerAPIKey{{Key: "k1", Enabled: true}},
+				Models:  []providerModelEntry{{ID: "m1", Enabled: true}}},
+			"off": {BaseURL: "https://y.example/v1", APIKey: "k", Enabled: boolPtr(false),
+				Models: []providerModelEntry{{ID: "m1", Enabled: true}}},
+		},
+	})
+	t.Cleanup(func() {
+		providerRTMu.Lock()
+		delete(providerRT, "multi")
+		delete(providerRT, "off")
+		providerRTMu.Unlock()
+	})
+	d := routerGet(t)
+	provs, _ := d["providers"].([]any)
+	byName := map[string]map[string]any{}
+	for _, p := range provs {
+		pm, _ := p.(map[string]any)
+		byName[pm["name"].(string)] = pm
+	}
+	if byName["multi"]["configured"] != true {
+		t.Fatalf("APIKeys-only provider must be configured: %+v", byName["multi"])
+	}
+	if models, _ := byName["multi"]["models"].([]any); len(models) != 1 {
+		t.Fatalf("APIKeys-only provider must list models: %+v", byName["multi"])
+	}
+	if byName["off"]["configured"] != false {
+		t.Fatalf("disabled provider must be unconfigured: %+v", byName["off"])
+	}
+}
+
 // 快照里必须带上诊断数据, 页面一次请求就能渲染完整。
 func TestRouterSnapshotCarriesDiagnostics(t *testing.T) {
 	withTestConfig(t, &zenConfigData{

@@ -128,7 +128,7 @@ func routerSnapshot() map[string]any {
 			})
 		}
 
-		configured := pc.APIKey != ""
+		configured := len(enabledAPIKeys(pc, name)) > 0
 		if !configured {
 			problems = append(problems, fmt.Sprintf("供应商 %s 还没有填写 API Key，它的模型无法参与自动路由", name))
 		} else if len(models) == 0 {
@@ -263,7 +263,7 @@ func validateRouterSelection(sel routerSelectionRequest) []string {
 				problems = append(problems, fmt.Sprintf("供应商 %s 已不存在，请重新勾选", p))
 				continue
 			}
-			if pc.APIKey == "" {
+			if len(enabledAPIKeys(pc, p)) == 0 {
 				problems = append(problems, fmt.Sprintf("供应商 %s 没有 API Key，它的模型都会被跳过", p))
 			}
 		}

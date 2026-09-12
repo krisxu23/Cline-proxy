@@ -199,7 +199,7 @@ func defaultAutoRouterChain() []routeCandidate {
 	var out []routeCandidate
 	for _, name := range providerNames() {
 		cfg, ok := providerConfigFor(name)
-		if !ok || cfg.APIKey == "" {
+		if !ok || len(enabledAPIKeys(cfg, name)) == 0 {
 			continue
 		}
 		p := providerByName(name)
@@ -248,7 +248,7 @@ func candidateSkip(c routeCandidate) string {
 		if !ok {
 			return "provider 未配置"
 		}
-		if cfg.APIKey == "" {
+		if len(enabledAPIKeys(cfg, c.Upstream)) == 0 {
 			return "provider 缺少 API key"
 		}
 		return ""

@@ -103,6 +103,44 @@ func TestResolveRouteChainAutoRouterFromWhitelist(t *testing.T) {
 	}
 }
 
+// 默认链与跳过判定统一走 enabled-keys 门控: APIKeys-only 参与, 禁用即跳过。
+func TestDefaultChainAndSkipAPIKeysOnlyAndDisabled(t *testing.T) {
+	withTestConfig(t, &zenConfigData{
+		Providers: map[string]providerConfig{
+			"multi": {BaseURL: "https://x.example/v1",
+				APIKeys: []providerAPIKey{{Key: "k1", Enabled: true}},
+				Models:  []providerModelEntry{{ID: "m1", Enabled: true}}},
+			"off": {BaseURL: "https://y.example/v1", APIKey: "k", Enabled: boolPtr(false),
+				Models: []providerModelEntry{{ID: "m1", Enabled: true}}},
+		},
+	})
+	t.Cleanup(func() {
+		providerRTMu.Lock()
+		delete(providerRT, "multi")
+		delete(providerRT, "off")
+		providerRTMu.Unlock()
+	})
+	resetCandidateState()
+	defer resetCandidateState()
+	chain := defaultAutoRouterChain()
+	seen := map[string]bool{}
+	for _, c := range chain {
+		seen[c.Upstream+":"+c.Model] = true
+	}
+	if !seen["multi:m1"] {
+		t.Fatalf("APIKeys-only provider must join default chain: %+v", chain)
+	}
+	if seen["off:m1"] {
+		t.Fatalf("disabled provider must not join default chain: %+v", chain)
+	}
+	if why := candidateSkip(routeCandidate{Upstream: "multi", Model: "m1"}); why != "" {
+		t.Fatalf("APIKeys-only candidate must be usable, got %q", why)
+	}
+	if why := candidateSkip(routeCandidate{Upstream: "off", Model: "m1"}); why == "" {
+		t.Fatal("disabled candidate must be skipped")
+	}
+}
+
 // 跳过判定综合了候选层冷却与"上游是否可用"。
 func TestCandidateSkip(t *testing.T) {
 	withTestConfig(t, &zenConfigData{

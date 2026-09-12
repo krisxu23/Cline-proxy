@@ -173,10 +173,26 @@ func (c providerConfig) applyAuthWithKey(target, key string, set func(key, value
 	set("Authorization", "Bearer "+key)
 }
 
+// hasEnabledKey 是否有可用的 key(不看冷却, 只看显式开关; 无 provider 名时用)。
+func hasEnabledKey(cfg providerConfig) bool {
+	if !cfg.isEnabled() {
+		return false
+	}
+	for _, e := range cfg.apiKeys() {
+		if e.Enabled && strings.TrimSpace(e.Key) != "" {
+			return true
+		}
+	}
+	return false
+}
+
 // enabledAPIKeys 可轮换的 key 列表: 健康打散在前、被冷却的沉底。
 // 只看显式开关, 不依赖 legacy 单 key 是否回填 —— 只有 APIKeys 列表的
 // provider 同样视为已配置。
 func enabledAPIKeys(cfg providerConfig, provider string) []string {
+	if !cfg.isEnabled() {
+		return nil
+	}
 	var head, tail []string
 	for _, e := range cfg.apiKeys() {
 		if !e.Enabled || strings.TrimSpace(e.Key) == "" {

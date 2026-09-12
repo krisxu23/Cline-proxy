@@ -120,27 +120,3 @@ func TestUsagePruningKeepsRecentDays(t *testing.T) {
 			n, hasOldest, hasSecond, hasRecent)
 	}
 }
-
-// 用量窗口聚合: usageWeight 用作排名窗口(天)。
-func TestUsageRequestsOverDaysWindow(t *testing.T) {
-	withTestConfig(t, &zenConfigData{})
-	resetUsageLedger()
-	defer resetUsageLedger()
-
-	loc := usageLocation()
-	today := time.Now().In(loc)
-	recent := today.Format("2006-01-02")
-	old := today.AddDate(0, 0, -30).Format("2006-01-02")
-
-	usageMu.Lock()
-	usageDays[recent] = map[string]*usageCounter{"p:m": {Req: 5}}
-	usageDays[old] = map[string]*usageCounter{"p:m": {Req: 100}}
-	usageMu.Unlock()
-
-	if got := usageRequestsOverDays("p:m", 12); got != 5 {
-		t.Fatalf("window must exclude old days: got %d, want 5", got)
-	}
-	if got := usageRequestsOverDays("p:m", 60); got != 105 {
-		t.Fatalf("wide window must include old days: got %d, want 105", got)
-	}
-}

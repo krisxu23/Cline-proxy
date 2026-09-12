@@ -323,6 +323,37 @@ func TestProviderModelList(t *testing.T) {
 	}
 }
 
+// APIKeys-only 与 disabled 的统一门控: 无 legacy 单 key 也视为已配置; 禁用即无 key、无模型。
+func TestProviderKeyGateAPIKeysOnlyAndDisabled(t *testing.T) {
+	setTestProvider(t, "multikey", providerConfig{BaseURL: "https://x",
+		APIKeys: []providerAPIKey{{Key: "k1", Enabled: true}, {Key: "k2", Enabled: false}},
+		Models:  []providerModelEntry{{ID: "m1", Enabled: true}}})
+	if got := len(enabledAPIKeys(providerConfig{APIKeys: []providerAPIKey{{Key: "k1", Enabled: true}}}, "multikey")); got == 0 {
+		t.Fatal("APIKeys-only provider must have enabled keys")
+	}
+	if !providerByName("multikey").isFree("m1") {
+		t.Fatal("APIKeys-only provider must publish explicit models")
+	}
+	if ids := providerByName("multikey").freeModelIDs(); len(ids) != 1 {
+		t.Fatalf("APIKeys-only freeModelIDs: %+v", ids)
+	}
+	if st := providerByName("multikey").catalogStatus(); st["configured"] != true {
+		t.Fatalf("APIKeys-only catalogStatus must be configured: %+v", st)
+	}
+	setTestProvider(t, "off", providerConfig{BaseURL: "https://x", APIKey: "k", Enabled: boolPtr(false),
+		Models: []providerModelEntry{{ID: "m1", Enabled: true}}})
+	cfg, _ := providerConfigFor("off")
+	if len(enabledAPIKeys(cfg, "off")) != 0 {
+		t.Fatal("disabled provider must expose no keys")
+	}
+	if providerByName("off").isFree("m1") {
+		t.Fatal("disabled provider must not be free")
+	}
+	if ids := providerByName("off").freeModelIDs(); len(ids) != 0 {
+		t.Fatalf("disabled freeModelIDs must be empty: %+v", ids)
+	}
+}
+
 // 显式开关等价旧勾选语义: 启用的可用, 勾掉的不可用。
 func TestExplicitModelsExclude(t *testing.T) {
 	setTestProvider(t, "sel", providerConfig{

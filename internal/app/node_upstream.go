@@ -49,7 +49,7 @@ func upstreamTargets() map[string]string {
 	}
 	for _, name := range providerNames() {
 		pc, ok := providerConfigFor(name)
-		if !ok || pc.APIKey == "" {
+		if !ok || len(enabledAPIKeys(pc, name)) == 0 {
 			continue
 		}
 		if h := providerUpstreamHost(pc); h != "" {

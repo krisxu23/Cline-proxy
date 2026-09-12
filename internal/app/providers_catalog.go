@@ -70,7 +70,7 @@ func catalogLookup(cat, slugs map[string]*catalogModel, modelID string) *catalog
 // Models 为空(尚未迁移)一律不可用; 缺 key 与永久拒绝直接否决。
 func (p *modelProvider) isFree(modelID string) bool {
 	cfg, _ := providerConfigFor(p.name)
-	if cfg.APIKey == "" {
+	if len(enabledAPIKeys(cfg, p.name)) == 0 {
 		return false
 	}
 	p.mu.Lock()
@@ -223,7 +223,7 @@ func catalogURL(cfg providerConfig) string {
 // catalogHeaders 目录请求的鉴权头: 与对话请求同一套规则,
 // Google 按目标路径择一(原生目录只认 x-goog-api-key, 见 googleUsesBearer)。
 func catalogHeaders(cfg providerConfig, target string) map[string]string {
-	if cfg.APIKey == "" {
+	if !hasEnabledKey(cfg) {
 		return nil
 	}
 	out := map[string]string{}
@@ -596,7 +596,7 @@ func (p *modelProvider) maybeBackfillExplicitModels() {
 // 缺 key、未迁移、已永久剔除的模型不得出现。
 func (p *modelProvider) freeModelIDs() []catalogModel {
 	cfg, _ := providerConfigFor(p.name)
-	if cfg.APIKey == "" {
+	if len(enabledAPIKeys(cfg, p.name)) == 0 {
 		return nil
 	}
 	explicit, ok := cfg.explicitModels()
@@ -648,7 +648,7 @@ func providerModelList() []map[string]any {
 			continue
 		}
 		cfg, _ := providerConfigFor(name)
-		if cfg.APIKey == "" {
+		if len(enabledAPIKeys(cfg, name)) == 0 {
 			continue
 		}
 		for _, m := range p.freeModelIDs() {
@@ -689,7 +689,7 @@ func (p *modelProvider) catalogStatus() map[string]any {
 		}
 	}
 	return map[string]any{
-		"configured":  cfg.APIKey != "",
+		"configured":  len(enabledAPIKeys(cfg, p.name)) > 0,
 		"catalog":     cfg.Catalog,
 		"catalogSize": len(p.catalog),
 		"freeCount":   freeCount,
