@@ -93,12 +93,18 @@ func handleChainedChatAs(w http.ResponseWriter, r *http.Request, params map[stri
 					recordUsageForCandidate(cand, false)
 					continue
 				}
-				if !chatBodyHasContent(body) {
+				if !chatBodyHasContent(body) || chainBodyOnlyBrokenToolCalls(body) {
 					lastErr = fmt.Errorf("%s: HTTP 200 with no usable content", cand.String())
 					lastStatus = http.StatusBadGateway
-					markCandidateCooldown(cand.Upstream, cand.Model, classEmpty, "200 但无内容")
+					reason := "200 但无内容"
+					if chainBodyOnlyBrokenToolCalls(body) {
+						// 带了 tool_calls 但 id/name 缺到一个都不剩: 对 agent 客户端
+						// 等价于空响应, 换下一站往往能拿到完整调用
+						reason = "200 但 tool_calls 不完整"
+					}
+					markCandidateCooldown(cand.Upstream, cand.Model, classEmpty, reason)
 					recordUsageForCandidate(cand, false)
-					log.Printf("  chain: %s 返回 200 但无内容, 换下一站", cand.String())
+					log.Printf("  chain: %s %s, 换下一站", cand.String(), reason)
 					continue
 				}
 				tracker := newZenStatsTracker(zenStatsRecord{
@@ -346,4 +352,29 @@ func chatBodyHasContent(body []byte) bool {
 		return true
 	}
 	return false
+}
+
+// chainBodyOnlyBrokenToolCalls 响应声称发起了工具调用, 但修补后一条都不剩
+// (全部缺 function.name, 缺 id 的会被补全所以不算)。对 agent 客户端而言这
+// 等价于空响应且更糟 —— 客户端会因校验失败直接报错, 因此与空内容同罪,
+// 候选链换下一站。
+func chainBodyOnlyBrokenToolCalls(body []byte) bool {
+	var raw map[string]any
+	if json.Unmarshal(body, &raw) != nil {
+		return false
+	}
+	out := raw
+	if d, ok := raw["data"].(map[string]any); ok {
+		out = d
+	}
+	msg, _ := getNested(out, "choices", 0, "message").(map[string]any)
+	if msg == nil {
+		return false
+	}
+	tcs, _ := msg["tool_calls"].([]any)
+	if len(tcs) == 0 {
+		return false
+	}
+	repaired, _ := repairToolCalls(tcs)
+	return len(repaired) == 0
 }

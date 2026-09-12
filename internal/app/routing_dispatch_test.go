@@ -35,6 +35,12 @@ func chainTestServer(t *testing.T) (string, func(string) int) {
 		case "m-empty":
 			// 200 + 空壳: 上游表示"这个模型现在不可用"
 			io.WriteString(w, `{"choices":[]}`)
+		case "m-tc-noid":
+			// 部分免费模型的常见形态: 有 name 没 id, 客户端会整体报错
+			io.WriteString(w, `{"choices":[{"index":0,"finish_reason":"tool_calls","message":{"role":"assistant","content":"","tool_calls":[{"type":"function","function":{"name":"read_file","arguments":"{\"path\":\"a.go\"}"}}]}}]}`)
+		case "m-tc-nameless":
+			// 无法执行的形态: 全部缺 name 且无正文
+			io.WriteString(w, `{"choices":[{"index":0,"finish_reason":"tool_calls","message":{"role":"assistant","content":"","tool_calls":[{"id":"call_x","type":"function","function":{"arguments":"{}"}}]}}]}`)
 		default:
 			io.WriteString(w, `{"id":"c1","object":"chat.completion","choices":[{"index":0,"finish_reason":"stop","message":{"role":"assistant","content":"pong"}}],"usage":{"prompt_tokens":3,"completion_tokens":1,"total_tokens":4}}`)
 		}
