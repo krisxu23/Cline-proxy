@@ -48,6 +48,29 @@ func TestBuiltinProvidersPinned(t *testing.T) {
 	if w2.Code == 200 {
 		t.Fatal("builtin opencode must not be deletable")
 	}
+	// 非 remove 更新同样不可占用内置名: 否则落盘的同名配置会被 GET 合成行
+	// 盖住(死配置), 还会劫持 parseProviderModel/providerByName 直接路径。
+	// clinepass 一并保留( adapters 自有路由名, 同一个 squat 洞)。
+	for _, name := range []string{"opencode", "cline", "clinepass"} {
+		body := `{"name":"` + name + `","provider":{"baseUrl":"https://squat.example/v1","apiKey":"k"}}`
+		w := httptest.NewRecorder()
+		handleProvidersUpdate(w, httptest.NewRequest("POST", "/admin/api/providers/update", strings.NewReader(body)))
+		if w.Code != 400 {
+			t.Fatalf("builtin %s must not be creatable via update: %d %s", name, w.Code, w.Body.String())
+		}
+		if _, ok := providerConfigFor(name); ok {
+			t.Fatalf("builtin %s must leave config unchanged", name)
+		}
+		// 清理: 万一哪天放行, 测试也不留脏配置。
+		zenConfigMu.Lock()
+		if zenConfig != nil {
+			delete(zenConfig.Providers, name)
+		}
+		zenConfigMu.Unlock()
+		providerRTMu.Lock()
+		delete(providerRT, name)
+		providerRTMu.Unlock()
+	}
 }
 
 // GET 管理口径: 内置行 pinned, 每个 provider 都有 keys/models/enabled。

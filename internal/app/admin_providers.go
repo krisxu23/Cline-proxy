@@ -139,9 +139,9 @@ func handleProvidersUpdate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if req.Remove {
-		// 内置行(opencode/cline)钉死在面板上: 不是可删除的配置,
+		// 内置名(opencode/cline/clinepass)钉死: 不是可删除的配置,
 		// 误删会导致 zen 免费模型 / cline 账号池从管理口径里消失。
-		if req.Name == "opencode" || req.Name == "cline" {
+		if isBuiltinProvider(req.Name) {
 			writeAPI(w, http.StatusBadRequest, apiResponse{Error: "builtin provider " + req.Name + " cannot be removed"})
 			return
 		}
@@ -154,6 +154,14 @@ func handleProvidersUpdate(w http.ResponseWriter, r *http.Request) {
 		delete(providerRT, req.Name)
 		providerRTMu.Unlock()
 		writeAPI(w, http.StatusOK, apiResponse{Success: true})
+		return
+	}
+	// 内置名不可占用: GET 用同名合成行覆盖展示, 落盘的同名配置会变成
+	// 看不见的死配置, 还会劫持 parseProviderModel/providerByName 的直接路径。
+	// clinepass 一并保留: 它是 adapters 注册的自有路由名(normalizeModelID 的
+	// "cline-pass/" 前缀同样落到它身上), 可创建会留下同一个 squat 洞。
+	if isBuiltinProvider(req.Name) {
+		writeAPI(w, http.StatusBadRequest, apiResponse{Error: "builtin provider " + req.Name + " is reserved"})
 		return
 	}
 	if req.Provider == nil {
