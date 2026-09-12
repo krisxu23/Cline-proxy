@@ -8,7 +8,7 @@ const adminHTML = `<!DOCTYPE html>
 <title>Cline 代理管理面板</title>
 <style>
 :root{
-  --bg:#0b0e17;--bg2:#111527;--bg3:#1a2038;--panel:rgba(148,163,184,.055);
+  --bg:#0b0e17;--bg2:#111527;--bg3:#1a2038;--panel:rgba(148,163,184,.055);--inset:rgba(2,6,23,.35);
   --border:rgba(148,163,184,.14);--border-strong:rgba(148,163,184,.28);
   --text:#e6edf6;--text2:#8b98b4;--text3:#5b6b89;
   --accent:#22d3ee;--accent2:#34d399;--amber:#f59e0b;--danger:#f87171;
@@ -21,7 +21,7 @@ const adminHTML = `<!DOCTYPE html>
   --radius:14px;--radius-sm:9px;
 }
 [data-theme="light"]{
-  --bg:#f3f5fa;--bg2:#ffffff;--bg3:#eef1f7;--panel:rgba(255,255,255,.7);
+  --bg:#f3f5fa;--bg2:#ffffff;--bg3:#eef1f7;--panel:rgba(255,255,255,.7);--inset:rgba(15,23,42,.05);
   --border:rgba(15,23,42,.12);--border-strong:rgba(15,23,42,.26);
   --text:#0f172a;--text2:#57617a;--text3:#8a94ab;
   --accent:#0891b2;--accent2:#059669;--amber:#b45309;--danger:#dc2626;
@@ -156,7 +156,7 @@ select{cursor:pointer;appearance:none;background-image:linear-gradient(45deg,tra
 .empty{padding:30px;text-align:center;color:var(--text2)}
 .empty-state{padding:44px 20px;text-align:center;color:var(--text2)}
 .empty-state .icon{font-size:40px;margin-bottom:10px;display:block;opacity:.8}
-.key-display{background:rgba(2,6,23,.45);padding:9px 13px;border-radius:var(--radius-sm);border:1px solid var(--border);font-family:'JetBrains Mono','Cascadia Code',Consolas,monospace;font-size:12px;word-break:break-all;cursor:pointer;transition:.15s}
+.key-display{background:var(--inset);padding:9px 13px;border-radius:var(--radius-sm);border:1px solid var(--border);font-family:'JetBrains Mono','Cascadia Code',Consolas,monospace;font-size:12px;word-break:break-all;cursor:pointer;transition:.15s}
 .key-display:hover{background:rgba(34,211,238,.08);border-color:var(--accent)}
 .copy-icon{cursor:pointer;color:var(--text2);padding:2px 6px;border-radius:4px}
 .copy-icon:hover{color:var(--text);background:var(--bg3)}
@@ -556,10 +556,10 @@ body:not([data-theme="dark"]) .theme-toggle .dark-label{display:none}
 
     <div class="form-row" style="margin-top:14px">
       <div class="field"><label>冷却中的候选</label>
-        <div id="arCoolingBox" style="border:1px solid var(--border);border-radius:10px;background:rgba(2,6,23,.3);min-height:42px"></div>
+        <div id="arCoolingBox" style="border:1px solid var(--border);border-radius:10px;background:var(--inset);min-height:42px"></div>
       </div>
       <div class="field"><label>永久剔除的候选</label>
-        <div id="arPermBox" style="border:1px solid var(--border);border-radius:10px;background:rgba(2,6,23,.3);min-height:42px;max-height:220px;overflow-y:auto"></div>
+        <div id="arPermBox" style="border:1px solid var(--border);border-radius:10px;background:var(--inset);min-height:42px;max-height:220px;overflow-y:auto"></div>
       </div>
     </div>
   </div>
@@ -630,7 +630,6 @@ body:not([data-theme="dark"]) .theme-toggle .dark-label{display:none}
           <option value="direct">直连（不走任何节点）</option>
         </select>
       </div>
-    </div>
       <div class="field"><label>节点全挂时</label>
         <select id="ocRescue">
           <option value="true">允许直连兜底（推荐，经 sing-box 的 direct 出站）</option>
@@ -679,12 +678,12 @@ body:not([data-theme="dark"]) .theme-toggle .dark-label{display:none}
     <div class="form-row">
       <div class="field"><label style="display:flex;align-items:center;justify-content:space-between">节点列表
         <button type="button" class="btn" style="padding:3px 10px;font-size:12px" onclick="refreshOcNodes()">连通检测</button></label>
-        <div id="ocNodesBox" style="max-height:190px;overflow-y:auto;border:1px solid var(--border);border-radius:10px;background:rgba(2,6,23,.3)"></div>
+        <div id="ocNodesBox" style="max-height:190px;overflow-y:auto;border:1px solid var(--border);border-radius:10px;background:var(--inset)"></div>
       </div>
     </div>
     <div class="form-row">
       <div class="field"><label>代理冷却</label>
-        <div id="ocCooldownBox" style="max-height:190px;overflow-y:auto;border:1px solid var(--border);border-radius:10px;background:rgba(2,6,23,.3);min-height:42px"></div>
+        <div id="ocCooldownBox" style="max-height:190px;overflow-y:auto;border:1px solid var(--border);border-radius:10px;background:var(--inset);min-height:42px"></div>
       </div>
     </div>
     <div class="form-actions"><button class="btn btn-primary" onclick="saveOcConfig()">💾 保存出口配置</button></div>
@@ -722,7 +721,7 @@ body:not([data-theme="dark"]) .theme-toggle .dark-label{display:none}
       <button class="btn" onclick="resetProviderForm()">✖ 清空表单</button>
     </div>
     <div id="pvResult" style="margin-top:10px"></div>
-    <div id="pvList" style="margin-top:10px;border:1px solid var(--border);border-radius:10px;background:rgba(2,6,23,.3)"></div>
+    <div id="pvList" style="margin-top:10px;border:1px solid var(--border);border-radius:10px;background:var(--inset)"></div>
   </div>
 </div>
 
@@ -1797,7 +1796,7 @@ function renderRouter() {
         meta.push(models.length + ' 个可用模型');
         if (chosen) meta.push('已选 ' + picked + ' 个');
         return '<label style="display:flex;align-items:center;gap:10px;padding:9px 12px;'
-          + 'border:1px solid var(--border);border-radius:10px;background:rgba(2,6,23,.3);cursor:pointer">'
+          + 'border:1px solid var(--border);border-radius:10px;background:var(--inset);cursor:pointer">'
           + '<input type="checkbox" data-prov="' + esc(p.name) + '"' + (chosen ? ' checked' : '') + '>'
           + '<span style="flex:1;display:flex;align-items:center;gap:10px;min-width:0;flex-wrap:wrap">'
           + '<strong>' + esc(p.display || p.name) + '</strong>'
@@ -1948,7 +1947,7 @@ function showRouterResult(kind, msg, problems) {
   if (!el) return;
   const color = kind === 'ok' ? '#4ade80' : (kind === 'warn' ? '#fbbf24' : '#f87171');
   el.innerHTML = '<div style="padding:10px 12px;border-radius:10px;border:1px solid ' + color
-    + ';background:rgba(2,6,23,.35);font-size:13px;color:' + color + '">' + esc(msg) + '</div>'
+    + ';background:var(--inset);font-size:13px;color:' + color + '">' + esc(msg) + '</div>'
     + (problems && problems.length
       ? '<ul style="margin:8px 0 0 18px;font-size:12.5px;color:var(--text2)">'
         + problems.map(p => '<li>' + esc(p) + '</li>').join('') + '</ul>'
