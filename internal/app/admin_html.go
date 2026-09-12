@@ -426,10 +426,34 @@ body:not([data-theme="dark"]) .theme-toggle .dark-label{display:none}
   <div class="section-body" style="padding:6px"><div id="ocModelsList" style="padding:12px">加载中...</div></div>
 </div>
 <div class="section">
-  <div class="section-title">🔌 通用 Provider 模型
-    <button class="btn btn-sm" onclick="loadProviderModels()" style="margin-left:auto">🔄 刷新</button>
+  <div class="section-title">🔌 通用 Provider（OpenAI 兼容上游）</div>
+  <div class="section-body">
+    <p class="hint" style="margin:0 0 14px">只需要 <strong style="color:var(--text)">Provider 名 + API 地址 + API Key</strong>，保存后会自动拉取模型目录。Google Gemini 只需填 <code>https://generativelanguage.googleapis.com</code>，端点后缀与鉴权方言由程序自动补齐。</p>
+    <div class="form-row">
+      <div class="field"><label>Provider 名 *</label><input type="text" id="pvName" placeholder="openrouter / gemini / tokenrouter / bai"></div>
+      <div class="field"><label>API 地址 *</label><input type="text" id="pvBaseUrl" placeholder="https://openrouter.ai/api/v1"></div>
+    </div>
+    <div class="form-row">
+      <div class="field"><label>API Key *</label><input type="password" id="pvKey" placeholder="sk-..."></div>
+      <div class="field"><label>模型目录</label>
+        <label style="display:flex;align-items:center;gap:8px;font-weight:normal"><input type="checkbox" id="pvCatalog" checked style="width:auto;min-width:0"> 拉取 /models 目录（关闭则只用下方手填模型）</label>
+      </div>
+    </div>
+    <div class="form-row">
+      <div class="field"><label>模型（每行一个，保存为显式启用；目录拉取后也可在下方列表逐个勾选）</label>
+        <textarea id="pvModels" rows="3" placeholder="glm-5.3-flash"></textarea></div>
+      <div class="field"><label>连通测试模型（留空用第一个可用模型）</label>
+        <input type="text" id="pvTestModel" placeholder="glm-5.3-flash"></div>
+    </div>
+    <div class="form-actions">
+      <button class="btn btn-primary" onclick="saveProvider()">💾 保存并拉取模型</button>
+      <button class="btn" onclick="testProvider()">🔍 连通测试</button>
+      <button class="btn" onclick="refreshProviderCatalog()">🔄 刷新目录</button>
+      <button class="btn" onclick="resetProviderForm()">✖ 清空表单</button>
+    </div>
+    <div id="pvResult" style="margin-top:10px"></div>
+    <div id="pvList" style="margin-top:10px;border:1px solid var(--border);border-radius:10px;background:var(--inset)"></div>
   </div>
-  <div class="section-body" style="padding:6px"><div id="pvModelsList" style="padding:12px">加载中...</div></div>
 </div>
 </div>
 
@@ -670,37 +694,6 @@ body:not([data-theme="dark"]) .theme-toggle .dark-label{display:none}
 </div>
 
 <div class="section">
-  <div class="section-title">🔌 通用 Provider（OpenAI 兼容上游）</div>
-  <div class="section-body">
-    <p class="hint" style="margin:0 0 14px">只需要 <strong style="color:var(--text)">Provider 名 + API 地址 + API Key</strong>，保存后会自动拉取模型目录。Google Gemini 只需填 <code>https://generativelanguage.googleapis.com</code>，端点后缀与鉴权方言由程序自动补齐。</p>
-    <div class="form-row">
-      <div class="field"><label>Provider 名 *</label><input type="text" id="pvName" placeholder="openrouter / gemini / tokenrouter / bai"></div>
-      <div class="field"><label>API 地址 *</label><input type="text" id="pvBaseUrl" placeholder="https://openrouter.ai/api/v1"></div>
-    </div>
-    <div class="form-row">
-      <div class="field"><label>API Key *</label><input type="password" id="pvKey" placeholder="sk-..."></div>
-      <div class="field"><label>模型目录</label>
-        <label style="display:flex;align-items:center;gap:8px;font-weight:normal"><input type="checkbox" id="pvCatalog" checked style="width:auto;min-width:0"> 拉取 /models 目录（关闭则只用下方手填模型）</label>
-      </div>
-    </div>
-    <div class="form-row">
-      <div class="field"><label>模型（每行一个，保存为显式启用；目录拉取后也可在下方列表逐个勾选）</label>
-        <textarea id="pvModels" rows="3" placeholder="glm-5.3-flash"></textarea></div>
-      <div class="field"><label>连通测试模型（留空用第一个可用模型）</label>
-        <input type="text" id="pvTestModel" placeholder="glm-5.3-flash"></div>
-    </div>
-    <div class="form-actions">
-      <button class="btn btn-primary" onclick="saveProvider()">💾 保存并拉取模型</button>
-      <button class="btn" onclick="testProvider()">🔍 连通测试</button>
-      <button class="btn" onclick="refreshProviderCatalog()">🔄 刷新目录</button>
-      <button class="btn" onclick="resetProviderForm()">✖ 清空表单</button>
-    </div>
-    <div id="pvResult" style="margin-top:10px"></div>
-    <div id="pvList" style="margin-top:10px;border:1px solid var(--border);border-radius:10px;background:var(--inset)"></div>
-  </div>
-</div>
-
-<div class="section">
   <div class="section-title">🛡️ 限流防御</div>
   <div class="section-body">
     <div class="form-row">
@@ -843,7 +836,7 @@ function switchTab(name) {
   if (name === 'accounts') { loadAccounts(); loadConfig(); }
   if (name === 'models') { loadModels(); loadOcModels(); loadProviders(); }
   if (name === 'router') { loadRouter(); }
-  if (name === 'settings') { loadKeys(); loadConfig(); loadOcConfig(); loadOcNodes(); loadProviders(); }
+  if (name === 'settings') { loadKeys(); loadConfig(); loadOcConfig(); loadOcNodes(); }
   if (name === 'logs') loadLogs();
 }
 
@@ -1582,18 +1575,26 @@ async function loadProviders() {
     const d = await api('GET', '/providers');
     pvData = (d.data && d.data.providers) || {};
     renderProviderList();
-    renderProviderModels();
   } catch (e) { _('pvList').innerHTML = fail(e, 'loadProviders()'); }
 }
 
 function renderProviderList() {
-  const names = Object.keys(pvData);
+  // 内置行钉在最前: 不可编辑/删除, 后端同样拒绝删除。
+  const names = Object.keys(pvData).sort((a, b) => (((pvData[b] || {}).builtin) ? 1 : 0) - (((pvData[a] || {}).builtin) ? 1 : 0));
   if (!names.length) {
     _('pvList').innerHTML = '<div style="padding:10px 12px;font-size:12px;color:var(--text3)">暂无 provider, 填上方表单添加</div>';
     return;
   }
   _('pvList').innerHTML = names.map(n => {
     const p = pvData[n] || {}, rt = p.runtime || {};
+    if (p.builtin) {
+      const st = (p.models || []).length + ' 个模型' + (rt.configured ? '' : ' · 未就绪');
+      return '<div style="display:flex;align-items:center;gap:9px;padding:6px 12px;font-size:12.5px;border-bottom:1px solid rgba(148,163,184,.07)">' +
+        '<span style="flex:none;min-width:92px;font-family:monospace;color:var(--text3)">' + esc(n) + '</span>' +
+        '<span style="flex:none;font-size:10.5px;color:var(--accent2);border:1px solid currentColor;border-radius:4px;padding:0 5px">内置</span>' +
+        '<span style="flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">' + esc(p.display || '') + '</span>' +
+        '<span style="flex:none;font-size:11px;color:var(--text3);max-width:44%">' + st + '</span></div>';
+    }
     let st;
     if (!rt.configured) { st = '未配置 key'; }
     else if (rt.error) { st = '❌ ' + esc(String(rt.error).slice(0, 90)); }
@@ -1614,41 +1615,6 @@ function renderProviderList() {
     if (open) block += renderPvModelBlock(n, p);
     return block;
   }).join('');
-}
-
-// renderProviderModels 模型列表页的「通用 Provider 模型」分组。
-function renderProviderModels() {
-  const el = _('pvModelsList');
-  if (!el) return;
-  const names = Object.keys(pvData);
-  const q = (window.pvModelFilter || '').toLowerCase();
-  const search = '<div style="margin-bottom:10px"><input type="text" id="pvModelSearch" placeholder="搜索模型（几百个时快速定位）" value="' + esc(window.pvModelFilter || '') + '" oninput="window.pvModelFilter=this.value;renderProviderModels()" style="max-width:320px"></div>';
-  const blocks = names.map(n => {
-    const p = pvData[n] || {}, rt = p.runtime || {};
-    const models = (p.models || []).filter(m => !q || String(m.id).toLowerCase().indexOf(q) >= 0);
-    let note = '';
-    if (!rt.configured) note = '未配置 API Key';
-    else if (!(p.models || []).length) note = rt.error ? ('拉取失败：' + String(rt.error).slice(0, 160)) : '目录为空，点「刷新目录」重试';
-    const rows = models.map(m => {
-      const disp = m.id;
-      return '<tr>' +
-        '<td style="text-align:left;font-family:monospace">' + esc(disp) + '</td>' +
-        '<td><span class="copy-icon" title="复制" onclick="copyText(\'' + esc(disp).replace(/'/g, "\\'") + '\')">📋</span></td></tr>';
-    }).join('');
-    return '<div style="margin-bottom:14px">' +
-      '<div style="display:flex;align-items:center;gap:8px;margin-bottom:6px">' +
-      '<span style="font-weight:600;font-family:monospace">' + esc(n) + '</span>' +
-      '<span class="model-tag">' + (p.models || []).length + ' 个可用模型</span>' +
-      (p.catalog ? '<span class="model-tag">目录已拉取</span>' : '<span class="model-tag">手动模式</span>') +
-      '<span style="font-size:11px;color:var(--text3)">启用/剔除去「设置 → 🔌 通用 Provider」点行内「模型▼」</span>' +
-      '</div>' +
-      (note ? '<div class="hint" style="margin:0">' + esc(note) + '</div>'
-        : '<div class="table-wrap"><table><thead><tr><th style="text-align:left">模型 ID</th><th style="width:44px"></th></tr></thead><tbody>' + rows + '</tbody></table></div>') +
-      '</div>';
-  }).join('');
-  el.innerHTML = search + (blocks || '<div class="empty">暂无通用 Provider，在「设置 → 🔌 通用 Provider」里添加</div>');
-  const si = document.getElementById('pvModelSearch');
-  if (si) { si.focus(); si.setSelectionRange(si.value.length, si.value.length); }
 }
 
 function togglePvModels(n) {
@@ -1711,8 +1677,6 @@ async function toggleProviderModel(box) {
     loadProviders();
   } catch (e) { toast('保存失败: ' + e.message, 'error'); box.checked = !box.checked; }
 }
-
-function loadProviderModels() { loadProviders(); }
 
 function editProvider(n) {
   const p = pvData[n] || {};

@@ -41,6 +41,10 @@ func handleProvidersConfig(w http.ResponseWriter, r *http.Request) {
 			catalogModels = p.catalogModels()
 		}
 		providers[name] = map[string]any{
+			"builtin":         false,
+			"enabled":         cfg.isEnabled(),
+			"keys":            len(enabledAPIKeys(cfg, name)),
+			"apiType":         cfg.APIType,
 			"baseUrl":         cfg.BaseURL,
 			"apiKey":          cfg.APIKey,
 			"catalog":         cfg.Catalog,
@@ -56,7 +60,56 @@ func handleProvidersConfig(w http.ResponseWriter, r *http.Request) {
 			"catalogEndpoint": catalogURL(cfg),
 		}
 	}
+	// 内置行钉在管理口径里: 与 routerSnapshot 同源, 不落盘。
+	for name, entry := range builtinProviderEntries() {
+		providers[name] = entry
+	}
 	writeAPI(w, http.StatusOK, apiResponse{Success: true, Data: map[string]any{"providers": providers}})
+}
+
+// builtinProviderEntries 两行内置行(opencode/cline)的合成口径。
+//
+// 不进 zenConfig.Providers、不落盘: 它们没有 baseUrl, 进了配置会被当成
+// 通用 Provider 做目录刷新/连通测试。与 routerSnapshot 同源
+// (opencode = zenFreeCatalog 含健康门, cline = 单个 "*" 占位, 门控 clinePoolReady)。
+func builtinProviderEntries() map[string]map[string]any {
+	zenKey := ""
+	if cfg := getZenConfig(); cfg != nil {
+		zenKey = cfg.Key
+	}
+	zenModels := []map[string]any{}
+	zenCatalog := []map[string]any{}
+	for _, m := range zenFreeCatalog() {
+		zenModels = append(zenModels, map[string]any{
+			"id": "opencode:" + m.ID, "model": m.ID, "context": m.Context, "output": m.Output,
+		})
+		zenCatalog = append(zenCatalog, map[string]any{"id": m.ID, "disabled": false})
+	}
+	zenKeys := 0
+	if zenKey != "" {
+		zenKeys = 1
+	}
+	clineOK := clinePoolReady()
+	return map[string]map[string]any{
+		"opencode": {
+			"builtin": true, "display": "opencode（zen 免费模型）",
+			"apiType": "builtin", "enabled": true, "keys": zenKeys,
+			"baseUrl": "", "apiKey": "", "catalog": false,
+			"modelEntries": []any{}, "runtime": map[string]any{"configured": zenKey != ""},
+			"models": zenModels, "catalogModels": zenCatalog, "google": false,
+		},
+		"cline": {
+			"builtin": true, "display": "Cline 账号池（自动选账号与模型）",
+			"apiType": "builtin", "enabled": true, "keys": 0,
+			"baseUrl": "", "apiKey": "", "catalog": false,
+			"modelEntries": []any{}, "runtime": map[string]any{"configured": clineOK},
+			"models": []map[string]any{
+				{"id": "cline:" + clinePoolPlaceholder, "model": clinePoolPlaceholder, "context": 0, "output": 0},
+			},
+			"catalogModels": []map[string]any{{"id": clinePoolPlaceholder, "disabled": false}},
+			"google":        false,
+		},
+	}
 }
 
 // POST /admin/api/providers/update  {name, provider?, remove?}
@@ -86,6 +139,12 @@ func handleProvidersUpdate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if req.Remove {
+		// 内置行(opencode/cline)钉死在面板上: 不是可删除的配置,
+		// 误删会导致 zen 免费模型 / cline 账号池从管理口径里消失。
+		if req.Name == "opencode" || req.Name == "cline" {
+			writeAPI(w, http.StatusBadRequest, apiResponse{Error: "builtin provider " + req.Name + " cannot be removed"})
+			return
+		}
 		mutateProvidersConfig(func(cfg *zenConfigData) {
 			if cfg.Providers != nil {
 				delete(cfg.Providers, req.Name)

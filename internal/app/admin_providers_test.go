@@ -2,6 +2,7 @@ package app
 
 import (
 	"context"
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -31,6 +32,61 @@ func TestAdminProvidersUpdateAndGet(t *testing.T) {
 		if !strings.Contains(body, want) {
 			t.Fatalf("response missing %s: %s", want, body)
 		}
+	}
+}
+
+func TestBuiltinProvidersPinned(t *testing.T) {
+	req := httptest.NewRequest("POST", "/admin/api/providers/update", strings.NewReader(`{"name":"cline","remove":true}`))
+	w := httptest.NewRecorder()
+	handleProvidersUpdate(w, req)
+	if w.Code == 200 {
+		t.Fatal("builtin cline must not be deletable")
+	}
+	req2 := httptest.NewRequest("POST", "/admin/api/providers/update", strings.NewReader(`{"name":"opencode","remove":true}`))
+	w2 := httptest.NewRecorder()
+	handleProvidersUpdate(w2, req2)
+	if w2.Code == 200 {
+		t.Fatal("builtin opencode must not be deletable")
+	}
+}
+
+// GET 管理口径: 内置行 pinned, 每个 provider 都有 keys/models/enabled。
+func TestBuiltinProvidersInGet(t *testing.T) {
+	setTestProvider(t, "shapeprov", providerConfig{BaseURL: "https://x.example/v1", APIKey: "k",
+		Models: []providerModelEntry{{ID: "m1", Enabled: true}}})
+	get := func() map[string]map[string]any {
+		w := httptest.NewRecorder()
+		handleProvidersConfig(w, httptest.NewRequest("GET", "/admin/api/providers", nil))
+		if w.Code != 200 {
+			t.Fatalf("get status: %d", w.Code)
+		}
+		var resp struct {
+			Data struct {
+				Providers map[string]map[string]any `json:"providers"`
+			} `json:"data"`
+		}
+		if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+			t.Fatal(err)
+		}
+		return resp.Data.Providers
+	}
+	providers := get()
+	for _, name := range []string{"opencode", "cline", "shapeprov"} {
+		p, ok := providers[name]
+		if !ok {
+			t.Fatalf("GET must include %s", name)
+		}
+		for _, k := range []string{"keys", "models", "enabled"} {
+			if _, ok := p[k]; !ok {
+				t.Fatalf("%s missing %q", name, k)
+			}
+		}
+	}
+	if providers["opencode"]["builtin"] != true || providers["cline"]["builtin"] != true {
+		t.Fatal("builtins must carry builtin:true")
+	}
+	if providers["shapeprov"]["builtin"] != false {
+		t.Fatal("generic provider must carry builtin:false")
 	}
 }
 

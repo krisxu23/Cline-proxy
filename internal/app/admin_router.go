@@ -132,7 +132,7 @@ func routerSnapshot() map[string]any {
 		if !configured {
 			problems = append(problems, fmt.Sprintf("供应商 %s 还没有填写 API Key，它的模型无法参与自动路由", name))
 		} else if len(models) == 0 {
-			problems = append(problems, fmt.Sprintf("供应商 %s 还没有拉取到可用模型，请在「设置 → 通用 Provider」点一次刷新目录", name))
+			problems = append(problems, fmt.Sprintf("供应商 %s 还没有拉取到可用模型，请在「模型列表 → 🔌 通用 Provider」点一次刷新目录", name))
 		}
 
 		addProvider(name, name, false, configured, isGoogleProvider(pc), models)
