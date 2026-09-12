@@ -1,6 +1,7 @@
 package app
 
 import (
+	"context"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -149,6 +150,39 @@ func TestAdminProvidersTestUnknown(t *testing.T) {
 	w := httptest.NewRecorder()
 	handleProvidersTest(w, req)
 	if w.Code != 404 {
-		t.Fatalf("unknown provider should be 404: %d", w.Code)
+		t.Fatalf("unknown provider should be 404: %d %s", w.Code, w.Body.String())
+	}
+}
+
+// 面板勾选列表的数据源: 全量目录 + 每个模型的启用状态(含被勾掉的)。
+func TestAdminProvidersCatalogModels(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(`{"data":[{"id":"m1"},{"id":"m2"}]}`))
+	}))
+	defer srv.Close()
+	setTestProvider(t, "cm", providerConfig{BaseURL: srv.URL, APIKey: "k", Catalog: true})
+	p := providerByName("cm")
+	if err := p.refreshCatalog(context.Background(), true); err != nil {
+		t.Fatal(err)
+	}
+
+	got := p.catalogModels()
+	if len(got) != 2 {
+		t.Fatalf("catalogModels must list all catalog entries: %+v", got)
+	}
+	for _, m := range got {
+		if m["disabled"] != false {
+			t.Fatalf("default enabled: %+v", m)
+		}
+	}
+
+	setTestProvider(t, "cm", providerConfig{BaseURL: srv.URL, APIKey: "k", Catalog: true, DisabledModels: []string{"m2"}})
+	got = providerByName("cm").catalogModels()
+	seen := map[string]bool{}
+	for _, m := range got {
+		seen[m["id"].(string)] = m["disabled"].(bool)
+	}
+	if seen["m1"] != false || seen["m2"] != true {
+		t.Fatalf("m2 must be disabled, m1 enabled: %+v", seen)
 	}
 }

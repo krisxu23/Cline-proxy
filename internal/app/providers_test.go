@@ -368,6 +368,27 @@ func TestProviderModelList(t *testing.T) {
 	}
 }
 
+// ai-gateway 式显式开关: 白名单/目录模型可逐个勾选加入或剔除。
+// DisabledModels 命中即不可用(优于一切免费判定), 空=全部启用, 兼容旧配置。
+func TestDisabledModelsExclude(t *testing.T) {
+	setTestProvider(t, "sel", providerConfig{
+		BaseURL: "https://x", APIKey: "k",
+		FreeModels:     []string{"keep-me", "drop-me"},
+		DisabledModels: []string{"drop-me"},
+	})
+	p := providerByName("sel")
+	if !p.isFree("keep-me") {
+		t.Fatal("未勾掉的模型必须可用")
+	}
+	if p.isFree("drop-me") {
+		t.Fatal("勾掉的模型必须不可用")
+	}
+	ids := p.freeModelIDs()
+	if len(ids) != 1 || ids[0].ID != "keep-me" {
+		t.Fatalf("freeModelIDs: %+v", ids)
+	}
+}
+
 // 线上故障: 价格模式 + 无价格目录(B.AI 类上游目录不带价格) + 白名单,
 // 白名单里的模型必须可用 —— 价格判据在无价格目录上恒为 false, 不能把白名单也埋了。
 func TestRefreshCatalogPricingFallsBackToWhitelist(t *testing.T) {

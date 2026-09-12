@@ -28,6 +28,7 @@ func handleProvidersConfig(w http.ResponseWriter, r *http.Request) {
 		// 已发布的模型列表: 面板的「模型列表」页要按 Provider 分组展示,
 		// 单独一次请求就能拿到, 不必再暴露一个"列模型"的接口。
 		models := []map[string]any{}
+		catalogModels := []map[string]any{}
 		if p != nil {
 			for _, m := range p.freeModelIDs() {
 				models = append(models, map[string]any{
@@ -37,6 +38,7 @@ func handleProvidersConfig(w http.ResponseWriter, r *http.Request) {
 					"output":  m.MaxOutput,
 				})
 			}
+			catalogModels = p.catalogModels()
 		}
 		providers[name] = map[string]any{
 			"baseUrl":         cfg.BaseURL,
@@ -51,8 +53,10 @@ func handleProvidersConfig(w http.ResponseWriter, r *http.Request) {
 			"modelsKeyHeader": cfg.ModelsKeyHeader,
 			"headers":         cfg.Headers,
 			"freeModels":      cfg.FreeModels,
+			"disabledModels":  cfg.DisabledModels,
 			"runtime":         runtime,
 			"models":          models,
+			"catalogModels":   catalogModels,
 			"google":          isGoogleProvider(cfg),
 			"chatEndpoint":    cfg.chatEndpoint(),
 			"catalogEndpoint": catalogURL(cfg),

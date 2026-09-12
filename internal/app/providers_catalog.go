@@ -84,6 +84,9 @@ func evalProviderFree(cfg providerConfig, cat, slugs map[string]*catalogModel, r
 	if _, bad := rejected[modelID]; bad {
 		return false
 	}
+	if cfg.disabledSet()[modelID] {
+		return false
+	}
 	if cfg.Catalog && cfg.AllModels {
 		if len(cat) == 0 {
 			// 目录尚未拉到(或该上游不提供 /models): 退回白名单, 保住手填的模型名,
@@ -636,6 +639,25 @@ func (p *modelProvider) freeModelIDs() []catalogModel {
 		}
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].ID < out[j].ID })
+	return out
+}
+
+// catalogModels 全量目录(含被勾掉的), 供面板勾选列表用。
+// 只收录聊天模型; 排序稳定; disabled 来自配置的 DisabledModels。
+func (p *modelProvider) catalogModels() []map[string]any {
+	cfg, _ := providerConfigFor(p.name)
+	disabled := cfg.disabledSet()
+	p.mu.Lock()
+	cat := p.catalog
+	p.mu.Unlock()
+	out := make([]map[string]any, 0, len(cat))
+	for _, m := range cat {
+		if !isChatModel(m) {
+			continue
+		}
+		out = append(out, map[string]any{"id": m.ID, "disabled": disabled[m.ID]})
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i]["id"].(string) < out[j]["id"].(string) })
 	return out
 }
 

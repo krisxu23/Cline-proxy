@@ -1649,33 +1649,58 @@ function renderProviderModels() {
   const el = _('pvModelsList');
   if (!el) return;
   const names = Object.keys(pvData);
+  const q = (window.pvModelFilter || '').toLowerCase();
+  const search = '<div style="margin-bottom:10px"><input type="text" id="pvModelSearch" placeholder="搜索模型（几百个时快速定位）" value="' + esc(window.pvModelFilter || '') + '" oninput="window.pvModelFilter=this.value;renderProviderModels()" style="max-width:320px"></div>';
   const blocks = names.map(n => {
     const p = pvData[n] || {}, rt = p.runtime || {};
-    const models = p.models || [];
+    const all = p.catalogModels && p.catalogModels.length ? p.catalogModels : (p.models || []).map(m => ({ id: m.model || String(m.id).split(':').slice(1).join(':'), disabled: false }));
+    const models = all.filter(m => !q || String(m.id).toLowerCase().indexOf(q) >= 0);
+    const disabledN = all.filter(m => m.disabled).length;
     let note = '';
     if (!rt.configured) note = '未配置 API Key';
-    else if (!models.length) note = rt.error ? ('拉取失败：' + String(rt.error).slice(0, 160)) : '目录为空，点「刷新目录」重试';
+    else if (!all.length) note = rt.error ? ('拉取失败：' + String(rt.error).slice(0, 160)) : '目录为空，点「刷新目录」重试';
     const rows = models.map(m => {
-      const disp = m.id;
-      const ctx = m.context ? m.context : '-';
-      const out = m.output ? m.output : '-';
+      const disp = n + ':' + m.id;
+      const checked = m.disabled ? '' : ' checked';
       return '<tr>' +
+        '<td><input type="checkbox" data-pv="' + esc(n).replace(/'/g, "\\'") + '" data-model="' + esc(m.id).replace(/'/g, "\\'") + '"' + checked + ' onchange="toggleProviderModel(this)" style="width:auto;min-width:0"></td>' +
         '<td style="text-align:left;font-family:monospace">' + esc(disp) + '</td>' +
-        '<td><span class="copy-icon" title="复制" onclick="copyText(\'' + esc(disp).replace(/'/g, "\\'") + '\')">📋</span></td>' +
-        '<td>' + ctx + '</td><td>' + out + '</td></tr>';
+        '<td><span class="copy-icon" title="复制" onclick="copyText(\'' + esc(disp).replace(/'/g, "\\'") + '\')">📋</span></td></tr>';
     }).join('');
     return '<div style="margin-bottom:14px">' +
       '<div style="display:flex;align-items:center;gap:8px;margin-bottom:6px">' +
       '<span style="font-weight:600;font-family:monospace">' + esc(n) + '</span>' +
-      '<span class="model-tag">' + models.length + ' 个可用模型</span>' +
+      '<span class="model-tag">' + all.length + ' 个模型' + (disabledN ? '（已剔 ' + disabledN + '）' : '') + '</span>' +
       (p.catalog ? '<span class="model-tag">目录已拉取</span>' : '<span class="model-tag">白名单模式</span>') +
       '<span style="font-size:11px;color:var(--text3);flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">' + esc(p.baseUrl || '') + '</span>' +
       '</div>' +
       (note ? '<div class="hint" style="margin:0">' + esc(note) + '</div>'
-        : '<div class="table-wrap"><table><thead><tr><th style="text-align:left">模型 ID</th><th style="width:44px"></th><th>上下文</th><th>最大输出</th></tr></thead><tbody>' + rows + '</tbody></table></div>') +
+        : '<div class="table-wrap"><table><thead><tr><th style="width:40px">启用</th><th style="text-align:left">模型 ID</th><th style="width:44px"></th></tr></thead><tbody>' + rows + '</tbody></table></div>') +
       '</div>';
   }).join('');
-  el.innerHTML = blocks || '<div class="empty">暂无通用 Provider，在「设置 → 🔌 通用 Provider」里添加</div>';
+  el.innerHTML = search + (blocks || '<div class="empty">暂无通用 Provider，在「设置 → 🔌 通用 Provider」里添加</div>');
+  const si = document.getElementById('pvModelSearch');
+  if (si) { si.focus(); si.setSelectionRange(si.value.length, si.value.length); }
+}
+
+async function toggleProviderModel(box) {
+  const name = box.getAttribute('data-pv'), id = box.getAttribute('data-model');
+  const p = pvData[name] || {};
+  const cur = new Set(p.disabledModels || []);
+  if (box.checked) cur.delete(id); else cur.add(id);
+  const existing = Object.assign({}, p);
+  delete existing.runtime;
+  delete existing.models;
+  delete existing.catalogModels;
+  delete existing.google;
+  delete existing.chatEndpoint;
+  delete existing.catalogEndpoint;
+  existing.disabledModels = Array.from(cur);
+  try {
+    await api('POST', '/providers/update', { name, provider: existing });
+    toast((box.checked ? '已启用 ' : '已剔除 ') + name + ':' + id, 'success');
+    loadProviders();
+  } catch (e) { toast('保存失败: ' + e.message, 'error'); box.checked = !box.checked; }
 }
 
 function loadProviderModels() { loadProviders(); }
@@ -1712,6 +1737,7 @@ async function saveProvider() {
   const existing = Object.assign({}, pvData[name] || {});
   delete existing.runtime;
   delete existing.models;
+  delete existing.catalogModels;
   delete existing.google;
   delete existing.chatEndpoint;
   delete existing.catalogEndpoint;

@@ -35,6 +35,8 @@ type providerConfig struct {
 	ModelsKeyHeader string                        `json:"modelsKeyHeader,omitempty"`
 	Headers         map[string]providerHeaderSpec `json:"headers,omitempty"`
 	FreeModels      []string                      `json:"freeModels,omitempty"`
+	// DisabledModels 面板勾选剔除的模型(优于一切免费判定)。空=全部启用。
+	DisabledModels []string `json:"disabledModels,omitempty"`
 }
 
 var providerIDRe = regexp.MustCompile(`^[a-z][a-z0-9_-]*$`)
@@ -190,6 +192,16 @@ func (c providerConfig) freeSet() map[string]bool {
 	return s
 }
 
+// disabledSet 剔除集合
+func (c providerConfig) disabledSet() map[string]bool {
+	s := make(map[string]bool, len(c.DisabledModels))
+	for _, m := range c.DisabledModels {
+		if m = strings.TrimSpace(m); m != "" {
+			s[m] = true
+		}
+	}
+	return s
+}
 // resolveHeader 解析请求头; ${origin} 展开为本地网关地址。
 func (c providerConfig) resolveHeader(spec providerHeaderSpec, origin string) string {
 	if spec.Env != "" {
