@@ -1633,14 +1633,18 @@ function renderProviderList() {
     else { st = '白名单 ' + ((p.freeModels || []).length) + ' 个'; }
     if (rt.rejected) { st += ' · 剔除 ' + rt.rejected; }
     const badge = p.google ? '<span style="flex:none;font-size:10.5px;color:#4285f4;border:1px solid currentColor;border-radius:4px;padding:0 5px" title="Google 特殊约定已内置">Google</span>' : '';
-    return '<div style="display:flex;align-items:center;gap:9px;padding:6px 12px;font-size:12.5px;border-bottom:1px solid rgba(148,163,184,.07)">' +
+    const open = (window.pvOpen && window.pvOpen[n]) ? true : false;
+    let block = '<div style="display:flex;align-items:center;gap:9px;padding:6px 12px;font-size:12.5px;border-bottom:1px solid rgba(148,163,184,.07)">' +
       '<span style="flex:none;min-width:92px;font-family:monospace;color:var(--text3)">' + esc(n) + '</span>' +
       badge +
       '<span style="flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">' + esc(p.baseUrl || '') + '</span>' +
       '<span style="flex:none;font-size:11px;color:var(--text3);max-width:44%">' + st + '</span>' +
+      '<button type="button" class="btn" style="padding:2px 8px;font-size:11px" onclick="togglePvModels(\'' + esc(n).replace(/'/g, "\\'") + '\')">模型' + (open ? '▲' : '▼') + '</button>' +
       '<button type="button" class="btn" style="padding:2px 8px;font-size:11px" onclick="editProvider(\'' + esc(n).replace(/'/g, "\\'") + '\')">编辑</button>' +
       '<button type="button" class="btn" style="padding:2px 8px;font-size:11px" onclick="testProviderByName(\'' + esc(n).replace(/'/g, "\\'") + '\')">测试</button>' +
       '<button type="button" class="btn" style="padding:2px 8px;font-size:11px;color:#f87171" onclick="delProvider(\'' + esc(n).replace(/'/g, "\\'") + '\')">删除</button></div>';
+    if (open) block += renderPvModelBlock(n, p);
+    return block;
   }).join('');
 }
 
@@ -1653,34 +1657,63 @@ function renderProviderModels() {
   const search = '<div style="margin-bottom:10px"><input type="text" id="pvModelSearch" placeholder="搜索模型（几百个时快速定位）" value="' + esc(window.pvModelFilter || '') + '" oninput="window.pvModelFilter=this.value;renderProviderModels()" style="max-width:320px"></div>';
   const blocks = names.map(n => {
     const p = pvData[n] || {}, rt = p.runtime || {};
-    const all = p.catalogModels && p.catalogModels.length ? p.catalogModels : (p.models || []).map(m => ({ id: m.model || String(m.id).split(':').slice(1).join(':'), disabled: false }));
-    const models = all.filter(m => !q || String(m.id).toLowerCase().indexOf(q) >= 0);
-    const disabledN = all.filter(m => m.disabled).length;
+    const models = (p.models || []).filter(m => !q || String(m.id).toLowerCase().indexOf(q) >= 0);
     let note = '';
     if (!rt.configured) note = '未配置 API Key';
-    else if (!all.length) note = rt.error ? ('拉取失败：' + String(rt.error).slice(0, 160)) : '目录为空，点「刷新目录」重试';
+    else if (!(p.models || []).length) note = rt.error ? ('拉取失败：' + String(rt.error).slice(0, 160)) : '目录为空，点「刷新目录」重试';
     const rows = models.map(m => {
-      const disp = n + ':' + m.id;
-      const checked = m.disabled ? '' : ' checked';
+      const disp = m.id;
       return '<tr>' +
-        '<td><input type="checkbox" data-pv="' + esc(n).replace(/'/g, "\\'") + '" data-model="' + esc(m.id).replace(/'/g, "\\'") + '"' + checked + ' onchange="toggleProviderModel(this)" style="width:auto;min-width:0"></td>' +
         '<td style="text-align:left;font-family:monospace">' + esc(disp) + '</td>' +
         '<td><span class="copy-icon" title="复制" onclick="copyText(\'' + esc(disp).replace(/'/g, "\\'") + '\')">📋</span></td></tr>';
     }).join('');
     return '<div style="margin-bottom:14px">' +
       '<div style="display:flex;align-items:center;gap:8px;margin-bottom:6px">' +
       '<span style="font-weight:600;font-family:monospace">' + esc(n) + '</span>' +
-      '<span class="model-tag">' + all.length + ' 个模型' + (disabledN ? '（已剔 ' + disabledN + '）' : '') + '</span>' +
+      '<span class="model-tag">' + (p.models || []).length + ' 个可用模型</span>' +
       (p.catalog ? '<span class="model-tag">目录已拉取</span>' : '<span class="model-tag">白名单模式</span>') +
-      '<span style="font-size:11px;color:var(--text3);flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">' + esc(p.baseUrl || '') + '</span>' +
+      '<span style="font-size:11px;color:var(--text3)">启用/剔除去「设置 → 🔌 通用 Provider」点行内「模型▼」</span>' +
       '</div>' +
       (note ? '<div class="hint" style="margin:0">' + esc(note) + '</div>'
-        : '<div class="table-wrap"><table><thead><tr><th style="width:40px">启用</th><th style="text-align:left">模型 ID</th><th style="width:44px"></th></tr></thead><tbody>' + rows + '</tbody></table></div>') +
+        : '<div class="table-wrap"><table><thead><tr><th style="text-align:left">模型 ID</th><th style="width:44px"></th></tr></thead><tbody>' + rows + '</tbody></table></div>') +
       '</div>';
   }).join('');
   el.innerHTML = search + (blocks || '<div class="empty">暂无通用 Provider，在「设置 → 🔌 通用 Provider」里添加</div>');
   const si = document.getElementById('pvModelSearch');
   if (si) { si.focus(); si.setSelectionRange(si.value.length, si.value.length); }
+}
+
+function togglePvModels(n) {
+  window.pvOpen = window.pvOpen || {};
+  window.pvOpen[n] = !window.pvOpen[n];
+  renderProviderList();
+}
+
+function pvSearchInput(n, el) {
+  window.pvModelQ = window.pvModelQ || {};
+  window.pvModelQ[n] = el.value;
+  const pos = el.selectionStart;
+  renderProviderList();
+  const si = document.querySelector('input[data-pvq="' + n + '"]');
+  if (si) { si.focus(); try { si.setSelectionRange(pos, pos); } catch (e) { /* ignore */ } }
+}
+
+// 行内模型管理(ai-gateway 式: 加/管/看在同一处): 搜索 + 逐个启用勾。
+function renderPvModelBlock(n, p) {
+  const q = ((window.pvModelQ || {})[n] || '').toLowerCase();
+  const all = p.catalogModels && p.catalogModels.length ? p.catalogModels : (p.models || []).map(m => ({ id: m.model || String(m.id).split(':').slice(1).join(':'), disabled: false }));
+  const models = all.filter(m => !q || String(m.id).toLowerCase().indexOf(q) >= 0);
+  const rows = models.map(m => {
+    const disp = n + ':' + m.id;
+    const checked = m.disabled ? '' : ' checked';
+    return '<tr>' +
+      '<td><input type="checkbox" data-pv="' + esc(n).replace(/'/g, "\\'") + '" data-model="' + esc(m.id).replace(/'/g, "\\'") + '"' + checked + ' onchange="toggleProviderModel(this)" style="width:auto;min-width:0"></td>' +
+      '<td style="text-align:left;font-family:monospace">' + esc(disp) + '</td>' +
+      '<td><span class="copy-icon" title="复制" onclick="copyText(\'' + esc(disp).replace(/'/g, "\\'") + '\')">📋</span></td></tr>';
+  }).join('');
+  return '<div style="padding:6px 12px 10px 24px;border-bottom:1px solid rgba(148,163,184,.07)">' +
+    '<input type="text" placeholder="搜索模型" data-pvq="' + esc(n).replace(/'/g, "\\'") + '" value="' + esc((window.pvModelQ || {})[n] || '') + '" oninput="pvSearchInput(\'' + esc(n).replace(/'/g, "\\'") + '\',this)" style="max-width:280px;margin-bottom:6px">' +
+    '<div class="table-wrap"><table><thead><tr><th style="width:40px">启用</th><th style="text-align:left">模型 ID</th><th style="width:44px"></th></tr></thead><tbody>' + rows + '</tbody></table></div></div>';
 }
 
 async function toggleProviderModel(box) {
