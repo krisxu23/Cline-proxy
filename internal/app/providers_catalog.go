@@ -531,8 +531,9 @@ func (p *modelProvider) refreshCatalog(ctx context.Context, force bool) error {
 // maybeBackfillExplicitModels 把 legacy 配置一次性快照为显式模型开关。
 // 已迁移 / 已有显式条目(面板写过就不再覆盖) / 快照为空时跳过。
 //
-// 快照取并集(宁多勿少): 白名单里的手填模型 + 目录里的聊天模型,
-// 被勾掉的折叠为 Enabled=false —— 多出的可在面板勾掉, 少了则是静默丢失。
+// 快照取并集(宁多勿少): 白名单里的手填模型固化为启用 + 目录里的聊天模型
+// 固化为禁用(待用户在面板勾选 opt-in), 被勾掉的折叠为 Enabled=false ——
+// 目录模型默认不直接可服务, 避免 ex-pricing 用户刷新后付费模型自动上线。
 // 永久拒绝的不固化(判定层仍会拦, 但不占用开关位)。
 func (p *modelProvider) maybeBackfillExplicitModels() {
 	cfg, ok := providerConfigFor(p.name)
@@ -566,7 +567,7 @@ func (p *modelProvider) maybeBackfillExplicitModels() {
 	}
 	for _, m := range cat {
 		if isChatModel(m) {
-			add(m.ID, true)
+			add(m.ID, false)
 		}
 	}
 	if len(entries) == 0 && len(disabledIDs) == 0 {

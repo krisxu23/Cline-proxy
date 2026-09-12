@@ -171,8 +171,8 @@ func TestAdminProvidersCatalogModels(t *testing.T) {
 		t.Fatalf("catalogModels must list all catalog entries: %+v", got)
 	}
 	for _, m := range got {
-		if m["disabled"] != false {
-			t.Fatalf("default enabled: %+v", m)
+		if m["disabled"] != true {
+			t.Fatalf("default opt-in disabled: %+v", m)
 		}
 	}
 

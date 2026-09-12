@@ -280,11 +280,14 @@ func TestHandleProviderChatRefreshesCatalogBeforeGate(t *testing.T) {
 	rec := httptest.NewRecorder()
 	req := httptest.NewRequest("POST", "/chat/completions", nil)
 	handleProviderChat(rec, req, map[string]any{"model": "cat:cat-free", "messages": []any{}}, "cat")
-	if rec.Code != http.StatusOK {
-		t.Fatalf("first request must refresh the catalog and pass the gate: %d body=%s", rec.Code, rec.Body.String())
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("catalog backfill is opt-in disabled, gate must stay closed: %d body=%s", rec.Code, rec.Body.String())
 	}
 	if len(p.catalog) == 0 {
 		t.Fatal("catalog should be populated by the first request")
+	}
+	if p.isFree("cat-free") {
+		t.Fatal("catalog-backfilled model must not be free before opt-in")
 	}
 }
 
@@ -340,7 +343,7 @@ func TestHandleProviderChatCatalogRefreshBacksOffAndRecovers(t *testing.T) {
 		t.Fatalf("second request must back off, catalog fetched %d times", calls())
 	}
 
-	// 退避窗口过去后必须重试并恢复。
+	// 退避窗口过去后必须重试; 目录回填为 opt-in 禁用, 门控仍关闭但目录已拉取。
 	p.mu.Lock()
 	p.attemptedAt = time.Now().UnixMilli() - providerCatalogRetryMs - 1000
 	p.mu.Unlock()
@@ -350,8 +353,11 @@ func TestHandleProviderChatCatalogRefreshBacksOffAndRecovers(t *testing.T) {
 	if calls() != 2 {
 		t.Fatalf("retry past the backoff window must fetch again, got %d", calls())
 	}
-	if rec.Code != http.StatusOK {
-		t.Fatalf("recovery retry must pass the gate: %d body=%s", rec.Code, rec.Body.String())
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("catalog backfill is opt-in disabled, gate must stay closed after recovery: %d body=%s", rec.Code, rec.Body.String())
+	}
+	if len(p.catalog) == 0 {
+		t.Fatal("catalog should be populated by the recovery retry")
 	}
 }
 

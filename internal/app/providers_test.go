@@ -236,16 +236,26 @@ func TestRefreshCatalogBackfillsExplicitModels(t *testing.T) {
 	if err := p.refreshCatalog(context.Background(), true); err != nil {
 		t.Fatal(err)
 	}
-	if !p.isFree("free-a") || !p.isFree("free-b") {
-		t.Fatal("catalog chat models must be backfilled as enabled")
+	if p.isFree("free-a") || p.isFree("free-b") {
+		t.Fatal("catalog models must be backfilled as disabled opt-in")
 	}
 	ids := p.freeModelIDs()
-	if len(ids) != 2 || ids[0].ID != "free-a" || ids[1].ID != "free-b" {
+	if len(ids) != 0 {
 		t.Fatalf("freeModelIDs: %+v", ids)
 	}
 	cfg, _ := providerConfigFor("t")
 	if !cfg.Migrated {
 		t.Fatal("refresh must mark the provider migrated")
+	}
+	byID := map[string]bool{}
+	for _, e := range cfg.Models {
+		byID[e.ID] = e.Enabled
+	}
+	if en, ok := byID["free-a"]; !ok || en {
+		t.Fatalf("free-a must be disabled: %+v", cfg.Models)
+	}
+	if en, ok := byID["free-b"]; !ok || en {
+		t.Fatalf("free-b must be disabled: %+v", cfg.Models)
 	}
 }
 
@@ -332,8 +342,8 @@ func TestExplicitModelsExclude(t *testing.T) {
 	}
 }
 
-// 回填取并集(宁多勿少): 白名单 + 目录聊天模型全部固化为显式启用,
-// 多出的在面板勾掉; 价格不再参与判定(定价模式随 legacy 判定一并删除)。
+// 回填取并集: 白名单固化为显式启用, 目录聊天模型固化为显式禁用(opt-in);
+// 价格不再参与判定(定价模式随 legacy 判定一并删除)。
 func TestRefreshCatalogBackfillIsUnion(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		json.NewEncoder(w).Encode(map[string]any{"data": []map[string]any{
@@ -354,11 +364,11 @@ func TestRefreshCatalogBackfillIsUnion(t *testing.T) {
 	if !p.isFree("glm-5.3-flash") {
 		t.Fatal("whitelisted model must stay available")
 	}
-	if !p.isFree("paid-pro") {
-		t.Fatal("catalog chat model must be backfilled as enabled")
+	if p.isFree("paid-pro") {
+		t.Fatal("catalog-only model must be backfilled as disabled opt-in")
 	}
 	ids := p.freeModelIDs()
-	if len(ids) != 2 {
+	if len(ids) != 1 || ids[0].ID != "glm-5.3-flash" {
 		t.Fatalf("freeModelIDs: %+v", ids)
 	}
 }
@@ -392,8 +402,8 @@ func TestMigrationBackfillOnRefresh(t *testing.T) {
 	for _, e := range cfg.Models {
 		byID[e.ID] = e.Enabled
 	}
-	if !cfg.Migrated || !byID["m1"] || !byID["m2"] || len(cfg.Models) != 2 {
-		t.Fatalf("must backfill whitelist + catalog chat models as enabled: %+v", cfg.Models)
+	if !cfg.Migrated || !byID["m1"] || byID["m2"] || len(cfg.Models) != 2 {
+		t.Fatalf("must backfill whitelist as enabled + catalog-only as disabled: %+v", cfg.Models)
 	}
 }
 
