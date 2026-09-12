@@ -577,11 +577,18 @@ func callZenAPI(ctx context.Context, params map[string]any, stream bool) (*http.
 	if isRegionRestrictedModel(zenModelIDOf(params)) && retries < 6 {
 		retries = 6
 	}
+	// 轮换重试不退避: 节点级失败换一个出口就是全新的机会, 睡眠只会把请求
+	// 拖过客户端超时(实测 59~150s, 客户端 30s 就断开了)。退避只保留给
+	// 429 —— 那种才需要等限流窗口过去。
 	delay := time.Second
 	rateLimited := 0
 	regionRetried := false // 地区拒绝最多主动换出口重试一次, 避免 hopeless 模型烧光重试
 
 	for attempt := 0; ; attempt++ {
+		// 客户端已断开(超时/取消): 立即停止, 再重试也没有人接收结果。
+		if ctx.Err() != nil {
+			return nil, rateLimited, fmt.Errorf("zen request aborted: %v", ctx.Err())
+		}
 		// 端点轮换: 第 N 次尝试用第 N % len(baseURLs) 个端点,
 		// 官方地址失败后自然落到 CDN 镜像。
 		base := baseURLs[attempt%len(baseURLs)]
@@ -620,15 +627,15 @@ func callZenAPI(ctx context.Context, params map[string]any, stream bool) (*http.
 		}
 		resp, err := client.Do(req)
 		if err != nil {
-			// 网络错误: 当前出口短冷却, 避免重试再次命中同一失效节点
-			if idx := lastZenProxyIdx(); idx >= 0 {
-				cooldownZenProxy(idx, 2*time.Minute)
+			// 客户端断开导致的取消: 直接终止, 不再重试
+			if ctx.Err() != nil {
+				return nil, rateLimited, fmt.Errorf("zen request aborted: %v", ctx.Err())
 			}
-			// 退避重试(不计入故障转移,瞬时可恢复);重试会自动换端点
+			// 网络错误: 冷却本次真实出口(而非全局轮询位置), 立即换出口/端点重试
+			cooldownActualExit(ctx, 2*time.Minute)
 			if attempt < retries {
-				log.Printf("  zen network error (%v), retry %d/%d after %v", err, attempt+1, retries, delay)
-				time.Sleep(kit.WithRetryJitter(delay))
-				delay *= 2
+				log.Printf("  zen network error (%v), retry %d/%d via next exit (next endpoint: %s)",
+					err, attempt+1, retries, baseURLs[(attempt+1)%len(baseURLs)])
 				continue
 			}
 			return nil, rateLimited, fmt.Errorf("zen request: %w", err)
@@ -660,15 +667,14 @@ func callZenAPI(ctx context.Context, params map[string]any, stream bool) (*http.
 
 		if isRateLimited(resp.StatusCode, bodyBytes) {
 			rateLimited++
-			// 冷却当前出口代理
-			if idx := lastZenProxyIdx(); idx >= 0 {
+			// 冷却本次真实出口代理(429 是等限流窗口, 保留退避睡眠)
+			cooldownActualExit(ctx, func() time.Duration {
 				d := parseRetryAfter(resp.Header.Get("Retry-After"))
 				if d <= 0 {
 					d = 10 * time.Minute
 				}
-				cooldownZenProxy(idx, d)
-				log.Printf("  zen rate limited (%d), proxy cooldown %v", resp.StatusCode, d)
-			}
+				return d
+			}())
 			if attempt < retries {
 				wait := delay
 				if retryAfter := parseRetryAfter(resp.Header.Get("Retry-After")); retryAfter > wait {
@@ -684,22 +690,13 @@ func callZenAPI(ctx context.Context, params map[string]any, stream bool) (*http.
 			return nil, rateLimited, &zenUpstreamError{Status: resp.StatusCode, Body: kit.Truncate(bodyBytes, 500)}
 		}
 
-		// 5xx: 冷却本次真实出口换下一个重试 —— 上游 500 常与出口线路相关
-		// (不同节点到上游的落地路径不同), 与网络错误同一套自愈逻辑。
+		// 5xx: 冷却本次真实出口换下一个重试, 不退避 —— 上游 500 常与出口
+		// 线路相关, 换一个出口就是全新的机会。
 		if resp.StatusCode >= http.StatusInternalServerError && attempt < retries {
-			if key := reqExitKey(ctx); key != "" {
-				for i, p := range effectiveProxyList() {
-					if nodeLocalKey(p) == nodeLocalKey(key) {
-						cooldownZenProxy(i, 2*time.Minute)
-						break
-					}
-				}
-			}
+			cooldownActualExit(ctx, 2*time.Minute)
 			log.Printf("  zen upstream %d via %s, retry %d/%d via next exit (next endpoint: %s)",
 				resp.StatusCode, describeExitRaw(reqExitKey(ctx)), attempt+1, retries,
 				baseURLs[(attempt+1)%len(baseURLs)])
-			time.Sleep(kit.WithRetryJitter(delay))
-			delay *= 2
 			continue
 		}
 

@@ -43,6 +43,21 @@ func cooldownZenProxy(idx int, d time.Duration) {
 	zenProxyCooldownsMu.Unlock()
 }
 
+// cooldownActualExit 冷却本次请求真实使用的出口(由拨号层经 ctx 回写),
+// 而不是全局轮询位置 —— 后者可能属于别的并发请求, 冷却它会误伤。
+func cooldownActualExit(ctx context.Context, d time.Duration) {
+	key := reqExitKey(ctx)
+	if key == "" {
+		return // 直连没有可冷却的出口
+	}
+	for i, p := range effectiveProxyList() {
+		if nodeLocalKey(p) == nodeLocalKey(key) {
+			cooldownZenProxy(i, d)
+			return
+		}
+	}
+}
+
 func zenProxyAvailable(idx int) bool {
 	zenProxyCooldownsMu.Lock()
 	defer zenProxyCooldownsMu.Unlock()
