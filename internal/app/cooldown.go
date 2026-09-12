@@ -264,3 +264,92 @@ func candidateUsesPacificReset(upstream string) bool {
 	cfg, ok := providerConfigFor(name)
 	return ok && isGoogleProvider(cfg)
 }
+
+// ============ Key 健康(抄 ai-gateway: 5 次失败冷却 5 分钟) ============
+
+const (
+	keyFailThreshold = 5
+	keyCooldownMs    = 5 * 60 * 1000
+)
+
+var keyHealthMu sync.Mutex
+var keyHealth = map[string]map[string]*keyHealthState{}
+
+type keyHealthState struct {
+	failures   int
+	demotedAt  int64
+	lastFailed bool
+}
+
+func recordKeyResult(provider, key string, status int, netErr bool) {
+	if status == 429 {
+		return
+	}
+	fail := netErr || status == 401 || status == 403 || status >= 500
+	keyHealthMu.Lock()
+	defer keyHealthMu.Unlock()
+	m := keyHealth[provider]
+	if m == nil {
+		m = map[string]*keyHealthState{}
+		keyHealth[provider] = m
+	}
+	st := m[key]
+	if st == nil {
+		st = &keyHealthState{}
+		m[key] = st
+	}
+	if fail {
+		st.failures++
+		st.lastFailed = true
+		if st.failures >= keyFailThreshold {
+			st.demotedAt = time.Now().UnixMilli()
+		}
+	} else {
+		delete(m, key)
+	}
+}
+
+func splitProviderKeys(s string) []string {
+	parts := strings.Split(s, ",")
+	out := make([]string, 0, len(parts))
+	for _, p := range parts {
+		if p = strings.TrimSpace(p); p != "" {
+			out = append(out, p)
+		}
+	}
+	return out
+}
+
+func pickHealthyKeys(provider string) []string {
+	var cfgKeys []string
+	if cfg, ok := providerConfigFor(provider); ok {
+		cfgKeys = splitProviderKeys(cfg.APIKey)
+	}
+	now := time.Now().UnixMilli()
+	keyHealthMu.Lock()
+	defer keyHealthMu.Unlock()
+	if len(cfgKeys) == 0 {
+		for k, st := range keyHealth[provider] {
+			if st != nil && st.failures >= keyFailThreshold && now-st.demotedAt < keyCooldownMs {
+				continue
+			}
+			cfgKeys = append(cfgKeys, k)
+		}
+		sort.Strings(cfgKeys)
+		return cfgKeys
+	}
+	out := make([]string, 0, len(cfgKeys))
+	for _, k := range cfgKeys {
+		if st := keyHealth[provider][k]; st != nil && st.failures >= keyFailThreshold && now-st.demotedAt < keyCooldownMs {
+			continue
+		}
+		out = append(out, k)
+	}
+	return out
+}
+
+func resetKeyHealthState() {
+	keyHealthMu.Lock()
+	keyHealth = map[string]map[string]*keyHealthState{}
+	keyHealthMu.Unlock()
+}
