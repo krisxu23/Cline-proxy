@@ -56,7 +56,7 @@ func TestAdminProvidersTestEndpoint(t *testing.T) {
 		w.Write([]byte(`{"choices":[{"message":{"content":"pong"}}]}`))
 	}))
 	defer srv.Close()
-	setTestProvider(t, "t", providerConfig{BaseURL: srv.URL, APIKey: "k", FreeModels: []string{"m1"}})
+	setTestProvider(t, "t", providerConfig{BaseURL: srv.URL, APIKey: "k", Models: []providerModelEntry{{ID: "m1", Enabled: true}}})
 	req := httptest.NewRequest("POST", "/admin/api/providers/test", strings.NewReader(`{"name":"t","model":"m1"}`))
 	w := httptest.NewRecorder()
 	handleProvidersTest(w, req)
@@ -176,7 +176,8 @@ func TestAdminProvidersCatalogModels(t *testing.T) {
 		}
 	}
 
-	setTestProvider(t, "cm", providerConfig{BaseURL: srv.URL, APIKey: "k", Catalog: true, DisabledModels: []string{"m2"}})
+	setTestProvider(t, "cm", providerConfig{BaseURL: srv.URL, APIKey: "k", Catalog: true,
+		Models: []providerModelEntry{{ID: "m1", Enabled: true}, {ID: "m2", Enabled: false}}})
 	got = providerByName("cm").catalogModels()
 	seen := map[string]bool{}
 	for _, m := range got {

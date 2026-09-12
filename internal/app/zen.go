@@ -256,7 +256,6 @@ type zenConfigData struct {
 	Routes          map[string][]string       `json:"routes,omitempty"`     // 路由别名 -> 有序候选链(如 free-best)
 	CooldownMs      map[string]int64          `json:"cooldownMs,omitempty"` // 候选层冷却时长覆盖(按错误类别)
 	Usage           zenUsageConfig            `json:"usage"`                // 每日配额账本
-	Discovery       zenDiscoveryConfig        `json:"discovery"`            // 免费模型自动发现
 	Router          zenRouterConfig           `json:"router"`               // 自动路由模型名与参与范围
 }
 

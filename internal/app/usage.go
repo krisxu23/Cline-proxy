@@ -124,6 +124,26 @@ func markUsageLoaded() {
 	usageMu.Unlock()
 }
 
+// usageRequestsOverDays 某候选最近 n 天的请求总数(账本聚合)。
+func usageRequestsOverDays(key string, days int) int {
+	if days <= 0 || key == "" {
+		return 0
+	}
+	cutoff := time.Now().In(usageLocation()).AddDate(0, 0, -days+1).Format("2006-01-02")
+	usageMu.Lock()
+	defer usageMu.Unlock()
+	total := 0
+	for day, m := range usageDays {
+		if day < cutoff {
+			continue
+		}
+		if c := m[key]; c != nil {
+			total += c.Req
+		}
+	}
+	return total
+}
+
 // recordUsageForCandidate 记一次调用结果。req 每次调用都加, ok/fail 二选一。
 func recordUsageForCandidate(cand routeCandidate, ok bool) {
 	if cand.Upstream == "" || cand.Model == "" {

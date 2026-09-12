@@ -92,7 +92,6 @@ func registerAdminRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("/admin/api/router/validate", corsHandler(handleAdminRouterValidate))
 	mux.HandleFunc("/admin/api/router/refresh", corsHandler(handleAdminRouterRefresh))
 	mux.HandleFunc("/admin/api/router/maintenance", corsHandler(handleAdminRouterMaintenance))
-	mux.HandleFunc("/admin/api/router/discovery", corsHandler(handleAdminRouterDiscovery))
 	// ClinePass 订阅池管理
 	registerClinePassAdminRoutes(mux)
 	mux.HandleFunc("/admin/zen/", func(w http.ResponseWriter, r *http.Request) {

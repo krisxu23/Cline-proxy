@@ -153,10 +153,6 @@ func routerSnapshot() map[string]any {
 		}
 	}
 
-	discoveredMu.Lock()
-	discoveredN := len(discoveredModels)
-	discoveredMu.Unlock()
-
 	return map[string]any{
 		"alias":        alias,
 		"providers":    providers,
@@ -168,7 +164,6 @@ func routerSnapshot() map[string]any {
 		"usage":        usageSnapshot(),
 		"usagePath":    usageLedgerPath(),
 		"cooldownMs":   effectiveCooldownTable(),
-		"discovery":    map[string]any{"config": discoveryConfig(), "discovered": discoveredN, "path": discoveredFilePath()},
 		"defaultAlias": defaultAutoRouterAlias,
 	}
 }
@@ -443,11 +438,12 @@ func clearAllCandidatePermanents() {
 
 // permanentRejectionList 面板展示用: 永久剔除列表(排序)。
 func permanentRejectionList() []map[string]string {
-	snap := candidatePermSnapshot()
-	out := make([]map[string]string, 0, len(snap))
-	for k, v := range snap {
+	candidateCoolMu.Lock()
+	out := make([]map[string]string, 0, len(candidatePerms))
+	for k, v := range candidatePerms {
 		out = append(out, map[string]string{"key": k, "reason": v})
 	}
+	candidateCoolMu.Unlock()
 	sort.Slice(out, func(i, j int) bool { return out[i]["key"] < out[j]["key"] })
 	return out
 }
@@ -475,33 +471,6 @@ func handleAdminRouterMaintenance(w http.ResponseWriter, r *http.Request) {
 	}
 	if req.ClearPermanent {
 		clearAllCandidatePermanents()
-		saveDiscovered()
 	}
-	writeAPI(w, http.StatusOK, apiResponse{Success: true})
-}
-
-// POST /admin/api/router/discovery  { enabled, provider, intervalMs, maxPerRun }
-func handleAdminRouterDiscovery(w http.ResponseWriter, r *http.Request) {
-	if r.Method != "POST" {
-		writeAPI(w, http.StatusMethodNotAllowed, apiResponse{Error: "method not allowed"})
-		return
-	}
-	body, _ := io.ReadAll(r.Body)
-	r.Body.Close()
-	var next zenDiscoveryConfig
-	if len(strings.TrimSpace(string(body))) > 0 {
-		if err := json.Unmarshal(body, &next); err != nil {
-			writeAPI(w, http.StatusBadRequest, apiResponse{Error: err.Error()})
-			return
-		}
-	}
-	if next.Provider != "" {
-		if _, ok := providerConfigFor(next.Provider); !ok {
-			writeAPI(w, http.StatusBadRequest, apiResponse{
-				Error: fmt.Sprintf("发现源 %s 不在已加入的供应商里", next.Provider)})
-			return
-		}
-	}
-	mutateProvidersConfig(func(cfg *zenConfigData) { cfg.Discovery = next })
 	writeAPI(w, http.StatusOK, apiResponse{Success: true})
 }

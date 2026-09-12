@@ -44,11 +44,11 @@ func TestRouterSnapshotDetectsEveryProvider(t *testing.T) {
 	withTestConfig(t, &zenConfigData{
 		Providers: map[string]providerConfig{
 			"bai": {BaseURL: "https://api.b.ai/v1", APIKey: "sk-1",
-				FreeModels: []string{"glm-5.3-flash", "deepseek-v4-flash"}},
+				Models: []providerModelEntry{{ID: "glm-5.3-flash", Enabled: true}, {ID: "deepseek-v4-flash", Enabled: true}}},
 			"nokey": {BaseURL: "https://x.example/v1",
-				FreeModels: []string{"m"}},
+				Models: []providerModelEntry{{ID: "m", Enabled: true}}},
 			"gemini": {BaseURL: "https://generativelanguage.googleapis.com", APIKey: "AQ.x",
-				FreeModels: []string{"gemini-3.8-flash"}},
+				Models: []providerModelEntry{{ID: "gemini-3.8-flash", Enabled: true}}},
 		},
 	})
 	d := routerGet(t)
@@ -107,7 +107,7 @@ func TestRouterSnapshotChainTableBlankBeforeFirstSave(t *testing.T) {
 	withTestConfig(t, &zenConfigData{
 		Providers: map[string]providerConfig{
 			"bai": {BaseURL: "https://api.b.ai/v1", APIKey: "sk-1",
-				FreeModels: []string{"glm-5.3-flash"}},
+				Models: []providerModelEntry{{ID: "glm-5.3-flash", Enabled: true}}},
 		},
 	})
 	d := routerGet(t)
@@ -122,7 +122,7 @@ func TestRouterSnapshotChainTableListsSavedRoutes(t *testing.T) {
 	withTestConfig(t, &zenConfigData{
 		Providers: map[string]providerConfig{
 			"bai": {BaseURL: "https://api.b.ai/v1", APIKey: "sk-1",
-				FreeModels: []string{"glm-5.3-flash"}},
+				Models: []providerModelEntry{{ID: "glm-5.3-flash", Enabled: true}}},
 		},
 	})
 	if code, data := routerPost(t, handleAdminRouterSave, "/admin/api/router/save",
@@ -156,7 +156,7 @@ func TestRouterSaveStoresAliasAndSelection(t *testing.T) {
 	withTestConfig(t, &zenConfigData{
 		Providers: map[string]providerConfig{
 			"bai": {BaseURL: "https://api.b.ai/v1", APIKey: "sk-1",
-				FreeModels: []string{"m1", "m2"}},
+				Models: []providerModelEntry{{ID: "m1", Enabled: true}, {ID: "m2", Enabled: true}}},
 		},
 		Routes: map[string][]string{defaultAutoRouterAlias: {"bai:m1"}},
 	})
@@ -203,7 +203,7 @@ func TestRouterSaveEmptySelectionFallsBackToDefaultChain(t *testing.T) {
 	withTestConfig(t, &zenConfigData{
 		Providers: map[string]providerConfig{
 			"bai": {BaseURL: "https://api.b.ai/v1", APIKey: "sk-1",
-				FreeModels: []string{"m1", "m2"}},
+				Models: []providerModelEntry{{ID: "m1", Enabled: true}, {ID: "m2", Enabled: true}}},
 		},
 		Routes: map[string][]string{defaultAutoRouterAlias: {"bai:m1"}},
 	})
@@ -249,9 +249,9 @@ func TestRouterValidateReportsSelectionProblems(t *testing.T) {
 	withTestConfig(t, &zenConfigData{
 		Providers: map[string]providerConfig{
 			"bai": {BaseURL: "https://api.b.ai/v1", APIKey: "sk-1",
-				FreeModels: []string{"m1"}},
+				Models: []providerModelEntry{{ID: "m1", Enabled: true}}},
 			"nokey": {BaseURL: "https://x.example/v1",
-				FreeModels: []string{"m"}},
+				Models: []providerModelEntry{{ID: "m", Enabled: true}}},
 		},
 	})
 
@@ -290,7 +290,7 @@ func TestRouterValidateReportsSelectionProblems(t *testing.T) {
 func TestRouterSnapshotCarriesDiagnostics(t *testing.T) {
 	withTestConfig(t, &zenConfigData{
 		Providers: map[string]providerConfig{
-			"bai": {BaseURL: "https://api.b.ai/v1", APIKey: "sk-1", FreeModels: []string{"m1"}},
+			"bai": {BaseURL: "https://api.b.ai/v1", APIKey: "sk-1", Models: []providerModelEntry{{ID: "m1", Enabled: true}}},
 		},
 	})
 	resetCandidateState()
@@ -307,9 +307,6 @@ func TestRouterSnapshotCarriesDiagnostics(t *testing.T) {
 	usage, _ := d["usage"].(map[string]any)
 	if rows, _ := usage["rows"].([]any); len(rows) != 1 {
 		t.Fatalf("usage rows must be present: %v", usage)
-	}
-	if _, ok := d["discovery"].(map[string]any); !ok {
-		t.Fatal("discovery status must be present")
 	}
 	if _, ok := d["cooldownMs"].(map[string]any); !ok {
 		t.Fatal("cooldown table must be present")

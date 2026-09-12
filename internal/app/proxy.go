@@ -87,7 +87,6 @@ func StartProxy(host string, port int) error {
 	startProviderRefresher()
 	startHeadersAutoSync()
 	startUsageLedger()
-	startDiscovery()
 	startNodeHealthLoop()
 
 	// Register proxy-aware HTTP client for ClinePass provider

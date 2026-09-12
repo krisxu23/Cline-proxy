@@ -526,34 +526,13 @@ body:not([data-theme="dark"]) .theme-toggle .dark-label{display:none}
 </div>
 
 <div class="section">
-  <div class="section-title">🌱 自动发现免费模型
+  <div class="section-title">🛠 候选维护
     <span style="margin-left:auto;display:flex;gap:8px">
       <button type="button" class="btn btn-sm" onclick="routerMaintenance('cooling')">解除全部冷却</button>
       <button type="button" class="btn btn-sm" onclick="routerMaintenance('permanent')">清空永久剔除</button>
     </span>
   </div>
   <div class="section-body">
-    <div class="form-row">
-      <div class="field"><label>自动发现</label>
-        <select id="discEnabled" onchange="saveDiscovery()">
-          <option value="false">关闭</option>
-          <option value="true">开启（定期拉取并试跑）</option>
-        </select>
-      </div>
-      <div class="field"><label>发现源（已加入的供应商）</label>
-        <select id="discProvider" onchange="saveDiscovery()"></select>
-      </div>
-    </div>
-    <div class="form-row">
-      <div class="field"><label>间隔（小时）</label>
-        <input id="discIntervalH" type="number" min="1" placeholder="48" onchange="saveDiscovery()">
-      </div>
-      <div class="field"><label>每轮最多试跑</label>
-        <input id="discMaxPerRun" type="number" min="1" placeholder="8" onchange="saveDiscovery()">
-      </div>
-    </div>
-    <div class="hint" id="discInfo" style="font-size:12px;color:var(--text3)"></div>
-
     <div class="form-row" style="margin-top:14px">
       <div class="field"><label>冷却中的候选</label>
         <div id="arCoolingBox" style="border:1px solid var(--border);border-radius:10px;background:var(--inset);min-height:42px"></div>
@@ -700,17 +679,13 @@ body:not([data-theme="dark"]) .theme-toggle .dark-label{display:none}
     </div>
     <div class="form-row">
       <div class="field"><label>API Key *</label><input type="password" id="pvKey" placeholder="sk-..."></div>
-      <div class="field"><label>可用模型范围</label>
-        <select id="pvMode">
-          <option value="all">目录中的全部模型（通用默认）</option>
-          <option value="pricing">按目录价格（仅 0 元模型）</option>
-          <option value="whitelist">仅白名单（不拉目录）</option>
-        </select>
+      <div class="field"><label>模型目录</label>
+        <label style="display:flex;align-items:center;gap:8px;font-weight:normal"><input type="checkbox" id="pvCatalog" checked style="width:auto;min-width:0"> 拉取 /models 目录（关闭则只用下方手填模型）</label>
       </div>
     </div>
     <div class="form-row">
-      <div class="field"><label>白名单（每行一个，仅「仅白名单」模式使用）</label>
-        <textarea id="pvFree" rows="3" placeholder="glm-5.3-flash"></textarea></div>
+      <div class="field"><label>模型（每行一个，保存为显式启用；目录拉取后也可在下方列表逐个勾选）</label>
+        <textarea id="pvModels" rows="3" placeholder="glm-5.3-flash"></textarea></div>
       <div class="field"><label>连通测试模型（留空用第一个可用模型）</label>
         <input type="text" id="pvTestModel" placeholder="glm-5.3-flash"></div>
     </div>
@@ -1611,13 +1586,6 @@ async function loadProviders() {
   } catch (e) { _('pvList').innerHTML = fail(e, 'loadProviders()'); }
 }
 
-// providerMode 把三个开关还原成面板上的单一选择。
-function providerMode(p) {
-  if (p.catalog && p.allModels) return 'all';
-  if (p.catalog && p.pricing) return 'pricing';
-  return 'whitelist';
-}
-
 function renderProviderList() {
   const names = Object.keys(pvData);
   if (!names.length) {
@@ -1630,7 +1598,7 @@ function renderProviderList() {
     if (!rt.configured) { st = '未配置 key'; }
     else if (rt.error) { st = '❌ ' + esc(String(rt.error).slice(0, 90)); }
     else if (p.catalog) { st = '目录 ' + (rt.catalogSize || 0) + ' · 可聊 ' + (rt.chatCount || 0) + ' · 可用 ' + (p.models || []).length; }
-    else { st = '白名单 ' + ((p.freeModels || []).length) + ' 个'; }
+    else { st = '手动 ' + (((p.modelEntries || []).length || (p.freeModels || []).length)) + ' 个'; }
     if (rt.rejected) { st += ' · 剔除 ' + rt.rejected; }
     const badge = p.google ? '<span style="flex:none;font-size:10.5px;color:#4285f4;border:1px solid currentColor;border-radius:4px;padding:0 5px" title="Google 特殊约定已内置">Google</span>' : '';
     const open = (window.pvOpen && window.pvOpen[n]) ? true : false;
@@ -1671,7 +1639,7 @@ function renderProviderModels() {
       '<div style="display:flex;align-items:center;gap:8px;margin-bottom:6px">' +
       '<span style="font-weight:600;font-family:monospace">' + esc(n) + '</span>' +
       '<span class="model-tag">' + (p.models || []).length + ' 个可用模型</span>' +
-      (p.catalog ? '<span class="model-tag">目录已拉取</span>' : '<span class="model-tag">白名单模式</span>') +
+      (p.catalog ? '<span class="model-tag">目录已拉取</span>' : '<span class="model-tag">手动模式</span>') +
       '<span style="font-size:11px;color:var(--text3)">启用/剔除去「设置 → 🔌 通用 Provider」点行内「模型▼」</span>' +
       '</div>' +
       (note ? '<div class="hint" style="margin:0">' + esc(note) + '</div>'
@@ -1719,8 +1687,12 @@ function renderPvModelBlock(n, p) {
 async function toggleProviderModel(box) {
   const name = box.getAttribute('data-pv'), id = box.getAttribute('data-model');
   const p = pvData[name] || {};
-  const cur = new Set(p.disabledModels || []);
-  if (box.checked) cur.delete(id); else cur.add(id);
+  const entries = new Map((p.modelEntries || []).map(e => [e.id, !!e.enabled]));
+  // 预迁移回退: 用目录勾选态/旧白名单补齐条目, 否则一次切换会丢数据
+  (p.catalogModels || []).forEach(m => { if (!entries.has(m.id)) entries.set(m.id, !m.disabled); });
+  (p.freeModels || []).forEach(mid => { if (!entries.has(mid)) entries.set(mid, true); });
+  (p.disabledModels || []).forEach(mid => { if (!entries.has(mid)) entries.set(mid, false); });
+  entries.set(id, box.checked);
   const existing = Object.assign({}, p);
   delete existing.runtime;
   delete existing.models;
@@ -1728,7 +1700,11 @@ async function toggleProviderModel(box) {
   delete existing.google;
   delete existing.chatEndpoint;
   delete existing.catalogEndpoint;
-  existing.disabledModels = Array.from(cur);
+  delete existing.modelEntries;
+  delete existing.freeModels;
+  delete existing.disabledModels;
+  existing.models = Array.from(entries, ([mid, enabled]) => ({ id: mid, enabled }));
+  existing.migrated = true;
   try {
     await api('POST', '/providers/update', { name, provider: existing });
     toast((box.checked ? '已启用 ' : '已剔除 ') + name + ':' + id, 'success');
@@ -1743,8 +1719,10 @@ function editProvider(n) {
   _('pvName').value = n;
   _('pvBaseUrl').value = p.baseUrl || '';
   _('pvKey').value = p.apiKey || '';
-  _('pvMode').value = providerMode(p);
-  _('pvFree').value = (p.freeModels || []).join('\n');
+  if (_('pvCatalog')) _('pvCatalog').checked = p.catalog !== false;
+  const entries = p.modelEntries || [];
+  const enabled = entries.length ? entries.filter(e => e.enabled).map(e => e.id) : (p.freeModels || []);
+  _('pvModels').value = enabled.join('\n');
   toast('已载入 ' + n + ', 修改后点保存', 'success');
 }
 
@@ -1752,8 +1730,8 @@ function resetProviderForm() {
   _('pvName').value = '';
   _('pvBaseUrl').value = '';
   _('pvKey').value = '';
-  _('pvMode').value = 'all';
-  _('pvFree').value = '';
+  if (_('pvCatalog')) _('pvCatalog').checked = true;
+  _('pvModels').value = '';
   _('pvTestModel').value = '';
   _('pvResult').innerHTML = '';
 }
@@ -1765,7 +1743,7 @@ async function saveProvider() {
   if (!name) { toast('请填写 Provider 名', 'error'); return; }
   if (!baseUrl) { toast('请填写 API 地址', 'error'); return; }
   if (!apiKey) { toast('请填写 API Key', 'error'); return; }
-  // 后端按整体替换处理 provider: 表单未编辑的字段(headers、chatPath 等)
+  // 后端按整体替换处理 provider: 表单未编辑的字段(headers 等)
   // 必须原样回传, 否则保存会把它们清掉, 已配好的 provider 会静默失真。
   const existing = Object.assign({}, pvData[name] || {});
   delete existing.runtime;
@@ -1774,19 +1752,26 @@ async function saveProvider() {
   delete existing.google;
   delete existing.chatEndpoint;
   delete existing.catalogEndpoint;
-  const mode = _('pvMode').value;
+  delete existing.modelEntries;
+  // 文本框里的行 = 显式启用; 之前已勾掉的不在框里, 要原样保留禁用态
+  const want = new Set(_('pvModels').value.split('\n').map(s => s.trim()).filter(Boolean));
+  const prev = new Map(((pvData[name] || {}).modelEntries || []).map(e => [e.id, !!e.enabled]));
+  const models = [];
+  want.forEach(id => models.push({ id, enabled: true }));
+  const keepDisabled = id => { if (!want.has(id) && !models.some(m => m.id === id)) models.push({ id, enabled: false }); };
+  prev.forEach((en, id) => { if (!en) keepDisabled(id); });
+  ((pvData[name] || {}).disabledModels || []).forEach(keepDisabled);
   const body = {
     name,
     provider: Object.assign(existing, {
       baseUrl,
       apiKey,
-      catalog: mode !== 'whitelist',
-      pricing: mode === 'pricing',
-      allModels: mode === 'all',
-      freeModels: _('pvFree').value.split('\n').map(s => s.trim()).filter(Boolean),
-      // 目录地址与鉴权方言由后端按上游推导, 面板不再暴露
-      modelsUrl: '',
-      modelsKeyHeader: '',
+      catalog: _('pvCatalog').checked,
+      models,
+      migrated: true,
+      // 旧白名单/剔除已折叠进 models, 不再保留
+      freeModels: [],
+      disabledModels: [],
     }),
   };
   try {
@@ -1911,13 +1896,12 @@ function renderRouter() {
   if (_('arSelectionWarn')) {
     _('arSelectionWarn').textContent = routerModels.size
       ? '已选 ' + routerModels.size + ' 个模型参与自动路由'
-      : '未勾选任何模型：保存后自动路由会回落为「全部供应商的全部免费模型」';
+      : '未勾选任何模型：保存后自动路由会回落为「全部供应商的全部已启用模型」';
   }
 
   renderRouterChain(d);
   renderRouterUsage(d);
   renderRouterCooling(d);
-  renderRouterDiscovery(d);
 }
 
 // 勾选交互统一走事件委托: 供应商名与模型 id 里可能带 / : . 等字符,
@@ -2104,46 +2088,6 @@ function renderRouterCooling(d) {
         + '<code>' + esc(p.key) + '</code><div style="color:var(--text3);margin-top:2px">' + esc(p.reason) + '</div></div>').join('')
       : '<div style="padding:8px 10px;font-size:12px;color:var(--text3)">暂无永久剔除</div>';
   }
-}
-
-function renderRouterDiscovery(d) {
-  const disc = d.discovery || {};
-  const dc = disc.config || {};
-  const provs = (d.providers || []).filter(p => !p.builtin);
-  if (_('discProvider')) {
-    // 发现源只能从"已加入的通用 Provider"里选(内置上游没有目录), 不允许手填
-    const cur = dc.provider || '';
-    _('discProvider').innerHTML = provs.map(p =>
-      '<option value="' + esc(p.name) + '"' + (p.name === cur ? ' selected' : '') + '>' + esc(p.display || p.name) + '</option>').join('')
-      || '<option value="">（还没有通用 Provider）</option>';
-    if (cur && provs.findIndex(p => p.name === cur) < 0) _('discProvider').value = '';
-  }
-  if (_('discEnabled')) _('discEnabled').value = dc.enabled ? 'true' : 'false';
-  if (_('discIntervalH')) {
-    const h = Math.round((dc.intervalMs || 0) / 3600000);
-    _('discIntervalH').value = h > 0 ? h : 48;
-  }
-  if (_('discMaxPerRun')) _('discMaxPerRun').value = dc.maxPerRun || 8;
-  if (_('discInfo')) {
-    _('discInfo').textContent = dc.enabled
-      ? ('已收录 ' + (disc.discovered || 0) + ' 个自动发现的模型，会追加在自动路由的末尾；文件 ' + (disc.path || ''))
-      : '当前为关闭状态：不会自动发现新模型，自动路由只用手动勾选的候选。';
-  }
-}
-
-async function saveDiscovery() {
-  const cfg = Object.assign({}, ((routerData && routerData.discovery) || {}).config || {});
-  cfg.enabled = _('discEnabled').value === 'true';
-  cfg.provider = _('discProvider').value || cfg.provider || '';
-  const h = parseInt(_('discIntervalH').value, 10);
-  cfg.intervalMs = (h > 0 ? h : 48) * 3600000;
-  const n = parseInt(_('discMaxPerRun').value, 10);
-  cfg.maxPerRun = n > 0 ? n : 8;
-  try {
-    await api('POST', '/router/discovery', cfg);
-    toast('已保存自动发现设置', 'success');
-    loadRouter();
-  } catch (e) { toast('保存失败：' + e.message, 'error'); }
 }
 
 async function delProvider(n) {

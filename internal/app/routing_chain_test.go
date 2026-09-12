@@ -84,10 +84,10 @@ func TestResolveRouteChainAutoRouterFromWhitelist(t *testing.T) {
 	withTestConfig(t, &zenConfigData{
 		Providers: map[string]providerConfig{
 			"bai": {BaseURL: "https://api.b.ai/v1", APIKey: "sk-x",
-				FreeModels: []string{"glm-5.3-flash", "deepseek-v4-flash"}},
+				Models: []providerModelEntry{{ID: "glm-5.3-flash", Enabled: true}, {ID: "deepseek-v4-flash", Enabled: true}}},
 			// 缺 key 的 provider 不参与候选
 			"nogkey": {BaseURL: "https://x.example/v1",
-				FreeModels: []string{"should-not-appear"}},
+				Models: []providerModelEntry{{ID: "should-not-appear", Enabled: true}}},
 		},
 	})
 	cands, matched, errMsg := resolveRouteChain(defaultAutoRouterAlias)
@@ -107,7 +107,7 @@ func TestResolveRouteChainAutoRouterFromWhitelist(t *testing.T) {
 func TestCandidateSkip(t *testing.T) {
 	withTestConfig(t, &zenConfigData{
 		Providers: map[string]providerConfig{
-			"bai": {BaseURL: "https://api.b.ai/v1", APIKey: "sk-x", FreeModels: []string{"glm-5.3-flash"}},
+			"bai": {BaseURL: "https://api.b.ai/v1", APIKey: "sk-x", Models: []providerModelEntry{{ID: "glm-5.3-flash", Enabled: true}}},
 		},
 	})
 	resetCandidateState()

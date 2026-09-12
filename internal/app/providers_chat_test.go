@@ -57,7 +57,7 @@ func TestProviderChatPassthrough(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	setTestProvider(t, "bai", providerConfig{BaseURL: srv.URL, APIKey: "k-bai", FreeModels: []string{"glm-5.3-flash"}})
+	setTestProvider(t, "bai", providerConfig{BaseURL: srv.URL, APIKey: "k-bai", Models: []providerModelEntry{{ID: "glm-5.3-flash", Enabled: true}}})
 	p := providerByName("bai")
 	resp, err := p.Chat(context.Background(), map[string]any{
 		"model":    "bai:glm-5.3-flash",
@@ -113,7 +113,7 @@ func TestProviderChatErrorCarriesStatus(t *testing.T) {
 		w.Write([]byte(`{"error":{"message":"nope"}}`))
 	}))
 	defer srv.Close()
-	setTestProvider(t, "x", providerConfig{BaseURL: srv.URL, APIKey: "k", FreeModels: []string{"m"}})
+	setTestProvider(t, "x", providerConfig{BaseURL: srv.URL, APIKey: "k", Models: []providerModelEntry{{ID: "m", Enabled: true}}})
 	p := providerByName("x")
 	_, err := p.Chat(context.Background(), map[string]any{"model": "m", "messages": []any{}}, false)
 	if err == nil {
@@ -134,7 +134,7 @@ func TestProviderChatRecordsPermanentRejection(t *testing.T) {
 		w.Write([]byte(`{"error":{"message":"model is no longer available"}}`))
 	}))
 	defer srv.Close()
-	setTestProvider(t, "gone", providerConfig{BaseURL: srv.URL, APIKey: "k", FreeModels: []string{"dead"}})
+	setTestProvider(t, "gone", providerConfig{BaseURL: srv.URL, APIKey: "k", Models: []providerModelEntry{{ID: "dead", Enabled: true}}})
 	p := providerByName("gone")
 	if _, err := p.Chat(context.Background(), map[string]any{"model": "dead", "messages": []any{}}, false); err == nil {
 		t.Fatal("404 must return an error")
@@ -152,7 +152,7 @@ func TestProviderChatInjectsThoughtSignature(t *testing.T) {
 		w.Write([]byte(`{"choices":[]}`))
 	}))
 	defer srv.Close()
-	setTestProvider(t, "gemini", providerConfig{BaseURL: srv.URL, APIKey: "gk", FreeModels: []string{"g1"}})
+	setTestProvider(t, "gemini", providerConfig{BaseURL: srv.URL, APIKey: "gk", Models: []providerModelEntry{{ID: "g1", Enabled: true}}})
 	p := providerByName("gemini")
 	params := map[string]any{
 		"model": "g1",
@@ -183,7 +183,7 @@ func TestProviderChatRemembersSignatureFromResponse(t *testing.T) {
 		w.Write([]byte(`{"choices":[{"message":{"tool_calls":[{"id":"call-9","extra_content":{"google":{"thought_signature":"sig-9"}}}]}}]}`))
 	}))
 	defer srv.Close()
-	setTestProvider(t, "gemini", providerConfig{BaseURL: srv.URL, APIKey: "gk", FreeModels: []string{"g1"}})
+	setTestProvider(t, "gemini", providerConfig{BaseURL: srv.URL, APIKey: "gk", Models: []providerModelEntry{{ID: "g1", Enabled: true}}})
 	p := providerByName("gemini")
 	resp, err := p.Chat(context.Background(), map[string]any{"model": "g1", "messages": []any{}}, false)
 	if err != nil {
@@ -224,7 +224,7 @@ func TestProviderChatNonStreamBodyFullyRead(t *testing.T) {
 		})
 	}))
 	defer srv.Close()
-	setTestProvider(t, "big", providerConfig{BaseURL: srv.URL, APIKey: "k", FreeModels: []string{"m1"}})
+	setTestProvider(t, "big", providerConfig{BaseURL: srv.URL, APIKey: "k", Models: []providerModelEntry{{ID: "m1", Enabled: true}}})
 	p := providerByName("big")
 	resp, err := p.Chat(context.Background(), map[string]any{"model": "m1", "messages": []any{}}, false)
 	if err != nil {
@@ -245,7 +245,7 @@ func TestProviderChatNonStreamBodyFullyRead(t *testing.T) {
 }
 
 func TestHandleProviderChatRejectsPaidModel(t *testing.T) {
-	setTestProvider(t, "bai", providerConfig{BaseURL: "https://x", APIKey: "k", FreeModels: []string{"free-one"}})
+	setTestProvider(t, "bai", providerConfig{BaseURL: "https://x", APIKey: "k", Models: []providerModelEntry{{ID: "free-one", Enabled: true}}})
 	rec := httptest.NewRecorder()
 	req := httptest.NewRequest("POST", "/chat/completions", nil)
 	handleProviderChat(rec, req, map[string]any{"model": "bai:paid-one", "messages": []any{}}, "bai")
@@ -255,7 +255,7 @@ func TestHandleProviderChatRejectsPaidModel(t *testing.T) {
 }
 
 func TestHandleProviderChatRejectsKeylessProvider(t *testing.T) {
-	setTestProvider(t, "nokey", providerConfig{BaseURL: "https://x", FreeModels: []string{"m"}})
+	setTestProvider(t, "nokey", providerConfig{BaseURL: "https://x", Models: []providerModelEntry{{ID: "m", Enabled: true}}})
 	rec := httptest.NewRecorder()
 	req := httptest.NewRequest("POST", "/chat/completions", nil)
 	handleProviderChat(rec, req, map[string]any{"model": "nokey:m", "messages": []any{}}, "nokey")
@@ -275,7 +275,7 @@ func TestHandleProviderChatRefreshesCatalogBeforeGate(t *testing.T) {
 		w.Write([]byte(`{"choices":[{"message":{"content":"ok"}}]}`))
 	}))
 	defer srv.Close()
-	setTestProvider(t, "cat", providerConfig{BaseURL: srv.URL, APIKey: "k", Catalog: true, Pricing: true})
+	setTestProvider(t, "cat", providerConfig{BaseURL: srv.URL, APIKey: "k", Catalog: true})
 	p := providerByName("cat")
 	rec := httptest.NewRecorder()
 	req := httptest.NewRequest("POST", "/chat/completions", nil)
@@ -310,7 +310,7 @@ func TestHandleProviderChatCatalogRefreshBacksOffAndRecovers(t *testing.T) {
 		w.Write([]byte(`{"choices":[{"message":{"content":"ok"}}]}`))
 	}))
 	defer srv.Close()
-	setTestProvider(t, "catretry", providerConfig{BaseURL: srv.URL, APIKey: "k", Catalog: true, Pricing: true})
+	setTestProvider(t, "catretry", providerConfig{BaseURL: srv.URL, APIKey: "k", Catalog: true})
 	p := providerByName("catretry")
 
 	calls := func() int {
@@ -380,7 +380,7 @@ func TestProviderChatReplaysOnRejectedSignature(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	setTestProvider(t, "gemini", providerConfig{BaseURL: srv.URL, APIKey: "gk", FreeModels: []string{"g1"}})
+	setTestProvider(t, "gemini", providerConfig{BaseURL: srv.URL, APIKey: "gk", Models: []providerModelEntry{{ID: "g1", Enabled: true}}})
 	p := providerByName("gemini")
 	params := map[string]any{
 		"model": "g1",

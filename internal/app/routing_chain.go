@@ -137,46 +137,21 @@ func resolveRouteChain(model string) (cands []routeCandidate, matched bool, errM
 	// 而不是让别名彻底失效。
 	if cfg != nil {
 		if list, ok := cfg.Routes[id]; ok && len(list) > 0 {
-			return appendChainTail(expandRouteList(id, list)), true, ""
+			return expandRouteList(id, list), true, ""
 		}
 	}
 	if !isAutoRouterAlias(id) {
 		return nil, false, ""
 	}
 
-	// 没有显式候选 -> 默认链: 已配置 provider 的免费模型。
+	// 没有显式候选 -> 默认链: 已配置 provider 的已启用模型。
 	chain := defaultAutoRouterChain()
-	chain = appendChainTail(chain)
 	if len(chain) == 0 {
 		return nil, true, fmt.Sprintf(
 			"model %q has no candidates: no provider with an API key is configured, "+
 				"and no model has been selected for it", id)
 	}
 	return chain, true, ""
-}
-
-// appendChainTail 把 discovery 收录的模型接到候选链尾部。
-//
-// 手动配置的条目永远在前且顺序不变 —— 发现的结果只是补充, 不能插队;
-// 同一个 upstream:model 已在前面的站点里出现时也不再重复追加。
-func appendChainTail(manual []routeCandidate) []routeCandidate {
-	tail := discoveredCandidates()
-	if len(tail) == 0 {
-		return manual
-	}
-	seen := make(map[string]bool, len(manual)+len(tail))
-	for _, c := range manual {
-		seen[c.String()] = true
-	}
-	out := manual
-	for _, c := range tail {
-		if seen[c.String()] {
-			continue
-		}
-		seen[c.String()] = true
-		out = append(out, c)
-	}
-	return out
 }
 
 // expandRouteList 把配置里的一串条目展开成候选。
@@ -215,7 +190,7 @@ func expandRouteList(alias string, list []string) []routeCandidate {
 	return out
 }
 
-// defaultAutoRouterChain 默认链: 已配置 provider 的全部免费模型。
+// defaultAutoRouterChain 默认链: 已配置 provider 的全部已启用模型。
 //
 // 顺序取 provider 名的字典序 —— 配置里 providers 是 map, 本身没有声明顺序,
 // 用字典序保证每次展开结果一致(否则同一请求两次可能命中不同站点)。

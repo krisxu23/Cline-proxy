@@ -44,16 +44,10 @@ func handleProvidersConfig(w http.ResponseWriter, r *http.Request) {
 			"baseUrl":         cfg.BaseURL,
 			"apiKey":          cfg.APIKey,
 			"catalog":         cfg.Catalog,
-			"pricing":         cfg.Pricing,
-			"allModels":       cfg.AllModels,
-			"probeFreeTier":   cfg.ProbeFreeTier,
-			"chatPath":        cfg.ChatPath,
-			"modelsPath":      cfg.ModelsPath,
-			"modelsUrl":       cfg.ModelsURL,
-			"modelsKeyHeader": cfg.ModelsKeyHeader,
 			"headers":         cfg.Headers,
-			"freeModels":      cfg.FreeModels,
-			"disabledModels":  cfg.DisabledModels,
+			"freeModels":      cfg.FreeModels,     // 已废弃: 未迁移配置的展示/回退
+			"disabledModels":  cfg.DisabledModels, // 已废弃: 未迁移配置的展示/回退
+			"modelEntries":    cfg.Models,         // 显式模型开关(面板勾选的读写源)
 			"runtime":         runtime,
 			"models":          models,
 			"catalogModels":   catalogModels,

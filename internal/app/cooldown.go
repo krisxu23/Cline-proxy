@@ -57,7 +57,7 @@ var (
 	candidateCoolMu sync.Mutex
 	candidateCools  = map[string]candidateCool{}
 	// candidatePerms 永久剔除(无免费层 / 已下架 / 非 chat 模型)。
-	// 进程内保存, 由 discovery 的持久化文件同存(spec §5.2)。
+	// 进程内保存, 面板可查看与清空。
 	candidatePerms = map[string]string{}
 )
 
@@ -166,25 +166,6 @@ func clearExpiredCandidateCooldowns() {
 		}
 	}
 	candidateCoolMu.Unlock()
-}
-
-// candidatePermSnapshot / candidatePermRestore 供 discovery 落盘与启动恢复使用。
-func candidatePermSnapshot() map[string]string {
-	candidateCoolMu.Lock()
-	defer candidateCoolMu.Unlock()
-	out := make(map[string]string, len(candidatePerms))
-	for k, v := range candidatePerms {
-		out[k] = v
-	}
-	return out
-}
-
-func candidatePermRestore(m map[string]string) {
-	candidateCoolMu.Lock()
-	defer candidateCoolMu.Unlock()
-	for k, v := range m {
-		candidatePerms[k] = v
-	}
 }
 
 // candidateCoolingSnapshot 面板用: 当前处于冷却期的候选, 按剩余时间倒序。

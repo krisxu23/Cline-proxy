@@ -144,14 +144,9 @@ func TestCandidatePermanentRejection(t *testing.T) {
 		t.Fatal("sweeping expired cooldowns must not clear permanent rejections")
 	}
 
-	// 快照/恢复: discovery 落盘与启动恢复依赖这一对
-	snap := candidatePermSnapshot()
+	// 清空后永久剔除也消失, 候选重新参与
 	resetCandidateState()
 	if candidateSkipReason("gemini", "gone") != "" {
 		t.Fatal("reset must drop permanent rejections for a clean slate")
-	}
-	candidatePermRestore(snap)
-	if candidateSkipReason("gemini", "gone") == "" {
-		t.Fatal("restore must bring permanent rejections back")
 	}
 }

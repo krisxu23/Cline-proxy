@@ -19,11 +19,6 @@ import (
 
 // 注: catalogModel 结构体声明在 providers_config.go, 此处不要重复声明。
 
-// isZeroCost 明确标价 0 的模型。
-func isZeroCost(m *catalogModel) bool {
-	return m != nil && m.PricesKnown && m.PromptPrice == 0 && m.CompletionPrice == 0
-}
-
 var moderationRe = regexp.MustCompile(`(?i)content[-_ ]?safety|moderation|guard(?:[:/_-]|$)`)
 
 // isChatModel 目录条目是否可作为聊天模型路由。
@@ -71,75 +66,23 @@ func catalogLookup(cat, slugs map[string]*catalogModel, modelID string) *catalog
 	return slugs[slug]
 }
 
-// evalProviderFree 免费判定四模式(纯函数):
-//   - catalog+allModels: 目录里的聊天模型全部可用(通用 Provider 的默认形态)
-//   - catalog+pricing: 目录按价格判定 isZeroCost && isChatModel;
-//     目录完全无价格时退回白名单+目录校验(见 catalogHasPrices)
-//   - 白名单: freeModels 命中; 目录已加载时还需目录中仍存在
-//   - 永久拒绝缓存命中 → false
-func evalProviderFree(cfg providerConfig, cat, slugs map[string]*catalogModel, rejected map[string]string, modelID string) bool {
+// isFree 该模型在本 provider 上是否可用 —— 只认显式开关:
+// Models 为空(尚未迁移)一律不可用; 缺 key 与永久拒绝直接否决。
+func (p *modelProvider) isFree(modelID string) bool {
+	cfg, _ := providerConfigFor(p.name)
 	if cfg.APIKey == "" {
 		return false
 	}
+	p.mu.Lock()
+	rejected := p.rejected
+	p.mu.Unlock()
 	if _, bad := rejected[modelID]; bad {
-		return false
-	}
-	if cfg.disabledSet()[modelID] {
 		return false
 	}
 	if explicit, ok := cfg.explicitModels(); ok {
 		return explicit[modelID]
 	}
-	if cfg.Catalog && cfg.AllModels {
-		if len(cat) == 0 {
-			// 目录尚未拉到(或该上游不提供 /models): 退回白名单, 保住手填的模型名,
-			// 避免首次连接或上游无目录时全部模型被判死。
-			return cfg.freeSet()[modelID]
-		}
-		m := catalogLookup(cat, slugs, modelID)
-		return m != nil && isChatModel(m)
-	}
-	if cfg.Catalog && cfg.Pricing {
-		if len(cat) == 0 {
-			return false
-		}
-		if !catalogHasPrices(cat) {
-			// 无价格目录: 价格判据无效, 退回白名单+目录校验。
-			if !cfg.freeSet()[modelID] {
-				return false
-			}
-			return catalogLookup(cat, slugs, modelID) != nil
-		}
-		m := catalogLookup(cat, slugs, modelID)
-		return m != nil && isZeroCost(m) && isChatModel(m)
-	}
-	if !cfg.freeSet()[modelID] {
-		return false
-	}
-	if cfg.Catalog && len(cat) > 0 {
-		return catalogLookup(cat, slugs, modelID) != nil
-	}
-	return true
-}
-
-// catalogHasPrices 目录里是否至少有一条带价格的信息。B.AI 类上游的目录
-// 完全不带价格, 此时价格判据恒为 false, 必须退回白名单语义。
-func catalogHasPrices(cat map[string]*catalogModel) bool {
-	for _, m := range cat {
-		if m != nil && m.PricesKnown {
-			return true
-		}
-	}
 	return false
-}
-
-// isFree 该模型在本 provider 上是否免费。
-func (p *modelProvider) isFree(modelID string) bool {
-	cfg, _ := providerConfigFor(p.name)
-	p.mu.Lock()
-	cat, slugs, rejected := p.catalog, p.slugs, p.rejected
-	p.mu.Unlock()
-	return evalProviderFree(cfg, cat, slugs, rejected, modelID)
 }
 
 // catalogEntry 精确或按 slug 查目录条目。
@@ -271,32 +214,19 @@ func normalizeCatalogPayload(payload []byte) catalogPage {
 }
 
 func catalogURL(cfg providerConfig) string {
-	if custom := cfg.customModelsURL(); custom != "" {
-		return custom
-	}
 	if isGoogleProvider(cfg) {
-		return googleOpenAIBase(cfg.BaseURL) + cfg.modelsPath()
+		return googleOpenAIBase(cfg.BaseURL) + "/models"
 	}
-	return strings.TrimRight(cfg.BaseURL, "/") + cfg.modelsPath()
+	return strings.TrimRight(cfg.BaseURL, "/") + "/models"
 }
 
-// catalogHeaders 目录请求的鉴权头。
-// 默认 Bearer; 显式配了 ModelsKeyHeader 时该头替代 Bearer(历史行为)。
-// Google 例外: OpenAI 兼容目录认 Bearer, 原生目录认 x-goog-api-key,
-// 按 target 路径择一发送 —— 原生目录上多发一个 Bearer 会被回 401,
-// 反而盖住真实原因(地区不受支持等)。
+// catalogHeaders 目录请求的鉴权头: 与对话请求同一套规则,
+// Google 按目标路径择一(原生目录只认 x-goog-api-key, 见 googleUsesBearer)。
 func catalogHeaders(cfg providerConfig, target string) map[string]string {
 	if cfg.APIKey == "" {
 		return nil
 	}
-	google := isGoogleProvider(cfg)
-	if cfg.ModelsKeyHeader != "" && !google {
-		return map[string]string{cfg.ModelsKeyHeader: cfg.APIKey}
-	}
 	out := map[string]string{}
-	if cfg.ModelsKeyHeader != "" {
-		out[cfg.ModelsKeyHeader] = cfg.APIKey
-	}
 	cfg.applyAuth(target, func(k, v string) { out[k] = v })
 	return out
 }
@@ -499,12 +429,15 @@ func (e *catalogHTTPError) Error() string {
 // refreshCatalog 拉取并重建目录; force 强制刷新, 否则受 15 分钟间隔限制。
 //
 // 同一个 provider 同时只允许一次刷新在跑: 定时循环、面板手动刷新、请求路径
-// 的按需刷新、discovery 都可能并发触发, 而每次刷新都可能长时间轮换出口。
+// 的按需刷新都可能并发触发, 而每次刷新都可能长时间轮换出口。
 // 重复触发时后到者直接返回(先到者会把结果写回), 否则出口池会被同一份目录
 // 的多个副本同时打爆 —— 这正是面板卡顿与"加载失败"的来源之一。
 func (p *modelProvider) refreshCatalog(ctx context.Context, force bool) error {
 	cfg, _ := providerConfigFor(p.name)
 	if !cfg.Catalog {
+		// 无目录 provider 没有可拉取的列表, 但 legacy 白名单仍要迁移:
+		// 在这里折叠为显式开关, 之后每次调用都是无操作。
+		p.maybeBackfillExplicitModels()
 		return nil
 	}
 	p.mu.Lock()
@@ -595,26 +528,58 @@ func (p *modelProvider) refreshCatalog(ctx context.Context, force bool) error {
 	return nil
 }
 
-// maybeBackfillExplicitModels 首次成功刷新后把 legacy 判定快照为显式模型开关。
-// 已迁移 / 目录为空 / 快照为空时跳过(避免把空结果误固化)。
+// maybeBackfillExplicitModels 把 legacy 配置一次性快照为显式模型开关。
+// 已迁移 / 已有显式条目(面板写过就不再覆盖) / 快照为空时跳过。
+//
+// 快照取并集(宁多勿少): 白名单里的手填模型 + 目录里的聊天模型,
+// 被勾掉的折叠为 Enabled=false —— 多出的可在面板勾掉, 少了则是静默丢失。
+// 永久拒绝的不固化(判定层仍会拦, 但不占用开关位)。
 func (p *modelProvider) maybeBackfillExplicitModels() {
 	cfg, ok := providerConfigFor(p.name)
-	if !ok || cfg.Migrated {
+	if !ok || cfg.Migrated || len(cfg.Models) > 0 {
 		return
 	}
 	p.mu.Lock()
-	empty := len(p.catalog) == 0
+	cat := p.catalog
+	rejected := p.rejected
 	p.mu.Unlock()
-	if empty {
+	disabledIDs := cfg.disabledSet()
+	entries := make([]providerModelEntry, 0, len(cat)+len(cfg.FreeModels)+len(disabledIDs))
+	seen := make(map[string]bool, len(cat)+len(cfg.FreeModels)+len(disabledIDs))
+	add := func(id string, enabled bool) {
+		if id = strings.TrimSpace(id); id == "" || seen[id] {
+			return
+		}
+		if enabled {
+			if _, bad := rejected[id]; bad {
+				return
+			}
+			if disabledIDs[id] {
+				return // 被勾掉的不进启用分支, 后面统一折叠为禁用
+			}
+		}
+		seen[id] = true
+		entries = append(entries, providerModelEntry{ID: id, Enabled: enabled})
+	}
+	for _, id := range cfg.FreeModels {
+		add(id, true)
+	}
+	for _, m := range cat {
+		if isChatModel(m) {
+			add(m.ID, true)
+		}
+	}
+	if len(entries) == 0 && len(disabledIDs) == 0 {
 		return
 	}
-	ids := p.freeModelIDs()
-	if len(ids) == 0 {
-		return
+	for id := range disabledIDs {
+		if seen[id] {
+			continue
+		}
+		add(id, false)
 	}
-	entries := make([]providerModelEntry, 0, len(ids))
-	for _, m := range ids {
-		entries = append(entries, providerModelEntry{ID: m.ID, Enabled: true})
+	if len(entries) == 0 {
+		return
 	}
 	name := p.name
 	mutateProvidersConfig(func(cfg *zenConfigData) {
@@ -625,79 +590,40 @@ func (p *modelProvider) maybeBackfillExplicitModels() {
 	})
 }
 
-// freeModelIDs 该 provider 的免费模型列表。
-// 候选统一经 evalProviderFree 过滤: 该列表会对外发布(providerModelList),
-// 必须与 isFree 的判定一致, 缺 key 或已永久剔除的模型不得出现。
+// freeModelIDs 该 provider 的已启用模型列表(只认显式开关)。
+// 对外发布(providerModelList)与 isFree 同源:
+// 缺 key、未迁移、已永久剔除的模型不得出现。
 func (p *modelProvider) freeModelIDs() []catalogModel {
 	cfg, _ := providerConfigFor(p.name)
+	if cfg.APIKey == "" {
+		return nil
+	}
+	explicit, ok := cfg.explicitModels()
+	if !ok {
+		return nil
+	}
 	p.mu.Lock()
-	cat, slugs, rejected := p.catalog, p.slugs, p.rejected
+	rejected := p.rejected
 	p.mu.Unlock()
-
-	if explicit, ok := cfg.explicitModels(); ok {
-		var candidates []catalogModel
-		for id, enabled := range explicit {
-			if enabled {
-				candidates = append(candidates, catalogModel{ID: id})
-			}
+	out := make([]catalogModel, 0, len(explicit))
+	for id, enabled := range explicit {
+		if !enabled {
+			continue
 		}
-		out := make([]catalogModel, 0, len(candidates))
-		for _, m := range candidates {
-			if evalProviderFree(cfg, cat, slugs, rejected, m.ID) {
-				out = append(out, m)
-			}
+		if _, bad := rejected[id]; bad {
+			continue
 		}
-		sort.Slice(out, func(i, j int) bool { return out[i].ID < out[j].ID })
-		return out
-	}
-
-	var candidates []catalogModel
-	switch {
-	case cfg.Catalog && cfg.AllModels:
-		// 目录里的聊天模型全部可用; 目录为空时退回白名单。
-		for _, m := range cat {
-			if isChatModel(m) {
-				candidates = append(candidates, *m)
-			}
-		}
-		if len(candidates) == 0 {
-			for id := range cfg.freeSet() {
-				candidates = append(candidates, catalogModel{ID: id})
-			}
-		}
-	case cfg.Catalog && cfg.Pricing:
-		if !catalogHasPrices(cat) {
-			// 无价格目录: 按白名单出候选(与 eval 侧回退一致, 否则恒为空)。
-			for id := range cfg.freeSet() {
-				candidates = append(candidates, catalogModel{ID: id})
-			}
-			break
-		}
-		for _, m := range cat {
-			if isZeroCost(m) && isChatModel(m) {
-				candidates = append(candidates, *m)
-			}
-		}
-	default:
-		for id := range cfg.freeSet() {
-			candidates = append(candidates, catalogModel{ID: id})
-		}
-	}
-	out := make([]catalogModel, 0, len(candidates))
-	for _, m := range candidates {
-		if evalProviderFree(cfg, cat, slugs, rejected, m.ID) {
-			out = append(out, m)
-		}
+		out = append(out, catalogModel{ID: id})
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].ID < out[j].ID })
 	return out
 }
 
 // catalogModels 全量目录(含被勾掉的), 供面板勾选列表用。
-// 只收录聊天模型; 排序稳定; disabled 来自配置的 DisabledModels。
+// 只收录聊天模型; 排序稳定; 启用状态来自显式开关(未迁移时默认全启用)。
 func (p *modelProvider) catalogModels() []map[string]any {
 	cfg, _ := providerConfigFor(p.name)
-	disabled := cfg.disabledSet()
+	explicit, _ := cfg.explicitModels()
 	p.mu.Lock()
 	cat := p.catalog
 	p.mu.Unlock()
@@ -706,7 +632,7 @@ func (p *modelProvider) catalogModels() []map[string]any {
 		if !isChatModel(m) {
 			continue
 		}
-		out = append(out, map[string]any{"id": m.ID, "disabled": disabled[m.ID]})
+		out = append(out, map[string]any{"id": m.ID, "disabled": explicit != nil && !explicit[m.ID]})
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i]["id"].(string) < out[j]["id"].(string) })
 	return out
@@ -746,11 +672,17 @@ func (p *modelProvider) catalogStatus() map[string]any {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	cfg, _ := providerConfigFor(p.name)
+	explicit, _ := cfg.explicitModels()
 	freeCount, chatCount := 0, 0
-	for _, m := range p.catalog {
-		if isZeroCost(m) {
+	for id, enabled := range explicit {
+		if !enabled {
+			continue
+		}
+		if _, bad := p.rejected[id]; !bad {
 			freeCount++
 		}
+	}
+	for _, m := range p.catalog {
 		if isChatModel(m) {
 			chatCount++
 		}
@@ -774,7 +706,12 @@ func startProviderRefresher() {
 			for _, name := range providerNames() {
 				p := providerByName(name)
 				pc, ok := providerConfigFor(name)
-				if p == nil || !ok || !pc.Catalog {
+				if p == nil || !ok {
+					continue
+				}
+				if !pc.Catalog {
+					// 无目录 provider 不拉取, 但要把 legacy 白名单迁移为显式开关。
+					p.maybeBackfillExplicitModels()
 					continue
 				}
 				ctx, cancel := context.WithTimeout(context.Background(), providerCatalogTimeout)

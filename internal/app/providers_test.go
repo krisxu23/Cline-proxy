@@ -34,15 +34,11 @@ func setTestProvider(t *testing.T, name string, pc providerConfig) {
 
 func TestProviderConfigDefaults(t *testing.T) {
 	pc := providerConfig{BaseURL: "https://example.com/v1"}
-	if pc.chatPath() != "/chat/completions" {
-		t.Fatalf("chatPath default: %q", pc.chatPath())
+	if got := pc.chatEndpoint(); got != "https://example.com/v1/chat/completions" {
+		t.Fatalf("chatEndpoint default: %q", got)
 	}
-	if pc.modelsPath() != "/models" {
-		t.Fatalf("modelsPath default: %q", pc.modelsPath())
-	}
-	custom := providerConfig{ChatPath: "/v1/chat", ModelsPath: "/v1/models"}
-	if custom.chatPath() != "/v1/chat" || custom.modelsPath() != "/v1/models" {
-		t.Fatal("explicit paths must win")
+	if got := catalogURL(pc); got != "https://example.com/v1/models" {
+		t.Fatalf("catalogURL default: %q", got)
 	}
 }
 
@@ -113,24 +109,6 @@ func TestNormalizeModelSlug(t *testing.T) {
 	}
 }
 
-func TestIsZeroCost(t *testing.T) {
-	zero := &catalogModel{PricesKnown: true, PromptPrice: 0, CompletionPrice: 0}
-	if !isZeroCost(zero) {
-		t.Fatal("zero prices must count as free")
-	}
-	paid := &catalogModel{PricesKnown: true, PromptPrice: 0.001, CompletionPrice: 0.002}
-	if isZeroCost(paid) {
-		t.Fatal("paid model must not be free")
-	}
-	unknown := &catalogModel{PricesKnown: false}
-	if isZeroCost(unknown) {
-		t.Fatal("unknown pricing must not count as free")
-	}
-	if isZeroCost(nil) {
-		t.Fatal("nil must not be free")
-	}
-}
-
 func TestIsChatModel(t *testing.T) {
 	if !isChatModel(&catalogModel{ChatCapable: boolPtr(true)}) {
 		t.Fatal("explicit chatCapable=true must pass")
@@ -156,44 +134,34 @@ func TestIsChatModel(t *testing.T) {
 	}
 }
 
-func TestEvalProviderFree(t *testing.T) {
-	cfg := providerConfig{APIKey: "k", Catalog: true, Pricing: true}
-	cat := map[string]*catalogModel{
-		"z-ai/glm-5.3:free": {ID: "z-ai/glm-5.3:free", PricesKnown: true, PromptPrice: 0, CompletionPrice: 0},
-		"paid":              {ID: "paid", PricesKnown: true, PromptPrice: 1, CompletionPrice: 1},
+// isFree 只认显式开关: 未迁移一律不可用, 缺 key 与永久拒绝直接否决。
+func TestIsFreeExplicit(t *testing.T) {
+	setTestProvider(t, "ex2", providerConfig{BaseURL: "https://x", APIKey: "k",
+		Models: []providerModelEntry{{ID: "a", Enabled: true}, {ID: "b", Enabled: false}}})
+	p := providerByName("ex2")
+	if !p.isFree("a") {
+		t.Fatal("explicit enabled must be free")
 	}
-	if !evalProviderFree(cfg, cat, nil, nil, "z-ai/glm-5.3:free") {
-		t.Fatal("zero-cost catalog model must be free")
+	if p.isFree("b") {
+		t.Fatal("explicit disabled must not be free")
 	}
-	if evalProviderFree(cfg, cat, nil, nil, "paid") {
-		t.Fatal("paid catalog model must not be free")
+	if p.isFree("missing") {
+		t.Fatal("unlisted model must not be free")
 	}
-	if evalProviderFree(cfg, cat, nil, nil, "missing") {
-		t.Fatal("model absent from catalog must not be free")
-	}
-	if evalProviderFree(providerConfig{APIKey: ""}, nil, nil, nil, "x") {
-		t.Fatal("provider without key must not be free")
-	}
-	// 白名单模式
-	wl := providerConfig{APIKey: "k", FreeModels: []string{"mimo-v2.5"}}
-	if !evalProviderFree(wl, nil, nil, nil, "mimo-v2.5") {
-		t.Fatal("whitelisted model must be free")
-	}
-	if evalProviderFree(wl, nil, nil, nil, "other") {
-		t.Fatal("non-whitelisted model must not be free")
-	}
-	// 白名单 + 目录校验: 已下架模型不算免费
-	wlc := providerConfig{APIKey: "k", Catalog: true, FreeModels: []string{"gone", "here"}}
-	cat2 := map[string]*catalogModel{"here": {ID: "here"}}
-	if evalProviderFree(wlc, cat2, nil, nil, "gone") {
-		t.Fatal("whitelisted but withdrawn model must not be free")
-	}
-	if !evalProviderFree(wlc, cat2, nil, nil, "here") {
-		t.Fatal("whitelisted and present model must be free")
-	}
-	// 永久拒绝
-	if evalProviderFree(cfg, cat, nil, map[string]string{"z-ai/glm-5.3:free": "withdrawn"}, "z-ai/glm-5.3:free") {
+	p.mu.Lock()
+	p.rejected = map[string]string{"a": "withdrawn"}
+	p.mu.Unlock()
+	if p.isFree("a") {
 		t.Fatal("permanently rejected model must not be free")
+	}
+	setTestProvider(t, "unmig", providerConfig{BaseURL: "https://x", APIKey: "k"})
+	if providerByName("unmig").isFree("a") {
+		t.Fatal("unmigrated provider must publish nothing")
+	}
+	setTestProvider(t, "nokey2", providerConfig{BaseURL: "https://x",
+		Models: []providerModelEntry{{ID: "a", Enabled: true}}})
+	if providerByName("nokey2").isFree("a") {
+		t.Fatal("provider without key must not be free")
 	}
 }
 
@@ -248,7 +216,7 @@ func TestNormalizeCatalogPayloadUnknown(t *testing.T) {
 	}
 }
 
-func TestRefreshCatalogPricingMode(t *testing.T) {
+func TestRefreshCatalogBackfillsExplicitModels(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/models" {
 			t.Errorf("catalog path: %s", r.URL.Path)
@@ -257,53 +225,27 @@ func TestRefreshCatalogPricingMode(t *testing.T) {
 			t.Errorf("catalog auth: %q", got)
 		}
 		json.NewEncoder(w).Encode(map[string]any{"data": []map[string]any{
-			{"id": "free-a", "pricing": map[string]any{"prompt": "0", "completion": "0"}},
-			{"id": "paid", "pricing": map[string]any{"prompt": "1", "completion": "1"}},
+			{"id": "free-a"},
+			{"id": "free-b"},
 		}})
 	}))
 	defer srv.Close()
 
-	setTestProvider(t, "t", providerConfig{BaseURL: srv.URL, APIKey: "k", Catalog: true, Pricing: true})
+	setTestProvider(t, "t", providerConfig{BaseURL: srv.URL, APIKey: "k", Catalog: true})
 	p := providerByName("t")
 	if err := p.refreshCatalog(context.Background(), true); err != nil {
 		t.Fatal(err)
 	}
-	if !p.isFree("free-a") {
-		t.Fatal("zero-cost catalog model must be free")
-	}
-	if p.isFree("paid") {
-		t.Fatal("paid catalog model must not be free")
+	if !p.isFree("free-a") || !p.isFree("free-b") {
+		t.Fatal("catalog chat models must be backfilled as enabled")
 	}
 	ids := p.freeModelIDs()
-	if len(ids) != 1 || ids[0].ID != "free-a" {
+	if len(ids) != 2 || ids[0].ID != "free-a" || ids[1].ID != "free-b" {
 		t.Fatalf("freeModelIDs: %+v", ids)
 	}
-}
-
-func TestRefreshCatalogGoogleKeyHeader(t *testing.T) {
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if got := r.Header.Get("x-goog-api-key"); got != "gk" {
-			t.Errorf("models key header: %q", got)
-		}
-		if got := r.Header.Get("Authorization"); got != "" {
-			t.Errorf("Bearer must not be used when modelsKeyHeader is set: %q", got)
-		}
-		json.NewEncoder(w).Encode(map[string]any{"models": []map[string]any{
-			{"name": "models/g1", "supportedGenerationMethods": []string{"generateContent"}},
-		}})
-	}))
-	defer srv.Close()
-
-	setTestProvider(t, "g", providerConfig{
-		BaseURL: srv.URL, APIKey: "gk", Catalog: true,
-		ModelsURL: srv.URL + "/models", ModelsKeyHeader: "x-goog-api-key",
-	})
-	p := providerByName("g")
-	if err := p.refreshCatalog(context.Background(), true); err != nil {
-		t.Fatal(err)
-	}
-	if p.catalogEntry("g1") == nil {
-		t.Fatalf("google catalog entry missing: %+v", p.catalog)
+	cfg, _ := providerConfigFor("t")
+	if !cfg.Migrated {
+		t.Fatal("refresh must mark the provider migrated")
 	}
 }
 
@@ -313,7 +255,7 @@ func TestRefreshCatalogErrorRecorded(t *testing.T) {
 		w.Write([]byte(`{"error":"bad key"}`))
 	}))
 	defer srv.Close()
-	setTestProvider(t, "bad", providerConfig{BaseURL: srv.URL, APIKey: "k", Catalog: true, Pricing: true})
+	setTestProvider(t, "bad", providerConfig{BaseURL: srv.URL, APIKey: "k", Catalog: true})
 	p := providerByName("bad")
 	if err := p.refreshCatalog(context.Background(), true); err == nil {
 		t.Fatal("catalog failure must return an error")
@@ -332,13 +274,14 @@ func TestFreeModelIDsMatchesIsFree(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	setTestProvider(t, "tr", providerConfig{BaseURL: srv.URL, APIKey: "k", Catalog: true, Pricing: true})
+	setTestProvider(t, "tr", providerConfig{BaseURL: srv.URL, APIKey: "k", Catalog: true,
+		Models: []providerModelEntry{{ID: "free-a", Enabled: true}}})
 	p := providerByName("tr")
 	if err := p.refreshCatalog(context.Background(), true); err != nil {
 		t.Fatal(err)
 	}
 	if !p.isFree("free-a") {
-		t.Fatal("zero-cost catalog model must be free before rejection")
+		t.Fatal("explicitly enabled model must be free before rejection")
 	}
 	p.mu.Lock()
 	p.rejected = map[string]string{"free-a": "withdrawn"}
@@ -353,8 +296,10 @@ func TestFreeModelIDsMatchesIsFree(t *testing.T) {
 }
 
 func TestProviderModelList(t *testing.T) {
-	setTestProvider(t, "bai", providerConfig{BaseURL: "https://x", APIKey: "k", FreeModels: []string{"glm-5.3-flash", "mimo-v2.5"}})
-	setTestProvider(t, "nokey", providerConfig{BaseURL: "https://y", FreeModels: []string{"whatever"}})
+	setTestProvider(t, "bai", providerConfig{BaseURL: "https://x", APIKey: "k",
+		Models: []providerModelEntry{{ID: "glm-5.3-flash", Enabled: true}, {ID: "mimo-v2.5", Enabled: true}}})
+	setTestProvider(t, "nokey", providerConfig{BaseURL: "https://y",
+		Models: []providerModelEntry{{ID: "whatever", Enabled: true}}})
 	list := providerModelList()
 	seen := map[string]bool{}
 	for _, m := range list {
@@ -368,17 +313,15 @@ func TestProviderModelList(t *testing.T) {
 	}
 }
 
-// ai-gateway 式显式开关: 白名单/目录模型可逐个勾选加入或剔除。
-// DisabledModels 命中即不可用(优于一切免费判定), 空=全部启用, 兼容旧配置。
-func TestDisabledModelsExclude(t *testing.T) {
+// 显式开关等价旧勾选语义: 启用的可用, 勾掉的不可用。
+func TestExplicitModelsExclude(t *testing.T) {
 	setTestProvider(t, "sel", providerConfig{
 		BaseURL: "https://x", APIKey: "k",
-		FreeModels:     []string{"keep-me", "drop-me"},
-		DisabledModels: []string{"drop-me"},
+		Models: []providerModelEntry{{ID: "keep-me", Enabled: true}, {ID: "drop-me", Enabled: false}},
 	})
 	p := providerByName("sel")
 	if !p.isFree("keep-me") {
-		t.Fatal("未勾掉的模型必须可用")
+		t.Fatal("启用的模型必须可用")
 	}
 	if p.isFree("drop-me") {
 		t.Fatal("勾掉的模型必须不可用")
@@ -389,9 +332,9 @@ func TestDisabledModelsExclude(t *testing.T) {
 	}
 }
 
-// 线上故障: 价格模式 + 无价格目录(B.AI 类上游目录不带价格) + 白名单,
-// 白名单里的模型必须可用 —— 价格判据在无价格目录上恒为 false, 不能把白名单也埋了。
-func TestRefreshCatalogPricingFallsBackToWhitelist(t *testing.T) {
+// 回填取并集(宁多勿少): 白名单 + 目录聊天模型全部固化为显式启用,
+// 多出的在面板勾掉; 价格不再参与判定(定价模式随 legacy 判定一并删除)。
+func TestRefreshCatalogBackfillIsUnion(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		json.NewEncoder(w).Encode(map[string]any{"data": []map[string]any{
 			{"id": "glm-5.3-flash"},
@@ -401,7 +344,7 @@ func TestRefreshCatalogPricingFallsBackToWhitelist(t *testing.T) {
 	defer srv.Close()
 
 	setTestProvider(t, "priceless", providerConfig{
-		BaseURL: srv.URL, APIKey: "k", Catalog: true, Pricing: true,
+		BaseURL: srv.URL, APIKey: "k", Catalog: true,
 		FreeModels: []string{"glm-5.3-flash"},
 	})
 	p := providerByName("priceless")
@@ -409,21 +352,20 @@ func TestRefreshCatalogPricingFallsBackToWhitelist(t *testing.T) {
 		t.Fatal(err)
 	}
 	if !p.isFree("glm-5.3-flash") {
-		t.Fatal("无价格目录时白名单模型必须可用")
+		t.Fatal("whitelisted model must stay available")
 	}
-	if p.isFree("paid-pro") {
-		t.Fatal("不在白名单的模型不得可用")
+	if !p.isFree("paid-pro") {
+		t.Fatal("catalog chat model must be backfilled as enabled")
 	}
 	ids := p.freeModelIDs()
-	if len(ids) != 1 || ids[0].ID != "glm-5.3-flash" {
+	if len(ids) != 2 {
 		t.Fatalf("freeModelIDs: %+v", ids)
 	}
 }
 
 func TestExplicitModelsPrecedence(t *testing.T) {
 	setTestProvider(t, "ex", providerConfig{BaseURL: "https://x", APIKey: "k",
-		FreeModels: []string{"a", "b"},
-		Models:     []providerModelEntry{{ID: "a", Enabled: true}, {ID: "b", Enabled: false}}})
+		Models: []providerModelEntry{{ID: "a", Enabled: true}, {ID: "b", Enabled: false}}})
 	p := providerByName("ex")
 	if !p.isFree("a") {
 		t.Fatal("explicit enabled must be free")
@@ -446,7 +388,44 @@ func TestMigrationBackfillOnRefresh(t *testing.T) {
 		t.Fatal(err)
 	}
 	cfg, _ := providerConfigFor("mig")
-	if !cfg.Migrated || len(cfg.Models) != 1 || cfg.Models[0].ID != "m1" {
-		t.Fatalf("must backfill whitelist into explicit models: %+v", cfg.Models)
+	byID := map[string]bool{}
+	for _, e := range cfg.Models {
+		byID[e.ID] = e.Enabled
+	}
+	if !cfg.Migrated || !byID["m1"] || !byID["m2"] || len(cfg.Models) != 2 {
+		t.Fatalf("must backfill whitelist + catalog chat models as enabled: %+v", cfg.Models)
+	}
+}
+
+// 回填必须把 DisabledModels 折叠为显式禁用条目, 而不是直接丢掉。
+func TestMigrationBackfillFoldsDisabledModels(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		json.NewEncoder(w).Encode(map[string]any{"data": []map[string]any{
+			{"id": "m1"}, {"id": "m2"},
+		}})
+	}))
+	defer srv.Close()
+	setTestProvider(t, "migdis", providerConfig{BaseURL: srv.URL, APIKey: "k", Catalog: true,
+		FreeModels: []string{"m1", "m2"}, DisabledModels: []string{"m2"}})
+	p := providerByName("migdis")
+	if err := p.refreshCatalog(context.Background(), true); err != nil {
+		t.Fatal(err)
+	}
+	cfg, _ := providerConfigFor("migdis")
+	if !cfg.Migrated {
+		t.Fatal("must be marked migrated")
+	}
+	byID := map[string]bool{}
+	for _, e := range cfg.Models {
+		byID[e.ID] = e.Enabled
+	}
+	if en, ok := byID["m1"]; !ok || !en {
+		t.Fatalf("m1 must stay enabled: %+v", cfg.Models)
+	}
+	if en, ok := byID["m2"]; !ok || en {
+		t.Fatalf("m2 must be backfilled as explicitly disabled: %+v", cfg.Models)
+	}
+	if p.isFree("m2") {
+		t.Fatal("m2 must not be free after migration")
 	}
 }

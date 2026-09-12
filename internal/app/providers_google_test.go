@@ -1,10 +1,7 @@
 package app
 
 import (
-	"context"
-	"encoding/json"
 	"net/http"
-	"net/http/httptest"
 	"testing"
 )
 
@@ -70,123 +67,31 @@ func TestGoogleChatEndpointAndAuth(t *testing.T) {
 	}
 }
 
-// Google 的目录形状写死在代码里: id 带 models/ 前缀时必须剥掉,
-// 否则面板和请求里会出现 provider:models/gemini-... 这种名字;
-// 同时 Bearer 与 x-goog-api-key 两个鉴权头都要发出。
-func TestGoogleCatalogStripsModelsPrefixAndSendsBothHeaders(t *testing.T) {
-	var sawBearer, sawKey string
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		sawBearer = r.Header.Get("Authorization")
-		sawKey = r.Header.Get(googleKeyHeader)
-		json.NewEncoder(w).Encode(map[string]any{"object": "list", "data": []map[string]any{
-			{"id": "models/gemini-3.8-flash", "object": "model"},
-			{"id": "models/text-embedding-004", "object": "model"},
-		}})
-	}))
-	defer srv.Close()
-
-	// Base URL 用真实 Google 域名(判定走 Google 分支), 目录地址指向本地测试服务。
-	setTestProvider(t, "g", providerConfig{
-		BaseURL:   "https://generativelanguage.googleapis.com/v1beta/openai",
-		APIKey:    "AK",
-		Catalog:   true,
-		AllModels: true,
-		ModelsURL: srv.URL + "/v1beta/openai/models",
-	})
-	p := providerByName("g")
-	if err := p.refreshCatalog(context.Background(), true); err != nil {
-		t.Fatal(err)
+// Google 的目录名前缀剥离与双鉴权头是纯函数: 直接断言, 不再经测试服务走完整刷新。
+func TestGoogleCatalogHeadersAndPrefixStripping(t *testing.T) {
+	cfg := providerConfig{BaseURL: "https://generativelanguage.googleapis.com/v1beta/openai", APIKey: "AK"}
+	if got := cfg.stripProviderModelPrefix("models/gemini-3.8-flash"); got != "gemini-3.8-flash" {
+		t.Fatalf("models/ prefix must be stripped: %q", got)
 	}
-	if p.catalogEntry("gemini-3.8-flash") == nil {
-		t.Fatalf("models/ prefix must be stripped: keys=%v", catalogKeys(p))
+	if got := cfg.stripProviderModelPrefix("gemini-3.8-flash"); got != "gemini-3.8-flash" {
+		t.Fatalf("bare id must pass through: %q", got)
 	}
-	for k := range p.catalog {
-		if len(k) > 7 && k[:7] == "models/" {
-			t.Fatalf("prefixed id must not be kept: %q", k)
-		}
+	other := providerConfig{BaseURL: "https://x.example/v1"}
+	if got := other.stripProviderModelPrefix("models/m"); got != "models/m" {
+		t.Fatalf("non-google prefix must be kept: %q", got)
 	}
-	if sawBearer == "" || sawKey == "" {
-		t.Fatalf("both auth headers expected, got bearer=%q key=%q", sawBearer, sawKey)
+	// 兼容端点同时发送两个头
+	open := catalogHeaders(cfg, cfg.chatEndpoint())
+	if open["Authorization"] != "Bearer AK" || open[googleKeyHeader] != "AK" {
+		t.Fatalf("openai-compat path must send both auth headers: %+v", open)
 	}
-}
-
-func catalogKeys(p *modelProvider) []string {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	out := make([]string, 0, len(p.catalog))
-	for k := range p.catalog {
-		out = append(out, k)
+	// 原生目录只认 x-goog-api-key: 多发 Bearer 会被回 401 并盖住真实错误
+	native := catalogHeaders(cfg, googleNativeCatalogURL(cfg))
+	if native["Authorization"] != "" {
+		t.Fatalf("native catalog must not send Bearer: %+v", native)
 	}
-	return out
-}
-
-func TestGoogleCustomModelsURLIgnoredWhenPathIsWrong(t *testing.T) {
-	// 用户在面板上填错的 /v1beta/model 不应被当成目录地址
-	cfg := providerConfig{
-		BaseURL:   "https://generativelanguage.googleapis.com/v1beta/openai",
-		ModelsURL: "https://generativelanguage.googleapis.com/v1beta/model",
-	}
-	if cfg.customModelsURL() != "" {
-		t.Fatal("bogus google models url must be ignored")
-	}
-	if got := catalogURL(cfg); got != "https://generativelanguage.googleapis.com/v1beta/openai/models" {
-		t.Fatalf("catalogURL = %q", got)
-	}
-	// 非 Google 上游的自定义目录地址照旧生效
-	other := providerConfig{BaseURL: "https://x.example/v1", ModelsURL: "https://x.example/whatever"}
-	if other.customModelsURL() == "" {
-		t.Fatal("explicit models url must be honoured for non-google providers")
-	}
-}
-
-// AllModels = 通用 Provider 的默认形态: 目录里的聊天模型全部可用,
-// 目录还没拉到(或上游不提供 /models)时退回白名单。
-func TestCatalogAllModelsMode(t *testing.T) {
-	yes, no := true, false
-	cfg := providerConfig{APIKey: "k", Catalog: true, AllModels: true, FreeModels: []string{"manual-only"}}
-	slugs := map[string]*catalogModel{}
-	cat := map[string]*catalogModel{
-		"glm-5.3-flash": {ID: "glm-5.3-flash", ChatCapable: &yes},
-		"whisper-1":     {ID: "whisper-1", ChatCapable: &no},
-	}
-	for k, v := range cat {
-		slugs[k] = v
-	}
-	if !evalProviderFree(cfg, cat, slugs, nil, "glm-5.3-flash") {
-		t.Fatal("catalog chat model must be usable in allModels mode")
-	}
-	if evalProviderFree(cfg, cat, slugs, nil, "whisper-1") {
-		t.Fatal("non-chat catalog model must stay unusable even in allModels mode")
-	}
-	if evalProviderFree(cfg, cat, slugs, nil, "not-in-catalog") {
-		t.Fatal("model absent from the loaded catalog must not be published")
-	}
-	// 空目录: 退回白名单
-	if !evalProviderFree(cfg, nil, nil, nil, "manual-only") {
-		t.Fatal("empty catalog must fall back to the whitelist")
-	}
-	if evalProviderFree(cfg, nil, nil, nil, "something-else") {
-		t.Fatal("empty catalog must not open up everything")
-	}
-	// 永久拒绝依然优先
-	if evalProviderFree(cfg, cat, slugs, map[string]string{"glm-5.3-flash": "gone"}, "glm-5.3-flash") {
-		t.Fatal("rejected models must stay rejected")
-	}
-	// 价格模式不受影响: 只有 0 价模型可用
-	priced := providerConfig{APIKey: "k", Catalog: true, Pricing: true}
-	paid := map[string]*catalogModel{
-		"paid":     {ID: "paid", ChatCapable: &yes, PricesKnown: true, PromptPrice: 0.1, CompletionPrice: 0.2},
-		"free-one": {ID: "free-one", ChatCapable: &yes, PricesKnown: true},
-	}
-	slugs2 := map[string]*catalogModel{}
-	for k, v := range paid {
-		slugs2[k] = v
-	}
-	if evalProviderFree(priced, paid, slugs2, nil, "paid") {
-		t.Fatal("priced mode must reject paid models")
-	}
-	if !evalProviderFree(priced, paid, slugs2, nil, "free-one") {
-		t.Fatal("priced mode must accept zero-cost models")
+	if native[googleKeyHeader] != "AK" {
+		t.Fatalf("native catalog must send %s: %+v", googleKeyHeader, native)
 	}
 }
 
@@ -229,42 +134,6 @@ func setConfigForTest(c *zenConfigData) {
 	zenConfigMu.Lock()
 	zenConfig = c
 	zenConfigMu.Unlock()
-}
-
-// 原生目录路径只发 x-goog-api-key。
-// 实测在 /v1beta/models 上带 Bearer 会被 Google 回 401
-// "API keys are not supported by this API", 从而盖住真实的地区拒绝。
-func TestGoogleNativeCatalogSendsOnlyKeyHeader(t *testing.T) {
-	var bearer, key string
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		bearer = r.Header.Get("Authorization")
-		key = r.Header.Get(googleKeyHeader)
-		json.NewEncoder(w).Encode(map[string]any{"models": []map[string]any{
-			{
-				"name":                       "models/gemini-3.8-flash",
-				"displayName":                "Gemini 3.8 Flash",
-				"supportedGenerationMethods": []string{"generateContent"},
-			},
-		}})
-	}))
-	defer srv.Close()
-
-	setTestProvider(t, "gn", providerConfig{
-		BaseURL:   "https://generativelanguage.googleapis.com",
-		APIKey:    "AQ.test",
-		Catalog:   true,
-		AllModels: true,
-		ModelsURL: srv.URL + "/v1beta/models",
-	})
-	if err := providerByName("gn").refreshCatalog(context.Background(), true); err != nil {
-		t.Fatal(err)
-	}
-	if bearer != "" {
-		t.Fatalf("native catalog must not send Bearer, got %q", bearer)
-	}
-	if key != "AQ.test" {
-		t.Fatalf("native catalog must send %s, got %q", googleKeyHeader, key)
-	}
 }
 
 // 出口地区被上游拒绝时与网络错误同源: 必须触发换出口重试,

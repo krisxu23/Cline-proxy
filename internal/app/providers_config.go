@@ -36,19 +36,14 @@ type providerModelEntry struct {
 // 面板只要求 Provider 名 + Base URL + API Key 三项即可自动拉取模型目录;
 // 其余字段都有默认值, 且 Google 的路径/鉴权方言由代码推导, 不需要用户填。
 type providerConfig struct {
-	BaseURL         string                        `json:"baseUrl"`
-	APIKey          string                        `json:"apiKey"`
-	Catalog         bool                          `json:"catalog"`       // 拉取 /models 目录
-	Pricing         bool                          `json:"pricing"`       // 目录含价格, 按价格判定免费
-	AllModels       bool                          `json:"allModels"`     // 目录中的聊天模型全部可用
-	ProbeFreeTier   bool                          `json:"probeFreeTier"` // 无价格目录时用最小请求探测(第3期 discovery)
-	ChatPath        string                        `json:"chatPath,omitempty"`
-	ModelsPath      string                        `json:"modelsPath,omitempty"`
-	ModelsURL       string                        `json:"modelsUrl,omitempty"`
-	ModelsKeyHeader string                        `json:"modelsKeyHeader,omitempty"`
-	Headers         map[string]providerHeaderSpec `json:"headers,omitempty"`
-	FreeModels      []string                      `json:"freeModels,omitempty"`
-	// DisabledModels 面板勾选剔除的模型(优于一切免费判定)。空=全部启用。
+	BaseURL string                        `json:"baseUrl"`
+	APIKey  string                        `json:"apiKey"`
+	Catalog bool                          `json:"catalog"` // 拉取 /models 目录
+	Headers map[string]providerHeaderSpec `json:"headers,omitempty"`
+	// FreeModels / DisabledModels 已废弃: 只作为一次性迁移的输入
+	// (maybeBackfillExplicitModels), 请求路径不再查它们。
+	// Migrated 置位后即为摆设, 保留字段只是为了不丢弃尚未迁移的配置。
+	FreeModels     []string `json:"freeModels,omitempty"`
 	DisabledModels []string `json:"disabledModels,omitempty"`
 	// DisplayName 面板展示名; APIType 上游方言("openai" 默认, "anthropic" 可选);
 	// Enabled 总开关(nil = true); APIKeys 显式 key 列表; Models 显式模型开关;
@@ -80,22 +75,6 @@ func normalizeModelID(id string) (string, string) {
 	return "", id
 }
 func isBuiltinProvider(id string) bool { return id == "opencode" || id == "cline" || id == "clinepass" }
-
-// chatPath 默认 /chat/completions
-func (c providerConfig) chatPath() string {
-	if c.ChatPath != "" {
-		return c.ChatPath
-	}
-	return "/chat/completions"
-}
-
-// modelsPath 默认 /models
-func (c providerConfig) modelsPath() string {
-	if c.ModelsPath != "" {
-		return c.ModelsPath
-	}
-	return "/models"
-}
 
 // ============ Google Gemini 特例(写死在代码里) ============
 //
@@ -152,19 +131,7 @@ func (c providerConfig) chatEndpoint() string {
 	if isGoogleProvider(c) {
 		base = googleOpenAIBase(base)
 	}
-	return base + c.chatPath()
-}
-
-// customModelsURL 用户显式配置的目录地址; Google 上不存在的路径直接忽略。
-func (c providerConfig) customModelsURL() string {
-	if c.ModelsURL == "" {
-		return ""
-	}
-	// 旧配置里出现过 /v1beta/model(漏了 s)这类地址, 命中即放弃, 回落到代码推导。
-	if isGoogleProvider(c) && !strings.Contains(strings.ToLower(c.ModelsURL), "/models") {
-		return ""
-	}
-	return c.ModelsURL
+	return base + "/chat/completions"
 }
 
 // googleUsesBearer 只有 Google 的 OpenAI 兼容方言认 Bearer。
@@ -248,7 +215,7 @@ func (c providerConfig) apiKeys() []providerAPIKey {
 }
 
 // explicitModels 显式模型开关表; Models 为空时返回 (nil,false) 表示尚未迁移,
-// 调用方回退到 legacy 白名单/目录语义。
+// 调用方视为无可用模型(等 backfill 或面板写入显式条目)。
 func (c providerConfig) explicitModels() (map[string]bool, bool) {
 	if len(c.Models) == 0 {
 		return nil, false
@@ -262,7 +229,7 @@ func (c providerConfig) explicitModels() (map[string]bool, bool) {
 	return m, true
 }
 
-// freeSet 白名单集合
+// freeSet legacy 白名单集合 —— 仅一次性迁移的输入, 请求路径不再使用。
 func (c providerConfig) freeSet() map[string]bool {
 	s := make(map[string]bool, len(c.FreeModels))
 	for _, m := range c.FreeModels {
@@ -273,7 +240,7 @@ func (c providerConfig) freeSet() map[string]bool {
 	return s
 }
 
-// disabledSet 剔除集合
+// disabledSet legacy 剔除集合 —— 仅一次性迁移的输入, 请求路径不再使用。
 func (c providerConfig) disabledSet() map[string]bool {
 	s := make(map[string]bool, len(c.DisabledModels))
 	for _, m := range c.DisabledModels {
@@ -403,19 +370,12 @@ func providerNames() []string {
 }
 
 // normalizeProviderConfig 落地前的归一化。目前只有 Google 需要:
-// 目录默认开启(用户只填地址和 key 就该自动拉到模型列表), 目录地址与鉴权头
-// 一律由代码推导, 因此把历史配置里手填的这两个字段清掉, 免得旧值继续生效。
+// 目录默认开启(用户只填地址和 key 就该自动拉到模型列表)。
 func normalizeProviderConfig(c providerConfig) providerConfig {
 	if !isGoogleProvider(c) {
 		return c
 	}
 	c.Catalog = true
-	c.ModelsURL = ""
-	c.ModelsKeyHeader = ""
-	if !c.AllModels && !c.Pricing && len(c.FreeModels) == 0 {
-		// 既没白名单也没价格策略: 目录里的聊天模型全部可用
-		c.AllModels = true
-	}
 	return c
 }
 
