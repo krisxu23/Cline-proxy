@@ -367,3 +367,34 @@ func TestProviderModelList(t *testing.T) {
 		t.Fatal("provider without key must be excluded")
 	}
 }
+
+// 线上故障: 价格模式 + 无价格目录(B.AI 类上游目录不带价格) + 白名单,
+// 白名单里的模型必须可用 —— 价格判据在无价格目录上恒为 false, 不能把白名单也埋了。
+func TestRefreshCatalogPricingFallsBackToWhitelist(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		json.NewEncoder(w).Encode(map[string]any{"data": []map[string]any{
+			{"id": "glm-5.3-flash"},
+			{"id": "paid-pro"},
+		}})
+	}))
+	defer srv.Close()
+
+	setTestProvider(t, "priceless", providerConfig{
+		BaseURL: srv.URL, APIKey: "k", Catalog: true, Pricing: true,
+		FreeModels: []string{"glm-5.3-flash"},
+	})
+	p := providerByName("priceless")
+	if err := p.refreshCatalog(context.Background(), true); err != nil {
+		t.Fatal(err)
+	}
+	if !p.isFree("glm-5.3-flash") {
+		t.Fatal("无价格目录时白名单模型必须可用")
+	}
+	if p.isFree("paid-pro") {
+		t.Fatal("不在白名单的模型不得可用")
+	}
+	ids := p.freeModelIDs()
+	if len(ids) != 1 || ids[0].ID != "glm-5.3-flash" {
+		t.Fatalf("freeModelIDs: %+v", ids)
+	}
+}

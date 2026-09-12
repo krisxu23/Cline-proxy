@@ -73,7 +73,8 @@ func catalogLookup(cat, slugs map[string]*catalogModel, modelID string) *catalog
 
 // evalProviderFree 免费判定四模式(纯函数):
 //   - catalog+allModels: 目录里的聊天模型全部可用(通用 Provider 的默认形态)
-//   - catalog+pricing: 目录按价格判定 isZeroCost && isChatModel
+//   - catalog+pricing: 目录按价格判定 isZeroCost && isChatModel;
+//     目录完全无价格时退回白名单+目录校验(见 catalogHasPrices)
 //   - 白名单: freeModels 命中; 目录已加载时还需目录中仍存在
 //   - 永久拒绝缓存命中 → false
 func evalProviderFree(cfg providerConfig, cat, slugs map[string]*catalogModel, rejected map[string]string, modelID string) bool {
@@ -96,6 +97,13 @@ func evalProviderFree(cfg providerConfig, cat, slugs map[string]*catalogModel, r
 		if len(cat) == 0 {
 			return false
 		}
+		if !catalogHasPrices(cat) {
+			// 无价格目录: 价格判据无效, 退回白名单+目录校验。
+			if !cfg.freeSet()[modelID] {
+				return false
+			}
+			return catalogLookup(cat, slugs, modelID) != nil
+		}
 		m := catalogLookup(cat, slugs, modelID)
 		return m != nil && isZeroCost(m) && isChatModel(m)
 	}
@@ -106,6 +114,17 @@ func evalProviderFree(cfg providerConfig, cat, slugs map[string]*catalogModel, r
 		return catalogLookup(cat, slugs, modelID) != nil
 	}
 	return true
+}
+
+// catalogHasPrices 目录里是否至少有一条带价格的信息。B.AI 类上游的目录
+// 完全不带价格, 此时价格判据恒为 false, 必须退回白名单语义。
+func catalogHasPrices(cat map[string]*catalogModel) bool {
+	for _, m := range cat {
+		if m != nil && m.PricesKnown {
+			return true
+		}
+	}
+	return false
 }
 
 // isFree 该模型在本 provider 上是否免费。
@@ -593,6 +612,13 @@ func (p *modelProvider) freeModelIDs() []catalogModel {
 			}
 		}
 	case cfg.Catalog && cfg.Pricing:
+		if !catalogHasPrices(cat) {
+			// 无价格目录: 按白名单出候选(与 eval 侧回退一致, 否则恒为空)。
+			for id := range cfg.freeSet() {
+				candidates = append(candidates, catalogModel{ID: id})
+			}
+			break
+		}
 		for _, m := range cat {
 			if isZeroCost(m) && isChatModel(m) {
 				candidates = append(candidates, *m)
