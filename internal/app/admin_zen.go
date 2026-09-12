@@ -25,6 +25,8 @@ func handleZenConfig(w http.ResponseWriter, r *http.Request) {
 		"proxies":         cfg.Proxies,
 		"subs":            cfg.Subs,
 		"exitMode":        cfg.ExitMode,
+		"dnsMode":         cfg.DNSMode,
+		"dnsCustom":       cfg.DNSCustomDNS,
 		"subsRefreshMins": cfg.SubsRefreshMins,
 		"proxyStrategy":   cfg.ProxyStrategy,
 		"maxConcurrency":  cfg.MaxConcurrency,
@@ -68,6 +70,8 @@ func handleZenConfigUpdate(w http.ResponseWriter, r *http.Request) {
 		Proxies         []string `json:"proxies"`
 		Subs            []string `json:"subs"`
 		ExitMode        *string  `json:"exitMode"`
+		DNSMode         *string  `json:"dnsMode"`
+		DNSCustom       *string  `json:"dnsCustom"`
 		SubsRefreshMins *int     `json:"subsRefreshMins"`
 		ProxyStrategy   *string  `json:"proxyStrategy"`
 		MaxConcurrency  *int     `json:"maxConcurrency"`
@@ -208,10 +212,36 @@ func handleZenConfigUpdate(w http.ResponseWriter, r *http.Request) {
 		}
 		next.Compaction = base
 	}
+	if patch.DNSMode != nil && *patch.DNSMode != "" {
+		mode := *patch.DNSMode
+		if normalizeDNSMode(mode) != mode {
+			writeAPI(w, http.StatusBadRequest, apiResponse{
+				Error: fmt.Sprintf("DNS 模式无效（需 %s / %s / %s / %s）",
+					dnsModeSystem, dnsModeDoHAli, dnsModeDoHCF, dnsModeCustom)})
+			return
+		}
+		next.DNSMode = mode
+	}
+	if patch.DNSCustom != nil {
+		custom := strings.TrimSpace(*patch.DNSCustom)
+		if custom != "" {
+			if _, _, _, err := parseDoHURL(custom); err != nil {
+				writeAPI(w, http.StatusBadRequest, apiResponse{Error: fmt.Sprintf("自定义 DoH 地址无效: %v", err)})
+				return
+			}
+		}
+		next.DNSCustomDNS = custom
+	}
 	// 订阅增删, 或出口模式切换(抓取路径随之改变)都重新抓取; 空列表会清空订阅节点
 	exitChanged := patch.ExitMode != nil && *patch.ExitMode != cur.ExitMode
+	dnsChanged := (patch.DNSMode != nil && next.DNSMode != cur.DNSMode) ||
+		(patch.DNSCustom != nil && next.DNSCustomDNS != cur.DNSCustomDNS)
 	subsChanged := (patch.Subs != nil && !strSliceEqual(patch.Subs, cur.Subs)) || exitChanged
 	setZenConfig(next)
+	if dnsChanged {
+		// DNS 段变了要重建单例, 否则新解析器不会生效
+		go syncNodeBox()
+	}
 	if subsChanged {
 		go resolveSubscriptions(next.Subs)
 	}

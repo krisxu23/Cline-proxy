@@ -632,6 +632,23 @@ body:not([data-theme="dark"]) .theme-toggle .dark-label{display:none}
       </div>
     </div>
     <div class="form-row">
+      <div class="field"><label>DNS 解析</label>
+        <select id="ocDnsMode">
+          <option value="doh-ali">DoH 阿里（推荐，节点域名与直连目标用 https://dns.alidns.com）</option>
+          <option value="doh-cf">DoH Cloudflare（1.1.1.1）</option>
+          <option value="custom">自定义 DoH 地址</option>
+          <option value="system">系统解析器（用本机 DNS）</option>
+        </select>
+      </div>
+      <div class="field"><label>自定义 DoH 地址</label>
+        <input id="ocDnsCustom" placeholder="https://dns.alidns.com/dns-query">
+      </div>
+    </div>
+    <p class="hint" style="margin:0 0 14px;font-size:12px;color:var(--text3)">
+      用于解析 <strong style="color:var(--text)">节点服务器域名</strong> 与直连目标域名；代理请求的目标域名仍由节点侧解析（本地不解析，无污染）。
+      默认不用明文 8.8.8.8 —— 它在国内常被污染，表现为"节点时通时不通"。
+    </p>
+    <div class="form-row">
       <div class="field"><label>代理列表</label>
         <textarea id="ocProxies" rows="4" placeholder="每行一个: http://user:pass@host:port / socks5://host:port&#10;或节点链接: vmess:// vless:// trojan:// ss:// hy2:// tuic:// hysteria:// anytls:// ssh:// shadowtls:// snell://"></textarea>
       </div>
@@ -1378,6 +1395,8 @@ async function loadOcConfig() {
     ocSubsArr = (c.subs || []).slice();
     renderOcSubs();
     _('ocExitMode').value = c.exitMode === 'direct' ? 'direct' : 'proxy';
+    if (_('ocDnsMode')) _('ocDnsMode').value = c.dnsMode || 'doh-ali';
+    if (_('ocDnsCustom')) _('ocDnsCustom').value = c.dnsCustom || '';
     _('ocSubRefresh').value = c.subsRefreshMins || 30;
     if (_('dashExitMode')) _('dashExitMode').value = (c.exitMode === 'direct') ? '直连（不走节点）' : '节点出口（走节点列表）';
     loadOcNodes();
@@ -1502,6 +1521,8 @@ async function saveOcConfig() {
     proxies: proxies,
     subs: ocSubsArr,
     exitMode: _('ocExitMode').value,
+    dnsMode: _('ocDnsMode') ? _('ocDnsMode').value : 'doh-ali',
+    dnsCustom: _('ocDnsCustom') ? _('ocDnsCustom').value.trim() : '',
     subsRefreshMins: refresh,
     proxyStrategy: _('ocStrategy').value,
     maxConcurrency: parseInt(_('ocMaxConc').value) || 8,

@@ -366,15 +366,16 @@ func buildNodeParts(entries []any) (ports map[string]int, inbounds, outbounds, r
 
 // startNodeInstance 组装并创建 sing-box 实例(不 Start)
 func startNodeInstance(ctx context.Context, inbounds, outbounds, rules []map[string]any) (*box.Box, error) {
+	dnsCfg, resolverTag := buildNodeDNS(getZenConfig())
 	boxCfg := map[string]any{
 		"log":       map[string]any{"disabled": true},
-		"dns":       map[string]any{"servers": []any{map[string]any{"type": "udp", "tag": "dns-direct", "server": "8.8.8.8"}}},
+		"dns":       dnsCfg,
 		"inbounds":  inbounds,
 		"outbounds": outbounds,
 		"route": map[string]any{
-			"rules":                    rules,
-			"final":                    "direct",
-			"default_domain_resolver":  map[string]any{"server": "dns-direct"},
+			"rules":                   rules,
+			"final":                   "direct",
+			"default_domain_resolver": map[string]any{"server": resolverTag},
 		},
 	}
 	data, err := json.Marshal(boxCfg)
@@ -396,13 +397,14 @@ func validateOutboundEntry(ob map[string]any) error {
 			entry[k] = v
 		}
 	}
+	dnsCfg, resolverTag := buildNodeDNS(getZenConfig())
 	boxCfg := map[string]any{
 		"log":       map[string]any{"disabled": true},
-		"dns":       map[string]any{"servers": []any{map[string]any{"type": "udp", "tag": "dns-direct", "server": "8.8.8.8"}}},
+		"dns":       dnsCfg,
 		"outbounds": []any{entry, map[string]any{"type": "direct", "tag": "direct"}},
 		"route": map[string]any{
 			"final":                   "direct",
-			"default_domain_resolver": map[string]any{"server": "dns-direct"},
+			"default_domain_resolver": map[string]any{"server": resolverTag},
 		},
 	}
 	data, err := json.Marshal(boxCfg)
@@ -543,17 +545,15 @@ func nodeViews() []nodeView {
 	return out
 }
 
-// dialNodeProxy 经节点本地 mixed 入站建立 CONNECT 隧道
+// dialNodeProxy 经节点本地 mixed 入站的 SOCKS5 侧建立到 addr 的隧道。
+// 入站是 mixed(HTTP + SOCKS5 同端口), 统一走 SOCKS5: 支持 UDP 能力、
+// 不在回环上暴露明文 CONNECT 主机名、无 HTTP 报文解析歧义。
 func dialNodeProxy(ctx context.Context, link, network, addr string) (net.Conn, error) {
-	local := nodeLocalAddr(link)
-	if local == "" {
-		return nil, fmt.Errorf("node outbound not running: %s", nodeLocalKey(link))
-	}
-	u, err := url.Parse(local)
+	u, err := socks5ProxyURL(link)
 	if err != nil {
 		return nil, err
 	}
-	return dialHTTPProxy(ctx, u, network, addr)
+	return dialSOCKS5(ctx, u, network, addr)
 }
 
 // ============ 分享链接 → sing-box 出站配置 ============
