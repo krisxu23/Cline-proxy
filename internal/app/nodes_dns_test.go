@@ -117,6 +117,7 @@ func TestParseDoHURL(t *testing.T) {
 
 // 生成的 DNS 段必须真能被 sing-box 接受 —— 写错字段会让整个出口实例起不来。
 func TestNodeDNSConfigAcceptedBySingBox(t *testing.T) {
+	requireNodeBox(t)
 	for _, mode := range []string{dnsModeDoHAli, dnsModeDoHCF, dnsModeSystem, dnsModeCustom} {
 		cfg := &zenConfigData{DNSMode: mode, DNSCustomDNS: "https://doh.example.com/dns-query"}
 		dnsCfg, resolverTag := buildNodeDNS(cfg)

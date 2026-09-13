@@ -294,6 +294,8 @@ func TestAllOutboundTypesRegistered(t *testing.T) {
 }
 
 func startTestBox(t *testing.T, cfg map[string]any) *box.Box {
+	// 守卫放在这里: 任何经此助手创建 sing-box 的用例都会自动跟随跳过, 不必逐个记得加。
+	requireNodeBox(t)
 	t.Helper()
 	ctx := include.Context(context.Background())
 	data, err := json.Marshal(cfg)

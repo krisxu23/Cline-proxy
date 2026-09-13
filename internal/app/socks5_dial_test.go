@@ -216,6 +216,7 @@ func TestDialSOCKS5BadTarget(t *testing.T) {
 // 真实 sing-box 集成: mixed 入站 + direct 出站, 用本地 SOCKS5 拨号访问本地 HTTP 服务。
 // 证明 mixed 入站的 SOCKS5 侧确实可用, 且不依赖外部网络。
 func TestDialSOCKS5ThroughRealSingBox(t *testing.T) {
+	requireNodeBox(t)
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Write([]byte("ok"))
 	}))
