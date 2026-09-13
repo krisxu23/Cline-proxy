@@ -42,6 +42,15 @@ import (
 // adminTokenCookie 面板会话 Cookie 名。
 const adminTokenCookie = "admin_token"
 
+// adminCookieMaxAge 会话 Cookie 的有效期(180 天)。
+//
+// 之前没设 Max-Age, 是浏览器会话级 Cookie —— 关掉浏览器就失效, 用户重新打开
+// 浏览器再访问 /admin/ 就会撞上"需要访问令牌"提示页, 体感上像"程序坏了"
+// (2026-09-13 用户实测反馈)。令牌本身静态落在 data/admin-token, Cookie 值就是
+// 令牌, 长效化不增加额外风险: 令牌一换, 旧 Cookie 校验自然失败; Cookie 自带
+// HttpOnly + SameSite=Strict, 与令牌文件同一暴露面。
+const adminCookieMaxAge = 180 * 24 * 3600
+
 // adminTokenFile 令牌落盘位置。
 func adminTokenFile() string { return kit.ResolveDataPath("admin-token") }
 
@@ -112,10 +121,13 @@ func adminAuth(next http.HandlerFunc) http.HandlerFunc {
 			return
 		}
 		// 令牌校验通过时顺手种 Cookie, 让面板后续同源请求自动带上。
+		// Max-Age 必设: 会话级 Cookie 随浏览器关闭失效, 用户重开浏览器就会
+		// 撞上"需要访问令牌"提示页(2026-09-13 实测反馈)。
 		http.SetCookie(w, &http.Cookie{
 			Name:     adminTokenCookie,
 			Value:    token,
 			Path:     "/",
+			MaxAge:   adminCookieMaxAge,
 			HttpOnly: true,
 			SameSite: http.SameSiteStrictMode,
 		})

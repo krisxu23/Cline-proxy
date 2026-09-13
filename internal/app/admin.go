@@ -99,27 +99,37 @@ func registerAdminRoutes(mux *http.ServeMux) {
 	})
 }
 
-// adminTokenPromptHTML 无令牌访问 /admin/ 时返回的小提示页。
+// adminTokenPromptHTML 无令牌访问 /admin/ 时返回的引导页。
 //
 // 此前 /admin/ 对任何本地进程都返回完整 121KB 外壳(含全部前端 JS), 同机多账号
 // 共享场景等于把管理界面裸暴露。现在只有带有效令牌才回完整外壳, 否则回这段几百
-// 字节、不含任何前端 JS 的提示页, 告诉用户令牌从哪儿拿。注意它是 200 而非 401:
-// 用户双击 exe 后浏览器第一次访问必然没 token, 得让他「看得到去哪拿 token」。
+// 字节、不含任何前端业务脚本的引导页。注意它是 200 而非 401: 用户双击 exe 后
+// 浏览器第一次访问必然没 token, 得让他「看得到去哪拿 token」。
+//
+// 2026-09-13 用户实测反馈"程序打不开了, 打开显示这个"后, 在提示页上补了一个
+// 令牌输入框: 用户从 data/admin-token 复制内容粘进来即可进入, 不必再手工拼
+// ?token= 地址。同时把会话 Cookie 改成 180 天长效(见 adminCookieMaxAge),
+// 修掉"关一次浏览器就要求重新带令牌"的体验问题。
 const adminTokenPromptHTML = `<!DOCTYPE html>
 <html lang="zh">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Cline Proxy · 需要访问令牌</title>
-<style>body{font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif;background:#0f172a;color:#e2e8f0;display:flex;min-height:100vh;align-items:center;justify-content:center;margin:0}main{max-width:540px;padding:32px;background:#1e293b;border-radius:12px;line-height:1.7}h1{font-size:20px;margin:0 0 12px}code{background:#0f172a;padding:2px 6px;border-radius:4px;word-break:break-all}a{color:#60a5fa}p{margin:10px 0}</style>
+<style>body{font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif;background:#0f172a;color:#e2e8f0;display:flex;min-height:100vh;align-items:center;justify-content:center;margin:0}main{max-width:560px;padding:32px;background:#1e293b;border-radius:12px;line-height:1.7}h1{font-size:20px;margin:0 0 12px}code{background:#0f172a;padding:2px 6px;border-radius:4px;word-break:break-all}a{color:#60a5fa}p{margin:10px 0}form{display:flex;gap:8px;margin:14px 0 4px}input{flex:1;background:#0f172a;border:1px solid #334155;border-radius:6px;color:#e2e8f0;padding:8px 10px;font-size:14px}button{background:#2563eb;border:0;border-radius:6px;color:#fff;padding:8px 16px;font-size:14px;cursor:pointer}button:hover{background:#1d4ed8}</style>
 </head>
 <body><main>
 <h1>管理后台需要访问令牌</h1>
-<p>本页面未携带有效的访问令牌, 因此只返回这段提示, 不加载完整管理界面(含全部前端脚本)。</p>
+<p>本页面未携带有效的访问令牌, 因此只返回这段引导, 不加载完整管理界面(含全部前端脚本)。</p>
+<p><b>程序在正常运行</b> —— 这不是启动失败。双击 exe 自动弹出的窗口、以及托盘「打开管理界面」打开的地址, 都已自带令牌, 用那些入口打开不会看到本页。</p>
+<form onsubmit="var v=document.getElementById('tk').value.replace(/\s+/g,'');if(v){location.href='/admin/?token='+encodeURIComponent(v);}return false;">
+<input id="tk" type="password" autocomplete="off" placeholder="粘贴 data/admin-token 文件内容">
+<button type="submit">进入管理界面</button>
+</form>
 <p>令牌位置(任选其一):</p>
-<p>1. 启动横幅 / 托盘弹出的面板地址已自带 <code>?token=…</code>, 直接用它打开即可。</p>
-<p>2. 数据目录下的 <code>data/admin-token</code> 文件, 把它拼到地址后面: <code>/admin/?token=文件内容</code>。</p>
-<p>带令牌打开后, 会话 Cookie 会被种下, 之后同源请求无需每次带 token。</p>
+<p>1. 数据目录下的 <code>data/admin-token</code> 文件, 复制内容粘贴到上面输入框。</p>
+<p>2. 托盘菜单「打开数据目录」可直接定位到该文件。</p>
+<p>令牌校验通过后会种下 <b>180 天有效</b> 的会话 Cookie(HttpOnly), 之后直接打开 <code>/admin/</code> 无需再带 token; 更换令牌后旧 Cookie 自动失效。</p>
 </main></body></html>`
 
 func adminStaticHandler(w http.ResponseWriter, r *http.Request) {
@@ -133,11 +143,14 @@ func adminStaticHandler(w http.ResponseWriter, r *http.Request) {
 			if provided := adminTokenFrom(r); provided != "" && tokenEqual(provided, token) {
 				ok = true
 				// 令牌来自查询参数时种下会话 Cookie, 后续同源请求自动携带。
+				// Max-Age 必设(见 adminCookieMaxAge 注释): 会话级 Cookie 随浏览器
+				// 关闭失效, 用户重开浏览器就会撞上提示页。
 				if strings.TrimSpace(r.URL.Query().Get("token")) != "" {
 					http.SetCookie(w, &http.Cookie{
 						Name:     adminTokenCookie,
 						Value:    token,
 						Path:     "/",
+						MaxAge:   adminCookieMaxAge,
 						HttpOnly: true,
 						SameSite: http.SameSiteStrictMode,
 					})
