@@ -63,7 +63,7 @@ func (clineAdapter) Kind() string { return "cline" }
 
 func (clineAdapter) Chat(ctx context.Context, req providers.ChatRequest) (*providers.ChatResponse, error) {
 	params := chatRequestToParams(req)
-	resp, acc, err := callClineAPIFailover(params, false)
+	resp, acc, err := callClineAPIFailover(ctx, params, false)
 	if err != nil {
 		return nil, err
 	}
@@ -90,7 +90,7 @@ func (clineAdapter) ChatStream(ctx context.Context, req providers.ChatRequest, w
 		return fmt.Errorf("cline streaming requires http.ResponseWriter")
 	}
 	params := chatRequestToParams(req)
-	resp, _, err := callClineAPIFailover(params, true)
+	resp, _, err := callClineAPIFailover(ctx, params, true)
 	if err != nil {
 		return err
 	}

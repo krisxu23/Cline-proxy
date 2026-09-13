@@ -12,8 +12,36 @@ permissions:
   contents: write
 
 jobs:
+  test:
+    name: Vet & Test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.26'
+
+      - name: go vet
+        run: go vet -tags with_quic,with_grpc,with_utls ./...
+
+      - name: go test
+        run: go test -count=1 -tags with_quic,with_grpc,with_utls ./internal/...
+
+      - name: go test (race)
+        # 开发者本机多为 Windows 且无 gcc，-race 在本地跑不了；
+        # ubuntu runner 自带 gcc，CGO 可用，竞态检测只能靠 CI 兜。
+        env:
+          CGO_ENABLED: '1'
+        run: go test -race -count=1 -tags with_quic,with_grpc,with_utls ./internal/...
+
   build:
     name: Build ${{ matrix.target }}
+    needs: test
     runs-on: ${{ matrix.os }}
     strategy:
       matrix:

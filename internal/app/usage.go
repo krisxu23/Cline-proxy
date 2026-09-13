@@ -212,14 +212,8 @@ func saveUsageLedger() {
 		log.Printf("  usage: 账本序列化失败: %v", err)
 		return
 	}
-	path := usageLedgerPath()
-	tmp := path + ".tmp"
-	if err := os.WriteFile(tmp, raw, 0o600); err != nil {
-		log.Printf("  usage: 账本写入失败: %v", err)
-		return
-	}
-	// 先写临时文件再改名: 进程被强杀时不会留下半个 JSON。
-	if err := os.Rename(tmp, path); err != nil {
+	// 原子写: 先写同目录临时文件再 rename, 进程被强杀时不会留下半个 JSON。
+	if err := kit.WriteFileAtomicDefault(usageLedgerPath(), raw); err != nil {
 		log.Printf("  usage: 账本落盘失败: %v", err)
 	}
 }

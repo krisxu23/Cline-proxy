@@ -70,14 +70,37 @@ go run -tags "with_quic,with_grpc,with_utls" . -start
 > 构建标签 `with_quic,with_grpc,with_utls` **不可省略**：缺少时 reality/uTLS 与 QUIC（hysteria2/tuic）类节点会被 sing-box 判为无效出站并从出口池剔除，可用节点数会大幅减少。
 
 ```bash
-./cline-proxy.exe                      # 默认监听所有网卡，局域网可访问
-./cline-proxy.exe -host 127.0.0.1      # 仅允许本机访问
+./cline-proxy.exe                      # 默认只监听 127.0.0.1，仅本机可访问
+./cline-proxy.exe -host 0.0.0.0        # 允许局域网访问（自行承担同网段风险）
 ./cline-proxy.exe -port 3457           # 指定端口
+./cline-proxy.exe -cli                 # Windows: 留在前台控制台模式（调试用），不进托盘
 
 # 局域网访问地址：http://<本机局域网IP>:3457/admin/
 ```
 
-监听所有网卡会开放管理后台给同网设备，建议仅在可信局域网使用，并在系统防火墙中限制 3457 端口。
+启动时会打印**管理后台地址（已内嵌访问令牌）**和令牌本身：
+
+```
+  管理后台(链接已含访问令牌, 直接打开即可):
+    http://127.0.0.1:3457/admin/?token=<token>
+  管理接口需要令牌, 可用 X-Admin-Token 头或 admin_token Cookie:
+    token: <token>
+  令牌落盘在 data/admin-token, 重启后不变。
+```
+
+### 管理后台访问控制
+
+`/admin/api/*` 全部需要访问令牌。令牌在首次启动时自动生成并落盘到 `data/admin-token`（0600），重启不变。三种传递方式：
+
+| 方式 | 用法 |
+|---|---|
+| 打开面板 | 直接用带 `?token=` 的地址打开，服务端校验后会种下 HttpOnly Cookie，之后正常使用 |
+| 请求头 | `X-Admin-Token: <token>` 或 `Authorization: Bearer <token>` |
+| Cookie | `admin_token=<token>` |
+
+同时管理接口**不再返回 CORS 头**，并会拒绝带公网 `Origin` 的请求。这两条是必需的：只加令牌不够 —— 没有它们，用户浏览器里打开的任意网页都能 `fetch` 本机管理接口并读走全部账号 refreshToken 与上游 API Key（防火墙拦不住，因为请求确实发自本机）。
+
+> 需要局域网访问时请显式 `-host 0.0.0.0`，并确保 `data/admin-token` 不随镜像或日志外泄。
 
 ### Docker 部署
 
@@ -168,19 +191,24 @@ api.cline.bot  opencode.ai/zen  api.cline.bot   你配置的任意上游
 在管理后台或通过 REST API 添加订阅 key：
 
 ```bash
+# 管理接口都需要访问令牌, 见「管理后台访问控制」; 令牌可从 data/admin-token 读取
+TOKEN=$(cat data/admin-token)
+
 # 添加
 curl -X POST http://127.0.0.1:3457/admin/api/clinepass/keys \
+  -H "X-Admin-Token: $TOKEN" \
   -H 'Content-Type: application/json' -d '{"key":"sk-..."}'
 
 # 查看（key 脱敏显示）
-curl http://127.0.0.1:3457/admin/api/clinepass/keys
+curl -H "X-Admin-Token: $TOKEN" http://127.0.0.1:3457/admin/api/clinepass/keys
 
 # 删除（传脱敏后的 key）
 curl -X POST http://127.0.0.1:3457/admin/api/clinepass/keys/delete \
+  -H "X-Admin-Token: $TOKEN" \
   -H 'Content-Type: application/json' -d '{"key":"sk-1****abcd"}'
 
 # 可用模型
-curl http://127.0.0.1:3457/admin/api/clinepass/models
+curl -H "X-Admin-Token: $TOKEN" http://127.0.0.1:3457/admin/api/clinepass/models
 ```
 
 多 key 自动轮询；key 命中 429 自动冷却 5 分钟，到期自动恢复。`reasoning` / `reasoning_content` 字段原样透传，CherryStudio 等客户端可正常显示思考过程。
@@ -259,7 +287,7 @@ Model:    同上
 
 ## 管理与观测
 
-- **API Key 鉴权**：后台 **🔑 API 密钥管理** 生成/删除；未配置任何 Key 时允许无鉴权访问
+- **API Key 鉴权**：后台 **🔑 API 密钥管理** 生成/删除。这是**调用方**访问 `/v1/*` 用的 key，与管理后台的访问令牌（`data/admin-token`）是两回事。未配置任何 Key 时 `/v1/*` 允许无鉴权访问 —— 因此默认只监听 127.0.0.1；若显式 `-host 0.0.0.0` 且未配置 Key，等于对局域网开放了一个会消耗你账号额度的开放代理，请务必先生成 Key。
 - **System Prompt 覆盖**：项目目录放 `override.md`，自动替换所有客户端的系统提示词
 - **自定义请求头**：后台 **📨 请求头配置（模拟 Cline CLI 发出）**，编辑转发给上游的头
 - **路由决策头**：每个响应带 `X-Proxy-Route`，标注 `upstream` / `model` / `failover`，排查路由一目了然

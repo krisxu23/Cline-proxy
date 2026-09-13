@@ -1,0 +1,17 @@
+# 统一行尾为 LF：本机 core.autocrlf=true 会把工作区检出为 CRLF，
+# 导致 gofmt -l 对大量文件误报"未格式化"、diff 出现行尾噪音。
+# 强制仓库内文本用 LF，使本地与 CI 的 gofmt / diff 结果稳定可信。
+
+*.go text eol=lf
+*.md text eol=lf
+*.yml text eol=lf
+*.yaml text eol=lf
+Dockerfile text eol=lf
+*.json text eol=lf
+
+*.exe binary
+*.dll binary
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary

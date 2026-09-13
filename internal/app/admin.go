@@ -48,50 +48,50 @@ func writeAPI(w http.ResponseWriter, status int, resp apiResponse) {
 
 func registerAdminRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("/admin/", adminStaticHandler)
-	mux.HandleFunc("/admin/api/accounts", corsHandler(handleAdminAccounts))
-	mux.HandleFunc("/admin/api/accounts/add", corsHandler(handleAdminAccountAdd))
-	mux.HandleFunc("/admin/api/accounts/delete", corsHandler(handleAdminAccountDelete))
-	mux.HandleFunc("/admin/api/accounts/test", corsHandler(handleAdminAccountTest))
-	mux.HandleFunc("/admin/api/oauth/start", corsHandler(handleOAuthStart))
-	mux.HandleFunc("/admin/api/oauth/status", corsHandler(handleOAuthStatus))
-	mux.HandleFunc("/admin/api/sso/import", corsHandler(handleSSOImport))
-	mux.HandleFunc("/admin/api/stats", corsHandler(handleAdminStats))
-	mux.HandleFunc("/admin/api/batch-import", corsHandler(handleBatchImport))
-	mux.HandleFunc("/admin/api/accounts/refresh-all", corsHandler(handleAdminRefreshAll))
-	mux.HandleFunc("/admin/api/accounts/delete-all", corsHandler(handleAdminDeleteAll))
-	mux.HandleFunc("/admin/api/accounts/reset", corsHandler(handleAdminAccountReset))
-	mux.HandleFunc("/admin/api/accounts/export", corsHandler(handleAccountsExport))
-	mux.HandleFunc("/admin/api/logs", corsHandler(handleRequestLogs))
-	mux.HandleFunc("/admin/api/keys", corsHandler(handleAdminGetKeys))
-	mux.HandleFunc("/admin/api/keys/generate", corsHandler(handleAdminGenerateKey))
-	mux.HandleFunc("/admin/api/keys/delete", corsHandler(handleAdminDeleteKey))
-	mux.HandleFunc("/admin/api/models", corsHandler(handleAdminModels))
-	mux.HandleFunc("/admin/api/models/refresh", corsHandler(handleAdminModelsRefresh))
-	mux.HandleFunc("/admin/api/config", corsHandler(handleAdminConfig))
-	mux.HandleFunc("/admin/api/config/update", corsHandler(handleAdminUpdateConfig))
-	mux.HandleFunc("/admin/api/config/headers/sync", corsHandler(handleAdminHeadersSync))
-	mux.HandleFunc("/admin/api/opencode/config", corsHandler(handleZenConfig))
-	mux.HandleFunc("/admin/api/opencode/config/update", corsHandler(handleZenConfigUpdate))
-	mux.HandleFunc("/admin/api/opencode/nodes", corsHandler(handleZenNodes))
-	mux.HandleFunc("/admin/api/opencode/nodes/check", corsHandler(handleZenNodesCheck))
-	mux.HandleFunc("/admin/api/opencode/models", corsHandler(handleZenModels))
-	mux.HandleFunc("/admin/api/opencode/models/refresh", corsHandler(handleZenModelsRefresh))
-	mux.HandleFunc("/admin/api/opencode/stats", corsHandler(handleZenStats))
+	mux.HandleFunc("/admin/api/accounts", adminAuth(handleAdminAccounts))
+	mux.HandleFunc("/admin/api/accounts/add", adminAuth(handleAdminAccountAdd))
+	mux.HandleFunc("/admin/api/accounts/delete", adminAuth(handleAdminAccountDelete))
+	mux.HandleFunc("/admin/api/accounts/test", adminAuth(handleAdminAccountTest))
+	mux.HandleFunc("/admin/api/oauth/start", adminAuth(handleOAuthStart))
+	mux.HandleFunc("/admin/api/oauth/status", adminAuth(handleOAuthStatus))
+	mux.HandleFunc("/admin/api/sso/import", adminAuth(handleSSOImport))
+	mux.HandleFunc("/admin/api/stats", adminAuth(handleAdminStats))
+	mux.HandleFunc("/admin/api/batch-import", adminAuth(handleBatchImport))
+	mux.HandleFunc("/admin/api/accounts/refresh-all", adminAuth(handleAdminRefreshAll))
+	mux.HandleFunc("/admin/api/accounts/delete-all", adminAuth(handleAdminDeleteAll))
+	mux.HandleFunc("/admin/api/accounts/reset", adminAuth(handleAdminAccountReset))
+	mux.HandleFunc("/admin/api/accounts/export", adminAuth(handleAccountsExport))
+	mux.HandleFunc("/admin/api/logs", adminAuth(handleRequestLogs))
+	mux.HandleFunc("/admin/api/keys", adminAuth(handleAdminGetKeys))
+	mux.HandleFunc("/admin/api/keys/generate", adminAuth(handleAdminGenerateKey))
+	mux.HandleFunc("/admin/api/keys/delete", adminAuth(handleAdminDeleteKey))
+	mux.HandleFunc("/admin/api/models", adminAuth(handleAdminModels))
+	mux.HandleFunc("/admin/api/models/refresh", adminAuth(handleAdminModelsRefresh))
+	mux.HandleFunc("/admin/api/config", adminAuth(handleAdminConfig))
+	mux.HandleFunc("/admin/api/config/update", adminAuth(handleAdminUpdateConfig))
+	mux.HandleFunc("/admin/api/config/headers/sync", adminAuth(handleAdminHeadersSync))
+	mux.HandleFunc("/admin/api/opencode/config", adminAuth(handleZenConfig))
+	mux.HandleFunc("/admin/api/opencode/config/update", adminAuth(handleZenConfigUpdate))
+	mux.HandleFunc("/admin/api/opencode/nodes", adminAuth(handleZenNodes))
+	mux.HandleFunc("/admin/api/opencode/nodes/check", adminAuth(handleZenNodesCheck))
+	mux.HandleFunc("/admin/api/opencode/models", adminAuth(handleZenModels))
+	mux.HandleFunc("/admin/api/opencode/models/refresh", adminAuth(handleZenModelsRefresh))
+	mux.HandleFunc("/admin/api/opencode/stats", adminAuth(handleZenStats))
 	// 旧 zen 路径别名,兼容旧引用
-	mux.HandleFunc("/admin/api/zen/config", corsHandler(handleZenConfig))
-	mux.HandleFunc("/admin/api/zen/config/update", corsHandler(handleZenConfigUpdate))
-	mux.HandleFunc("/admin/api/zen/models", corsHandler(handleZenModels))
-	mux.HandleFunc("/admin/api/zen/models/refresh", corsHandler(handleZenModelsRefresh))
-	mux.HandleFunc("/admin/api/zen/stats", corsHandler(handleZenStats))
-	mux.HandleFunc("/admin/api/providers", corsHandler(handleProvidersConfig))
-	mux.HandleFunc("/admin/api/providers/update", corsHandler(handleProvidersUpdate))
-	mux.HandleFunc("/admin/api/providers/refresh", corsHandler(handleProvidersRefresh))
-	mux.HandleFunc("/admin/api/providers/test", corsHandler(handleProvidersTest))
-	mux.HandleFunc("/admin/api/router", corsHandler(handleAdminRouter))
-	mux.HandleFunc("/admin/api/router/save", corsHandler(handleAdminRouterSave))
-	mux.HandleFunc("/admin/api/router/validate", corsHandler(handleAdminRouterValidate))
-	mux.HandleFunc("/admin/api/router/refresh", corsHandler(handleAdminRouterRefresh))
-	mux.HandleFunc("/admin/api/router/maintenance", corsHandler(handleAdminRouterMaintenance))
+	mux.HandleFunc("/admin/api/zen/config", adminAuth(handleZenConfig))
+	mux.HandleFunc("/admin/api/zen/config/update", adminAuth(handleZenConfigUpdate))
+	mux.HandleFunc("/admin/api/zen/models", adminAuth(handleZenModels))
+	mux.HandleFunc("/admin/api/zen/models/refresh", adminAuth(handleZenModelsRefresh))
+	mux.HandleFunc("/admin/api/zen/stats", adminAuth(handleZenStats))
+	mux.HandleFunc("/admin/api/providers", adminAuth(handleProvidersConfig))
+	mux.HandleFunc("/admin/api/providers/update", adminAuth(handleProvidersUpdate))
+	mux.HandleFunc("/admin/api/providers/refresh", adminAuth(handleProvidersRefresh))
+	mux.HandleFunc("/admin/api/providers/test", adminAuth(handleProvidersTest))
+	mux.HandleFunc("/admin/api/router", adminAuth(handleAdminRouter))
+	mux.HandleFunc("/admin/api/router/save", adminAuth(handleAdminRouterSave))
+	mux.HandleFunc("/admin/api/router/validate", adminAuth(handleAdminRouterValidate))
+	mux.HandleFunc("/admin/api/router/refresh", adminAuth(handleAdminRouterRefresh))
+	mux.HandleFunc("/admin/api/router/maintenance", adminAuth(handleAdminRouterMaintenance))
 	// ClinePass 订阅池管理
 	registerClinePassAdminRoutes(mux)
 	mux.HandleFunc("/admin/zen/", func(w http.ResponseWriter, r *http.Request) {
@@ -101,6 +101,20 @@ func registerAdminRoutes(mux *http.ServeMux) {
 
 func adminStaticHandler(w http.ResponseWriter, r *http.Request) {
 	if r.URL.Path == "/admin/" || r.URL.Path == "/admin" {
+		// 面板 HTML 本身不含任何凭据, 可以匿名取; 真正的数据都在 /admin/api/*
+		// 后面。用带 ?token= 的地址打开时校验一次并种下会话 Cookie, 之后同源
+		// 的 fetch 会自动携带, 面板 JS 不需要任何改动。
+		if q := strings.TrimSpace(r.URL.Query().Get("token")); q != "" {
+			if token := loadOrCreateAdminToken(); token != "" && tokenEqual(q, token) {
+				http.SetCookie(w, &http.Cookie{
+					Name:     adminTokenCookie,
+					Value:    token,
+					Path:     "/",
+					HttpOnly: true,
+					SameSite: http.SameSiteStrictMode,
+				})
+			}
+		}
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
 		w.WriteHeader(http.StatusOK)
 		w.Write([]byte(adminHTML))
@@ -849,22 +863,40 @@ func proxyConfigFile() string { return kit.ResolveDataPath(".proxy-config.json")
 
 // loadProxyConfig 读取持久化的客户端配置, 缺失或损坏时退回默认值。
 // 面板上改过的请求头必须跨重启保留, 否则每次重启都会悄悄回到内置默认值。
+//
+// 解析失败不能"部分采用": json.Unmarshal 不是事务性的, 半截 JSON 会留下已经
+// 解出来的字段、丢掉其余部分, 得到的是一份"看着正常但少了东西"的配置, 而且
+// 面板上看不出任何异常。这里改成解析失败就整体退回默认值, 并把坏文件改名留证。
 func loadProxyConfig() *proxyConfigData {
-	cfg := defaultProxyConfig()
-	data, err := os.ReadFile(proxyConfigFile())
+	path := proxyConfigFile()
+	data, err := os.ReadFile(path)
 	if err != nil {
-		return cfg
+		return defaultProxyConfig() // 首次运行没有文件是正常情况
 	}
-	if err := json.Unmarshal(data, cfg); err != nil {
-		log.Printf("proxy config parse failed: %v", err)
+	next := defaultProxyConfig()
+	if err := json.Unmarshal(data, next); err != nil {
+		log.Printf("proxy config parse failed (%s): %v; 退回默认配置", path, err)
+		quarantineBadConfig(path)
+		return defaultProxyConfig()
 	}
-	if cfg.Headers == nil {
-		cfg.Headers = map[string]string{}
+	if next.Headers == nil {
+		next.Headers = map[string]string{}
 	}
-	if cfg.Strategy == "" {
-		cfg.Strategy = "round_robin"
+	if next.Strategy == "" {
+		next.Strategy = "round_robin"
 	}
-	return cfg
+	return next
+}
+
+// quarantineBadConfig 把解析不了的配置文件改名留证, 而不是删除 ——
+// 用户往往需要从里面手工捞回请求头之类的内容。
+func quarantineBadConfig(path string) {
+	bak := path + ".bad-" + time.Now().Format("20060102-150405")
+	if err := os.Rename(path, bak); err != nil {
+		log.Printf("  保留坏配置失败(%v), 原文件仍在 %s", err, path)
+		return
+	}
+	log.Printf("  坏配置已保留为 %s", bak)
 }
 
 func saveProxyConfig() {
@@ -879,15 +911,34 @@ func saveProxyConfig() {
 	}
 }
 
+// getProxyConfig 返回当前客户端配置的深拷贝。
+//
+// 与 getZenConfig 同理: 调用方包含每个 cline 上游请求(clineHeaders 会遍历
+// Headers)与选账号热路径, 它们在锁外持有引用; 返回裸指针时后台的请求头
+// 自动同步一写就与这些遍历并发访问同一张 map。
 func getProxyConfig() *proxyConfigData {
 	proxyConfigMu.Lock()
 	defer proxyConfigMu.Unlock()
-	return proxyConfig
+	return proxyConfig.clone()
 }
 
 func setProxyConfig(c *proxyConfigData) {
 	proxyConfigMu.Lock()
-	proxyConfig = c
+	proxyConfig = c.clone()
+	proxyConfigMu.Unlock()
+	saveProxyConfig()
+}
+
+// mutateProxyConfig 是 proxyConfig 的唯一写入口, 语义同 mutateProvidersConfig:
+// 锁内克隆 → 回调改克隆 → 整体替换 → 落盘。回调内不得再读配置(会自锁)。
+func mutateProxyConfig(fn func(cfg *proxyConfigData)) {
+	proxyConfigMu.Lock()
+	next := proxyConfig.clone()
+	if next == nil {
+		next = defaultProxyConfig()
+	}
+	fn(next)
+	proxyConfig = next
 	proxyConfigMu.Unlock()
 	saveProxyConfig()
 }
@@ -1047,10 +1098,12 @@ func handleAdminUpdateConfig(w http.ResponseWriter, r *http.Request) {
 	}
 
 	writeAPI(w, http.StatusOK, apiResponse{Success: true, Data: map[string]any{
-		"strategy":     cfg.Strategy,
-		"headers":      cfg.Headers,
-		"headersAuto":  cfg.HeadersAuto,
-		"defaultModel": defaultModel,
+		"strategy":    cfg.Strategy,
+		"headers":     cfg.Headers,
+		"headersAuto": cfg.HeadersAuto,
+		// 走 getDefaultModel() 而不是直接读包级变量: 后者由 modelsMu 保护,
+		// 直接读会与并发的 setDefaultModel 构成数据竞争。
+		"defaultModel": getDefaultModel(),
 	}})
 }
 

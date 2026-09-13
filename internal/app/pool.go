@@ -52,22 +52,29 @@ func loadPool() *AccountPool {
 		p.Keys = []string{}
 	}
 	pool = &p
-	if pool.DefaultModel != "" {
-		defaultModel = pool.DefaultModel
+	if p.DefaultModel != "" {
+		// defaultModel 由 modelsMu 统一保护(与 setDefaultModel / getDefaultModel 同锁)。
+		// 此处持 poolMu, 临时获取 modelsMu; 全代码库不存在"持 modelsMu 再取 poolMu"的
+		// 同时持锁顺序, 因此不会与 setDefaultModel 的 modelsMu→poolMu 形成死锁。
+		modelsMu.Lock()
+		defaultModel = p.DefaultModel
+		modelsMu.Unlock()
 	}
 	return pool
 }
 
-// setDefaultModel 持久化默认模型：更新内存全局并写入账号池文件
+// setDefaultModel 持久化默认模型：更新内存全局(由 modelsMu 保护)并写入账号池文件
 func setDefaultModel(modelID string) {
 	initModelsCache()
 	modelsMu.Lock()
 	_, ok := modelsCache[modelID]
-	modelsMu.Unlock()
 	if !ok {
+		modelsMu.Unlock()
 		return
 	}
+	// defaultModel 由 modelsMu 统一保护: 所有读写点都持 modelsMu, 避免数据竞争。
 	defaultModel = modelID
+	modelsMu.Unlock()
 	p := loadPool()
 	poolMu.Lock()
 	p.DefaultModel = modelID
@@ -86,8 +93,13 @@ func savePoolLocked() {
 	poolSaveMu.Lock()
 	defer poolSaveMu.Unlock()
 
-	data, _ := json.MarshalIndent(pool, "", "  ")
-	if err := os.WriteFile(poolPath, data, 0600); err != nil {
+	data, err := json.MarshalIndent(pool, "", "  ")
+	if err != nil {
+		// marshal 失败绝不能落盘: 写 nil 会清空账号池, 宁可保留旧文件。
+		log.Printf("Failed to marshal accounts: %v", err)
+		return
+	}
+	if err := kit.WriteFileAtomicDefault(poolPath, data); err != nil {
 		log.Printf("Failed to save accounts: %v", err)
 	}
 }
@@ -129,8 +141,18 @@ func getAccountByID(accountID string) *Account {
 	return nil
 }
 
+// refreshAccountTokenFn 是 cline.RefreshClineToken 的可替换包装(便于测试 stub 网络调用)。
+// 返回解析后的 accessToken / refreshToken / 过期毫秒时间戳。生产默认直接转发到 cline 包。
+var refreshAccountTokenFn = func(refreshToken string) (accessToken string, refreshTokenOut string, expiresAt int64, err error) {
+	resp, e := cline.RefreshClineToken(refreshToken)
+	if e != nil {
+		return "", "", 0, e
+	}
+	return "workos:" + resp.Data.AccessToken, resp.Data.RefreshToken, cline.ParseExpiry(resp.Data.ExpiresAt) - 60000, nil
+}
+
 func refreshAccountToken(acc *Account) error {
-	resp, err := cline.RefreshClineToken(acc.RefreshToken)
+	accessToken, refreshTokenOut, expiresAt, err := refreshAccountTokenFn(acc.RefreshToken)
 	if err != nil {
 		poolMu.Lock()
 		acc.Status = "expired"
@@ -140,11 +162,11 @@ func refreshAccountToken(acc *Account) error {
 	}
 
 	poolMu.Lock()
-	acc.AccessToken = "workos:" + resp.Data.AccessToken
-	if resp.Data.RefreshToken != "" {
-		acc.RefreshToken = resp.Data.RefreshToken
+	acc.AccessToken = accessToken
+	if refreshTokenOut != "" {
+		acc.RefreshToken = refreshTokenOut
 	}
-	acc.ExpiresAt = cline.ParseExpiry(resp.Data.ExpiresAt) - 60000
+	acc.ExpiresAt = expiresAt
 	acc.Status = "active"
 	savePoolLocked()
 	poolMu.Unlock()
@@ -198,15 +220,25 @@ func pickAccount() *Account {
 }
 
 func ensureAccountToken(acc *Account) (string, error) {
-	if acc.AccessToken != "" && time.Now().UnixMilli() < acc.ExpiresAt {
-		return acc.AccessToken, nil
+	// 在 poolMu 下把字段读进局部变量, 避免与 refreshAccountToken 的写并发竞争。
+	// 持锁只做快照, 不在锁内发网络请求(刷新由 refreshAccountToken 内部在无锁态完成)。
+	poolMu.Lock()
+	valid := acc.AccessToken != "" && time.Now().UnixMilli() < acc.ExpiresAt
+	tok := acc.AccessToken
+	poolMu.Unlock()
+	if valid {
+		return tok, nil
 	}
 
 	if err := refreshAccountToken(acc); err != nil {
 		return "", err
 	}
 
-	return acc.AccessToken, nil
+	// 刷新后再次在锁内读最新 token。
+	poolMu.Lock()
+	tok = acc.AccessToken
+	poolMu.Unlock()
+	return tok, nil
 }
 
 func ListAccounts() []*Account {

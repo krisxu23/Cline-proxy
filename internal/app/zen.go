@@ -436,9 +436,24 @@ func isRateLimited(status int, body string) bool {
 func loadZenConfig() *zenConfigData {
 	path := kit.ResolveDataPath(".zen-config.json")
 	cfg := defaultZenConfig()
-	if data, err := os.ReadFile(path); err == nil {
-		if err := json.Unmarshal(data, cfg); err != nil {
-			log.Printf("zen config parse failed: %v", err)
+	data, err := os.ReadFile(path)
+	switch {
+	case err != nil:
+		// 首次运行没有文件属于正常情况, 其它读取错误要留记录。
+		if !os.IsNotExist(err) {
+			log.Printf("zen config read failed (%s): %v", path, err)
+		}
+	default:
+		next := defaultZenConfig()
+		if uerr := json.Unmarshal(data, next); uerr != nil {
+			// json.Unmarshal 不是事务性的: 半截 JSON 会保留已经解出来的字段、
+			// 丢掉其余部分(最典型的是 providers 整段消失), 得到的是一份
+			// "看着正常但少了东西"的配置, 面板上完全看不出异常。
+			// 宁可整体退回默认值, 并把坏文件改名留证。
+			log.Printf("zen config parse failed (%s): %v; 退回默认配置", path, uerr)
+			quarantineBadConfig(path)
+		} else {
+			cfg = next
 		}
 	}
 	if cfg.Key == "" {
@@ -471,21 +486,34 @@ func loadZenConfig() *zenConfigData {
 func saveZenConfig() {
 	zenConfigMu.Lock()
 	defer zenConfigMu.Unlock()
-	data, _ := json.MarshalIndent(zenConfig, "", "  ")
-	if err := os.WriteFile(kit.ResolveDataPath(".zen-config.json"), data, 0600); err != nil {
+	data, err := json.MarshalIndent(zenConfig, "", "  ")
+	if err != nil {
+		// marshal 失败绝不落盘: 写 nil 会清空 zen 配置, 宁可保留旧文件。
+		log.Printf("zen config marshal failed: %v", err)
+		return
+	}
+	if err := kit.WriteFileAtomicDefault(kit.ResolveDataPath(".zen-config.json"), data); err != nil {
 		log.Printf("zen config save failed: %v", err)
 	}
 }
 
+// getZenConfig 返回当前 zen 配置的深拷贝。
+//
+// 必须是克隆体而不是裸指针: 调用方遍布请求热路径(选出口、解析路由别名、
+// 构造上游请求头、后台订阅刷新), 它们在锁外长时间持有引用。返回裸指针
+// 等于让这些读与 mutateProvidersConfig 的写并发访问同一张 map, 会触发
+// Go 运行时的 concurrent map read/write —— fatal error, recover 无效。
 func getZenConfig() *zenConfigData {
 	zenConfigMu.Lock()
 	defer zenConfigMu.Unlock()
-	return zenConfig
+	return zenConfig.clone()
 }
 
+// setZenConfig 整体替换 zen 配置并落盘。
+// 存入的是克隆体, 调用方之后再改自己那份不会影响全局。
 func setZenConfig(c *zenConfigData) {
 	zenConfigMu.Lock()
-	zenConfig = c
+	zenConfig = c.clone()
 	zenConfigMu.Unlock()
 	saveZenConfig()
 	rebuildZenTransport()

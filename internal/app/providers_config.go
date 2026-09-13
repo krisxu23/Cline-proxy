@@ -1,6 +1,7 @@
 package app
 
 import (
+	"encoding/json"
 	"fmt"
 	"math/rand"
 	"net/url"
@@ -94,26 +95,43 @@ const (
 )
 
 // isGoogleProvider Base URL 是否指向 Google Gemini。
+//
+// 判据取**主机名**, 而不是整条 URL 的子串包含: 后者会让任何在路径或查询参数里
+// 出现该域名的第三方端点(例如自建反代 https://my-proxy/gemini?upstream=
+// generativelanguage.googleapis.com)被误判成 Google, 进而被强制打开目录抓取、
+// 切到 Google 鉴权方言、并被剥掉路径前缀。
 func isGoogleProvider(c providerConfig) bool {
-	return strings.Contains(strings.ToLower(c.BaseURL), googleAPIHost)
+	base := strings.TrimSpace(c.BaseURL)
+	u, err := url.Parse(base)
+	if err != nil || u.Host == "" {
+		return strings.Contains(strings.ToLower(base), googleAPIHost)
+	}
+	host := strings.ToLower(u.Hostname())
+	return host == googleAPIHost || strings.HasSuffix(host, "."+googleAPIHost)
 }
 
 // googleOpenAIBase 把任意 Gemini Base URL 归一到 OpenAI 兼容前缀。
+//
+// Google 的 OpenAI 兼容方言固定挂在 /v1beta/openai 下, 所以不管用户填的是裸域名、
+// /v1beta、/v1beta/models 还是 /v1, 都应该落到同一个前缀 —— 面板只要求填
+// API 地址 + Key, 路径形态由代码推导。
+//
+// 此前只有 /v1beta 系列与空路径会走归一化, 其余走的是 `base + "/v1beta/openai"`
+// 这条兜底, 于是 https://generativelanguage.googleapis.com/v1/models 会被拼成
+// .../v1/models/v1beta/openai 这种畸形地址。
 func googleOpenAIBase(base string) string {
 	base = strings.TrimRight(strings.TrimSpace(base), "/")
 	u, err := url.Parse(base)
 	if err != nil || u.Host == "" {
 		return base + googleOpenAIPath
 	}
-	path := strings.ToLower(u.Path)
-	if strings.Contains(path, "/openai") {
+	// 用户已经自己填了兼容前缀, 原样尊重, 不再叠加。
+	if strings.Contains(strings.ToLower(u.Path), "/openai") {
 		return base
 	}
-	// /v1beta、/v1beta/models、/v1beta/model 等都归一到 /v1beta/openai
-	if strings.HasPrefix(path, "/v1beta") || path == "" || path == "/" {
-		return u.Scheme + "://" + u.Host + googleOpenAIPath
-	}
-	return base + googleOpenAIPath
+	// 其余一律收敛到 scheme://host/v1beta/openai。能走到这里的主体必然是
+	// generativelanguage.googleapis.com(见 isGoogleProvider), 丢弃 path 是安全的。
+	return u.Scheme + "://" + u.Host + googleOpenAIPath
 }
 
 // googleNativeCatalogURL Google 原生目录地址(带 x-goog-api-key 与 pageToken 分页)。
@@ -403,13 +421,71 @@ func validateProviderConfig(name string, c providerConfig) error {
 	if strings.TrimSpace(c.BaseURL) == "" {
 		return fmt.Errorf("provider %s: baseUrl is required", name)
 	}
+	// baseUrl 会由服务端直接请求(目录抓取与对话转发), 属于 SSRF 面。
+	// 此前只校验了非空, 于是 file:// 或云元数据地址都能存进来。
+	// 现在要求显式 http/https, 并拒绝链路本地地址。
+	if err := validateOutboundURL(c.BaseURL); err != nil {
+		return fmt.Errorf("provider %s: %w", name, err)
+	}
 	return nil
 }
 
-// mutateProvidersConfig 锁内修改全局配置并落盘。
+// mergeProviderConfigPatch 把请求体里**实际出现**的字段覆盖到底配置上。
+//
+// providers/update 原本是整体替换: 直接调 API 只传 {"baseUrl": "..."} 就会把
+// apiKeys / models / migrated 一并清空; 其中 migrated 变回 false 且 models 为空,
+// 会让下一次目录刷新走 backfill 分支, 把用户启用过的模型集体重建成"默认关闭"。
+// 面板自己会回传整份配置, 所以从界面上看不出问题, 但只要用 API 或脚本改配置
+// 就会中招。
+//
+// 实现刻意走 "struct → map → 覆盖出现的键 → struct", 而不是逐字段 if:
+// 逐字段列举正是本轮审查里反复致错的那种写法(新增字段必然被漏掉), 而这里
+// 天然与字段集合同步。是否覆盖看的是键**是否出现**, 不是值是否为零 ——
+// 否则用户永远没法把一个字段显式清空。
+func mergeProviderConfigPatch(base providerConfig, raw map[string]json.RawMessage) (providerConfig, error) {
+	if len(raw) == 0 {
+		return base, nil
+	}
+	encoded, err := json.Marshal(base)
+	if err != nil {
+		return base, err
+	}
+	merged := map[string]json.RawMessage{}
+	if err := json.Unmarshal(encoded, &merged); err != nil {
+		return base, err
+	}
+	for k, v := range raw {
+		merged[k] = v
+	}
+	out, err := json.Marshal(merged)
+	if err != nil {
+		return base, err
+	}
+	var next providerConfig
+	if err := json.Unmarshal(out, &next); err != nil {
+		return base, err
+	}
+	return next, nil
+}
+
+// mutateProvidersConfig 是 zen 配置唯一的写入口: 锁内克隆 → 回调改克隆 →
+// 整体替换 → 落盘。
+//
+// 不给调用方裸指针, 也不让回调原地改全局对象, 有两个目的:
+//   1. 消除数据竞争。回调内改的是私有克隆, 与热路径上无锁读配置的请求互不干扰。
+//   2. 消除"重建配置时漏字段"。每个回调都从完整的当前配置出发, 只会改动它
+//      真正关心的字段, 不会把其余字段覆盖成零值。
+//
+// 注意: 回调在持锁状态下执行, 里面不得再调用 getZenConfig / 其它配置读写函数
+// (sync.Mutex 不可重入, 会自锁), 也只应做纯内存改动。
 func mutateProvidersConfig(fn func(cfg *zenConfigData)) {
 	zenConfigMu.Lock()
-	fn(zenConfig)
+	next := zenConfig.clone()
+	if next == nil {
+		next = defaultZenConfig()
+	}
+	fn(next)
+	zenConfig = next
 	zenConfigMu.Unlock()
 	saveZenConfig()
 }

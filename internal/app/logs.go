@@ -5,11 +5,13 @@ import (
 	"context"
 	"encoding/json"
 	"io"
+	"log"
 	"net"
 	"net/http"
 	"os"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"cline-go-proxy/internal/kit"
@@ -37,11 +39,24 @@ const (
 var (
 	reqLogsMu sync.Mutex
 	reqLogs   []RequestLog
+
+	// 落盘异步化: 单写协程 + 有界缓冲 channel。AppendReqLog 永不阻塞调用方,
+	// 缓冲满则丢弃并记一次丢弃计数(请求路径延迟优先于日志完整性)。
+	reqLogCh      chan RequestLog
+	reqLogFlushCh chan chan struct{}
+	reqLogCloseCh chan chan struct{}
+	reqLogDropped int64
+	reqLogOnce    sync.Once
+	reqLogFile    *os.File // 仅由写协程持有
 )
+
+// 写协程的缓冲容量: 远大于常规突发, 正常流量下几乎不丢; 异常突发时丢弃而非阻塞。
+const reqLogChanCap = 8192
 
 var reqLogsFile = kit.ResolveDataPath("requests.jsonl")
 
-// AppendReqLog 记录一条请求日志：内存环形保留 + 异步追加落盘
+// AppendReqLog 记录一条请求日志：内存环形保留 + 异步追加落盘。
+// 永不阻塞调用方: 通过 select/default 投递到缓冲 channel, 满了就丢弃。
 func AppendReqLog(l RequestLog) {
 	reqLogsMu.Lock()
 	reqLogs = append(reqLogs, l)
@@ -49,18 +64,111 @@ func AppendReqLog(l RequestLog) {
 		reqLogs = reqLogs[len(reqLogs)-maxReqLogs:]
 	}
 	reqLogsMu.Unlock()
-	go func() {
-		data, _ := json.Marshal(l)
+
+	startReqLogWriter()
+	select {
+	case reqLogCh <- l:
+	default:
+		// 缓冲满: 丢弃本条, 记一次丢弃(延迟优先于日志完整性)。
+		atomic.AddInt64(&reqLogDropped, 1)
+	}
+}
+
+// startReqLogWriter 惰性启动单写协程(全局仅一次)。写协程是唯一对落盘文件
+// 做写入/轮转的地方, 避免多协程并发 append 与"截断 vs 追加"的竞争。
+func startReqLogWriter() {
+	reqLogOnce.Do(func() {
+		reqLogCh = make(chan RequestLog, reqLogChanCap)
+		reqLogFlushCh = make(chan chan struct{}, 64)
+		reqLogCloseCh = make(chan chan struct{}, 16)
+		go reqLogWriterLoop()
+	})
+}
+
+// reqLogWriterLoop 常驻写协程: 串行消费 channel, 写入文件, 并在超限时轮转。
+func reqLogWriterLoop() {
+	for {
+		select {
+		case l := <-reqLogCh:
+			writeReqLog(l)
+		case ack := <-reqLogFlushCh:
+			// 把已经入队的日志全部写完, 再回 ack。
+		drain:
+			for {
+				select {
+				case l := <-reqLogCh:
+					writeReqLog(l)
+				default:
+					break drain
+				}
+			}
+			ack <- struct{}{}
+		case ack := <-reqLogCloseCh:
+			// 关闭句柄并回 ack(优雅退出/测试清理)。下次写入会惰性重开。
+			if reqLogFile != nil {
+				reqLogFile.Close()
+				reqLogFile = nil
+			}
+			ack <- struct{}{}
+		}
+	}
+}
+
+// writeReqLog 仅在写协程内执行: 惰性打开文件, 追加一行, 超限则串行轮转。
+// 句柄打开失败只打日志并允许后续重试, 不永久放弃。
+func writeReqLog(l RequestLog) {
+	if reqLogFile == nil {
 		f, err := os.OpenFile(reqLogsFile, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0600)
 		if err != nil {
+			log.Printf("reqlog: open file failed (will retry): %v", err)
 			return
 		}
-		f.Write(append(data, '\n'))
-		f.Close()
-		if st, err := os.Stat(reqLogsFile); err == nil && st.Size() > maxReqLogsFile {
-			os.WriteFile(reqLogsFile, nil, 0600)
+		reqLogFile = f
+	}
+	data, err := json.Marshal(l)
+	if err != nil {
+		return
+	}
+	if _, err := reqLogFile.Write(append(data, '\n')); err != nil {
+		log.Printf("reqlog: write failed (will retry): %v", err)
+		reqLogFile.Close()
+		reqLogFile = nil
+		return
+	}
+	// 轮转与追加串行, 消除旧实现"截断竞态丢行/半行"的问题。
+	if st, err := reqLogFile.Stat(); err == nil && st.Size() > maxReqLogsFile {
+		if err := reqLogFile.Truncate(0); err != nil {
+			log.Printf("reqlog: truncate failed: %v", err)
+			reqLogFile.Close()
+			reqLogFile = nil
+			return
 		}
-	}()
+		if _, err := reqLogFile.Seek(0, io.SeekStart); err != nil {
+			log.Printf("reqlog: seek failed: %v", err)
+			reqLogFile.Close()
+			reqLogFile = nil
+			return
+		}
+	}
+}
+
+// flushReqLogs 等待写协程把已入队的日志写完(发哨兵并等 ack)。
+// 供测试与优雅退出使用。
+func flushReqLogs() {
+	startReqLogWriter()
+	ack := make(chan struct{})
+	reqLogFlushCh <- ack
+	<-ack
+}
+
+// closeReqLogs 等待已入队日志写完并关闭文件句柄(优雅退出/测试清理用)。
+// 写协程常驻, 句柄关闭后下次写入会惰性重开。
+func closeReqLogs() {
+	flushReqLogs()
+	startReqLogWriter()
+	ack := make(chan struct{})
+	reqLogCloseCh <- ack
+	<-ack
 }
 
 // LoadRequestLogs 返回最近的请求日志（内存优先，启动后从落盘文件补载）

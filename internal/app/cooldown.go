@@ -168,6 +168,21 @@ func clearExpiredCandidateCooldowns() {
 	candidateCoolMu.Unlock()
 }
 
+// startCooldownJanitor 定期清理已过期的候选冷却项。
+//
+// 这个清理此前只被测试调用, 生产路径里没有任何人调用 —— candidateCools
+// 于是只增不减。过期项虽然会因为时间比较而失效(不会误跳过候选), 但 map
+// 会随着"见过多少候选"持续增长, 长期运行是纯泄漏。
+func startCooldownJanitor() {
+	go func() {
+		t := time.NewTicker(10 * time.Minute)
+		defer t.Stop()
+		for range t.C {
+			clearExpiredCandidateCooldowns()
+		}
+	}()
+}
+
 // candidateCoolingSnapshot 面板用: 当前处于冷却期的候选, 按剩余时间倒序。
 func candidateCoolingSnapshot() []map[string]any {
 	now := time.Now().UnixMilli()

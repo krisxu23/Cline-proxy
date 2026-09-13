@@ -172,7 +172,7 @@ func nowMillis() int64 { return protocol.NowMillis() }
 // registerClinePassAdminRoutes wires key management into the admin API.
 func registerClinePassAdminRoutes(mux *http.ServeMux) {
 	cp := clinePassProvider()
-	mux.HandleFunc("/admin/api/clinepass/keys", corsHandler(func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("/admin/api/clinepass/keys", adminAuth(func(w http.ResponseWriter, r *http.Request) {
 		switch r.Method {
 		case "GET":
 			writeAPI(w, http.StatusOK, apiResponse{Success: true, Data: map[string]any{"keys": cp.KeyStatuses()}})
@@ -190,7 +190,7 @@ func registerClinePassAdminRoutes(mux *http.ServeMux) {
 			writeAPI(w, http.StatusMethodNotAllowed, apiResponse{Error: "method not allowed"})
 		}
 	}))
-	mux.HandleFunc("/admin/api/clinepass/keys/delete", corsHandler(func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("/admin/api/clinepass/keys/delete", adminAuth(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != "POST" {
 			writeAPI(w, http.StatusMethodNotAllowed, apiResponse{Error: "method not allowed"})
 			return
@@ -205,7 +205,7 @@ func registerClinePassAdminRoutes(mux *http.ServeMux) {
 		cp.RemoveKey(body.Key)
 		writeAPI(w, http.StatusOK, apiResponse{Success: true, Data: map[string]any{"keys": cp.KeyStatuses()}})
 	}))
-	mux.HandleFunc("/admin/api/clinepass/models", corsHandler(func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("/admin/api/clinepass/models", adminAuth(func(w http.ResponseWriter, r *http.Request) {
 		writeAPI(w, http.StatusOK, apiResponse{Success: true, Data: map[string]any{"models": clinePassProvider().ListModels()}})
 	}))
 	_ = fmt.Sprint() // keep fmt import if handlers change

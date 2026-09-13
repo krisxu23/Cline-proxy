@@ -3,6 +3,7 @@ package app
 import (
 	"net/http"
 	"testing"
+	"time"
 )
 
 // Google 的端点归一化: 用户只需要填 https://generativelanguage.googleapis.com,
@@ -119,6 +120,16 @@ func TestExitModeDirectBypassesProxyPool(t *testing.T) {
 	proxied := direct
 	proxied.ExitMode = exitModeProxy
 	setConfigForTest(&proxied)
+
+	// 出口冷却表是按**索引**记录、且是进程级状态: 前面的用例可能已经把下标 0
+	// 冷却掉了。这个用例验证的是"出口模式开关", 不是冷却跳过逻辑, 所以先清空
+	// 冷却表再断言。
+	//
+	// 这个清理是必需的: pickZenProxyWhere 此前有个缺陷 —— 整池都不满足条件时
+	// 会落回起始下标并直接返回, 于是"冷却中的出口"照样被选中。本用例曾经就是
+	// 靠那个缺陷碰巧通过的, 修复后残留的冷却状态才会暴露出来。
+	clearZenProxyCooldowns()
+
 	if exitModeDirectNow() {
 		t.Fatal("exit mode must read back as proxy")
 	}
@@ -126,6 +137,13 @@ func TestExitModeDirectBypassesProxyPool(t *testing.T) {
 	if p != "socks5://127.0.0.1:1080" || idx != 0 {
 		t.Fatalf("proxy mode must pick from the pool: %q %d", p, idx)
 	}
+}
+
+// clearZenProxyCooldowns 清空出口冷却表(测试用)。
+func clearZenProxyCooldowns() {
+	zenProxyCooldownsMu.Lock()
+	zenProxyCooldowns = map[int]time.Time{}
+	zenProxyCooldownsMu.Unlock()
 }
 
 // setConfigForTest 测试内换配置: 不落盘、不重建 sing-box 节点,

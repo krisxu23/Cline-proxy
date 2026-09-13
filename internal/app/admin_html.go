@@ -798,6 +798,17 @@ applyTheme(getTheme());
 
 const _ = id => document.getElementById(id);
 const esc = s => { const d=document.createElement('div'); d.textContent=s||''; return d.innerHTML; };
+// 属性值转义: 用于 value="..." / data-x="..." / class="..." 这类双引号属性。
+const escAttr = s => esc(s).replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+// 用于 onclick="fn('...')" 这类「JS 字符串嵌在 HTML 属性里」的场景。
+// 顺序很关键: 先做 HTML 实体化(注意 & 必须最先), 再做 JS 反斜杠与引号转义。
+const escJs = s => String(s == null ? '' : s)
+  .replace(/&/g, '&amp;')
+  .replace(/"/g, '&quot;')
+  .replace(/</g, '&lt;')
+  .replace(/>/g, '&gt;')
+  .replace(/\\/g, '\\\\')
+  .replace(/'/g, "\\'");
 const fmtNum = n => (n || 0).toLocaleString('zh-CN');
 const fmtTokens = n => {
   n = n || 0;
@@ -882,7 +893,7 @@ async function api(method, path, body, timeoutMs) {
 function fail(e, retryExpr) {
   const msg = (e && e.message) ? e.message : '加载失败';
   return '<div class="empty" style="padding:14px;line-height:1.9">⚠️ ' + esc(msg)
-    + (retryExpr ? '<br><button class="btn btn-sm" style="margin-top:8px" onclick="' + retryExpr + '">重试</button>' : '')
+    + (retryExpr ? '<br><button class="btn btn-sm" style="margin-top:8px" onclick="' + escAttr(retryExpr) + '">重试</button>' : '')
     + '</div>';
 }
 
@@ -920,14 +931,14 @@ async function loadAccounts() {
       }
       return '<tr>' +
         '<td>' + esc(a.email) + '</td>' +
-        '<td><span class="status ' + a.status + '"><span class="status-dot ' + a.status + '"></span>' + (sn[a.status] || a.status) + '</span>' + statusExtra + '</td>' +
+        '<td><span class="status ' + escAttr(a.status) + '"><span class="status-dot ' + escAttr(a.status) + '"></span>' + esc(sn[a.status] || a.status) + '</span>' + statusExtra + '</td>' +
           '<td title="今日 ' + fmtNum(a.tokensToday) + ' / 累计 ' + fmtNum(a.tokensTotal) + ' tokens（上游返回 usage 时精确，否则为估算值）">' + fmtTokens(a.tokensToday) + ' / ' + fmtTokens(a.tokensTotal) + '</td>' +
         '<td class="mono" style="font-size:11px">' + lu + '</td>' +
         '<td class="mono" style="font-size:11px">' + cr + '</td>' +
         '<td style="white-space:nowrap">' +
-          '<button class="btn btn-sm" onclick="testAccount(\'' + a.accountId + '\', this)" title="测试账号是否可用（成功会清除冷却/过期状态）">⚡</button> ' +
-          '<button class="btn btn-sm" onclick="resetAccount(\'' + a.accountId + '\', this)" title="检测限流并解除：探测上游，若仍限流则保持冷却并提示恢复时间">↻</button> ' +
-          '<button class="btn btn-sm btn-danger" onclick="deleteAccount(\'' + a.accountId + '\')" title="删除">✕</button>' +
+          '<button class="btn btn-sm" onclick="testAccount(\'' + escJs(a.accountId) + '\', this)" title="测试账号是否可用（成功会清除冷却/过期状态）">⚡</button> ' +
+          '<button class="btn btn-sm" onclick="resetAccount(\'' + escJs(a.accountId) + '\', this)" title="检测限流并解除：探测上游，若仍限流则保持冷却并提示恢复时间">↻</button> ' +
+          '<button class="btn btn-sm btn-danger" onclick="deleteAccount(\'' + escJs(a.accountId) + '\')" title="删除">✕</button>' +
         '</td></tr>';
     }).join('');
   } catch (e) { toast('加载账号失败: ' + e.message, 'error'); }
@@ -1102,8 +1113,8 @@ async function loadKeys() {
     }
     el.innerHTML = keys.map(k =>
       '<div class="flex" style="margin-bottom:8px">' +
-        '<span class="key-display" style="flex:1" onclick="copyText(\'' + k + '\')" title="点击复制">' + esc(k) + '</span>' +
-        '<button class="btn btn-sm btn-danger" onclick="deleteKey(\'' + k + '\')">✕</button>' +
+        '<span class="key-display" style="flex:1" onclick="copyText(\'' + escJs(k) + '\')" title="点击复制">' + esc(k) + '</span>' +
+        '<button class="btn btn-sm btn-danger" onclick="deleteKey(\'' + escJs(k) + '\')">✕</button>' +
       '</div>'
     ).join('');
   } catch (e) { _('keysList').innerHTML = fail(e, 'loadKeys()'); }
@@ -1116,7 +1127,7 @@ async function generateKey() {
     _('keyGenResult').innerHTML =
       '<div style="background:rgba(52,211,153,.08);border:1px solid rgba(52,211,153,.4);border-radius:10px;padding:12px">' +
         '<div style="color:var(--accent2);font-weight:600;margin-bottom:8px">✓ 新密钥已生成（点击复制）</div>' +
-        '<div class="key-display" onclick="copyText(\'' + key + '\')">' + esc(key) + '</div>' +
+        '<div class="key-display" onclick="copyText(\'' + escJs(key) + '\')">' + esc(key) + '</div>' +
       '</div>';
     loadKeys();
     toast('密钥已生成', 'success');
@@ -1306,7 +1317,7 @@ async function loadModels() {
       const disp = 'cline/' + m.id;
       return '<div style="display:flex;align-items:center;gap:10px;padding:8px 12px;margin:5px 0;background:rgba(148,163,184,.06);border:1px solid var(--border);border-radius:10px;transition:.15s">' +
         '<span style="font-family:\'JetBrains Mono\',monospace;font-size:13px;flex:1">' + esc(disp) + '</span>' +
-        '<span class="copy-icon" title="复制" onclick="copyText(\'' + esc(disp).replace(/'/g, "\\'") + '\')">📋</span>' +
+        '<span class="copy-icon" title="复制" onclick="copyText(\'' + escJs(disp) + '\')">📋</span>' +
         (m.cost === 'free' ? '<span style="font-size:11px;color:var(--accent2)">不扣费</span>' : '') +
         (cost ? '<span class="model-tag">' + esc(cost) + '</span>' : '') +
         '<span class="model-tag" style="' + st.css + '">' + st.label + '</span>' +
@@ -1333,7 +1344,7 @@ async function loadModelOptions() {
     if (!sel) return;
     sel.innerHTML = models.map(m => {
       const st = MODEL_STYLE[m.status] || MODEL_STYLE.unknown;
-      return '<option value="' + esc(m.id) + '">' + esc(m.id) + ' (' + st.label + ')</option>';
+      return '<option value="' + escAttr(m.id) + '">' + esc(m.id) + ' (' + st.label + ')</option>';
     }).join('');
     const c = await api('GET', '/config');
     if (c.data.defaultModel) sel.value = c.data.defaultModel;
@@ -1368,8 +1379,8 @@ async function loadConfig() {
       const tbody = _('headersTableBody');
       tbody.innerHTML = Object.entries(c.headers).map(([k, v]) =>
         '<tr>' +
-          '<td><input type="text" class="header-key" value="' + esc(k) + '" style="font-size:12px;font-family:monospace;width:100%"></td>' +
-          '<td><input type="text" class="header-val" value="' + esc(v) + '" style="font-size:12px;font-family:monospace;width:100%"></td>' +
+          '<td><input type="text" class="header-key" value="' + escAttr(k) + '" style="font-size:12px;font-family:monospace;width:100%"></td>' +
+          '<td><input type="text" class="header-val" value="' + escAttr(v) + '" style="font-size:12px;font-family:monospace;width:100%"></td>' +
           '<td><button class="btn btn-sm btn-danger" onclick="this.closest(\'tr\').remove()">✕</button></td>' +
         '</tr>'
       ).join('');
@@ -1608,10 +1619,10 @@ function renderProviderList() {
       badge +
       '<span style="flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">' + esc(p.baseUrl || '') + '</span>' +
       '<span style="flex:none;font-size:11px;color:var(--text3);max-width:44%">' + st + '</span>' +
-      '<button type="button" class="btn" style="padding:2px 8px;font-size:11px" onclick="togglePvModels(\'' + esc(n).replace(/'/g, "\\'") + '\')">模型' + (open ? '▲' : '▼') + '</button>' +
-      '<button type="button" class="btn" style="padding:2px 8px;font-size:11px" onclick="editProvider(\'' + esc(n).replace(/'/g, "\\'") + '\')">编辑</button>' +
-      '<button type="button" class="btn" style="padding:2px 8px;font-size:11px" onclick="testProviderByName(\'' + esc(n).replace(/'/g, "\\'") + '\')">测试</button>' +
-      '<button type="button" class="btn" style="padding:2px 8px;font-size:11px;color:#f87171" onclick="delProvider(\'' + esc(n).replace(/'/g, "\\'") + '\')">删除</button></div>';
+      '<button type="button" class="btn" style="padding:2px 8px;font-size:11px" onclick="togglePvModels(\'' + escJs(n) + '\')">模型' + (open ? '▲' : '▼') + '</button>' +
+      '<button type="button" class="btn" style="padding:2px 8px;font-size:11px" onclick="editProvider(\'' + escJs(n) + '\')">编辑</button>' +
+      '<button type="button" class="btn" style="padding:2px 8px;font-size:11px" onclick="testProviderByName(\'' + escJs(n) + '\')">测试</button>' +
+      '<button type="button" class="btn" style="padding:2px 8px;font-size:11px;color:#f87171" onclick="delProvider(\'' + escJs(n) + '\')">删除</button></div>';
     if (open) block += renderPvModelBlock(n, p);
     return block;
   }).join('');
@@ -1641,12 +1652,12 @@ function renderPvModelBlock(n, p) {
     const disp = n + ':' + m.id;
     const checked = m.disabled ? '' : ' checked';
     return '<tr>' +
-      '<td><input type="checkbox" data-pv="' + esc(n).replace(/'/g, "\\'") + '" data-model="' + esc(m.id).replace(/'/g, "\\'") + '"' + checked + ' onchange="toggleProviderModel(this)" style="width:auto;min-width:0"></td>' +
+      '<td><input type="checkbox" data-pv="' + escAttr(n) + '" data-model="' + escAttr(m.id) + '"' + checked + ' onchange="toggleProviderModel(this)" style="width:auto;min-width:0"></td>' +
       '<td style="text-align:left;font-family:monospace">' + esc(disp) + '</td>' +
-      '<td><span class="copy-icon" title="复制" onclick="copyText(\'' + esc(disp).replace(/'/g, "\\'") + '\')">📋</span></td></tr>';
+      '<td><span class="copy-icon" title="复制" onclick="copyText(\'' + escJs(disp) + '\')">📋</span></td></tr>';
   }).join('');
   return '<div style="padding:6px 12px 10px 24px;border-bottom:1px solid rgba(148,163,184,.07)">' +
-    '<input type="text" placeholder="搜索模型" data-pvq="' + esc(n).replace(/'/g, "\\'") + '" value="' + esc((window.pvModelQ || {})[n] || '') + '" oninput="pvSearchInput(\'' + esc(n).replace(/'/g, "\\'") + '\',this)" style="max-width:280px;margin-bottom:6px">' +
+    '<input type="text" placeholder="搜索模型" data-pvq="' + escAttr(n) + '" value="' + escAttr((window.pvModelQ || {})[n] || '') + '" oninput="pvSearchInput(\'' + escJs(n) + '\',this)" style="max-width:280px;margin-bottom:6px">' +
     '<div class="table-wrap"><table><thead><tr><th style="width:40px">启用</th><th style="text-align:left">模型 ID</th><th style="width:44px"></th></tr></thead><tbody>' + rows + '</tbody></table></div></div>';
 }
 
@@ -1822,7 +1833,7 @@ function renderRouter() {
         if (chosen) meta.push('已选 ' + picked + ' 个');
         return '<label style="display:flex;align-items:center;gap:10px;padding:9px 12px;'
           + 'border:1px solid var(--border);border-radius:10px;background:var(--inset);cursor:pointer">'
-          + '<input type="checkbox" data-prov="' + esc(p.name) + '"' + (chosen ? ' checked' : '') + '>'
+          + '<input type="checkbox" data-prov="' + escAttr(p.name) + '"' + (chosen ? ' checked' : '') + '>'
           + '<span style="flex:1;display:flex;align-items:center;gap:10px;min-width:0;flex-wrap:wrap">'
           + '<strong>' + esc(p.display || p.name) + '</strong>'
           + (p.builtin ? '<span class="model-tag" style="opacity:.8">内置上游</span>' : '')
@@ -1848,7 +1859,7 @@ function renderRouter() {
           const label = m.id === '*' ? '账号池自动选模型' : m.id;
           const ctx = m.context ? (' · ' + Math.round(m.context / 1000) + 'k 上下文') : '';
           return '<label style="display:flex;align-items:center;gap:8px;padding:5px 10px;font-size:12.5px;cursor:pointer">'
-            + '<input type="checkbox" data-key="' + esc(key) + '"' + (routerModels.has(key) ? ' checked' : '') + '>'
+            + '<input type="checkbox" data-key="' + escAttr(key) + '"' + (routerModels.has(key) ? ' checked' : '') + '>'
             + '<code>' + esc(label) + '</code><span style="color:var(--text3)">' + esc(ctx) + '</span></label>';
         }).join('') || '<div style="padding:8px 10px;color:var(--text3);font-size:12px">该供应商暂无可用模型（先点上面的「刷新全部目录」）</div>';
         const pname = p.display || p.name;
@@ -1857,8 +1868,8 @@ function renderRouter() {
           + '<strong>' + esc(pname) + '</strong>'
           + '<span style="color:var(--text3);font-weight:normal">已选 ' + picked + ' / ' + models.length + '</span>'
           + '<span style="margin-left:auto;display:flex;gap:6px">'
-          + '<button type="button" class="btn btn-sm" data-prov-all="' + esc(p.name) + '">全选</button>'
-          + '<button type="button" class="btn btn-sm" data-prov-none="' + esc(p.name) + '">全不选</button>'
+          + '<button type="button" class="btn btn-sm" data-prov-all="' + escAttr(p.name) + '">全选</button>'
+          + '<button type="button" class="btn btn-sm" data-prov-none="' + escAttr(p.name) + '">全不选</button>'
           + '</span></div><div style="padding:4px 6px">' + rows + '</div></div>';
       }).join('');
     }
@@ -2014,7 +2025,7 @@ function renderRouterChain(d) {
     const hops = (r.hops || []).map((h, i) => {
       const label = (i + 1) + '. <code>' + esc(h.upstream) + ':' + esc(h.model) + '</code>';
       return h.skip
-        ? '<span class="model-tag" style="opacity:.55;text-decoration:line-through" title="' + esc(h.skip) + '">' + label + '</span>'
+        ? '<span class="model-tag" style="opacity:.55;text-decoration:line-through" title="' + escAttr(h.skip) + '">' + label + '</span>'
         : '<span class="model-tag">' + label + '</span>';
     }).join(' <span style="color:var(--text3)">→</span> ');
     return '<tr><td><code>' + esc(r.alias || '') + '</code></td><td>'
@@ -2117,7 +2128,7 @@ async function loadOcModels() {
       models.map(m => {
         const disp = 'zen/' + m.id;
         return '<tr><td style="text-align:left;font-family:monospace">' + esc(disp) + '</td>' +
-          '<td><span class="copy-icon" title="复制" onclick="copyText(\'' + esc(disp).replace(/'/g, "\\'") + '\')">📋</span></td>' +
+          '<td><span class="copy-icon" title="复制" onclick="copyText(\'' + escJs(disp) + '\')">📋</span></td>' +
           '<td>' + m.context + '</td><td>' + m.output + '</td><td>' + m.source + '</td></tr>';
       }).join('') +
       '</tbody></table></div><div class="hint">共 ' + models.length + ' 个免费模型（每 10 分钟自动同步）</div>';

@@ -1,5 +1,7 @@
 version: "3.9"
 
+# 管理后台需要 token 才能访问；token 首次启动自动生成并落盘到 data/admin-token，
+# 启动横幅会打印该 token。请妥善保管，不要随镜像或日志外泄。
 services:
   cline-proxy:
     build: .
@@ -7,6 +9,8 @@ services:
     restart: unless-stopped
     ports:
       - "3457:3457"
+    # 监听地址由 Dockerfile 的 CMD 传入 -host 0.0.0.0 保证宿主机可访问 3457；
+    # 不要改回 127.0.0.1，否则容器外端口映射不可达。
     volumes:
       - ./data:/app/data
       - ./override.md:/app/override.md:ro

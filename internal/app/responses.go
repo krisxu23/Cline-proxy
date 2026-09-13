@@ -452,6 +452,16 @@ func handleResponses(w http.ResponseWriter, r *http.Request) {
 	chatModel, _ := chat["model"].(string)
 	chatModel = stripDisplayPrefix(chatModel)
 	chat["model"] = chatModel
+	// 通用 Provider 直选: "provider:model"。与 OpenAI / Anthropic 两个入口对齐 ——
+	// /v1/models 公开了这些模型, 这里却缺分支的话, 客户端会拿到"模型不可用"。
+	if name, sub, ok := parseProviderModel(chatModel); ok {
+		setRouteHeader(w, name, chatModel, "")
+		handleChainedChatAs(w, r, chat,
+			[]routeCandidate{{Upstream: name, Model: sub}}, chatModel,
+			chainTarget{Shape: shapeResponses})
+		return
+	}
+
 	// 候选链: 路由别名(如 free-best)展开成有序候选, 逐站 failover。
 	if chain, matched, errMsg := resolveRouteChain(chatModel); matched {
 		if errMsg != "" {
@@ -482,12 +492,24 @@ func handleResponses(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		sid := requestSessionID(chat, r.Header)
-		out := maybeCompact(chat, zm, sid)
+		out := maybeCompact(r.Context(), chat, zm, sid)
 		if out.changed {
 			log.Printf("  responses zen: %s", out.note)
 		}
+		// 与其它 zen 路径一样接上统计: 此前流式分支传的是 nil, zen 的
+		// 流式调用用量完全不进账本, 面板上的 token 统计因此偏低。
+		tracker := newZenStatsTracker(zenStatsRecord{
+			TS:           time.Now().UnixMilli(),
+			Upstream:     upstreamZen,
+			Model:        zm.ID,
+			Stream:       isStream,
+			PromptTokens: estimateJSON(chat),
+		})
+		tracker.rec.Compacted = out.changed
+
 		resp, _, err := callZenAPI(r.Context(), chat, isStream)
 		if err != nil {
+			tracker.finish(false, http.StatusBadGateway)
 			writeJSON(w, http.StatusBadGateway, map[string]any{
 				"error": map[string]string{"message": err.Error(), "type": "api_error"},
 			})
@@ -500,15 +522,30 @@ func handleResponses(w http.ResponseWriter, r *http.Request) {
 			w.Header().Set("Connection", "keep-alive")
 			w.Header().Set("Access-Control-Allow-Origin", "*")
 			w.WriteHeader(http.StatusOK)
-			chatStreamToResponses(w, resp, nil)
+			chatStreamToResponses(w, resp, tracker.observeUsage)
+			tracker.finish(resp.StatusCode < 400, resp.StatusCode)
 			return
 		}
 		var raw map[string]any
 		if err := json.NewDecoder(resp.Body).Decode(&raw); err != nil {
+			tracker.finish(false, http.StatusBadGateway)
 			writeJSON(w, http.StatusBadGateway, map[string]any{"error": err.Error()})
 			return
 		}
-		writeJSON(w, http.StatusOK, chatToResponses(raw))
+		// 与 cline 分支保持一致地拆掉 {"data": {...}} 包装。
+		// 同一形状的响应在两个分支里被区别对待, 会让上游回包为 data 包装时
+		// 这条路径直接输出一层空壳。
+		zenOut := raw
+		if data, ok := raw["data"]; ok {
+			if d, ok := data.(map[string]any); ok {
+				zenOut = d
+			}
+		}
+		if u, ok := zenOut["usage"].(map[string]any); ok && len(u) > 0 {
+			tracker.observeUsage(u)
+		}
+		tracker.finish(resp.StatusCode < 400, resp.StatusCode)
+		writeJSON(w, http.StatusOK, chatToResponses(zenOut))
 		return
 	}
 
@@ -529,7 +566,7 @@ func handleResponses(w http.ResponseWriter, r *http.Request) {
 	if !isStream && modelNeedsStream(normalizeRequestModel(chatModel)) {
 		stream = true
 	}
-	up, acc, err := callClineAPIFailover(chat, stream)
+	up, acc, err := callClineAPIFailover(r.Context(), chat, stream)
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]any{
 			"error": map[string]string{"message": err.Error(), "type": "api_error"},

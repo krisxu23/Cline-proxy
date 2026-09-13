@@ -63,6 +63,9 @@ func handleZenConfigUpdate(w http.ResponseWriter, r *http.Request) {
 	defer r.Body.Close()
 
 	cur := getZenConfig()
+	if cur == nil {
+		cur = defaultZenConfig()
+	}
 	var patch struct {
 		Enabled         *bool    `json:"enabled"`
 		Key             *string  `json:"key"`
@@ -93,24 +96,15 @@ func handleZenConfigUpdate(w http.ResponseWriter, r *http.Request) {
 		writeAPI(w, http.StatusBadRequest, apiResponse{Error: "invalid JSON: " + err.Error()})
 		return
 	}
-	next := &zenConfigData{
-		Enabled:         cur.Enabled,
-		Key:             cur.Key,
-		BaseURL:         cur.BaseURL,
-		BaseURLs:        cur.BaseURLs,
-		Proxies:         cur.Proxies,
-		Subs:            cur.Subs,
-		ExitMode:        cur.ExitMode,
-		SubsRefreshMins: cur.SubsRefreshMins,
-		ProxyStrategy:   cur.ProxyStrategy,
-		MaxConcurrency:  cur.MaxConcurrency,
-		Retries:         cur.Retries,
-		Failover:        cur.Failover,
-		FailoverCount:   cur.FailoverCount,
-		FailoverMinutes: cur.FailoverMinutes,
-		Compaction:      cur.Compaction,
-		Providers:       cur.Providers,
-	}
+	// 从完整的当前配置出发, 只覆盖请求里显式出现的字段。
+	//
+	// 这里曾经是 `next := &zenConfigData{...}` 手工列举 16 个字段。结构体现有
+	// 23 个字段, 于是 Routes(候选链) / Router(自动路由) / Usage(每日配额账本) /
+	// CooldownMs / DNSMode / DNSCustomDNS / RescueDirect 每次保存都被零值覆盖
+	// 并落盘 —— 在 zen 设置页改任意无关项(例如重试次数), 用户在自动路由页配好的
+	// 候选链就直接消失, RescueDirect 归 nil 还会把"节点全挂时直连兜底"悄悄
+	// 重新打开, 绕开统一出口。改用 clone 之后新增字段不可能再被漏掉。
+	next := cur.clone()
 	if patch.Enabled != nil {
 		next.Enabled = *patch.Enabled
 	}
@@ -118,21 +112,21 @@ func handleZenConfigUpdate(w http.ResponseWriter, r *http.Request) {
 		next.Key = *patch.Key
 	}
 	if patch.BaseURL != nil && *patch.BaseURL != "" {
-		next.BaseURL = strings.TrimRight(*patch.BaseURL, "/")
+		u := strings.TrimRight(strings.TrimSpace(*patch.BaseURL), "/")
+		if err := validateOutboundURL(u); err != nil {
+			writeAPI(w, http.StatusBadRequest, apiResponse{Error: err.Error()})
+			return
+		}
+		next.BaseURL = u
 	}
 	if patch.BaseURLs != nil {
-		// 端点列表整体替换;空数组 = 恢复默认(官方 + 全部镜像)
-		cleaned := make([]string, 0, len(patch.BaseURLs))
-		for _, u := range patch.BaseURLs {
-			u = strings.TrimRight(strings.TrimSpace(u), "/")
-			if u == "" {
-				continue
-			}
-			if !strings.HasPrefix(u, "http://") && !strings.HasPrefix(u, "https://") {
-				writeAPI(w, http.StatusBadRequest, apiResponse{Error: fmt.Sprintf("端点 %q 协议无效（需 http:// 或 https://）", u)})
-				return
-			}
-			cleaned = append(cleaned, u)
+		// 端点列表整体替换;空数组 = 恢复默认(官方 + 全部镜像)。
+		// 走统一的出站地址校验: 这些端点由服务端主动请求, 只查 "http://" 前缀
+		// 挡不住云元数据地址(http://169.254.169.254/...)。
+		cleaned, err := filterOutboundURLs(patch.BaseURLs, "端点")
+		if err != nil {
+			writeAPI(w, http.StatusBadRequest, apiResponse{Error: err.Error()})
+			return
 		}
 		next.BaseURLs = cleaned
 		// 主端点同步为列表第一个,保持旧字段语义
@@ -148,17 +142,11 @@ func handleZenConfigUpdate(w http.ResponseWriter, r *http.Request) {
 		next.Proxies = patch.Proxies
 	}
 	if patch.Subs != nil {
-		cleaned := make([]string, 0, len(patch.Subs))
-		for _, u := range patch.Subs {
-			u = strings.TrimSpace(u)
-			if u == "" {
-				continue
-			}
-			if !strings.HasPrefix(u, "http://") && !strings.HasPrefix(u, "https://") {
-				writeAPI(w, http.StatusBadRequest, apiResponse{Error: fmt.Sprintf("订阅 %q 协议无效（需 http:// 或 https://）", u)})
-				return
-			}
-			cleaned = append(cleaned, u)
+		// 同理: 订阅是服务端去抓取的地址。
+		cleaned, err := filterOutboundURLs(patch.Subs, "订阅")
+		if err != nil {
+			writeAPI(w, http.StatusBadRequest, apiResponse{Error: err.Error()})
+			return
 		}
 		next.Subs = cleaned
 	}

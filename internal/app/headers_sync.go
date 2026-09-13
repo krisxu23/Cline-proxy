@@ -194,14 +194,16 @@ func syncOfficialHeaders(ctx context.Context) (map[string]string, clineVersionIn
 	if info.CLI == "" && info.Core == "" {
 		return nil, info, errNoVersionsInPayload
 	}
-	cfg := getProxyConfig()
-	merged := mergeOfficialHeaders(cfg.Headers, headersFromVersions(info))
-	proxyConfigMu.Lock()
-	cfg.Headers = merged
-	cfg.HeadersSyncedAt = time.Now().UnixMilli()
-	cfg.HeadersAutoVersion = versionLabel(info)
-	proxyConfigMu.Unlock()
-	saveProxyConfig()
+	// 整体替换而不是就地改字段: getProxyConfig() 现在返回克隆体, 就地改克隆
+	// 不会影响全局, 落盘会把改动丢掉。必须走 mutateProxyConfig 让替换与落盘
+	// 在同一个写入口内完成。
+	merged := mergeOfficialHeaders(getProxyConfig().Headers, headersFromVersions(info))
+	label := versionLabel(info)
+	mutateProxyConfig(func(cfg *proxyConfigData) {
+		cfg.Headers = merged
+		cfg.HeadersSyncedAt = time.Now().UnixMilli()
+		cfg.HeadersAutoVersion = label
+	})
 	return merged, info, nil
 }
 

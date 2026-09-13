@@ -120,18 +120,14 @@ func regionModelSnapshot() []string {
 }
 
 // probeRegionModelsAsync 对全部已知受限模型异步刷新节点能力(健康检测后调用)。
-// 统一出口下地区探测已降级为 provider 可选开关, 这里直接返回保留引用不断裂。
 func probeRegionModelsAsync() {
-	return
 	for _, m := range regionModelSnapshot() {
 		go probeModelAllNodes(m)
 	}
 }
 
 // probeModelAllNodes 对全部已就绪节点探测指定模型的地区可用性。
-// 统一出口下已停用, 直接返回保留引用不断裂。
 func probeModelAllNodes(modelID string) {
-	return
 	regionProbeMu.Lock()
 	if regionProbing[modelID] {
 		regionProbeMu.Unlock()
@@ -190,7 +186,6 @@ func probeModelAllNodes(modelID string) {
 // 返回 (regionOK, known): known=false 表示连结果都没拿到(拨号失败),
 // 节点可能只是抖动, 此时不应更新它的地区能力记录。
 func probeNodeModel(key, modelID string) (regionOK, known bool) {
-	return false, false
 	local := nodeLocalAddr(key)
 	if local == "" {
 		return false, false

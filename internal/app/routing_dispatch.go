@@ -143,6 +143,10 @@ func handleChainedChatAs(w http.ResponseWriter, r *http.Request, params map[stri
 			default:
 				handleStreamResponseWithUsage(w, resp, tracker.observeUsage)
 			}
+			// 这里以前从不关闭上游响应体。对比上面两条失败路径(87/154 行)都显式
+			// Close 了, 唯独流式成功这条漏掉, 而三个流式 handler 内部也都只读到
+			// EOF、不负责 Close —— 连接因此无法归还复用池, 长时间运行持续堆积。
+			resp.Body.Close()
 			tracker.finish(resp.StatusCode < 400, resp.StatusCode)
 			recordUsageForCandidate(cand, true)
 			logChainResult(cand, tried, skipped)
@@ -262,7 +266,7 @@ func callChainUpstream(ctx context.Context, cand routeCandidate, params map[stri
 		resp, _, err := callZenAPI(ctx, params, stream)
 		return resp, err
 	case upstreamCline:
-		resp, _, err := callClineAPIFailover(params, stream)
+		resp, _, err := callClineAPIFailover(ctx, params, stream)
 		return resp, err
 	default:
 		p := providerByName(cand.Upstream)

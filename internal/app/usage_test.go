@@ -1,6 +1,8 @@
 package app
 
 import (
+	"encoding/json"
+	"os"
 	"testing"
 	"time"
 )
@@ -118,5 +120,58 @@ func TestUsagePruningKeepsRecentDays(t *testing.T) {
 	if n != 2 || hasOldest || hasSecond || !hasRecent {
 		t.Fatalf("pruning must keep the 2 newest days: n=%d oldest=%v second=%v recent=%v",
 			n, hasOldest, hasSecond, hasRecent)
+	}
+}
+
+// TestSaveUsageLedgerAtomic 验证账本落盘收敛到原子写(临时文件+rename), 落盘后是完整可解析的 JSON。
+func TestSaveUsageLedgerAtomic(t *testing.T) {
+	usageMu.Lock()
+	usageDays = map[string]map[string]*usageCounter{
+		"2026-09-13": {"up:model": {Req: 3, OK: 2, Fail: 1}},
+	}
+	usageLoaded = true
+	usageDirty = true
+	usageMu.Unlock()
+	defer func() {
+		usageMu.Lock()
+		usageDays = map[string]map[string]*usageCounter{}
+		usageLoaded = false
+		usageDirty = false
+		usageMu.Unlock()
+	}()
+
+	saveUsageLedger()
+
+	data, err := os.ReadFile(usageLedgerPath())
+	if err != nil {
+		t.Fatalf("ledger not written: %v", err)
+	}
+	var got usageLedgerFile
+	if err := json.Unmarshal(data, &got); err != nil {
+		t.Fatalf("ledger not valid JSON: %v\nraw=%s", err, data)
+	}
+	if got.Days["2026-09-13"]["up:model"].Req != 3 {
+		t.Fatalf("ledger content mismatch: %+v", got)
+	}
+}
+
+// TestSaveUsageLedgerSkipsWhenNotLoaded 验证 usageLoaded 为假时不落盘, 避免用空表覆盖真实账本。
+func TestSaveUsageLedgerSkipsWhenNotLoaded(t *testing.T) {
+	usageMu.Lock()
+	usageLoaded = false
+	usageDirty = true
+	usageMu.Unlock()
+	defer func() {
+		usageMu.Lock()
+		usageLoaded = false
+		usageDirty = false
+		usageMu.Unlock()
+	}()
+
+	path := usageLedgerPath()
+	os.Remove(path)
+	saveUsageLedger()
+	if _, err := os.Stat(path); !os.IsNotExist(err) {
+		t.Fatalf("should not write ledger when not loaded")
 	}
 }

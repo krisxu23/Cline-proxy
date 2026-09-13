@@ -7,6 +7,7 @@ import (
 	"cline-go-proxy/internal/kit"
 	"cline-go-proxy/internal/protocol"
 	"cline-go-proxy/internal/providers"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -14,13 +15,16 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"path/filepath"
+	"runtime"
+	"strconv"
 	"strings"
 	"time"
 )
 
 var defaultModel = "deepseek/deepseek-v4-flash"
 
-var proxyListenAddress = "0.0.0.0:3457"
+var proxyListenAddress = "127.0.0.1:3457"
 
 const (
 	defaultMaxTokens       = 128000
@@ -49,7 +53,9 @@ type chatRequest struct {
 
 func StartProxy(host string, port int) error {
 	if strings.TrimSpace(host) == "" {
-		host = "0.0.0.0"
+		// 与命令行默认值保持一致: 只监听回环地址。管理接口虽然另需访问令牌,
+		// 但把"默认不对外"作为第一层防线, 要局域网访问必须显式指定。
+		host = "127.0.0.1"
 	}
 	initLogFile()
 	setListenOrigin(fmt.Sprintf("http://127.0.0.1:%d", port))
@@ -88,6 +94,7 @@ func StartProxy(host string, port int) error {
 	startHeadersAutoSync()
 	startUsageLedger()
 	startNodeHealthLoop()
+	startCooldownJanitor()
 
 	// Register proxy-aware HTTP client for ClinePass provider
 	providers.SetProxyDoer(func(req *http.Request) (*http.Response, error) {
@@ -326,11 +333,13 @@ func StartProxy(host string, port int) error {
 			}
 		}
 
-		resp, acc, err := callClineAPIFailover(params, upstreamStream)
+		resp, acc, err := callClineAPIFailover(r.Context(), params, upstreamStream)
 		if err != nil {
 			log.Printf("  api error: %v", err)
-			status = http.StatusInternalServerError
-			writeJSON(w, http.StatusInternalServerError, map[string]any{
+			// 上游 4xx 原样透传, 其余(网络错误 / 5xx)统一 502。
+			// 此前一律回 500, 客户端因此看不出"是模型不存在"还是"被限流"。
+			status = upstreamErrorStatus(err)
+			writeJSON(w, status, map[string]any{
 				"error": map[string]string{"message": err.Error(), "type": "api_error"},
 			})
 			return
@@ -392,9 +401,21 @@ func StartProxy(host string, port int) error {
 	proxyListenAddress = addr
 	server := &http.Server{
 		Addr:    addr,
-		Handler: requestLogMiddleware(mux),
+		Handler: limitInboundBody(requestLogMiddleware(mux)),
+		// 以前一个超时都没设。ReadHeaderTimeout 是必须的: 不设的话一个
+		// 只发半个请求头的连接就能一直占着 goroutine 不放, 几百条就能把
+		// 进程拖垮(Slowloris), 而默认零鉴权让任何人都能发。IdleTimeout
+		// 回收空闲 keep-alive 连接。
+		//
+		// WriteTimeout 仍然不设 —— 它是整条响应的绝对上限, 会把 LLM 的
+		// 长流式响应直接切断, 这属于刻意的取舍。
+		ReadHeaderTimeout: 20 * time.Second,
+		IdleTimeout:       120 * time.Second,
+		MaxHeaderBytes:    1 << 20,
 	}
 
+	token := loadOrCreateAdminToken()
+	panelURL := wrapAdminTokenURL(fmt.Sprintf("http://127.0.0.1:%d/admin/", port))
 	fmt.Println("")
 	fmt.Println(strings.Repeat("=", 58))
 	fmt.Println("  Cline Go Proxy v1.0 - No CLI Required")
@@ -404,9 +425,39 @@ func StartProxy(host string, port int) error {
 	fmt.Println("  API Key: any value")
 	fmt.Printf("  Model:   %s (auto-detected)\n", getDefaultModel())
 	fmt.Printf("  Accounts: %d total, %d active\n", len(loadPool().Accounts), activeCount)
+	fmt.Println(strings.Repeat("-", 58))
+	fmt.Println("  管理后台(链接已含访问令牌, 直接打开即可):")
+	fmt.Printf("    %s\n", panelURL)
+	fmt.Println("  管理接口需要令牌, 可用 X-Admin-Token 头或 admin_token Cookie:")
+	fmt.Printf("    token: %s\n", token)
+	fmt.Println("  令牌落盘在 data/admin-token, 重启后不变。")
 	fmt.Println(strings.Repeat("=", 58))
+	// windowsgui 构建下没有控制台, 上面这些输出用户看不到, 必须同时进日志文件。
+	log.Printf("admin panel: %s", panelURL)
+	log.Printf("admin token: %s", token)
 
 	return server.ListenAndServe()
+}
+
+// maxInboundBodyBytes 单个入站请求体的上限(64 MiB)。
+//
+// 取这个量级是为了不误伤正常用法 —— 多模态请求会把图片以 base64 塞进 body,
+// 几十 MB 属于合理范围。此前一个上限都没有, 而 /v1/* 在未配置 API Key 时
+// 是敞开的, 任何人 POST 一个几 GB 的 body 就能把进程撑爆。出站响应一侧
+// 早就统一用了 io.LimitReader, 入站这一侧一直是空白。
+const maxInboundBodyBytes = 64 << 20
+
+// limitInboundBody 给所有入站请求体加上上限。
+//
+// 放在最外层而不是逐个 handler 里: 请求日志中间件也会 io.ReadAll(r.Body),
+// 而它对每个请求都跑, 逐个 handler 补一定会漏。
+func limitInboundBody(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Body != nil {
+			r.Body = http.MaxBytesReader(w, r.Body, maxInboundBodyBytes)
+		}
+		next.ServeHTTP(w, r)
+	})
 }
 
 // initLogFile 将日志同时输出到控制台与 cline-proxy.log（追加模式），
@@ -515,7 +566,7 @@ func handleZenChat(w http.ResponseWriter, r *http.Request, params map[string]any
 	})
 
 	sid := requestSessionID(params, r.Header)
-	out := maybeCompact(params, zm, sid)
+	out := maybeCompact(r.Context(), params, zm, sid)
 	tracker.rec.Compacted = out.changed
 	tracker.rec.CompactionTokens = out.compactTokens
 	if out.changed {
@@ -640,7 +691,7 @@ func clineHeaders(token, sessionID string) http.Header {
 // account — pickAccount() already excludes cooled-down and expired
 // accounts, so each retry naturally rotates — while non-retryable 4xx
 // errors return immediately. Attempts are bounded by the pool size.
-func callClineAPIFailover(params map[string]any, stream bool) (*http.Response, *Account, error) {
+func callClineAPIFailover(ctx context.Context, params map[string]any, stream bool) (*http.Response, *Account, error) {
 	total := len(loadPool().Accounts)
 	if total < 1 {
 		total = 1
@@ -651,7 +702,13 @@ func callClineAPIFailover(params map[string]any, stream bool) (*http.Response, *
 		err  error
 	)
 	for attempt := 0; attempt < total; attempt++ {
-		resp, acc, err = callClineAPI(params, stream)
+		// 客户端断开(或上层超时)后立即收手, 不再继续换账号重试。
+		// 之前这里既没有 ctx 也没有取消检查, 客户端早就走了, 网关还在
+		// 逐个账号把请求打完。
+		if cerr := ctx.Err(); cerr != nil {
+			return nil, acc, cerr
+		}
+		resp, acc, err = callClineAPI(ctx, params, stream)
 		if err == nil {
 			return resp, acc, nil
 		}
@@ -678,7 +735,7 @@ func isRetryableUpstreamError(err error) bool {
 	return false
 }
 
-func callClineAPI(params map[string]any, stream bool) (*http.Response, *Account, error) {
+func callClineAPI(ctx context.Context, params map[string]any, stream bool) (*http.Response, *Account, error) {
 	acc := pickAccount()
 	if acc == nil {
 		return nil, nil, fmt.Errorf("no active accounts available: %s", describePoolStatus())
@@ -698,11 +755,28 @@ func callClineAPI(params map[string]any, stream bool) (*http.Response, *Account,
 		return nil, acc, fmt.Errorf("marshal body: %w", err)
 	}
 
-	req, err := http.NewRequest("POST", cline.ClineAPIBase+"/chat/completions", bytes.NewReader(bodyJSON))
+	// newClineRequest 每次发送都重建请求对象。
+	//
+	// http.Request 的 Body 是一次性的: 首次 Do 之后 bytes.Reader 已经读到 EOF
+	// 并被关闭。此前 401 分支刷新 token 后直接复用同一个 req 再 Do 一次, 于是
+	// transport 报 "http: ContentLength=N with Body length 0" —— 也就是说
+	// token 刷新成功之后的补救请求必然失败, 单账号池上直接表现成 500, 多账号池
+	// 则被外层换账号掩盖过去。同库 providers_chat.go 踩过同一个坑并留了注释。
+	//
+	// 顺手带上 ctx: 客户端断开后请求要能被取消, 而不是继续把上游打完。
+	newClineRequest := func(tok string) (*http.Request, error) {
+		req, err := http.NewRequestWithContext(ctx, "POST", cline.ClineAPIBase+"/chat/completions", bytes.NewReader(bodyJSON))
+		if err != nil {
+			return nil, err
+		}
+		req.Header = clineHeaders(tok, sessionID)
+		return req, nil
+	}
+
+	req, err := newClineRequest(token)
 	if err != nil {
 		return nil, acc, fmt.Errorf("create request: %w", err)
 	}
-	req.Header = clineHeaders(token, sessionID)
 
 	toolCount := 0
 	if tools, ok := params["tools"]; ok {
@@ -724,8 +798,14 @@ func callClineAPI(params map[string]any, stream bool) (*http.Response, *Account,
 		resp.Body.Close()
 		// Refresh token and retry
 		if err := refreshAccountToken(acc); err == nil {
+			// acc.AccessToken 由 refreshAccountToken 在 poolMu 内写入, 读取也走同一把锁。
+			poolMu.Lock()
 			token = acc.AccessToken
-			req.Header = clineHeaders(token, sessionID)
+			poolMu.Unlock()
+			req, err = newClineRequest(token)
+			if err != nil {
+				return nil, acc, fmt.Errorf("rebuild request: %w", err)
+			}
 			resp, err = getZenHTTPClient().Do(req)
 			if err != nil {
 				return nil, acc, fmt.Errorf("upstream retry: %w", err)
@@ -760,7 +840,19 @@ func callClineAPI(params map[string]any, stream bool) (*http.Response, *Account,
 			markAccountCooldown(acc, "429: "+reason, duration)
 			log.Printf("  account %s cooldown %v (reason: %s)", truncateEmail(acc.Email), duration, reason)
 		}
-		return nil, acc, fmt.Errorf("API %d: %s", resp.StatusCode, kit.Truncate(string(bodyBytes), 500))
+		// 返回带类型的上游错误, 而不是裸 fmt.Errorf。
+		//
+		// 候选链是靠**错误类型**取状态码的(chainErrorStatusBody 只认
+		// upstreamError / zenUpstreamError / providerError)。此前这里返回裸
+		// error, 于是 cline 的 429/403/404 一律拿不到状态码 → 被
+		// classifyCandidateFailure 当成"网络超时"只做 5 分钟短冷却, 并且
+		// 回给客户端的响应码被压成 502, 真实原因(限流/下架/无权限)全部丢失。
+		// 同目录 providers_chat.go 早就用 providerError 这么做了, 这里补上。
+		return nil, acc, &upstreamError{
+			Upstream: upstreamCline,
+			Status:   resp.StatusCode,
+			Body:     kit.Truncate(string(bodyBytes), 500),
+		}
 	}
 
 	bumpUsage(acc)
@@ -1594,6 +1686,23 @@ func handleAnthropicMessages(w http.ResponseWriter, r *http.Request) {
 
 	log.Printf("  anthropic: model=%s stream=%v msgs=%d", req.Model, req.Stream, len(req.Messages))
 
+	// 通用 Provider 直选: "provider:model"。
+	//
+	// 必须与 OpenAI 入口(/v1/chat/completions)保持一致: /v1/models 会把这些模型
+	// 公开出去, 但此前只有 OpenAI 入口认这个前缀, 于是在 Anthropic 端点上
+	// bai:glm-5.3 会落到 routeModel 被当成 cline 池的模型名送出去并必然失败 ——
+	// 同一个模型名在三个协议端点上行为不一致。
+	//
+	// 直接复用候选链的调度器(单候选): 三种响应形状的转换只维护一份, 不为
+	// 这一条路径再写一个新的 shape 转换分支。
+	if name, sub, ok := parseProviderModel(req.Model); ok {
+		setRouteHeader(w, name, req.Model, "")
+		handleChainedChatAs(w, r, openAIReq,
+			[]routeCandidate{{Upstream: name, Model: sub}}, req.Model,
+			chainTarget{Shape: shapeAnthropic, ToolSchemas: toolSchemas})
+		return
+	}
+
 	// 候选链: 路由别名(如 free-best)展开成有序候选, 逐站 failover。
 	// openAIReq 已是转换后的 OpenAI 形状, 胜出那一站的响应再转回 Anthropic。
 	if chain, matched, errMsg := resolveRouteChain(req.Model); matched {
@@ -1658,7 +1767,7 @@ func handleAnthropicMessages(w http.ResponseWriter, r *http.Request) {
 		log.Printf("  anthropic model %s requires stream: forcing upstream stream, will aggregate", req.Model)
 	}
 
-	resp, acc, err := callClineAPIFailover(openAIReq, upstreamStream)
+	resp, acc, err := callClineAPIFailover(r.Context(), openAIReq, upstreamStream)
 	if err != nil {
 		log.Printf("  anthropic api error: %v", err)
 		writeJSON(w, http.StatusInternalServerError, map[string]any{
@@ -1747,7 +1856,7 @@ func handleZenAnthropic(w http.ResponseWriter, r *http.Request, req anthropicReq
 	})
 
 	sid := requestSessionID(openAIReq, r.Header)
-	out := maybeCompact(openAIReq, zm, sid)
+	out := maybeCompact(r.Context(), openAIReq, zm, sid)
 	tracker.rec.Compacted = out.changed
 	tracker.rec.CompactionTokens = out.compactTokens
 	if out.changed {
@@ -2272,28 +2381,100 @@ func getNested(obj map[string]any, keys ...any) any {
 	return current
 }
 
+// freePort 启动前清理占着目标端口的「旧实例」。
+//
+// 此前这里是无条件的 Stop-Process: 只要端口被占, 就把占用者的进程强杀, 既没有
+// 任何身份校验也没有提示 —— 用户机器上恰好用该端口的无关程序会被静默干掉。
+// 现在只清理与当前可执行文件同名的进程(即另一个 cline-proxy), 遇到陌生进程
+// 如实记录后放手, 让 ListenAndServe 用 "address already in use" 明确报错。
 func freePort(port int) {
 	addr := fmt.Sprintf("127.0.0.1:%d", port)
-	conn, err := net.DialTimeout("tcp", addr, 2*time.Second)
-	if err != nil {
+	if !portInUse(addr) {
 		return // port is free
+	} else if runtime.GOOS != "windows" {
+		// 非 Windows 没有可靠的「按端口找进程」手段。旧实现在这里会去执行
+		// 根本不存在的 powershell, 失败后仍进入 5 秒重试循环, 而每次都能
+		// 拨通旧进程 —— 等于白等 5 秒才失败。直接交给监听报错更清楚。
+		return
 	}
-	conn.Close()
-
-	// Try to kill the process using the port
-	cmd := kit.ExecCommand("powershell", "-Command",
-		fmt.Sprintf(`$p=Get-NetTCPConnection -LocalPort %d -ErrorAction SilentlyContinue; if($p){$p.OwningProcess | Sort-Object -Unique | ForEach-Object {Stop-Process -Id $_ -Force -ErrorAction SilentlyContinue}}`, port))
-	_ = cmd.Run()
+	if !killOwnProcessOnPort(port) {
+		return
+	}
 	// 杀进程后确认端口确实释放，避免旧进程尚未退出时立刻竞争监听。
 	deadline := time.Now().Add(5 * time.Second)
 	for time.Now().Before(deadline) {
-		conn, err := net.DialTimeout("tcp", addr, 100*time.Millisecond)
-		if err != nil {
+		if !portInUse(addr) {
 			return
 		}
-		conn.Close()
 		time.Sleep(100 * time.Millisecond)
 	}
+	log.Printf("  端口 %d 仍被占用, 监听可能失败", port)
+}
+
+// portInUse 目标地址当前是否有进程在监听。
+func portInUse(addr string) bool {
+	conn, err := net.DialTimeout("tcp", addr, 500*time.Millisecond)
+	if err != nil {
+		return false
+	}
+	conn.Close()
+	return true
+}
+
+// selfProcessName 当前可执行文件名(去扩展名), 用于识别「自己人」。
+func selfProcessName() string {
+	exe, err := os.Executable()
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSuffix(filepath.Base(exe), filepath.Ext(exe))
+}
+
+// killOwnProcessOnPort 只终止与自身同名的进程占用的端口, 返回是否杀掉过进程。
+func killOwnProcessOnPort(port int) bool {
+	self := selfProcessName()
+	if self == "" {
+		return false
+	}
+	// 只列 Listen 态连接, 并带上进程名, 供下面按名字过滤。
+	script := fmt.Sprintf(
+		`$p=Get-NetTCPConnection -LocalPort %d -State Listen -ErrorAction SilentlyContinue; `+
+			`if($p){ $p.OwningProcess | Sort-Object -Unique | ForEach-Object { `+
+			`$proc=Get-Process -Id $_ -ErrorAction SilentlyContinue; `+
+			`if($proc){ Write-Output "$($proc.Id) $($proc.ProcessName)" } } }`, port)
+	out, err := kit.ExecCommand("powershell", "-NoProfile", "-Command", script).Output()
+	if err != nil && len(bytes.TrimSpace(out)) == 0 {
+		log.Printf("  端口 %d 被占用, 但无法枚举占用进程: %v", port, err)
+		return false
+	}
+
+	selfPID := strconv.Itoa(os.Getpid())
+	killed := false
+	var foreign []string
+	for _, line := range strings.Split(string(out), "\n") {
+		fields := strings.Fields(line)
+		if len(fields) != 2 {
+			continue
+		}
+		pid, name := fields[0], fields[1]
+		if !strings.EqualFold(name, self) {
+			foreign = append(foreign, name+"(pid "+pid+")")
+			continue
+		}
+		if pid == selfPID {
+			continue // 绝不自杀
+		}
+		stop := kit.ExecCommand("powershell", "-NoProfile", "-Command",
+			fmt.Sprintf("Stop-Process -Id %s -Force -ErrorAction SilentlyContinue", pid))
+		if err := stop.Run(); err == nil {
+			killed = true
+			log.Printf("  已终止占用端口 %d 的旧实例 %s(pid %s)", port, name, pid)
+		}
+	}
+	if len(foreign) > 0 {
+		log.Printf("  端口 %d 被无关进程占用, 不会强杀: %s", port, strings.Join(foreign, ", "))
+	}
+	return killed
 }
 
 // parseInferenceCapDuration 从 Cline 429 错误体中解析 "Try again in 17h 59m" 形式的等待时长。

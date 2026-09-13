@@ -61,8 +61,13 @@ func subStatusSnapshot() map[string]string {
 
 func saveSubCacheLocked() {
 	b, err := json.Marshal(map[string]any{"nodes": subNodes})
-	if err == nil {
-		os.WriteFile(subCacheFile(), b, 0600)
+	if err != nil {
+		// marshal 失败绝不能落盘, 否则写空文件会清空订阅缓存。
+		log.Printf("subs cache marshal failed: %v", err)
+		return
+	}
+	if err := kit.WriteFileAtomicDefault(subCacheFile(), b); err != nil {
+		log.Printf("subs cache save failed: %v", err)
 	}
 }
 
@@ -79,8 +84,10 @@ func loadSubCache() {
 		subMu.Lock()
 		subNodes = c.Nodes
 		rebuildSubKeysLocked()
+		// 长度必须在锁内读取: 否则与 resolveSubscriptions 并发时会读到未同步的 subNodes。
+		n := len(subNodes)
 		subMu.Unlock()
-		log.Printf("  订阅缓存: %d 个节点已恢复", len(subNodes))
+		log.Printf("  订阅缓存: %d 个节点已恢复", n)
 		// 缓存节点立即进入出口池, 不等首次订阅抓取
 		syncNodeBox()
 	}
@@ -181,7 +188,8 @@ func resolveSubscriptions(urls []string) {
 func subsRefreshInterval() time.Duration {
 	mins := getZenConfig().SubsRefreshMins
 	if mins < subRefreshMinMins {
-		mins = defaultSubsRefreshMins
+		// 低于下限夹到下限(而非回落默认), 与写入侧(越界直接 400)行为一致。
+		mins = subRefreshMinMins
 	}
 	if mins > subRefreshMaxMins {
 		mins = subRefreshMaxMins

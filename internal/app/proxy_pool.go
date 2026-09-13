@@ -87,11 +87,18 @@ func zenProxyCooldownStatus() map[string]string {
 	return out
 }
 
-// rebuildZenTransport 代理池或配置变化时重建 zen 上游 HTTP 客户端
+// rebuildZenTransport 代理池或配置变化时重建 zen 上游 HTTP 客户端。
+//
+// 必须显式关掉旧 transport 的空闲连接: 它持有已经建好的 TCP/TLS 连接,
+// 直接丢弃引用会让这些连接无人回收。setZenConfig 每次保存配置都会走到这里,
+// 所以"反复改配置"就是成批泄漏连接。
 func rebuildZenTransport() {
 	zenTransportMu.Lock()
-	defer zenTransportMu.Unlock()
+	if old, ok := zenHTTPClient.Transport.(*http.Transport); ok {
+		old.CloseIdleConnections()
+	}
 	zenHTTPClient = &http.Client{Transport: buildZenTransport()}
+	zenTransportMu.Unlock()
 }
 
 func getZenHTTPClient() *http.Client {
@@ -159,19 +166,23 @@ func pickZenProxyWhere(extra func(p string) bool) (string, int) {
 		idx = 0
 	}
 	// 冷却/未就绪/已检测不可达/该上游不可达的出口跳过: 线性探测下一个可用代理
+	found := false
 	for i := 0; i < n; i++ {
 		if zenProxyAvailable(idx) && nodeDialable(list[idx]) && nodeUsable(list[idx]) &&
 			(extra == nil || extra(list[idx])) {
+			found = true
 			break
 		}
 		idx = (idx + 1) % n
 	}
-	if !nodeDialable(list[idx]) {
-		return "", -1
-	}
-	if extra != nil && !extra(list[idx]) {
-		// 池里没有一个节点满足该上游的要求: 不要退而求其次乱拨, 交给上层决定
-		// (让出口决策走 catch-all / 兜底), 否则会被误认为"该上游可用"。
+	if !found {
+		// 整池都不满足条件时返回直连决策(交给上层), 不退而求其次。
+		//
+		// 这里曾经是: 循环跑满 n 次后又落回起始下标, 然后只检查一次
+		// nodeDialable 就把它返回 —— 于是冷却中 / 健康度为 fail /
+		// 该上游不可达的节点照样会被选中, 与函数注释声明的
+		// "全部不可用时返回直连" 完全相反。extra 那条分支下面本来
+		// 就有正确写法(返回 "", -1), 冷却与健康度这两条漏了。
 		return "", -1
 	}
 	return list[idx], idx

@@ -70,7 +70,11 @@ var (
 	statsToday    *zenStatsAgg
 	statsTotal    *zenStatsAgg
 	statsAggMu    sync.Mutex
-	statsFileInit sync.Once
+
+	// 可重试初始化: 用 Mutex + 状态替代 sync.Once, 打开失败后能重试而不永久降级。
+	statsInitMu     sync.Mutex
+	statsRollStarted bool
+	statsFilePath   string // 可赋值变量, 便于测试注入不可写路径
 )
 
 type zenStatsTracker struct {
@@ -109,22 +113,48 @@ func (t *zenStatsTracker) observeUsage(u map[string]any) {
 	}
 }
 
+// initStats 幂等且可重试地初始化统计:
+//   - 内存聚合对象始终建立, 即便落盘文件打不开也能在内存里统计(面板不再恒为 null);
+//   - 日界翻转协程只启动一次;
+//   - 落盘文件打开失败仅 log.Printf 并允许后续重试, 不永久关闭统计功能。
 func initStats() {
-	statsFileInit.Do(func() {
-		f, err := os.OpenFile(kit.ResolveDataPath("zen-stats.jsonl"), os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
-		if err != nil {
-			log.Printf("zen stats file open failed: %v", err)
-			return
-		}
-		statsFile = f
+	statsInitMu.Lock()
+	defer statsInitMu.Unlock()
+
+	if statsToday == nil {
 		statsToday = newZenStatsAgg()
+	}
+	if statsTotal == nil {
 		statsTotal = newZenStatsAgg()
-		agg := loadStatsFromFile()
-		if agg != nil {
-			statsTotal = agg
-		}
+	}
+
+	if !statsRollStarted {
+		statsRollStarted = true
 		go rollStatsDate()
-	})
+	}
+
+	// 已成功打开则直接返回(幂等)。
+	if statsFile != nil {
+		return
+	}
+
+	path := statsFilePath
+	if path == "" {
+		path = kit.ResolveDataPath("zen-stats.jsonl")
+	}
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
+	if err != nil {
+		log.Printf("zen stats file open failed (will retry on next record): %v", err)
+		return
+	}
+	statsFileMu.Lock()
+	statsFile = f
+	statsFileMu.Unlock()
+
+	agg := loadStatsFromFile(path)
+	if agg != nil {
+		statsTotal = agg
+	}
 }
 
 func newZenStatsAgg() *zenStatsAgg {
@@ -136,9 +166,9 @@ func newZenStatsAgg() *zenStatsAgg {
 }
 
 // loadStatsFromFile 从 JSONL 重建累计统计(仅今日的计入今日)
-func loadStatsFromFile() *zenStatsAgg {
+func loadStatsFromFile(path string) *zenStatsAgg {
 	agg := newZenStatsAgg()
-	data, err := os.ReadFile(kit.ResolveDataPath("zen-stats.jsonl"))
+	data, err := os.ReadFile(path)
 	if err != nil {
 		return nil
 	}

@@ -126,9 +126,12 @@ func handleProvidersUpdate(w http.ResponseWriter, r *http.Request) {
 	defer r.Body.Close()
 
 	var req struct {
-		Name     string          `json:"name"`
-		Provider *providerConfig `json:"provider"`
-		Remove   bool            `json:"remove"`
+		Name string `json:"name"`
+		// 用 map[string]json.RawMessage 而不是 providerConfig:
+		// 需要知道请求里到底提交了哪些字段, 才能做到"只改提交的字段"。
+		// 直接解成结构体的话, 未提交的字段会变成零值, 与"显式设成零值"无从区分。
+		Provider map[string]json.RawMessage `json:"provider"`
+		Remove   bool                       `json:"remove"`
 	}
 	if err := json.Unmarshal(body, &req); err != nil {
 		writeAPI(w, http.StatusBadRequest, apiResponse{Error: err.Error()})
@@ -168,11 +171,22 @@ func handleProvidersUpdate(w http.ResponseWriter, r *http.Request) {
 		writeAPI(w, http.StatusBadRequest, apiResponse{Error: "provider is required"})
 		return
 	}
-	if err := validateProviderConfig(req.Name, *req.Provider); err != nil {
+	// 以现有配置为底(新建时为零值), 只覆盖请求里真正出现的字段 ——
+	// 避免"只想改 baseUrl 却把 apiKeys/models 清空"。
+	base := providerConfig{}
+	if cur, ok := providerConfigFor(req.Name); ok {
+		base = cur
+	}
+	next, err := mergeProviderConfigPatch(base, req.Provider)
+	if err != nil {
+		writeAPI(w, http.StatusBadRequest, apiResponse{Error: "invalid provider: " + err.Error()})
+		return
+	}
+	next = normalizeProviderConfig(next)
+	if err := validateProviderConfig(req.Name, next); err != nil {
 		writeAPI(w, http.StatusBadRequest, apiResponse{Error: err.Error()})
 		return
 	}
-	next := normalizeProviderConfig(*req.Provider)
 	mutateProvidersConfig(func(cfg *zenConfigData) {
 		if cfg.Providers == nil {
 			cfg.Providers = map[string]providerConfig{}

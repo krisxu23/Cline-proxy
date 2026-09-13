@@ -217,14 +217,24 @@ func buildSummaryPrompt(previousSummary string, context []string) string {
 
 // ============ 摘要生成 ============
 
-func generateSummary(modelID, prompt string, maxSummary int) (string, error) {
+// summaryTimeout 单次摘要生成的上界。
+//
+// 摘要是在请求处理路径内同步发起的上游调用。原来用的是 context.Background(),
+// 既没有超时也不跟随客户端: 摘要模型一旦挂住(限流、地区拒绝、网络黑洞),
+// 这个请求就会无限期挂着, 客户端断开也取消不掉。
+const summaryTimeout = 90 * time.Second
+
+func generateSummary(ctx context.Context, modelID, prompt string, maxSummary int) (string, error) {
+	ctx, cancel := context.WithTimeout(ctx, summaryTimeout)
+	defer cancel()
+
 	body := map[string]any{
 		"model":      modelID,
 		"messages":   []any{map[string]any{"role": "user", "content": prompt}},
 		"max_tokens": maxSummary,
 		"stream":     false,
 	}
-	resp, _, err := callZenAPI(context.Background(), body, false)
+	resp, _, err := callZenAPI(ctx, body, false)
 	if err != nil {
 		return "", err
 	}
@@ -329,7 +339,10 @@ type compactOutcome struct {
 
 // maybeCompact 官方 compactIfNeeded 移植:
 // 估算超 context - max(output, buffer) 时 -> select -> 摘要 -> 重组 [system]+[摘要]+recent
-func maybeCompact(params map[string]any, m *ZenModel, sessionID string) compactOutcome {
+//
+// ctx 贯穿到摘要生成: 压缩是请求处理路径内的同步上游调用, 必须能被客户端断开
+// 取消, 否则一次挂住的摘要会把整个请求拖死。
+func maybeCompact(ctx context.Context, params map[string]any, m *ZenModel, sessionID string) compactOutcome {
 	cfg := getZenConfig()
 	if !cfg.Enabled || !cfg.Compaction.Auto {
 		return compactOutcome{}
@@ -408,7 +421,7 @@ func maybeCompact(params map[string]any, m *ZenModel, sessionID string) compactO
 	}
 	log.Printf("  compact: ctx=%d est=%d > threshold=%d keep=%d split@%d summary_model=%s",
 		context, estimateJSON(params), threshold, keep, sel.split, summaryModel)
-	summary, err := generateSummary(summaryModel, prompt, maxSum)
+	summary, err := generateSummary(ctx, summaryModel, prompt, maxSum)
 	if err != nil {
 		log.Printf("  compact: summary generation failed (%v), falling back to truncation", err)
 		return fallbackTruncate(params, m)
