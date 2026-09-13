@@ -37,6 +37,7 @@ func resetNodeBoxForTest(t *testing.T) {
 
 // 零节点也要建立实例: 否则"直连模式也经 sing-box"这条路径整个落空。
 func TestZeroNodesStillBuildsCatchAllInbound(t *testing.T) {
+	requireNodeBox(t)
 	withTestConfig(t, &zenConfigData{ExitMode: exitModeDirect})
 	resetNodeBoxForTest(t)
 	syncNodeBox()
@@ -54,6 +55,7 @@ func TestZeroNodesStillBuildsCatchAllInbound(t *testing.T) {
 
 // 直连模式下, 出站请求必须经 catch-all 入站(即经过 sing-box)而不是 Go 原生拨号。
 func TestDirectModeDialsThroughCatchAll(t *testing.T) {
+	requireNodeBox(t)
 	withTestConfig(t, &zenConfigData{ExitMode: exitModeDirect})
 	resetNodeBoxForTest(t)
 	syncNodeBox()
@@ -82,6 +84,7 @@ func TestDirectModeDialsThroughCatchAll(t *testing.T) {
 
 // 代理模式 + 无可用节点 + 兜底开启: 仍然经 catch-all 出网(由 sing-box 的 direct 出站), 不应报错。
 func TestProxyModeWithNoNodeRescuesThroughCatchAll(t *testing.T) {
+	requireNodeBox(t)
 	rescue := true
 	withTestConfig(t, &zenConfigData{ExitMode: exitModeProxy, RescueDirect: &rescue})
 	resetNodeBoxForTest(t)
@@ -110,6 +113,7 @@ func TestProxyModeWithNoNodeRescuesThroughCatchAll(t *testing.T) {
 
 // 代理模式 + 无可用节点 + 兜底关闭: 必须明确失败, 不能偷偷直连。
 func TestProxyModeNoNodeWithoutRescueFails(t *testing.T) {
+	requireNodeBox(t)
 	rescue := false
 	withTestConfig(t, &zenConfigData{ExitMode: exitModeProxy, RescueDirect: &rescue})
 	resetNodeBoxForTest(t)

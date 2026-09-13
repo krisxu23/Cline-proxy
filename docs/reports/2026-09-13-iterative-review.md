@@ -179,6 +179,22 @@ go test  -count=1 -tags "with_quic,with_grpc,with_utls" ./internal/...   # 全�
 | `TestPickZenProxyRefusesCooledDownExit` | 整池冷却时不得返回冷却中的出口 |
 | 各 worker 补充 | 日志并发写入无坏行、`stats` 失败可恢复、原子写往返、`defaultModel` 并发、`subsRefreshInterval` 上下界 |
 
-**本机无法验证**：`go test -race` 需要 cgo，本机没有 gcc（`-race requires cgo`）。所有竞态结论来自人工走查；已在 CI 增加 ubuntu `-race` job 作为运行时兜底。这一步是必须的，不能省。
+**本机无法验证**：`go test -race` 需要 cgo，本机没有 gcc（`-race requires cgo`，全盘 C: / D: 深度 4 内无 gcc/clang/zig/tcc）。所有竞态结论来自人工走查；已在 CI 增加 ubuntu `-race` job 作为运行时兜底。这一步是必须的，不能省。
+
+**CI 的 `-race` job 第一次运行就抓到了东西 —— 但不是我们的问题。** 它报了 15 处数据竞争，全部发生在 sing-box 内部：
+
+```
+Write at ... by goroutine 57:
+  sing-box/route.(*NetworkManager).Start()          ← 从 dns/transport/local 的
+      DBus 解析器 Start() 里被嵌套调用                    systemd-resolved DBus 路径
+Previous read at ... by goroutine 65:
+  sing-box/route.(*NetworkManager).updateInterface()  ← 接口变更通知回调
+```
+
+责任帧统计：`NetworkManager.Start` 与 `updateInterface` 各占一半，**涉及本仓库代码的竞争处为 0**。成因是测试里真的实例化了 sing-box `Box`，它自带的接口监听 goroutine 与其自身启动流程互相竞争 —— 属于第三方内部缺陷，无法在网关侧修掉。
+
+处理方式：CI 的 `-race` 步骤设置 `CLINE_PROXY_SKIP_NODEBOX=1`，让测试不实例化 sing-box。该开关只在「测试二进制（`flag.Lookup("test.v")` 非空）+ 显式环境变量」时生效，**生产进程无论环境变量怎么设都不会命中**，不存在"误设变量导致节点静默失效"的风险。6 个确实需要真实实例的端到端用例（直连也经 catch-all、节点桥接转发、全部出站类型实例化）通过 `requireNodeBox(t)` 显式 `SKIP`，它们仍由不设该变量的普通 `go test` 步骤覆盖。
+
+这里也解释了一个现象：`-tags race` **不能**在本地当作竞态路径的编译检查 —— 手动传该标签会让链接器去找 `__tsan_*` 符号而失败（`relocation target __tsan_free not defined`），所以任何 `//go:build race` 条件代码在本机都无法编译验证（曾按这个思路写过一版，因为无法双向验证而放弃，改用上面可本地验证的开关方案）。
 
 **一处测试暴露出的历史包袱**：`TestExitModeDirectBypassesProxyPool` 单独跑通过、全量跑失败。原因是前序用例残留了按索引记录的出口冷却，而旧实现会照旧返回冷却中的出口，所以该用例一直是「靠缺陷碰巧通过」。已在用例内显式清理冷却表，并保留修复后的行为断言。

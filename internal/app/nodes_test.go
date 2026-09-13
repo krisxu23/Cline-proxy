@@ -192,6 +192,7 @@ func TestIsNodeLink(t *testing.T) {
 
 // TestNodeBridgeEndToEnd 全链路: 网关节点桥 → 本地 sing-box 假节点服务器 → 目标回声服务
 func TestNodeBridgeEndToEnd(t *testing.T) {
+	requireNodeBox(t)
 	nodeMu.Lock()
 	if nodeBox != nil {
 		nodeBox.Close()
@@ -267,6 +268,7 @@ func TestNodeBridgeEndToEnd(t *testing.T) {
 // TestAllOutboundTypesRegistered 验证带构建标签的产物中,
 // 全部受支持节点类型都能被 sing-box 实例化(出站惰性拨号, 无需真实服务器)。
 func TestAllOutboundTypesRegistered(t *testing.T) {
+	requireNodeBox(t)
 	cfg := map[string]any{
 		"log": map[string]any{"disabled": true},
 		"dns": map[string]any{"servers": []any{map[string]any{"type": "udp", "tag": "dns-direct", "server": "8.8.8.8"}}},

@@ -5,10 +5,12 @@ import (
 	"crypto/tls"
 	"encoding/base64"
 	"encoding/json"
+	"flag"
 	"fmt"
 	"log"
 	"net"
 	"net/url"
+	"os"
 	"sort"
 	"strconv"
 	"strings"
@@ -82,9 +84,34 @@ func nodeLocalAddr(link string) string {
 	return ""
 }
 
+// nodeBoxSkipEnv 设置后, 测试进程不再实例化真实 sing-box。
+//
+// 为什么需要: sing-box 的 Box 起来后会拉起自己的后台 goroutine(网络接口变更
+// 监听、systemd-resolved 的 DBus 连接), 这些**第三方内部实现**之间存在数据竞争
+// —— CI 的 -race 任务实测报了 15 处, 全部是
+// route.(*NetworkManager).Start() 与 route.(*NetworkManager).updateInterface()
+// 之间的竞争, 没有任何一处涉及本仓库代码。它们无法在网关侧修掉, 但会让整个
+// -race 任务变红, 反而掩盖我们自己代码里真正需要被发现的问题。
+//
+// 所以 -race 任务带上这个变量, 让测试不建实例; 确实需要真实实例的用例通过
+// requireNodeBox(t) 显式跳过, 它们继续在普通构建下运行。
+const nodeBoxSkipEnv = "CLINE_PROXY_SKIP_NODEBOX"
+
+// nodeBoxSkipRequested 是否应跳过实例化 sing-box。
+//
+// 只在"当前是测试二进制"且"显式设了环境变量"时成立 —— 加了测试二进制的判定,
+// 生产进程无论环境变量怎么设都不会命中, 不存在"误设变量导致节点静默失效"的风险。
+func nodeBoxSkipRequested() bool {
+	return flag.Lookup("test.v") != nil && os.Getenv(nodeBoxSkipEnv) != ""
+}
+
 // syncNodeBox 按代理列表节点链接 + 订阅解析节点重建 sing-box 实例
 // (setZenConfig/订阅刷新/启动时调用)
 func syncNodeBox() {
+	if nodeBoxSkipRequested() {
+		log.Printf("  nodes: %s 已设置, 跳过 sing-box 实例化(仅用于测试进程)", nodeBoxSkipEnv)
+		return
+	}
 	nodeMu.Lock()
 	defer nodeMu.Unlock()
 
