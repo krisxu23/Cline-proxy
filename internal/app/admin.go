@@ -99,25 +99,60 @@ func registerAdminRoutes(mux *http.ServeMux) {
 	})
 }
 
+// adminTokenPromptHTML 无令牌访问 /admin/ 时返回的小提示页。
+//
+// 此前 /admin/ 对任何本地进程都返回完整 121KB 外壳(含全部前端 JS), 同机多账号
+// 共享场景等于把管理界面裸暴露。现在只有带有效令牌才回完整外壳, 否则回这段几百
+// 字节、不含任何前端 JS 的提示页, 告诉用户令牌从哪儿拿。注意它是 200 而非 401:
+// 用户双击 exe 后浏览器第一次访问必然没 token, 得让他「看得到去哪拿 token」。
+const adminTokenPromptHTML = `<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Cline Proxy · 需要访问令牌</title>
+<style>body{font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif;background:#0f172a;color:#e2e8f0;display:flex;min-height:100vh;align-items:center;justify-content:center;margin:0}main{max-width:540px;padding:32px;background:#1e293b;border-radius:12px;line-height:1.7}h1{font-size:20px;margin:0 0 12px}code{background:#0f172a;padding:2px 6px;border-radius:4px;word-break:break-all}a{color:#60a5fa}p{margin:10px 0}</style>
+</head>
+<body><main>
+<h1>管理后台需要访问令牌</h1>
+<p>本页面未携带有效的访问令牌, 因此只返回这段提示, 不加载完整管理界面(含全部前端脚本)。</p>
+<p>令牌位置(任选其一):</p>
+<p>1. 启动横幅 / 托盘弹出的面板地址已自带 <code>?token=…</code>, 直接用它打开即可。</p>
+<p>2. 数据目录下的 <code>data/admin-token</code> 文件, 把它拼到地址后面: <code>/admin/?token=文件内容</code>。</p>
+<p>带令牌打开后, 会话 Cookie 会被种下, 之后同源请求无需每次带 token。</p>
+</main></body></html>`
+
 func adminStaticHandler(w http.ResponseWriter, r *http.Request) {
 	if r.URL.Path == "/admin/" || r.URL.Path == "/admin" {
-		// 面板 HTML 本身不含任何凭据, 可以匿名取; 真正的数据都在 /admin/api/*
-		// 后面。用带 ?token= 的地址打开时校验一次并种下会话 Cookie, 之后同源
-		// 的 fetch 会自动携带, 面板 JS 不需要任何改动。
-		if q := strings.TrimSpace(r.URL.Query().Get("token")); q != "" {
-			if token := loadOrCreateAdminToken(); token != "" && tokenEqual(q, token) {
-				http.SetCookie(w, &http.Cookie{
-					Name:     adminTokenCookie,
-					Value:    token,
-					Path:     "/",
-					HttpOnly: true,
-					SameSite: http.SameSiteStrictMode,
-				})
+		// 校验令牌: 支持 ?token= 或已种下的会话 Cookie。面板 HTML 本身不含任何
+		// 凭据, 但此前对**任何**本地进程都返回完整 121KB 外壳(含全部前端 JS),
+		// 同机多账号共享场景下等于把管理界面裸暴露。现在改为: 没令牌只回一个
+		// 几百字节的「请附带令牌」提示页, 带令牌才回完整外壳。
+		ok := false
+		if token := loadOrCreateAdminToken(); token != "" {
+			if provided := adminTokenFrom(r); provided != "" && tokenEqual(provided, token) {
+				ok = true
+				// 令牌来自查询参数时种下会话 Cookie, 后续同源请求自动携带。
+				if strings.TrimSpace(r.URL.Query().Get("token")) != "" {
+					http.SetCookie(w, &http.Cookie{
+						Name:     adminTokenCookie,
+						Value:    token,
+						Path:     "/",
+						HttpOnly: true,
+						SameSite: http.SameSiteStrictMode,
+					})
+				}
 			}
 		}
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		if ok {
+			w.WriteHeader(http.StatusOK)
+			w.Write([]byte(adminHTML))
+			return
+		}
+		// 无令牌: 返回小提示页(非 401, 否则双击 exe 后浏览器首次访问看不到任何内容)。
 		w.WriteHeader(http.StatusOK)
-		w.Write([]byte(adminHTML))
+		w.Write([]byte(adminTokenPromptHTML))
 		return
 	}
 	http.NotFound(w, r)
@@ -906,7 +941,9 @@ func saveProxyConfig() {
 	if err != nil {
 		return
 	}
-	if err := os.WriteFile(proxyConfigFile(), data, 0600); err != nil {
+	// 全仓此前唯一的"先截断再写"非原子写: 写到一半被强杀会留下半个 JSON, 下次
+	// 启动解析失败 -> 配置静默丢失。改用原子写(临时文件 + fsync + rename)。
+	if err := kit.WriteFileAtomicDefault(proxyConfigFile(), data); err != nil {
 		log.Printf("proxy config save failed: %v", err)
 	}
 }
@@ -1009,7 +1046,7 @@ func handleAdminConfig(w http.ResponseWriter, r *http.Request) {
 		"listenAddr":   proxyListenAddress,
 		"apiBase":      localOrigin(),
 		"strategy":     cfg.Strategy,
-		"version":      "go-1.1",
+		"version":      buildVersion,
 		"poolPath":     poolPath,
 		"defaultModel": getDefaultModel(),
 		"headers":      cfg.Headers,
@@ -1132,9 +1169,11 @@ func handleAdminHeadersSync(w http.ResponseWriter, r *http.Request) {
 // GET /admin/api/models
 func handleAdminModels(w http.ResponseWriter, r *http.Request) {
 	ensureModelsFresh()
+	// modelsSyncStamp 带锁读 lastSync: 同步协程在持锁状态下写它,
+	// 直接裸读会与 /models/refresh 并发竞争。
 	writeAPI(w, http.StatusOK, apiResponse{Success: true, Data: map[string]any{
 		"models":   getFreeModels(),
-		"lastSync": modelsLastSync,
+		"lastSync": modelsSyncStamp(),
 	}})
 }
 
@@ -1184,7 +1223,7 @@ func handleAdminStats(w http.ResponseWriter, r *http.Request) {
 			"cooldown": cooldown,
 			"expired":  expired,
 			"strategy": "round_robin",
-			"version":  "go-1.1",
+			"version":  buildVersion,
 		},
 	})
 }

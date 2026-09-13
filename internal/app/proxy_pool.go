@@ -228,6 +228,36 @@ func maskProxyURL(raw string) string {
 	return u.String()
 }
 
+// maskURLForLog 专用于日志: maskProxyURL 只遮 User, 但订阅链接更常见的是
+// ?token=xxx / #password=xxx 这类查询参数与片段 —— 那些它一概不遮。
+//
+// 日志文件在 data/ 下, 常被云同步盘和一键备份整目录收走, 一条落盘等于
+// 长期访问权限外泄。所以这里把 User、查询参数、片段全部替换, 只留
+// scheme+host+path 让人能认出是哪条订阅。
+func maskURLForLog(raw string) string {
+	if raw == "" {
+		return raw
+	}
+	if u, err := url.Parse(raw); err == nil && u.Scheme != "" && u.Host != "" {
+		if u.User != nil {
+			u.User = url.User("***")
+		}
+		if u.RawQuery != "" {
+			u.RawQuery = "***"
+		}
+		if u.RawFragment != "" {
+			u.RawFragment = "***"
+		}
+		return u.String()
+	}
+	// 非标准 URL(vmess://vless:// 这类把凭据编码进整条字符串的写法):
+	// 只留 scheme, 其余整段遮掉。日志需要的是"哪条订阅出了问题", 不是内容。
+	if i := strings.IndexAny(raw, "://"); i >= 0 {
+		return raw[:i+3] + "***"
+	}
+	return "***"
+}
+
 func buildZenTransport() *http.Transport {
 	t := &http.Transport{
 		MaxIdleConns:        100,

@@ -2,7 +2,6 @@ package app
 
 import (
 	"context"
-	"crypto/tls"
 	"encoding/base64"
 	"encoding/json"
 	"flag"
@@ -29,13 +28,51 @@ import (
 // 内嵌 sing-box 把每个节点转成本地 mixed 入站端口, 拨号层当作普通 http 代理使用。
 // 轮询/冷却/策略逻辑与 http/socks5 代理完全一致。
 
+// nodeBoxInstance 是 sing-box 实例的抽象。用接口而不是具体 *box.Box, 是为了让测试
+// 能注入替身(不实例化真实 sing-box)来验证 failKeepOld 等核心并发逻辑, 见 §2.3 第 9/22 项。
+type nodeBoxInstance interface {
+	Start() error
+	Close() error
+}
+
+// 锁顺序(唯一合法): nodeMu -> subMu。
+// 只有在已经持有 nodeMu 的情况下才能再取 subMu; 反向(subMu 内取 nodeMu)禁止。
+// syncNodeBox 在持 nodeMu 时短暂取 subMu 仅做快照并立即释放, 绝不在持 subMu 期间做慢操作;
+// resolveSubscriptions 也只在持 subMu 时快照, 慢操作(saveSubCacheLocked)放到释放 subMu 之后。
+// 见 §2.3 第 10 项。
 var (
 	nodeMu        sync.Mutex
-	nodeBox       *box.Box
+	nodeBox       nodeBoxInstance
 	nodePorts     map[string]int // 节点链接(去 # 名称) -> 本地 mixed 端口
 	nodePortsKeys string         // 当前运行实例对应的链接集合, 用于配置变化比对
 	catchAllPort  int            // 常驻 catch-all 入站的本地端口(0 = 未就绪)
 )
+
+// startNodeInstanceFn 是可替换的实例构建入口: 测试可注入错误以验证 failKeepOld(§2.6 第 22 项),
+// 或注入替身以避开真实 sing-box 实例化(配合 CLINE_PROXY_SKIP_NODEBOX)。默认指向 startNodeInstance。
+//
+// 配套的 startNodeInstanceInjected 记录「钩子是否被测试替换过」。这里不能用函数值做相等
+// 比较 —— Go 里 func 只能和 nil 比, `startNodeInstanceFn == startNodeInstance` 编译不过。
+// 所以单独一个 bool 追踪, 统一由 setStartNodeInstanceFn 维护, 测试不要直接给 var 赋值。
+var startNodeInstanceFn = startNodeInstance
+var startNodeInstanceInjected bool
+
+// setStartNodeInstanceFn 替换实例构建入口并记下「已被替换」; 传 nil 恢复默认实现。
+func setStartNodeInstanceFn(fn func(ctx context.Context, inbounds, outbounds, rules []map[string]any) (nodeBoxInstance, error)) {
+	if fn == nil {
+		startNodeInstanceFn = startNodeInstance
+		startNodeInstanceInjected = false
+		return
+	}
+	startNodeInstanceFn = fn
+	startNodeInstanceInjected = true
+}
+
+// testNodeComprehensiveFn 是可替换的单节点探测入口, 默认指向 testNodeComprehensive。
+// 测试可注入替身以绕开真实网络探测(节点连通检测依赖出口链路), 用于锁住 healthRunAgain
+// 重入补跑等并发行为(§2.6 第 23 项)。这里只做直接赋值, 没有「是否被替换」的判定需求,
+// 所以不需要配套的注入标记。
+var testNodeComprehensiveFn = testNodeComprehensive
 
 // catchAllInTag 常驻兜底入站: 让"任何非节点直选"的网络行为也经 sing-box 出去。
 // 它的 route.final 是 direct, 因此出口模式为直连时, 流量依然在 sing-box 内部
@@ -107,14 +144,20 @@ func nodeBoxSkipRequested() bool {
 
 // syncNodeBox 按代理列表节点链接 + 订阅解析节点重建 sing-box 实例
 // (setZenConfig/订阅刷新/启动时调用)
+//
+// 并发模型(修复 §2.3 第 9 项): 锁内只做 map 快照 + 原子替换; box 的构建
+// (startNodeInstance 内含 freeLocalPort / box.New)与 Start 都是可达秒级的 I/O,
+// 全部挪到锁外执行, 持锁期间不再阻塞任何读节点 / 取出口的请求。
+// 失败路径一律不改全局状态, 旧实例继续服务(§4 已确认 failKeepOld 性质不变)。
 func syncNodeBox() {
-	if nodeBoxSkipRequested() {
+	// 普通测试进程: 跳过真实 sing-box 实例化(sing-box 后台 goroutine 自身有竞争, 见 nodeBoxSkipEnv)。
+	// 但若测试注入了 startNodeInstanceFn, 说明要走注入的错误/替身路径, 此时仍需放行(注入点不会真正实例化 sing-box)。
+	if nodeBoxSkipRequested() && !startNodeInstanceInjected {
 		log.Printf("  nodes: %s 已设置, 跳过 sing-box 实例化(仅用于测试进程)", nodeBoxSkipEnv)
 		return
 	}
+	// ---- 快照阶段: 仅持 nodeMu 做 map 快照 + 重建判定 ----
 	nodeMu.Lock()
-	defer nodeMu.Unlock()
-
 	cfg := getZenConfig()
 	var entries []any
 	seen := map[string]bool{}
@@ -130,6 +173,8 @@ func syncNodeBox() {
 		seen[key] = true
 		entries = append(entries, line)
 	}
+	// 锁序 nodeMu -> subMu: 仅在持 nodeMu 时取 subMu, 仅做快照后立刻释放,
+	// 绝不在持 subMu 期间做慢操作(§2.3 第 10 项)。
 	subMu.Lock()
 	entries = append(entries, subNodes...)
 	subMu.Unlock()
@@ -146,35 +191,48 @@ func syncNodeBox() {
 	// 零节点启动时 joined 与初值都是空串, 但实例还没建, 要建出只含
 	// catch-all 的实例(直连模式也要经过 sing-box)。
 	if joined == nodePortsKeys && nodeBox != nil {
+		nodeMu.Unlock()
 		return
 	}
+	// 快照旧实例, 失败回滚 / 成功后关闭都基于此快照。
+	prevBox, prevPorts, prevCatchAll := nodeBox, nodePorts, catchAllPort
+	hasPrev := prevBox != nil
+	nodeMu.Unlock()
 
-	if nodeBox != nil {
-		nodeBox.Close()
-		nodeBox = nil
-		nodePorts = nil
-		nodePortsKeys = ""
-		catchAllPort = 0
-	}
-
-	var inbounds, outbounds, rules []map[string]any
+	// ---- 构建阶段: 锁外完成可达秒级的 I/O(freeLocalPort / box.New / Start) ----
+	// 三条失败路径均不修改全局状态: 旧实例继续服务, 出口池不被清空, catch-all 保留旧值。
 	ports, inbounds, outbounds, rules, hasMap := buildNodeParts(entries)
 
 	// 常驻 catch-all 入站: 与节点数量无关, 保证"只要网关联网就经过 sing-box"。
 	// 零节点时也建实例 —— 直连模式下流量仍走 sing-box 的 direct 出站。
-	if cp, err := freeLocalPort(); err == nil {
-		catchAllPort = cp
+	newCatchAll := prevCatchAll
+	if cp, cerr := freeLocalPort(); cerr != nil {
+		// 缺 catch-all 的新实例比旧实例更糟, 此时宁可保留旧实例。
+		if hasPrev {
+			log.Printf("  nodes: catch-all 入站端口分配失败(%v), 保留上一个可用实例", cerr)
+			return
+		}
+		log.Printf("  nodes: catch-all 入站端口分配失败: %v", cerr)
+	} else {
+		newCatchAll = cp
 		inbounds = append(inbounds, map[string]any{
 			"type": "mixed", "tag": catchAllInTag,
 			"listen": "127.0.0.1", "listen_port": cp,
 		})
-	} else {
-		log.Printf("  nodes: catch-all 入站端口分配失败: %v", err)
 	}
 	outbounds = append(outbounds, map[string]any{"type": "direct", "tag": "direct"})
 
+	// failKeepOld 构建/启动失败时保留上一个可用实例继续服务
+	failKeepOld := func(why error) {
+		if hasPrev {
+			log.Printf("  nodes: %v; 保留上一个可用实例(%d 个出口)继续服务", why, len(prevPorts))
+		} else {
+			log.Printf("  nodes: 启动失败: %v", why)
+		}
+	}
+
 	ctx := include.Context(context.Background())
-	instance, err := startNodeInstance(ctx, inbounds, outbounds, rules)
+	instance, err := startNodeInstanceFn(ctx, inbounds, outbounds, rules)
 	if err != nil && hasMap {
 		// 订阅提供的原始出站可能有个别不合法: 退回仅手动节点链接重建,
 		// 避免单个坏节点拖垮全部出口
@@ -182,14 +240,14 @@ func syncNodeBox() {
 		var p2, inb2, outb2, rules2, _ = buildNodeParts(stringEntries(entries))
 		if len(outb2) > 0 {
 			// 退回重建同样要保留 catch-all, 否则"全部经 sing-box"在这条路径上失效
-			if catchAllPort != 0 {
+			if newCatchAll != 0 {
 				inb2 = append(inb2, map[string]any{
 					"type": "mixed", "tag": catchAllInTag,
-					"listen": "127.0.0.1", "listen_port": catchAllPort,
+					"listen": "127.0.0.1", "listen_port": newCatchAll,
 				})
 			}
 			outb2 = append(outb2, map[string]any{"type": "direct", "tag": "direct"})
-			if inst2, err2 := startNodeInstance(ctx, inb2, outb2, rules2); err2 == nil {
+			if inst2, err2 := startNodeInstanceFn(ctx, inb2, outb2, rules2); err2 == nil {
 				instance, ports, err = inst2, p2, nil
 			} else {
 				err = err2
@@ -197,18 +255,36 @@ func syncNodeBox() {
 		}
 	}
 	if err != nil {
-		log.Printf("  nodes: 启动失败: %v", err)
+		failKeepOld(err)
 		return
 	}
 	if err := instance.Start(); err != nil {
 		instance.Close()
-		log.Printf("  nodes: 启动失败: %v", err)
+		failKeepOld(fmt.Errorf("启动失败: %v", err))
 		return
 	}
-	nodeBox = instance
-	nodePorts = ports
-	nodePortsKeys = joined
-	log.Printf("  nodes: %d 个高级节点出口已就绪", len(ports))
+
+	// ---- 替换阶段: 重新持锁做原子替换 ----
+	// 期间若没有其它 sync 替换过实例(nodeBox 仍等于快照里的旧实例), 才关闭旧实例并换上新实例;
+	// 否则说明并发的另一次 sync 已经接手, 本次刚建好的新实例直接丢弃, 保留现有实例。
+	// 这保证了 failKeepOld 的核心不变量: 先建新实例、成功才 Close 旧实例, 无半替换窗口,
+	// 且任何失败路径都不修改全局状态(§2.6 第 22 项测试锁住此性质)。
+	nodeMu.Lock()
+	if nodeBox == prevBox {
+		if prevBox != nil {
+			prevBox.Close()
+		}
+		nodeBox = instance
+		nodePorts = ports
+		nodePortsKeys = joined
+		catchAllPort = newCatchAll
+		log.Printf("  nodes: %d 个高级节点出口已就绪", len(ports))
+	} else {
+		// 期间已被其它 sync 替换: 丢弃本次刚建好的新实例, 保留现有实例。
+		instance.Close()
+	}
+	nodeMu.Unlock()
+
 	// 稍后再做连通检测: 上百个节点同时拨号会占满出口与 CPU, 让面板先可用。
 	// 在此之前 healthOf 返回 unknown, 出口照常参与轮询(未探测≠不可用)。
 	go func() {
@@ -275,6 +351,10 @@ var (
 	nodeHealth        = map[string]nodeHealthState{}
 	nodeHealthRunMu   sync.Mutex
 	nodeHealthRunning bool
+	// healthRunAgain 本轮检测进行中又有人触发时置位: 上一轮结束后补跑一次。
+	// 订阅刷新会反复触发 syncNodeBox → 排检测, 原来"重入即静默丢弃"会让新刷进来的
+	// 节点一直挂到下一个 30 分钟周期才被测, 面板上表现为"永远是白色未检测"。
+	healthRunAgain bool
 )
 
 // nodeStartupHealthDelay 启动后第一次连通检测前的等待。
@@ -283,8 +363,9 @@ var (
 const nodeStartupHealthDelay = 12 * time.Second
 
 type nodeHealthState struct {
-	Ok bool
-	At time.Time
+	Ok     bool
+	At     time.Time
+	Result nodeTestResult // 增强测试引擎的完整结果(活性/出口IP/测速/MITM/分类)
 }
 
 // healthCheckTargets 连通检测目标: zen 主端点与 cline 上游的 host
@@ -301,46 +382,42 @@ func healthCheckTargets() []string {
 	return hosts
 }
 
-// checkNodeHealth 经单个节点出口连到上游: 任一目标 TLS 握手成功即健康
+// checkNodeHealth 经单个节点出口跑增强测试(活性/出口IP/测速/MITM/分类)。
+// 增强测试的"健康"判定: 活且无 MITM 风险且未断流。
+// 上游可达性矩阵(probeUpstreamMatrixAsync)仍独立运行, 两者互补。
 func checkNodeHealth(key string) bool {
-	targets := healthCheckTargets()
-	if len(targets) == 0 {
-		return false
-	}
-	ctx, cancel := context.WithTimeout(context.Background(), 14*time.Second)
-	defer cancel()
-	for _, host := range targets {
-		conn, err := dialNodeProxy(ctx, key, "tcp", host+":443")
-		if err != nil {
-			continue
-		}
-		hsCtx, hsCancel := context.WithTimeout(ctx, 7*time.Second)
-		err = tls.Client(conn, &tls.Config{ServerName: host}).HandshakeContext(hsCtx)
-		hsCancel()
-		conn.Close()
-		if err == nil {
-			return true
-		}
-	}
-	return false
+	r := testNodeComprehensiveFn(key)
+	// 健康 = 节点存活 + 无 MITM 劫持 + 未断流
+	ok := r.Alive && !r.MITMRisk && !r.IsStalled
+	return ok
 }
 
-// checkAllNodeHealth 并发检测全部节点出口(10 并发)。
+// checkAllNodeHealth 并发检测全部节点出口, 并发数随节点规模放大(上限 48)。
 // 同时只允许一轮: 节点集合在启动阶段会被订阅解析触发多次重建, 每轮重建都会
 // 排一次检测, 不设防会让上百个节点的探测成倍重复, 把出口池与 CPU 一起打满
 // (面板的"加载失败"与卡顿就是被这种重复风暴拖出来的)。
+//
+// 但"重入即丢弃"必须补偿: 置 healthRunAgain 让上一轮结束后立刻补跑, 否则订阅
+// 新刷进来的节点要等到下一个 30 分钟周期才被测。
 func checkAllNodeHealth() {
 	nodeHealthRunMu.Lock()
 	if nodeHealthRunning {
+		healthRunAgain = true
 		nodeHealthRunMu.Unlock()
 		return
 	}
 	nodeHealthRunning = true
+	healthRunAgain = false
 	nodeHealthRunMu.Unlock()
 	defer func() {
 		nodeHealthRunMu.Lock()
 		nodeHealthRunning = false
+		again := healthRunAgain
+		healthRunAgain = false
 		nodeHealthRunMu.Unlock()
+		if again {
+			checkAllNodeHealth()
+		}
 	}()
 
 	nodeMu.Lock()
@@ -350,11 +427,23 @@ func checkAllNodeHealth() {
 	}
 	nodeMu.Unlock()
 	if len(keys) == 0 {
+		// 出口池为空 = sing-box 实例没起来(构建失败)。必须显式告警: 静默 return
+		// 会让面板上一切节点永远停在"未检测", 而看不出是池子挂了。
+		log.Printf("  nodes: 没有可检测的出口(sing-box 实例未就绪), 本轮检测跳过")
 		return
+	}
+	// 并发随规模走: 固定 10 并发跑 800+ 节点, 一轮要几十分钟, 远超 30 分钟周期,
+	// 导致绝大多数节点在两次周期之间始终没被测到。
+	workers := nodeTestWorkers
+	if w := len(keys) / 4; w > workers {
+		workers = w
+	}
+	if workers > nodeTestMaxWorkers {
+		workers = nodeTestMaxWorkers
 	}
 	var okCount int32
 	var mu sync.Mutex
-	sem := make(chan struct{}, 10)
+	sem := make(chan struct{}, workers)
 	var wg sync.WaitGroup
 	for _, k := range keys {
 		wg.Add(1)
@@ -362,19 +451,20 @@ func checkAllNodeHealth() {
 			defer wg.Done()
 			sem <- struct{}{}
 			defer func() { <-sem }()
-			ok := checkNodeHealth(key)
+			r := testNodeComprehensiveFn(key)
+			ok := r.Alive && !r.MITMRisk && !r.IsStalled
 			mu.Lock()
 			if ok {
 				okCount++
 			}
 			mu.Unlock()
 			nodeHealthMu.Lock()
-			nodeHealth[key] = nodeHealthState{Ok: ok, At: time.Now()}
+			nodeHealth[key] = nodeHealthState{Ok: ok, At: time.Now(), Result: r}
 			nodeHealthMu.Unlock()
 		}(k)
 	}
 	wg.Wait()
-	log.Printf("  nodes: 连通检测完成, %d/%d 个出口可达", okCount, len(keys))
+	log.Printf("  nodes: 增强检测完成(%d 并发), %d/%d 个出口可达", workers, okCount, len(keys))
 	// 连通性刷新后, 同步刷新地区受限模型的节点能力标记, 以及
 	// "节点 × 每个上游"的可达性矩阵(后者用于选节点时跳过到该上游不通的节点)。
 	probeRegionModelsAsync()
@@ -411,14 +501,23 @@ func buildNodeParts(entries []any) (ports map[string]int, inbounds, outbounds, r
 		var err error
 		switch v := e.(type) {
 		case string:
-			port, err = freeLocalPort()
-			if err != nil {
-				log.Printf("  node %d: 分配本地端口失败: %v", i+1, err)
-				continue
-			}
 			ob, err = nodeOutbound(v, fmt.Sprintf("out-%d", i))
 			if err != nil {
 				log.Printf("  node %d: 解析失败已跳过: %v", i+1, err)
+				continue
+			}
+			// 链接解析出的出站必须同样过 sing-box 校验。订阅聚合源里常有 sing-box
+			// 不认的写法(实测 ss 的 chacha20-poly1305), 只校验 map 分支会让这类坏
+			// 节点一路进到 box.New, 把**整个实例**打死 → nodePorts 归零 → 健康检测
+			// 直接跳过 → 面板上全部节点永久停在"未检测"。校验只做 box.New 不建连,
+			// 成本极低, 逐节点剔除即可。
+			if verr := validateOutboundEntry(ob); verr != nil {
+				log.Printf("  node %d(%s): 出站无效已剔除: %v", i+1, subEntryKey(v), verr)
+				continue
+			}
+			port, err = freeLocalPort()
+			if err != nil {
+				log.Printf("  node %d: 分配本地端口失败: %v", i+1, err)
 				continue
 			}
 			key = nodeLocalKey(v)
@@ -460,7 +559,7 @@ func buildNodeParts(entries []any) (ports map[string]int, inbounds, outbounds, r
 }
 
 // startNodeInstance 组装并创建 sing-box 实例(不 Start)
-func startNodeInstance(ctx context.Context, inbounds, outbounds, rules []map[string]any) (*box.Box, error) {
+func startNodeInstance(ctx context.Context, inbounds, outbounds, rules []map[string]any) (nodeBoxInstance, error) {
 	dnsCfg, resolverTag := buildNodeDNS(getZenConfig())
 	boxCfg := map[string]any{
 		"log":       map[string]any{"disabled": true},
@@ -541,6 +640,17 @@ type nodeView struct {
 	Health    string          `json:"health"`              // ok / fail / unknown
 	Regions   []string        `json:"regions,omitempty"`   // 该出口已验证可用的地区受限模型
 	Upstreams map[string]bool `json:"upstreams,omitempty"` // 该出口到各上游的可达性
+
+	// 增强检测数据(来自 nodeTestResult)
+	LatencyMs   int64  `json:"latencyMs,omitempty"`
+	ExitIP      string `json:"exitIp,omitempty"`
+	ExitCountry string `json:"exitCountry,omitempty"`
+	ExitASNorg  string `json:"exitAsnOrg,omitempty"`
+	SpeedBPS    int64  `json:"speedBps,omitempty"`
+	IsStalled   bool   `json:"isStalled"`
+	MITMRisk    bool   `json:"mitmRisk"`
+	IsWarp      bool   `json:"isWarp"`
+	NetworkType string `json:"networkType,omitempty"` // datacenter/residential/mobile/cdn/unknown
 }
 
 // healthOf 节点最近一次连通检测结果
@@ -555,6 +665,17 @@ func healthOf(key string) string {
 		return "ok"
 	}
 	return "fail"
+}
+
+// healthResultOf 节点最近一次增强检测结果(可能为零值)
+func healthResultOf(key string) (nodeTestResult, bool) {
+	nodeHealthMu.RLock()
+	defer nodeHealthMu.RUnlock()
+	st, ok := nodeHealth[key]
+	if !ok {
+		return nodeTestResult{}, false
+	}
+	return st.Result, true
 }
 
 // nodeLinkScheme 取节点链接/代理的协议名
@@ -595,6 +716,22 @@ func subNodeDisplayName(tag string) string {
 	return tag
 }
 
+// withHealthResult 将增强检测结果填入 nodeView(非节点行不调用)
+func withHealthResult(v nodeView, key string) nodeView {
+	if r, ok := healthResultOf(key); ok {
+		v.LatencyMs = r.LatencyMs
+		v.ExitIP = r.ExitIP
+		v.ExitCountry = r.ExitCountry
+		v.ExitASNorg = r.ExitASNorg
+		v.SpeedBPS = r.SpeedBPS
+		v.IsStalled = r.IsStalled
+		v.MITMRisk = r.MITMRisk
+		v.IsWarp = r.IsWarp
+		v.NetworkType = r.NetworkType
+	}
+	return v
+}
+
 // nodeViews 出口池全量条目: 手动代理/节点 + 订阅节点, 按池内顺序
 func nodeViews() []nodeView {
 	cfg := getZenConfig()
@@ -606,11 +743,12 @@ func nodeViews() []nodeView {
 		}
 		if isNodeLink(line) {
 			key := nodeLocalKey(line)
-			out = append(out, nodeView{
+			v := nodeView{
 				Name: nodeDisplayName(line), Type: nodeLinkScheme(line),
 				Source: "手动", Running: nodeLocalAddr(line) != "", Health: healthOf(key),
 				Regions: regionNodeSupport(key), Upstreams: nodeUpstreamSnapshot(key),
-			})
+			}
+			out = append(out, withHealthResult(v, key))
 			continue
 		}
 		out = append(out, nodeView{
@@ -625,20 +763,22 @@ func nodeViews() []nodeView {
 		switch v := e.(type) {
 		case string:
 			key := nodeLocalKey(v)
-			out = append(out, nodeView{
+			nv := nodeView{
 				Name: nodeDisplayName(v), Type: nodeLinkScheme(v),
 				Source: "订阅", Running: nodeLocalAddr(v) != "", Health: healthOf(key),
 				Regions: regionNodeSupport(key), Upstreams: nodeUpstreamSnapshot(key),
-			})
+			}
+			out = append(out, withHealthResult(nv, key))
 		case map[string]any:
 			tag, _ := v["tag"].(string)
 			typ, _ := v["type"].(string)
 			key := "sbox://" + tag
-			out = append(out, nodeView{
+			nv := nodeView{
 				Name: subNodeDisplayName(tag), Type: typ,
 				Source: "订阅", Running: nodeLocalAddr(key) != "", Health: healthOf(key),
 				Regions: regionNodeSupport(key), Upstreams: nodeUpstreamSnapshot(key),
-			})
+			}
+			out = append(out, withHealthResult(nv, key))
 		}
 	}
 	return out
@@ -908,6 +1048,60 @@ func orDefault(v, def string) string {
 	return v
 }
 
+// ssMethodCanonical 把常见 SS method 的大小写 / 别名写法归一到 sing-box 接受的规范小写形式。
+//
+// 订阅聚合源常给大写或别名写法(如 AES-128-CFB / CHACHA20-POLY1305), 不归一会原样透传,
+// 而 sing-box 只认小写规范形式, 单个节点就会构建失败、拖垮整组出口。
+//
+// 表外写法一律原样返回(lookup 命中不了就走 default): 由 buildNodeParts 的逐节点校验决定
+// 剔除, 不做猜测性映射(把 rc4 硬改成 gcm 会让节点连得上但握手必然失败, 比剔除更难排查)。
+var ssMethodCanonical = map[string]string{
+	// chacha20 别名 -> 规范
+	"chacha20-poly1305":      "chacha20-ietf-poly1305",
+	"chacha20poly1305":       "chacha20-ietf-poly1305",
+	"chacha20_poly1305":      "chacha20-ietf-poly1305",
+	"chacha20-ietf-poly1305": "chacha20-ietf-poly1305",
+	// AES 系列(大写 / 混合写法归一到小写规范)
+	"aes-128-cfb": "aes-128-cfb",
+	"aes-192-cfb": "aes-192-cfb",
+	"aes-256-cfb": "aes-256-cfb",
+	"aes-128-gcm": "aes-128-gcm",
+	"aes-192-gcm": "aes-192-gcm",
+	"aes-256-gcm": "aes-256-gcm",
+	"aes-128-ctr": "aes-128-ctr",
+	"aes-192-ctr": "aes-192-ctr",
+	"aes-256-ctr": "aes-256-ctr",
+	// chacha 系列
+	"chacha20-ietf":      "chacha20-ietf",
+	"xchacha20":          "xchacha20",
+	"xchacha20-poly1305": "xchacha20-poly1305",
+	// 其余规范写法(大小写归一后原样返回小写)
+	"rc4-md5":                       "rc4-md5",
+	"none":                          "none",
+	"2022-blake3-aes-128-gcm":       "2022-blake3-aes-128-gcm",
+	"2022-blake3-aes-256-gcm":       "2022-blake3-aes-256-gcm",
+	"2022-blake3-chacha20-poly1305": "2022-blake3-chacha20-poly1305",
+}
+
+// normalizeSSMethod 把订阅常见的 SS method 写法大小写不敏感地归一到 sing-box 接受的规范形式。
+//
+// 实测订阅聚合源大量使用 chacha20-poly1305(v2ray 的写法, 语义即 IETF 变体),
+// 而 sing-box 只认 chacha20-ietf-poly1305 —— 不做这一步, 单个 ss 节点就会让整个
+// sing-box 实例构建失败, 拖垮全部出口。同样 AES-128-CFB 等大写写法也必须归一到小写。
+//
+// 表外写法一律原样返回: 由 buildNodeParts 的逐节点校验决定剔除, 不做猜测性
+// 映射(把 rc4 硬改成 gcm 会让节点连得上但握手必然失败, 比剔除更难排查)。
+func normalizeSSMethod(m string) string {
+	method := strings.TrimSpace(m)
+	if method == "" {
+		return m
+	}
+	if canon, ok := ssMethodCanonical[strings.ToLower(method)]; ok {
+		return canon
+	}
+	return m
+}
+
 // parseSS ss://base64(method:pass)@host:port#name 或 ss://base64(method:pass@host:port)#name,
 // SIP002 插件参数(v2ray-plugin / obfs-local)按 plugin + plugin_opts 透传
 func parseSS(rest, tag string) (map[string]any, error) {
@@ -953,7 +1147,7 @@ func parseSS(rest, tag string) (map[string]any, error) {
 	}
 	ob := map[string]any{
 		"type": "shadowsocks", "tag": tag, "server": host, "server_port": port,
-		"method": method, "password": password,
+		"method": normalizeSSMethod(method), "password": password,
 	}
 	// SIP002 插件: plugin=v2ray-plugin;mode=websocket;host=...;tls;... 原样透传
 	if pv := q.Get("plugin"); pv != "" {

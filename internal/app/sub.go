@@ -33,6 +33,9 @@ const (
 )
 
 var (
+	// 锁顺序(唯一合法): nodeMu -> subMu。详见 nodes.go 的 nodeMu 声明处注释(§2.3 第 10 项)。
+	// 即: 只有在已经持有 nodeMu 的情况下才能再取 subMu; 反之禁止。resolveSubscriptions
+	// 只在持 subMu 时做快照, 慢操作(saveSubCache)放到释放 subMu 之后。
 	subMu       sync.Mutex
 	subFetchMu  sync.Mutex            // 串行化抓取轮次, 保证后到的清理/更新不被在途抓取覆盖
 	subNodes    []any                 // 解析后的节点: 节点链接 string 或 sing-box 出站 map
@@ -59,8 +62,10 @@ func subStatusSnapshot() map[string]string {
 	return out
 }
 
-func saveSubCacheLocked() {
-	b, err := json.Marshal(map[string]any{"nodes": subNodes})
+// saveSubCache 把给定的订阅节点快照原子落盘。调用方负责在持 subMu 期间先拷出快照,
+// 再释放 subMu 后调用本函数 —— 避免文件 I/O 这种慢操作长时间占用 subMu(§2.3 第 10 项)。
+func saveSubCache(nodes []any) {
+	b, err := json.Marshal(map[string]any{"nodes": nodes})
 	if err != nil {
 		// marshal 失败绝不能落盘, 否则写空文件会清空订阅缓存。
 		log.Printf("subs cache marshal failed: %v", err)
@@ -130,8 +135,9 @@ func resolveSubscriptions(urls []string) {
 		subNodes = nil
 		subNodeKeys = nil
 		subStatus = map[string]string{}
-		saveSubCacheLocked()
 		subMu.Unlock()
+		// 慢操作(文件 I/O)放到释放 subMu 之后, 不在持锁期间做(§2.3 第 10 项)。
+		saveSubCache(nil)
 		syncNodeBox()
 		return
 	}
@@ -154,13 +160,13 @@ func resolveSubscriptions(urls []string) {
 	for _, u := range clean {
 		nodes, err := fetchSubscription(u)
 		if err != nil {
-			log.Printf("  订阅 %s 抓取失败: %v", u, err)
+			log.Printf("  订阅 %s 抓取失败: %v", maskURLForLog(u), err)
 			subMu.Lock()
 			subStatus[u] = "❌ 抓取失败: " + err.Error()
 			subMu.Unlock()
 			continue
 		}
-		log.Printf("  订阅 %s: 解析出 %d 个节点", u, len(nodes))
+		log.Printf("  订阅 %s: 解析出 %d 个节点", maskURLForLog(u), len(nodes))
 		subMu.Lock()
 		subStatus[u] = fmt.Sprintf("✅ %s · %d 节点", time.Now().Format("01-02 15:04"), len(nodes))
 		subMu.Unlock()
@@ -179,8 +185,10 @@ func resolveSubscriptions(urls []string) {
 	}
 	subNodes = merged
 	rebuildSubKeysLocked()
-	saveSubCacheLocked()
+	// 先在持锁期间拷出快照, 再释放 subMu 后做慢操作(文件 I/O), 不在持锁期间做(§2.3 第 10 项)。
+	snap := append([]any(nil), subNodes...)
 	subMu.Unlock()
+	saveSubCache(snap)
 	syncNodeBox()
 }
 
@@ -239,7 +247,7 @@ func fetchSubscription(u string) ([]any, error) {
 	if !rescueDirectEnabled() {
 		return nil, err
 	}
-	log.Printf("  订阅 %s 经出口抓取失败(%v), 用直连兜底再试一次", u, err)
+	log.Printf("  订阅 %s 经出口抓取失败(%v), 用直连兜底再试一次", maskURLForLog(u), err)
 	dctx, dcancel := context.WithTimeout(context.Background(), subsFetchTimeout)
 	defer dcancel()
 	body, err = doFetch(dctx, u, &http.Client{Timeout: subsFetchTimeout})

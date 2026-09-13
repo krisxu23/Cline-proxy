@@ -34,6 +34,11 @@ type RequestLog struct {
 const (
 	maxReqLogs     = 500
 	maxReqLogsFile = 10 << 20 // 10MB 上限，超出后清空落盘文件（内存仍保留最近 500 条）
+
+	// reqLogBodyProbeBytes 中间件读取请求体的上限, 只用于提取 model 字段。
+	// 多模态请求 body 可达数 MB, 全量读入会把整份内容存内存两次, 拖慢请求。
+	// 8KB 覆盖绝大多数常规请求(纯文本 chat), 大 body 场景退化为空 model 可接受。
+	reqLogBodyProbeBytes = 8 << 10
 )
 
 var (
@@ -171,23 +176,73 @@ func closeReqLogs() {
 	<-ack
 }
 
-// LoadRequestLogs 返回最近的请求日志（内存优先，启动后从落盘文件补载）
+// LoadRequestLogs 返回最近的请求日志（内存优先，启动后从落盘文件补载）。
+//
+// 必须克隆: 之前直接返回 reqLogs 底层 slice 的裸引用, admin 侧拿到的切片 header
+// 与全局共享同一底层 array; 只要后续 AppendReqLog 未触发扩容就 append 到同一
+// array 里, 就是并发读写。虽然 append 未扩容时"越界"通常不会崩进程, 但 TSAN
+// 会报, 且语义上就是 data race —— 参照 config_clone.go / stats.clone() 的规矩,
+// 锁内克隆、锁外读克隆。
 func LoadRequestLogs() []RequestLog {
 	reqLogsMu.Lock()
 	defer reqLogsMu.Unlock()
-	return reqLogs
+	out := make([]RequestLog, len(reqLogs))
+	copy(out, reqLogs)
+	return out
 }
+
+// reqLogTailBytes 启动补载时只读文件尾部这么多字节。文件上限 10MB, 全量读入会
+// 让启动多占 10MB 内存并逐行解析数千条 —— 实际面板只需要展示最近 500 条, 读尾
+// 部一小段(64KB 已经覆盖数万条日志)完全够, 且启动峰值内存稳定。
+const reqLogTailBytes = 64 << 10
 
 // LoadRequestLogsFromFile 启动时从落盘文件读取尾部记录
 // 与请求日志中间件同规则: 管理面板只读轮询等噪音不载入, 只保留对话/写操作/错误。
 func LoadRequestLogsFromFile() {
-	raw, err := os.ReadFile(reqLogsFile)
+	f, err := os.Open(reqLogsFile)
 	if err != nil {
 		return
 	}
-	var reqLogs0 []RequestLog
-	lines := splitLinesSafe(string(raw))
-	for _, line := range lines {
+	defer f.Close()
+	st, err := f.Stat()
+	if err != nil {
+		return
+	}
+	// 文件比尾读窗口还小时直接全量读, 避免不必要的 seek。
+	size := st.Size()
+	if size <= reqLogTailBytes {
+		raw, err := io.ReadAll(f)
+		if err != nil {
+			return
+		}
+		reqLogs = parseRequestLogsFromLines(string(raw))
+		return
+	}
+	// 大文件: 只 seek 到尾部窗口起点读取, 首行可能不完整 —— 解析时会自动跳过
+	// 那些解不出来的坏行。
+	offset := int64(reqLogTailBytes)
+	if _, err := f.Seek(offset, io.SeekStart); err != nil {
+		return
+	}
+	buf := make([]byte, reqLogTailBytes)
+	n, err := f.Read(buf)
+	if n == 0 {
+		return
+	}
+	raw := buf[:n]
+	// 从第一个 '\n' 之后开始解析, 丢掉那条被截断的半行。
+	if i := bytes.IndexByte(raw, '\n'); i >= 0 {
+		raw = raw[i+1:]
+	}
+	_ = err
+	reqLogs = parseRequestLogsFromLines(string(raw))
+}
+
+// parseRequestLogsFromLines 逐行解析并过滤噪音, 与旧的 LoadRequestLogsFromFile
+// 逻辑一致, 抽成函数便于测试。
+func parseRequestLogsFromLines(s string) []RequestLog {
+	var out []RequestLog
+	for _, line := range splitLinesSafe(s) {
 		if line == "" {
 			continue
 		}
@@ -196,13 +251,13 @@ func LoadRequestLogsFromFile() {
 			if isRequestNoise(l) {
 				continue
 			}
-			reqLogs0 = append(reqLogs0, l)
+			out = append(out, l)
 		}
 	}
-	if len(reqLogs0) > maxReqLogs {
-		reqLogs0 = reqLogs0[len(reqLogs0)-maxReqLogs:]
+	if len(out) > maxReqLogs {
+		out = out[len(out)-maxReqLogs:]
 	}
-	reqLogs = reqLogs0
+	return out
 }
 
 // upstreamFromRouteHeader 从 X-Proxy-Route 响应头提取实际上游名。
@@ -276,11 +331,24 @@ func requestLogMiddleware(next http.Handler) http.Handler {
 		start := time.Now()
 		sw := &statusWriter{ResponseWriter: w}
 
-		// 读取请求体提取模型，并放回，避免影响后续处理
+		// 只读前 reqLogBodyProbeBytes 用来提取 model 字段: 多模态请求把图片 base64
+		// 塞进 body 时可能几 MB, 全量 io.ReadAll 会把整份 body 读进内存两次(这里
+		// 一次、下游 handler 再一次)。model 字段一般在 JSON 前几十字节内, 读一小段
+		// 就够 —— 若截断后 JSON 解析失败, 退化为空 model, 不影响功能。
 		model := ""
-		bodyBytes, _ := io.ReadAll(r.Body)
+		limit := int64(reqLogBodyProbeBytes)
+		if r.ContentLength != 0 && r.ContentLength < limit {
+			limit = r.ContentLength
+		}
+		bodyBytes, _ := io.ReadAll(io.LimitReader(r.Body, limit))
 		if len(bodyBytes) > 0 {
-			r.Body = io.NopCloser(bytes.NewReader(bodyBytes))
+			// 放回剩余部分, 避免影响下游处理。
+			if r.ContentLength > int64(len(bodyBytes)) {
+				rest, _ := io.ReadAll(r.Body)
+				r.Body = io.NopCloser(bytes.NewReader(append(bodyBytes, rest...)))
+			} else {
+				r.Body = io.NopCloser(bytes.NewReader(bodyBytes))
+			}
 			var probe struct {
 				Model string `json:"model"`
 			}

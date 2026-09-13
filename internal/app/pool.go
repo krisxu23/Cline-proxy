@@ -7,7 +7,9 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -16,10 +18,70 @@ var (
 	poolMu     sync.Mutex
 	poolSaveMu sync.Mutex
 	poolPath   string
+
+	// 写盘批量化: 之前每次 pickAccount / bumpUsage / recordAccountTokens 都直接
+	// 落盘, 多账号池 + 高并发下 poolSaveMu 成为写入热点, 磁盘 I/O 是主瓶颈。
+	// 现在的策略:
+	//   - 关键状态变更(账号增删、token 刷新、cooldown 切换)→ 立即 flush;
+	//   - 计数器类变更(usage / tokens / CurrentIdx)→ 只标记 dirty, 后台每 30s
+	//     或下一次关键事件时 flush。
+	// 进程崩溃时最坏丢 30s 内的计数器增量, 不丢账号/token/status 这类关键状态。
+	poolDirty       atomic.Bool
+	poolFlusherOnce sync.Once
+	poolFlushCh     chan struct{}
+	// poolFlushInterval 后台 flush 周期。30s 是"用户能感知到数据更新"与"写盘频率"
+	// 的折中: 面板轮询通常 10-30s 一次, 更短没有意义; 更长则崩溃时丢的计数器更多。
+	poolFlushInterval = 30 * time.Second
 )
 
 func init() {
 	poolPath = kit.ResolveDataPath(".cline-accounts.json")
+}
+
+// startPoolFlusher 惰性启动写盘协程(全局一次)。
+func startPoolFlusher() {
+	poolFlusherOnce.Do(func() {
+		poolFlushCh = make(chan struct{}, 1)
+		go poolFlusherLoop()
+	})
+}
+
+// poolFlusherLoop 常驻协程: 定期或收到 kick 时把 dirty 的 pool 落到磁盘。
+// 注意这里不持 poolMu, 由 flushPoolLocked 自己拿锁, 避免死锁。
+func poolFlusherLoop() {
+	ticker := time.NewTicker(poolFlushInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-poolFlushCh:
+			if poolDirty.Swap(false) {
+				flushPoolLocked()
+			}
+		case <-ticker.C:
+			if poolDirty.Swap(false) {
+				flushPoolLocked()
+			}
+		}
+	}
+}
+
+// markPoolDirty 只标记脏, 不立即写盘。用于计数器类更新(bumpUsage / recordAccountTokens
+// / pickAccount 的 CurrentIdx 推进 / ListAccounts 释放冷却)。
+func markPoolDirty() {
+	poolDirty.Store(true)
+	startPoolFlusher()
+	select {
+	case poolFlushCh <- struct{}{}:
+	default:
+	}
+}
+
+// flushPoolLocked 立即把 pool 落盘, 调用方不持 poolMu 也可以安全调用。
+// 供关键状态变更(账号增删、token 刷新、cooldown 切换)使用。
+func flushPoolLocked() {
+	poolMu.Lock()
+	defer poolMu.Unlock()
+	savePoolLocked()
 }
 
 // kit.ResolveDataPath 数据文件路径解析：优先可执行文件目录，其次当前工作目录。
@@ -41,6 +103,11 @@ func loadPool() *AccountPool {
 
 	var p AccountPool
 	if err := json.Unmarshal(data, &p); err != nil {
+		// 与 loadZenConfig 保持同一行为: 解析失败不能静默清空 —— .cline-accounts.json
+		// 一旦坏了(半截 JSON / 编码错), 里面是所有账号的 refreshToken, 无声丢光的
+		// 后果比"暂时用不上"严重得多。改个名留证, 让用户能从副本里人工恢复。
+		log.Printf("pool parse failed (%s): %v; quarantining and starting with empty pool", poolPath, err)
+		quarantineBadConfig(poolPath)
 		pool = &AccountPool{Accounts: []*Account{}, Keys: []string{}}
 		return pool
 	}
@@ -151,11 +218,49 @@ var refreshAccountTokenFn = func(refreshToken string) (accessToken string, refre
 	return "workos:" + resp.Data.AccessToken, resp.Data.RefreshToken, cline.ParseExpiry(resp.Data.ExpiresAt) - 60000, nil
 }
 
+// classifyRefreshError 判定 refreshAccountTokenFn 返回的错误属于"refreshToken
+// 真的无效"还是"上游/网络瞬态故障"。判定依据来自 cline.RefreshClineToken 的错误
+// 字符串:
+//   - "cline refresh failed: 401/403" → 上游明确拒绝, refreshToken 已失效;
+//   - 其余("cline refresh: <neterr>" / "failed: 5xx" / decode 失败等) → 可能是
+//     网络抖动或上游故障, 账号本身没坏。
+//
+// 之前的实现把两种都判成 expired: 一次节点抖动就让账号永久过期, 用户只能去 UI
+// 手动"重置"。这里把瞬态故障走 cooldown(默认 5 分钟), 到期自动恢复, 避免池子
+// 因为网络抖动整池清空。
+func classifyRefreshError(err error) (isExpired bool, reason string) {
+	if err == nil {
+		return false, ""
+	}
+	s := err.Error()
+	// cline.RefreshClineToken 在 HTTP 非 200 时返回 "cline refresh failed: <status>"
+	for _, code := range []string{"failed: 401", "failed: 403"} {
+		if strings.Contains(s, code) {
+			return true, "refresh token rejected by upstream"
+		}
+	}
+	// 上游限流/内部错误的 429/503 也算瞬态, 冷却后重试
+	return false, "token refresh transient failure: " + s
+}
+
 func refreshAccountToken(acc *Account) error {
+	if acc == nil {
+		return fmt.Errorf("refreshAccountToken: nil account")
+	}
 	accessToken, refreshTokenOut, expiresAt, err := refreshAccountTokenFn(acc.RefreshToken)
 	if err != nil {
+		isExpired, reason := classifyRefreshError(err)
 		poolMu.Lock()
-		acc.Status = "expired"
+		if isExpired {
+			acc.Status = "expired"
+			acc.LastReason = reason
+		} else {
+			// 短冷却 5 分钟, 到期后 pickAccount 会自动恢复为 active。
+			acc.Status = "cooldown"
+			acc.CooldownUntil = time.Now().Add(5 * time.Minute)
+			acc.LastReason = reason
+			log.Printf("  account %s refresh failed (%v), cooldown 5m", acc.AccountID, err)
+		}
 		savePoolLocked()
 		poolMu.Unlock()
 		return fmt.Errorf("token refresh failed: %w", err)
@@ -168,6 +273,8 @@ func refreshAccountToken(acc *Account) error {
 	}
 	acc.ExpiresAt = expiresAt
 	acc.Status = "active"
+	acc.CooldownUntil = time.Time{}
+	acc.LastReason = ""
 	savePoolLocked()
 	poolMu.Unlock()
 	return nil
@@ -214,7 +321,7 @@ func pickAccount() *Account {
 		p.CurrentIdx = (p.CurrentIdx + 1) % len(active)
 	}
 
-	savePoolLocked()
+	markPoolDirty()
 	poolMu.Unlock()
 	return acc
 }
@@ -281,7 +388,7 @@ func ListAccounts() []*Account {
 			LastReason:      a.LastReason,
 		}
 	}
-	savePoolLocked()
+	markPoolDirty()
 	poolMu.Unlock()
 	return result
 }
@@ -304,6 +411,7 @@ func markAccountCooldown(acc *Account, reason string, duration time.Duration) {
 }
 
 // bumpUsage 递增本地成功调用计数（含今日计数），自动处理跨日重置。
+// 计数器变更走 markPoolDirty: 进程崩溃最多丢 30s 的增量, 不丢账号/token/status。
 func bumpUsage(acc *Account) {
 	if acc == nil {
 		return
@@ -319,7 +427,7 @@ func bumpUsage(acc *Account) {
 	acc.UsageCountToday++
 	acc.UsageCount++
 	acc.LastUsed = now
-	savePoolLocked()
+	markPoolDirty()
 	poolMu.Unlock()
 }
 
@@ -340,6 +448,7 @@ func resetTodayUsage(acc *Account) {
 
 // recordAccountTokens 记录账号本次请求消耗的 token（prompt+completion），
 // 自动处理跨日重置，累计值不重置。tokens<=0 时忽略。
+// 计数器变更走 markPoolDirty, 同上。
 func recordAccountTokens(acc *Account, tokens int64) {
 	if acc == nil || tokens <= 0 {
 		return
@@ -353,7 +462,7 @@ func recordAccountTokens(acc *Account, tokens int64) {
 	}
 	acc.TokensToday += tokens
 	acc.TokensTotal += tokens
-	savePoolLocked()
+	markPoolDirty()
 	poolMu.Unlock()
 }
 

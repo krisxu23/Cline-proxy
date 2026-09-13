@@ -16,7 +16,11 @@ func TestSaveSubCacheAtomic(t *testing.T) {
 	rebuildSubKeysLocked()
 	subMu.Unlock()
 
-	saveSubCacheLocked()
+	// 持锁期间调用: 顺带验证 saveSubCache 不会再取 subMu(Go mutex 不可重入,
+	// 若它内部仍会 lock, 这里会直接死锁 —— 正是 §2.3 第 10 项要锁住的性质)。
+	subMu.Lock()
+	saveSubCache(seed)
+	subMu.Unlock()
 
 	data, err := os.ReadFile(subCacheFile())
 	if err != nil {
@@ -47,7 +51,7 @@ func TestSaveSubCacheMarshalErrorNoWrite(t *testing.T) {
 	subNodes = []any{func() {}}
 	subMu.Unlock()
 
-	saveSubCacheLocked()
+	saveSubCache([]any{func() {}})
 
 	// marshal 失败时缓存文件必须保持原样
 	b, err := os.ReadFile(path)

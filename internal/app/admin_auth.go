@@ -11,6 +11,7 @@ import (
 	"net/url"
 	"os"
 	"strings"
+	"sync"
 
 	"cline-go-proxy/internal/kit"
 )
@@ -44,11 +45,20 @@ const adminTokenCookie = "admin_token"
 // adminTokenFile 令牌落盘位置。
 func adminTokenFile() string { return kit.ResolveDataPath("admin-token") }
 
-var adminTokenCache string
+var (
+	// adminTokenCache + adminTokenMu: 首次调用时启动横幅/托盘/adminStaticHandler/
+	// adminAuth 可能同时进入, 两个 goroutine 都读到 "" 就各自 rand.Read 出不同
+	// token, 但只写一个进 cache —— 结果横幅里打印的那个 token 用不了, 用户按提示
+	// 打开面板反而 401。加一把锁串行化, 保证"生成一次、返回同一个值"。
+	adminTokenCache string
+	adminTokenMu    sync.Mutex
+)
 
 // loadOrCreateAdminToken 读取已有令牌, 不存在则生成并落盘。
-// 进程内缓存, 避免每次请求都读磁盘。
+// 进程内缓存, 避免每次请求都读磁盘。首次并发调用返回同一个值。
 func loadOrCreateAdminToken() string {
+	adminTokenMu.Lock()
+	defer adminTokenMu.Unlock()
 	if adminTokenCache != "" {
 		return adminTokenCache
 	}

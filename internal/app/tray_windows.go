@@ -3,12 +3,22 @@
 package app
 
 import (
+	"archive/zip"
+	"bytes"
+	"encoding/json"
 	"fmt"
+	"io"
+	"log"
 	"math"
+	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
+	"time"
 
+	"cline-go-proxy/internal/kit"
 	"fyne.io/systray"
 )
 
@@ -139,6 +149,8 @@ func RunTray(adminURL string) {
 		systray.SetTitle("Cline Proxy")
 		systray.SetTooltip("Cline Go Proxy 综合网关 - 运行中")
 		mOpen := systray.AddMenuItem("打开管理界面", "在应用窗口中打开 Web 后台")
+		mData := systray.AddMenuItem("打开数据目录", "在资源管理器中打开 data/ 目录(日志与配置所在)")
+		mDiag := systray.AddMenuItem("导出诊断包", "打包 health/日志尾部/节点概览为 zip, 便于排障")
 		systray.AddSeparator()
 		mQuit := systray.AddMenuItem("退出", "停止代理并退出程序")
 		go func() {
@@ -146,8 +158,13 @@ func RunTray(adminURL string) {
 				select {
 				case <-mOpen.ClickedCh:
 					OpenAdminWindow(adminURL)
+				case <-mData.ClickedCh:
+					openDataDir()
+				case <-mDiag.ClickedCh:
+					exportDiagnostics(adminURL)
 				case <-mQuit.ClickedCh:
-					systray.Quit()
+					// 优雅退出: 停服 → 刷请求日志 → 关节点盒 → 退出进程。
+					GracefulExit()
 					return
 				}
 			}
@@ -155,4 +172,139 @@ func RunTray(adminURL string) {
 	}, func() {
 		fmt.Println("tray exited")
 	})
+}
+
+// openDataDir 在资源管理器中打开 data/ 目录(日志、配置、令牌都在这里)。
+func openDataDir() {
+	dir := filepath.Dir(kit.ResolveDataPath("cline-proxy.log"))
+	exec.Command("explorer", dir).Start()
+}
+
+// exportDiagnostics 把当前运行状态的快照打包成 data/diag-<时间戳>.zip, 便于排障:
+//   - health.json: 实时 /health(含 nodePool/subNodes/logBytes/dropped 等);
+//   - logs/*: 主日志与流式日志的尾部(不复制整份, 控制体积);
+//   - nodes.json: 监听地址、出口节点数、订阅节点数;
+//   - data_listing.txt: data/ 目录清单(只列文件名与大小, 不复制内容, 避免把
+//     admin-token 等敏感文件带出去);
+//   - version.txt: 构建版本与 Go 运行时版本。
+//
+// 默认导出到 data/diag-<时间戳>.zip, 完成后用资源管理器定位到该文件方便取走。
+func exportDiagnostics(adminURL string) {
+	dir := filepath.Dir(kit.ResolveDataPath("cline-proxy.log"))
+	ts := time.Now().Format("20060102-150405")
+	zipPath := filepath.Join(dir, "diag-"+ts+".zip")
+	if err := writeDiagnosticsZip(zipPath, adminURL); err != nil {
+		log.Printf("diag: 导出失败: %v", err)
+		return
+	}
+	// 用资源管理器定位到该文件, 用户无需自己翻目录。
+	exec.Command("explorer", "/select,", zipPath).Start()
+}
+
+func writeDiagnosticsZip(zipPath, adminURL string) error {
+	dir := filepath.Dir(kit.ResolveDataPath("cline-proxy.log"))
+	f, err := os.Create(zipPath)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	zw := zip.NewWriter(f)
+	defer zw.Close()
+
+	var werr error
+	writeZipFile := func(name string, data []byte) {
+		if werr != nil {
+			return
+		}
+		w, e := zw.Create(name)
+		if e != nil {
+			werr = e
+			return
+		}
+		if _, e := w.Write(data); e != nil {
+			werr = e
+		}
+	}
+
+	// 1) /health 实时快照(真实端点)。本机探测走无代理 client, 避免被环境的
+	//    HTTP_PROXY 拦掉。
+	if u, e := url.Parse(adminURL); e == nil {
+		healthURL := "http://" + u.Host + "/health"
+		client := &http.Client{Timeout: 5 * time.Second, Transport: &http.Transport{Proxy: nil}}
+		if resp, e2 := client.Get(healthURL); e2 == nil {
+			b, _ := io.ReadAll(resp.Body)
+			resp.Body.Close()
+			writeZipFile("health.json", b)
+		} else {
+			writeZipFile("health.json", []byte("error: "+e2.Error()))
+		}
+	}
+
+	// 2) 主日志与流式日志的尾部(各 64KB, 控制体积)。
+	writeZipFile("logs/cline-proxy.log.tail", readTailFile(kit.ResolveDataPath("cline-proxy.log"), 64<<10))
+	writeZipFile("logs/cline-proxy-stream.log.tail", readTailFile(kit.ResolveDataPath("cline-proxy-stream.log"), 64<<10))
+
+	// 3) 节点与订阅概览。nodePorts 由 nodeMu 保护, 短暂加锁读长度。
+	nodeMu.Lock()
+	np := len(nodePorts)
+	nodeMu.Unlock()
+	nodesJSON, _ := json.MarshalIndent(map[string]any{
+		"listen":   proxyListenAddress,
+		"nodePool": np,
+		"subNodes": len(subNodeKeysSnapshot()),
+	}, "", "  ")
+	writeZipFile("nodes.json", nodesJSON)
+
+	// 4) data/ 目录清单(只列名字与大小, 不复制内容, 避免敏感文件外泄)。
+	writeZipFile("data_listing.txt", dataDirListing(dir))
+
+	// 5) 版本信息。
+	ver := "buildVersion=" + buildVersion + "\nGo=" + runtime.Version() + "\n"
+	writeZipFile("version.txt", []byte(ver))
+
+	return werr
+}
+
+// readTailFile 读取文件尾部至多 n 字节; 文件不存在/为空时返回说明文本。
+func readTailFile(path string, n int64) []byte {
+	f, err := os.Open(path)
+	if err != nil {
+		return []byte("error: " + err.Error())
+	}
+	defer f.Close()
+	st, err := f.Stat()
+	if err != nil {
+		return []byte("error: " + err.Error())
+	}
+	size := st.Size()
+	if size == 0 {
+		return []byte("(empty)")
+	}
+	if size <= n {
+		b, _ := io.ReadAll(f)
+		return b
+	}
+	if _, err = f.Seek(size-n, io.SeekStart); err != nil {
+		return []byte("error: " + err.Error())
+	}
+	buf := make([]byte, n)
+	m, _ := f.Read(buf)
+	return buf[:m]
+}
+
+// dataDirListing 列出 data/ 下的文件名、大小与修改时间(不含内容)。
+func dataDirListing(dir string) []byte {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return []byte("error: " + err.Error())
+	}
+	var b bytes.Buffer
+	for _, e := range entries {
+		info, err := e.Info()
+		if err != nil {
+			continue
+		}
+		fmt.Fprintf(&b, "%-40s %12d  %s\n", e.Name(), info.Size(), info.ModTime().Format("2006-01-02 15:04:05"))
+	}
+	return b.Bytes()
 }

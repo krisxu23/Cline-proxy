@@ -424,7 +424,10 @@ func isRateLimited(status int, body string) bool {
 	}
 	if status == http.StatusBadGateway || status == http.StatusForbidden {
 		low := strings.ToLower(body)
-		for _, kw := range []string{"resourceexhausted", "limit reached", "rate limit", "too many", "overloaded", "busy"} {
+		// resource_exhausted 是 Google API 的错误码原样, 带下划线; 之前写成
+		// "resourceexhausted" 是死代码 —— 429 已被上面的状态码命中, 但这个分支
+		// 的语义本意就是"用 body 兜底识别限流", 关键词不匹配等于形同虚设。
+		for _, kw := range []string{"resource_exhausted", "resourceexhausted", "limit reached", "rate limit", "too many", "overloaded", "busy"} {
 			if strings.Contains(low, kw) {
 				return true
 			}

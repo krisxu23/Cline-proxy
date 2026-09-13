@@ -520,7 +520,7 @@ func handleResponses(w http.ResponseWriter, r *http.Request) {
 			w.Header().Set("Content-Type", "text/event-stream")
 			w.Header().Set("Cache-Control", "no-cache")
 			w.Header().Set("Connection", "keep-alive")
-			w.Header().Set("Access-Control-Allow-Origin", "*")
+			setCORSOrigin(w)
 			w.WriteHeader(http.StatusOK)
 			chatStreamToResponses(w, resp, tracker.observeUsage)
 			tracker.finish(resp.StatusCode < 400, resp.StatusCode)
@@ -580,7 +580,7 @@ func handleResponses(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/event-stream")
 		w.Header().Set("Cache-Control", "no-cache")
 		w.Header().Set("Connection", "keep-alive")
-		w.Header().Set("Access-Control-Allow-Origin", "*")
+		setCORSOrigin(w)
 		w.WriteHeader(http.StatusOK)
 		chatStreamToResponses(w, up, usageFn)
 		return

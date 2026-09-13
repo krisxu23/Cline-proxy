@@ -99,10 +99,11 @@ func TestBuildNodePartsSanitizesPassedThroughOutbound(t *testing.T) {
 	entry := map[string]any{
 		"type": "vless", "tag": "sub-x",
 		"server": "1.2.3.4", "server_port": 443, "uuid": "00000000-0000-0000-0000-000000000000",
-		// 故意只给 tls 特征字段, 不给 enabled —— 就是打死进程的那种写法
+		// 故意只给 tls 特征字段, 不给 enabled —— 就是打死进程的那种写法。
+		// 不带 utls 块: 这条用例必须在裸 go test(没有 -tags with_utls)下也能跑,
+		// 而 vless+tls 本身不依赖 uTLS 编译支持, 同样能触发那个 nil dialer panic。
 		"tls": map[string]any{
 			"server_name": "sni.example.com",
-			"utls":        map[string]any{"enabled": true, "fingerprint": "chrome"},
 		},
 	}
 	_, _, outbounds, _, _ := buildNodeParts([]any{entry})
@@ -136,8 +137,11 @@ func TestCatalogExitBudgetBounded(t *testing.T) {
 	}
 }
 
-// anytls 缺 tls 块: 补块的 server_name 必须取 server 本身, 且补完后
-// validateOutboundEntry 不得再报 "TLS required" 把节点剔除。
+// anytls 缺 tls 块: 补块的 server_name 必须取 server 本身。
+//
+// 只断言 sanitize 的产物, 不碰 sing-box —— 这样裸 go test 也能跑。
+// sing-box 合法性校验那条放在 nodes_tls_sanitize_utls_test.go(anytls 依赖
+// uTLS, 没有 -tags with_utls 时 sing-box 会报 "uTLS is not included in this build")。
 func TestAnytlsMissingTLSDefaults(t *testing.T) {
 	ob := map[string]any{"type": "anytls", "server": "a.com", "server_port": 443, "password": "x"}
 	sanitizeOutboundTLS(ob)
@@ -147,8 +151,5 @@ func TestAnytlsMissingTLSDefaults(t *testing.T) {
 	}
 	if blk["enabled"] != true || blk["server_name"] != "a.com" {
 		t.Fatalf("默认块错误: %#v", blk)
-	}
-	if err := validateOutboundEntry(ob); err != nil {
-		t.Fatalf("补块后仍被判无效: %v", err)
 	}
 }

@@ -21,8 +21,20 @@ var HTTPTransport = &http.Transport{
 	DisableCompression:  false,
 }
 
+// HTTPClient 不走超时: 它被流式转发路径(clinepass 的 SSE 长连接)复用, 而
+// http.Client.Timeout 约束的是「从发请求到读完响应体」的整段时长 —— 长流式响应
+// 会被它中途切断。这类调用方(如 clinepass)必须自己通过 request context 设上限
+// (clinepass 已传 r.Context()), 故这里刻意保持零超时。
 var HTTPClient = &http.Client{
 	Transport: HTTPTransport,
+}
+
+// HTTPClientTimeout 带默认超时(30s)的客户端, 专供**短请求**(device auth、OAuth
+// 等)使用。此前 kit.HTTPClient 无超时, 调用方忘设 context 会永久挂住; 这些短请求
+// 本就不该无限等待, 给一个上限更稳。
+var HTTPClientTimeout = &http.Client{
+	Transport: HTTPTransport,
+	Timeout:   30 * time.Second,
 }
 
 func HTTPPostForm(rawURL string, form url.Values) (*http.Response, error) {
@@ -31,7 +43,7 @@ func HTTPPostForm(rawURL string, form url.Values) (*http.Response, error) {
 		return nil, err
 	}
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-	return HTTPClient.Do(req)
+	return HTTPClientTimeout.Do(req)
 }
 
 func HTTPPostJSON(rawURL string, body any) (*http.Response, error) {
@@ -44,7 +56,7 @@ func HTTPPostJSON(rawURL string, body any) (*http.Response, error) {
 		return nil, err
 	}
 	req.Header.Set("Content-Type", "application/json")
-	return HTTPClient.Do(req)
+	return HTTPClientTimeout.Do(req)
 }
 
 func ReadBody(resp *http.Response) string {

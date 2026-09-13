@@ -3,23 +3,29 @@ package app
 import (
 	"bufio"
 	"bytes"
-	"cline-go-proxy/internal/cline"
-	"cline-go-proxy/internal/kit"
-	"cline-go-proxy/internal/protocol"
-	"cline-go-proxy/internal/providers"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
 	"net"
 	"net/http"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"runtime"
 	"strconv"
 	"strings"
+	"sync"
+	"sync/atomic"
+	"syscall"
 	"time"
+
+	"cline-go-proxy/internal/cline"
+	"cline-go-proxy/internal/kit"
+	"cline-go-proxy/internal/protocol"
+	"cline-go-proxy/internal/providers"
 )
 
 var defaultModel = "deepseek/deepseek-v4-flash"
@@ -29,6 +35,22 @@ var proxyListenAddress = "127.0.0.1:3457"
 const (
 	defaultMaxTokens       = 128000
 	defaultReasoningEffort = "high"
+)
+
+// buildVersion 由构建时注入: `-ldflags "-X cline-go-proxy/internal/app.buildVersion=$(git describe)"`。
+// 未注入时回退到本硬编码默认值, 这样手工 `go build`(不带 -X)也不会得到空串。
+var buildVersion = "go-1.1"
+
+// 进程级生命周期:
+//   - appRootCtx 由 StartProxy 通过 signal.NotifyContext 建立, 所有后台循环都应
+//     select 在 appRootCtx.Done() 上以便优雅退出(见各后台循环的收口点清单)。
+//   - appServer 保存 *http.Server 引用, 供优雅关闭时调用 Shutdown。
+//   - shutdownOnce 保证收口逻辑只跑一次(信号与显式退出可能同时触发)。
+var (
+	appRootCtx    context.Context    = context.Background()
+	appRootCancel context.CancelFunc = func() {}
+	appServer     *http.Server
+	shutdownOnce  sync.Once
 )
 
 var passThroughKeys = []string{
@@ -59,6 +81,13 @@ func StartProxy(host string, port int) error {
 	}
 	initLogFile()
 	setListenOrigin(fmt.Sprintf("http://127.0.0.1:%d", port))
+
+	// 进程级生命周期: 用 signal.NotifyContext 建立可取消的 rootCtx。
+	// 所有后台循环(rollStatsDate 等)都 select 在 appRootCtx.Done() 上, 收到
+	// SIGINT/SIGTERM 后统一收口(见 doGracefulShutdown)。Shutdown() 也复用同一
+	// 个 cancel, 供托盘"退出"与未来控制面复用。
+	appRootCtx, appRootCancel = signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer appRootCancel()
 
 	p := loadPool()
 	activeCount := 0
@@ -116,19 +145,10 @@ func StartProxy(host string, port int) error {
 	})
 
 	mux.HandleFunc("/v1/health", corsHandler(func(w http.ResponseWriter, r *http.Request) {
-		info := map[string]any{
-			"status":         "ok",
-			"version":        "go-1.1",
-			"activeAccounts": activeCount,
-		}
-		writeJSON(w, http.StatusOK, info)
+		writeJSON(w, http.StatusOK, healthInfo(activeCount))
 	}))
 	mux.HandleFunc("/health", corsHandler(func(w http.ResponseWriter, r *http.Request) {
-		writeJSON(w, http.StatusOK, map[string]any{
-			"status":         "ok",
-			"version":        "go-1.1",
-			"activeAccounts": activeCount,
-		})
+		writeJSON(w, http.StatusOK, healthInfo(activeCount))
 	}))
 
 	// Admin API (frontend + REST)
@@ -413,6 +433,15 @@ func StartProxy(host string, port int) error {
 		IdleTimeout:       120 * time.Second,
 		MaxHeaderBytes:    1 << 20,
 	}
+	appServer = server
+
+	// 优雅退出: rootCtx 被取消(收到 SIGINT/SIGTERM 或显式 Shutdown())后, 先停服
+	// 给在途请求一个收尾窗口, 再刷请求日志、关 sing-box 节点、关诊断日志句柄。
+	// 收口逻辑用 sync.Once 保证只跑一次。
+	go func() {
+		<-appRootCtx.Done()
+		doGracefulShutdown()
+	}()
 
 	token := loadOrCreateAdminToken()
 	panelURL := wrapAdminTokenURL(fmt.Sprintf("http://127.0.0.1:%d/admin/", port))
@@ -433,10 +462,60 @@ func StartProxy(host string, port int) error {
 	fmt.Println("  令牌落盘在 data/admin-token, 重启后不变。")
 	fmt.Println(strings.Repeat("=", 58))
 	// windowsgui 构建下没有控制台, 上面这些输出用户看不到, 必须同时进日志文件。
-	log.Printf("admin panel: %s", panelURL)
-	log.Printf("admin token: %s", token)
+	// 但日志里绝不能带令牌: panelURL 自带 ?token=, 而 data/ 常被云同步盘和
+	// 一键备份整目录收走, 一次落盘就等于长期访问权限外泄。GUI 下面板从托盘
+	// 就能打开, 不需要靠日志。
+	log.Printf("admin panel: http://%s/admin/ (访问令牌已省略, 落盘在 data/admin-token)", addr)
 
-	return server.ListenAndServe()
+	// ListenAndServe 阻塞直到 server.Shutdown 被调用(优雅退出)或发生致命错误。
+	// 优雅退出时 Shutdown 会让 ListenAndServe 返回 http.ErrServerClosed, 视为正常。
+	err := server.ListenAndServe()
+	if err == http.ErrServerClosed {
+		err = nil
+	}
+	return err
+}
+
+// healthInfo 把网关自身健康指标并入 /health 响应。除了"有几个账号可用",
+// 还要能回答"网关自己还好吗": 出口节点池、能否优雅退出、订阅刷新时间、
+// 日志体积与丢弃计数都在这一并暴露。
+func healthInfo(activeCount int) map[string]any {
+	info := map[string]any{
+		"status":         "ok",
+		"version":        buildVersion,
+		"activeAccounts": activeCount,
+	}
+
+	// nodePool: 当前出口节点隧道数(出口池未初始化时为 0)。nodePorts 由 nodeMu 保护,
+	// 这里短暂加锁读长度, 避免与 syncNodeBox 并发写产生数据竞争。
+	nodeMu.Lock()
+	info["nodePool"] = len(nodePorts)
+	nodeMu.Unlock()
+
+	// exitReady: 优雅退出收口已就绪(server 已注册、信号监听已建立)。
+	info["exitReady"] = appServer != nil
+
+	// lastSubFetch: 订阅缓存文件最近一次写入时间(订阅刷新成功即落盘)。
+	if st, err := os.Stat(kit.ResolveDataPath("subs_cache.json")); err == nil {
+		info["lastSubFetch"] = st.ModTime().UnixMilli()
+	} else {
+		info["lastSubFetch"] = int64(0)
+	}
+
+	// subNodes: 订阅展开后的节点数。
+	info["subNodes"] = len(subNodeKeysSnapshot())
+
+	// logBytes: 主日志文件当前大小(诊断磁盘占用)。
+	if st, err := os.Stat(kit.ResolveDataPath("cline-proxy.log")); err == nil {
+		info["logBytes"] = st.Size()
+	} else {
+		info["logBytes"] = int64(0)
+	}
+
+	// dropped: 请求日志因缓冲满被丢弃的条数(运维可见性, 此前只 atomic.Add 从不暴露)。
+	info["dropped"] = atomic.LoadInt64(&reqLogDropped)
+
+	return info
 }
 
 // maxInboundBodyBytes 单个入站请求体的上限(64 MiB)。
@@ -460,16 +539,39 @@ func limitInboundBody(next http.Handler) http.Handler {
 	})
 }
 
+// maxLogBytes cline-proxy.log 的上限(10 MiB)。
+//
+// GUI 构建下没有控制台, 这个文件是唯一的诊断通道; 无限追加会在长期运行后
+// 撑爆磁盘, 也让翻日志越来越难。超限时截断成空而不是滚动保留历史 ——
+// 诊断日志要的是最近一段, 不值得为历史轮转引入额外复杂度。
+const maxLogBytes = 10 << 20
+
 // initLogFile 将日志同时输出到控制台与 cline-proxy.log（追加模式），
-// 控制台窗口滚动内容有限，文件可完整保留所有日志。
+// 控制台窗口滚动内容有限，文件可完整保留最近 maxLogBytes 的日志。
 func initLogFile() {
 	path := kit.ResolveDataPath("cline-proxy.log")
-	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
+	// 0600 是「不写敏感信息」之外的第二道防线: 日志会记录订阅节点、上游返回文本等
+	// 可能带凭据的内容。注意 Windows 不实现数字权限位(实测文件仍是 644), 真正生效的
+	// 是把令牌本身挡在日志外 —— 见下方「访问令牌已省略」那条 Printf。
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0600)
 	if err != nil {
 		log.Printf("  open log file failed: %v", err)
 		return
 	}
+	truncated := false
+	if st, serr := f.Stat(); serr == nil && st.Size() > maxLogBytes {
+		if terr := f.Truncate(0); terr == nil {
+			// Windows 的 Truncate 不会把写偏移归零, O_APPEND 下下一次写会在
+			// 文件中间留出一段空字节, 必须显式 Seek 回文件头。
+			if _, serr := f.Seek(0, io.SeekStart); serr == nil {
+				truncated = true
+			}
+		}
+	}
 	log.SetOutput(logFanout{f, os.Stderr})
+	if truncated {
+		log.Printf("log file 超过 %d MiB, 已截断(只保留最近内容)", maxLogBytes>>20)
+	}
 	log.Printf("========== proxy started, log file: %s ==========", path)
 }
 
@@ -485,11 +587,155 @@ func (w logFanout) Write(p []byte) (int, error) {
 	return len(p), nil
 }
 
+// ============================================================================
+// 生命周期与优雅退出
+// ============================================================================
+
+// Shutdown 触发进程级优雅退出: 取消 rootCtx → 后台循环停止 → server 关闭 →
+// 刷盘 → 关 sing-box 节点。托盘"退出"与未来可能的 RPC 控制面都走这里。
+func Shutdown() {
+	if appRootCancel != nil {
+		appRootCancel()
+	}
+}
+
+// GracefulExit 同步执行完整优雅退出并终止进程, 供托盘"退出"菜单调用:
+// 停服 → 刷请求日志(超时兜底) → 关闭 sing-box 节点 → 关闭诊断日志 → os.Exit。
+func GracefulExit() {
+	Shutdown()
+	doGracefulShutdown()
+	os.Exit(0)
+}
+
+// doGracefulShutdown 实际执行收口工作, 用 sync.Once 保证只跑一次(信号与显式
+// 退出可能同时触发)。
+func doGracefulShutdown() {
+	shutdownOnce.Do(func() {
+		// 1) 停服: server.Shutdown 会停止接收新连接并等待在途请求完成, 自带 5s 超时兜底。
+		if appServer != nil {
+			sctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			if err := appServer.Shutdown(sctx); err != nil {
+				log.Printf("shutdown: server.Shutdown 超时: %v", err)
+			}
+		}
+		// 2) 请求日志: 把 channel 里已入队的尽量刷出去; 超时也不阻塞退出
+		//    (超时意味着写协程卡死, 强行退出比无限等待更可取)。
+		closeReqLogsTimed(3 * time.Second)
+		// 3) sing-box 节点: 释放端口与句柄。nodeBox 为 nil(如跳过节点盒的测试)时直接跳过。
+		closeNodeBoxTimed(3 * time.Second)
+		// 4) 流式诊断日志句柄。
+		closeStreamLog()
+	})
+}
+
+// closeReqLogsTimed 在超时内等待请求日志写协程刷盘并关闭句柄; 超时则尽力而为。
+func closeReqLogsTimed(timeout time.Duration) {
+	done := make(chan struct{})
+	go func() {
+		closeReqLogs()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(timeout):
+		log.Printf("shutdown: 请求日志关闭超时, 部分已排队日志可能未落盘")
+	}
+}
+
+// closeNodeBoxTimed 在超时内关闭 sing-box 节点盒; 超时则放弃等待。
+func closeNodeBoxTimed(timeout time.Duration) {
+	if nodeBox == nil {
+		return
+	}
+	done := make(chan struct{})
+	go func() {
+		nodeBox.Close()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(timeout):
+		log.Printf("shutdown: 节点盒关闭超时, 端口可能需手动回收")
+	}
+}
+
+// ============================================================================
+// 流式诊断日志(cline-proxy-stream.log)的共享写句柄
+//
+// 每次 anthropic 流式请求都会把出站 SSE 事件追加进该文件(内容只有模型输出文本,
+// 不含请求头与 API key, 不是凭据泄露), 此前无轮转上限会无限增长。复用
+// cline-proxy.log 的 10MiB 截断思路: 多并发请求共用同一句柄并加锁, 超过上限则
+// 截断成空, 只保留最近内容。
+// ============================================================================
+
+var (
+	streamLogMu   sync.Mutex
+	streamLogFile *os.File
+)
+
+func writeStreamLog(line string) {
+	streamLogMu.Lock()
+	defer streamLogMu.Unlock()
+	if streamLogFile == nil {
+		f, err := os.OpenFile(kit.ResolveDataPath("cline-proxy-stream.log"), os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
+		if err != nil {
+			return
+		}
+		streamLogFile = f
+	}
+	// 超过上限则截断成空, 只保留最近内容(与 cline-proxy.log 的 rotate 思路一致)。
+	if st, serr := streamLogFile.Stat(); serr == nil && st.Size() > maxLogBytes {
+		if terr := streamLogFile.Truncate(0); terr == nil {
+			// Windows 下 Truncate 不归零写偏移, O_APPEND 下需显式 Seek 回文件头。
+			if _, serr := streamLogFile.Seek(0, io.SeekStart); serr != nil {
+				log.Printf("streamlog: seek 失败: %v", serr)
+			}
+		} else {
+			log.Printf("streamlog: truncate 失败: %v", terr)
+		}
+	}
+	streamLogFile.WriteString(line)
+}
+
+func closeStreamLog() {
+	streamLogMu.Lock()
+	defer streamLogMu.Unlock()
+	if streamLogFile != nil {
+		streamLogFile.Close()
+		streamLogFile = nil
+	}
+}
+
+// CORS 策略常量: 未来收紧时改这一处就够。之前散落在 7 个 handler 里手写 "*"
+// 是历史遗留 —— corsHandler 里是唯一的完整策略源, 但 handleStreamResponseWithUsage /
+// handleAnthropicStreamWithUsage / handleResponses / handleClinePass /
+// handleChainedChatAs(shapeResponses) 这几个流式/子协议 handler 内部又各自 Set
+// 了一次 Origin, 收紧策略时这些点会漏改, 形成同一入口下策略不一致。抽成
+// applyCORS / setCORSOrigin 之后, 改一个点就影响所有 handler。
+const (
+	corsAllowOrigin  = "*"
+	corsAllowMethods = "GET, POST, OPTIONS"
+	corsAllowHeaders = "Content-Type, Authorization, x-api-key, anthropic-version, anthropic-beta"
+)
+
+// applyCORS 在响应上写完整 CORS 头。用于 corsHandler 入口, 以及需要在子 handler
+// 里补一遍的流式/子协议路径。
+func applyCORS(w http.ResponseWriter) {
+	w.Header().Set("Access-Control-Allow-Origin", corsAllowOrigin)
+	w.Header().Set("Access-Control-Allow-Methods", corsAllowMethods)
+	w.Header().Set("Access-Control-Allow-Headers", corsAllowHeaders)
+}
+
+// setCORSOrigin 只补 Origin 头, 用于那些父级 handler 已设过 Methods/Headers、
+// 但流式路径自己在 W.WriteHeader 前又刷一遍 Origin 的场景。
+func setCORSOrigin(w http.ResponseWriter) {
+	w.Header().Set("Access-Control-Allow-Origin", corsAllowOrigin)
+}
+
 func corsHandler(h http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Access-Control-Allow-Origin", "*")
-		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
-		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization, x-api-key, anthropic-version, anthropic-beta")
+		applyCORS(w)
 
 		if r.Method == "OPTIONS" {
 			w.WriteHeader(http.StatusNoContent)
@@ -720,12 +966,34 @@ func callClineAPIFailover(ctx context.Context, params map[string]any, stream boo
 	return nil, acc, err
 }
 
-// isRetryableUpstreamError reports whether the error from callClineAPI is
-// worth retrying with a different account.
+// isRetryableUpstreamError 判断 callClineAPI 返回的错误是否值得换账号重试。
+//
+// 优先级: 先看结构化错误里的 HTTP 状态码 —— callClineAPI 对一切非 200 响应都会
+// 包装成 *upstreamError 并带上 Status。按状态码判定最稳: 429 限流与 5xx 重试,
+// 其余(包括所有 4xx, 如 400 模型不存在 / 401 鉴权 / 403 地域限制)一律不重试,
+// 否则这些"必然失败"的请求会被白白打满整个账号池的 failover 轮次。
+//
+// 字符串兜底不能删: 网络层错误(token 刷新失败、拨号失败)和早期的调用点返回的是
+// 没有 Status 的裸 fmt.Errorf, 只能靠既有文案关键词识别。一刀切删掉会让网络抖动
+// 被当成"不可重试"而直接 502。
 func isRetryableUpstreamError(err error) bool {
 	if err == nil {
 		return false
 	}
+	var ue *upstreamError
+	if errors.As(err, &ue) && ue.Status != 0 {
+		switch ue.Status {
+		case http.StatusTooManyRequests, // 429 限流
+			http.StatusInternalServerError, // 500
+			http.StatusBadGateway,          // 502
+			http.StatusServiceUnavailable,  // 503
+			http.StatusGatewayTimeout:      // 504
+			return true
+		}
+		// 其余(含全部 4xx)不重试。
+		return false
+	}
+	// 兜底: 无状态码的错误按文案关键词判断(网络错误 / token 刷新失败等)。
 	s := err.Error()
 	for _, mark := range []string{"429", "token failed", "token expired", "refresh failed", "network error", "upstream request", "upstream retry"} {
 		if strings.Contains(s, mark) {
@@ -913,7 +1181,7 @@ func handleStreamResponseWithUsage(w http.ResponseWriter, upstream *http.Respons
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
-	w.Header().Set("Access-Control-Allow-Origin", "*")
+	setCORSOrigin(w)
 	w.WriteHeader(http.StatusOK)
 
 	flusher, ok := w.(http.Flusher)
@@ -1921,30 +2189,19 @@ func handleAnthropicStreamWithUsage(w http.ResponseWriter, upstream *http.Respon
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
-	w.Header().Set("Access-Control-Allow-Origin", "*")
+	setCORSOrigin(w)
 	w.WriteHeader(http.StatusOK)
 	flusher, ok := w.(http.Flusher)
 	if !ok {
 		return
 	}
 
-	var streamLog *os.File
-	if sf, err := os.OpenFile(kit.ResolveDataPath("cline-proxy-stream.log"), os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644); err == nil {
-		streamLog = sf
-	}
-	defer func() {
-		if streamLog != nil {
-			streamLog.Close()
-		}
-	}()
-
+	// 流式诊断日志改走共享、带轮转上限的 writeStreamLog(见其定义), 不再每请求独占句柄。
 	emit := func(event string, data any) {
 		d, _ := json.Marshal(data)
 		line := fmt.Sprintf("event: %s\ndata: %s\n\n", event, string(d))
 		w.Write([]byte(line))
-		if streamLog != nil {
-			streamLog.WriteString(line)
-		}
+		writeStreamLog(line)
 		flusher.Flush()
 	}
 

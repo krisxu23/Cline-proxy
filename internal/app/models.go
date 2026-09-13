@@ -65,12 +65,27 @@ func initModelsCache() {
 	}
 }
 
-func getFreeModels() []*ModelInfo {
-	initModelsCache()
+// modelsCacheSnapshot 持锁返回 modelsCache 的一份独立深拷贝。
+// 任何需要从 modelsCache 读取多字段 / 多次读取的调用方都应走这个 accessor,
+// 而不是在锁外裸读全局 map(会与 syncRecommendedModels 的并发写形成数据竞争,
+// 见 §2.1 / §5.9)。返回的拷贝与全局状态隔离, 调用方可在锁外安全使用。
+func modelsCacheSnapshot() map[string]*ModelInfo {
 	modelsMu.Lock()
 	defer modelsMu.Unlock()
-	out := make([]*ModelInfo, 0, len(modelsCache))
-	for _, m := range modelsCache {
+	out := make(map[string]*ModelInfo, len(modelsCache))
+	for k, v := range modelsCache {
+		cp := *v
+		out[k] = &cp
+	}
+	return out
+}
+
+func getFreeModels() []*ModelInfo {
+	initModelsCache()
+	// 走一致的快照 accessor, 不在锁外裸读 modelsCache(§2.1 / §5.9)。
+	snap := modelsCacheSnapshot()
+	out := make([]*ModelInfo, 0, len(snap))
+	for _, m := range snap {
 		cp := *m
 		out = append(out, &cp)
 	}
@@ -83,6 +98,16 @@ func getFreeModels() []*ModelInfo {
 		}
 	}
 	return out
+}
+
+// modelsSyncStamp 带锁读 lastSync(时间戳格式), 避免与同步协程的写形成数据竞争。
+func modelsSyncStamp() string {
+	modelsMu.Lock()
+	defer modelsMu.Unlock()
+	if modelsLastSync.IsZero() {
+		return ""
+	}
+	return modelsLastSync.UTC().Format(time.RFC3339)
 }
 
 type recommendedPayload struct {
@@ -239,8 +264,12 @@ func normalizeRequestModel(id string) string {
 }
 
 func apiModelList() []map[string]any {
-	out := make([]map[string]any, 0, len(modelsCache))
-	for _, m := range getFreeModels() {
+	// 必须走持锁的 accessor, 不要裸读 modelsCache —— 那是全局 map, 与
+	// syncRecommendedModels 的并发写构成数据竞争(本文件唯一一处裸读点)。
+	// 顺便只取一次快照: 原来 len(modelsCache) 和下面的 range 是两次独立遍历。
+	free := getFreeModels()
+	out := make([]map[string]any, 0, len(free))
+	for _, m := range free {
 		out = append(out, map[string]any{
 			"id":             m.ID,
 			"object":         "model",

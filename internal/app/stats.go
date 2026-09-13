@@ -1,8 +1,10 @@
 package app
 
 import (
+	"bytes"
 	"cline-go-proxy/internal/kit"
 	"encoding/json"
+	"io"
 	"log"
 	"os"
 	"sync"
@@ -65,16 +67,16 @@ type zenStatsModel struct {
 }
 
 var (
-	statsFile     *os.File
-	statsFileMu   sync.Mutex
-	statsToday    *zenStatsAgg
-	statsTotal    *zenStatsAgg
-	statsAggMu    sync.Mutex
+	statsFile   *os.File
+	statsFileMu sync.Mutex
+	statsToday  *zenStatsAgg
+	statsTotal  *zenStatsAgg
+	statsAggMu  sync.Mutex
 
 	// 可重试初始化: 用 Mutex + 状态替代 sync.Once, 打开失败后能重试而不永久降级。
-	statsInitMu     sync.Mutex
+	statsInitMu      sync.Mutex
 	statsRollStarted bool
-	statsFilePath   string // 可赋值变量, 便于测试注入不可写路径
+	statsFilePath    string // 可赋值变量, 便于测试注入不可写路径
 )
 
 type zenStatsTracker struct {
@@ -151,10 +153,18 @@ func initStats() {
 	statsFile = f
 	statsFileMu.Unlock()
 
-	agg := loadStatsFromFile(path)
-	if agg != nil {
-		statsTotal = agg
+	// 从落盘文件重建的聚合要在 statsAggMu 内一次性 swap 进全局变量,
+	// 不能在本函数里直接 aggregateRecord(statsToday, ...) —— 那时 statsInitMu
+	// 已释放, recordZenStats 可以并发拿 statsAggMu 写同一张 map。
+	total, today := loadStatsFromFile(path)
+	statsAggMu.Lock()
+	if total != nil {
+		statsTotal = total
 	}
+	if today != nil {
+		statsToday = today
+	}
+	statsAggMu.Unlock()
 }
 
 func newZenStatsAgg() *zenStatsAgg {
@@ -165,26 +175,121 @@ func newZenStatsAgg() *zenStatsAgg {
 	}
 }
 
-// loadStatsFromFile 从 JSONL 重建累计统计(仅今日的计入今日)
-func loadStatsFromFile(path string) *zenStatsAgg {
-	agg := newZenStatsAgg()
-	data, err := os.ReadFile(path)
-	if err != nil {
+// clone 深拷贝一份聚合体, 供 admin 快照使用。
+//
+// 必须克隆: zenStatsSnapshot 之前的实现是"锁内返回裸指针, 锁外被 marshal",
+// 而 admin 拿到 map 后立刻 json.Marshal 遍历 ByModel / ByUpstream, 期间
+// recordZenStats 会在 statsAggMu 下继续 aggregateRecord 往同一张 map 里写
+// —— Go 运行时对 concurrent map read/write 抛的是 fatal error, recover 无效,
+// 进程直接退出。面板开着 + 任何一次成功记账就能触发, 是日常场景。
+// 与 config_clone.go 的规矩保持一致: 快照就是"锁内克隆、锁外读克隆"。
+func (a *zenStatsAgg) clone() *zenStatsAgg {
+	if a == nil {
 		return nil
 	}
-	today := time.Now().Format("2006-01-02")
+	out := &zenStatsAgg{
+		Date:        a.Date,
+		Requests:    a.Requests,
+		PromptTok:   a.PromptTok,
+		CompleteTok: a.CompleteTok,
+		Compaction:  a.Compaction,
+		RateLimited: a.RateLimited,
+		ByModel:     make(map[string]*zenStatsModel, len(a.ByModel)),
+		ByUpstream:  make(map[string]*zenStatsModel, len(a.ByUpstream)),
+	}
+	for k, v := range a.ByModel {
+		out.ByModel[k] = cloneStatsModel(v)
+	}
+	for k, v := range a.ByUpstream {
+		out.ByUpstream[k] = cloneStatsModel(v)
+	}
+	return out
+}
+
+func cloneStatsModel(m *zenStatsModel) *zenStatsModel {
+	if m == nil {
+		return nil
+	}
+	return &zenStatsModel{
+		Requests:    m.Requests,
+		PromptTok:   m.PromptTok,
+		CompleteTok: m.CompleteTok,
+	}
+}
+
+// statsReadTailBytes 启动重建聚合时最多读取文件尾部的字节数。zen-stats.jsonl 可能
+// 非常大, 全量读重建既占内存又慢; 记录按时间顺序追加, 读尾部足够覆盖"今天+昨日"。
+const statsReadTailBytes = 64 << 20
+
+// maxZenStatsBytes zen-stats.jsonl 的轮转上限。此前无上限, 长期运行会无限增长;
+// 超过则截断成空, 只保留最近记录(诊断统计要的是最近一段, 不值得为历史做日期分文件)。
+const maxZenStatsBytes = 64 << 20
+
+// loadStatsFromFile 从 JSONL 重建累计统计(仅今日的计入今日)。
+//
+// 返回 (total, today): 由调用方在 statsAggMu 内一次性 swap 进全局变量,
+// 不在函数内部直接写 statsToday —— 那会与 recordZenStats 在 statsAggMu 下的
+// 写并发, 命中 concurrent map write。
+func loadStatsFromFile(path string) (*zenStatsAgg, *zenStatsAgg) {
+	total := newZenStatsAgg()
+	today := newZenStatsAgg()
+	data, err := readFileTail(path, statsReadTailBytes)
+	if err != nil || len(data) == 0 {
+		return nil, nil
+	}
+	todayDate := time.Now().Format("2006-01-02")
 	lines := splitLines(string(data))
 	for _, line := range lines {
 		var rec zenStatsRecord
 		if json.Unmarshal([]byte(line), &rec) != nil {
 			continue
 		}
-		aggregateRecord(agg, &rec)
-		if time.UnixMilli(rec.TS).Format("2006-01-02") == today {
-			aggregateRecord(statsToday, &rec)
+		aggregateRecord(total, &rec)
+		if time.UnixMilli(rec.TS).Format("2006-01-02") == todayDate {
+			aggregateRecord(today, &rec)
 		}
 	}
-	return agg
+	return total, today
+}
+
+// readFileTail 读取文件尾部至多 maxBytes 字节, 自动跳过被截断的半行。
+// 文件比窗口还小时直接全量读, 避免不必要的 seek。
+func readFileTail(path string, maxBytes int64) ([]byte, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+	st, err := f.Stat()
+	if err != nil {
+		return nil, err
+	}
+	size := st.Size()
+	if size == 0 {
+		return nil, nil
+	}
+	var raw []byte
+	if size <= maxBytes {
+		raw, err = io.ReadAll(f)
+		if err != nil {
+			return nil, err
+		}
+	} else {
+		if _, err = f.Seek(size-maxBytes, io.SeekStart); err != nil {
+			return nil, err
+		}
+		buf := make([]byte, maxBytes)
+		n, err := f.Read(buf)
+		if err != nil && err != io.EOF {
+			return nil, err
+		}
+		raw = buf[:n]
+	}
+	// 从第一个 '\n' 之后开始解析, 丢掉那条被截断的半行。
+	if i := bytes.IndexByte(raw, '\n'); i >= 0 {
+		raw = raw[i+1:]
+	}
+	return raw, nil
 }
 
 func aggregateRecord(agg *zenStatsAgg, rec *zenStatsRecord) {
@@ -244,6 +349,16 @@ func recordZenStats(rec zenStatsRecord) {
 		if err == nil {
 			statsFile.Write(append(b, '\n'))
 		}
+		// 轮转: 超过上限则截断成空, 只保留最近记录(与 cline-proxy.log / requests.jsonl 同思路)。
+		if st, serr := statsFile.Stat(); serr == nil && st.Size() > maxZenStatsBytes {
+			if terr := statsFile.Truncate(0); terr == nil {
+				if _, serr := statsFile.Seek(0, io.SeekStart); serr != nil {
+					log.Printf("zen-stats: seek 失败: %v", serr)
+				}
+			} else {
+				log.Printf("zen-stats: truncate 失败: %v", terr)
+			}
+		}
 	}
 	statsFileMu.Unlock()
 
@@ -255,13 +370,20 @@ func recordZenStats(rec zenStatsRecord) {
 
 func rollStatsDate() {
 	ticker := time.NewTicker(time.Minute)
-	for range ticker.C {
-		today := time.Now().Format("2006-01-02")
-		statsAggMu.Lock()
-		if statsToday.Date != today {
-			statsToday = newZenStatsAgg()
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ticker.C:
+			today := time.Now().Format("2006-01-02")
+			statsAggMu.Lock()
+			if statsToday.Date != today {
+				statsToday = newZenStatsAgg()
+			}
+			statsAggMu.Unlock()
+		case <-appRootCtx.Done():
+			// 收到退出信号: 停止日期滚动协程, 让进程能够真正停下。
+			return
 		}
-		statsAggMu.Unlock()
 	}
 }
 
@@ -269,8 +391,9 @@ func zenStatsSnapshot() map[string]any {
 	initStats()
 	statsAggMu.Lock()
 	defer statsAggMu.Unlock()
+	// 锁内克隆, 锁外读克隆 —— 见 zenStatsAgg.clone 的注释。
 	return map[string]any{
-		"today": statsToday,
-		"total": statsTotal,
+		"today": statsToday.clone(),
+		"total": statsTotal.clone(),
 	}
 }

@@ -42,6 +42,7 @@ func handleProvidersConfig(w http.ResponseWriter, r *http.Request) {
 		}
 		providers[name] = map[string]any{
 			"builtin":         false,
+			"display":         cfg.DisplayName,
 			"enabled":         cfg.isEnabled(),
 			"keys":            len(enabledAPIKeys(cfg, name)),
 			"apiType":         cfg.APIType,
@@ -71,7 +72,7 @@ func handleProvidersConfig(w http.ResponseWriter, r *http.Request) {
 //
 // 不进 zenConfig.Providers、不落盘: 它们没有 baseUrl, 进了配置会被当成
 // 通用 Provider 做目录刷新/连通测试。与 routerSnapshot 同源
-// (opencode = zenFreeCatalog 含健康门, cline = 单个 "*" 占位, 门控 clinePoolReady)。
+// (opencode = zenFreeCatalog 含健康门, cline = 官方推荐清单全量)。
 func builtinProviderEntries() map[string]map[string]any {
 	zenKey := ""
 	if cfg := getZenConfig(); cfg != nil {
@@ -89,25 +90,46 @@ func builtinProviderEntries() map[string]map[string]any {
 	if zenKey != "" {
 		zenKeys = 1
 	}
+	// cline 池给官方推荐清单全量(带状态/费用/同步时间): 面板要按状态逐个
+	// 展示, 不能只给单个 "*" 占位。具体命中哪个模型由池内轮询决定,
+	// 所以它没有 per-model 开关, 前端对内置行不渲染勾选列。
+	clineModels := []map[string]any{}
+	clineCatalog := []map[string]any{}
+	for _, m := range getFreeModels() {
+		// 零值时间要返回空串而不是 "0001-01-01T00:00:00Z" —— 前端 new Date()
+		// 对年份 1 会得到 Invalid Date, 界面显示 "Invalid Date"。口径与
+		// modelsSyncStamp() 保持一致: 没同步过就是空串。
+		syncedAt := ""
+		if !m.SyncedAt.IsZero() {
+			syncedAt = m.SyncedAt.UTC().Format(time.RFC3339)
+		}
+		clineModels = append(clineModels, map[string]any{
+			"id":             "cline:" + m.ID,
+			"model":          m.ID,
+			"status":         string(m.Status),
+			"cost":           m.Cost,
+			"source":         m.Source,
+			"requiresStream": m.RequiresStream,
+			"syncedAt":       syncedAt,
+		})
+		clineCatalog = append(clineCatalog, map[string]any{"id": m.ID, "disabled": m.Status == ModelRemoved})
+	}
 	clineOK := clinePoolReady()
 	return map[string]map[string]any{
 		"opencode": {
 			"builtin": true, "display": "opencode（zen 免费模型）",
 			"apiType": "builtin", "enabled": true, "keys": zenKeys,
-			"baseUrl": "", "apiKey": "", "catalog": false,
+			"baseUrl": "zen 免费目录", "apiKey": "", "catalog": false,
 			"modelEntries": []any{}, "runtime": map[string]any{"configured": zenKey != ""},
 			"models": zenModels, "catalogModels": zenCatalog, "google": false,
 		},
 		"cline": {
-			"builtin": true, "display": "Cline 账号池（自动选账号与模型）",
+			"builtin": true, "display": "Cline 账号池",
 			"apiType": "builtin", "enabled": true, "keys": 0,
-			"baseUrl": "", "apiKey": "", "catalog": false,
+			"baseUrl": "Cline 账号池（自动选账号与模型）", "apiKey": "", "catalog": false,
 			"modelEntries": []any{}, "runtime": map[string]any{"configured": clineOK},
-			"models": []map[string]any{
-				{"id": "cline:" + clinePoolPlaceholder, "model": clinePoolPlaceholder, "context": 0, "output": 0},
-			},
-			"catalogModels": []map[string]any{{"id": clinePoolPlaceholder, "disabled": false}},
-			"google":        false,
+			"models": clineModels, "catalogModels": clineCatalog, "google": false,
+			"lastSync": modelsSyncStamp(),
 		},
 	}
 }
