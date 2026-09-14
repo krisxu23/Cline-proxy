@@ -297,6 +297,15 @@ check('展开态变化时仍会重建并带 open',
   els.modelIndex._html.slice(0, 90));
 pvOpenSet.bai = false;   // 还原, 不影响后续用例
 
+console.log('\\n[9c] 全选/全不选按钮: 只出现在有勾选框的通用 Provider 表头');
+pvData = SAMPLE;
+renderModelIndex();
+const ah9c = els.modelIndex._html;
+check('通用 Provider 表头带 全选/全不选',
+  /onclick="toggleAllProviderModels\\('bai',true\\)"/.test(ah9c) &&
+  /onclick="toggleAllProviderModels\\('bai',false\\)"/.test(ah9c), '');
+check('内置 cline 表头不带批量按钮', ah9c.indexOf("toggleAllProviderModels('cline'") < 0, '');
+
 console.log('\\n[10] 空数据兜底');
 pvData = {};
 renderModelIndex();

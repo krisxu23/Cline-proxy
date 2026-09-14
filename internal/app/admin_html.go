@@ -1810,7 +1810,10 @@ function providerCardBody(n, p, stat) {
     head = '<tr><th style="text-align:left">模型 ID</th><th>上下文</th><th>最大输出</th><th style="width:44px"></th></tr>';
     note = 'zen 免费目录, 每 10 分钟自动同步; 用 zen/ 前缀调用。';
   } else {
-    head = '<tr><th style="width:44px">启用</th><th style="text-align:left">模型 ID</th><th style="width:44px"></th></tr>';
+    head = '<tr><th style="width:44px">启用</th><th style="text-align:left">模型 ID' +
+      '<button type="button" class="btn btn-sm" style="margin-left:10px;padding:2px 10px;font-size:11.5px" onclick="toggleAllProviderModels(\'' + escJs(n) + '\',true)">全选</button>' +
+      '<button type="button" class="btn btn-sm" style="margin-left:6px;padding:2px 10px;font-size:11.5px" onclick="toggleAllProviderModels(\'' + escJs(n) + '\',false)">全不选</button>' +
+      '</th><th style="width:44px"></th></tr>';
     note = '用 ' + n + ':模型名 调用; 勾选决定它是否对网关发布。';
   }
 
@@ -1970,6 +1973,35 @@ async function toggleProviderModel(box) {
     renderOneCard(name);
     try { await api('POST', '/providers/refresh', { name }); setTimeout(loadModelIndex, 8000); } catch (e2) { /* 目录回来后自动对齐 */ }
   } catch (e) { toast('保存失败: ' + e.message, 'error'); box.checked = !box.checked; }
+}
+
+// toggleAllProviderModels 一键全选/全不选当前 provider 的全部模型。
+// 条目归并口径与 toggleProviderModel 完全一致(modelEntries + catalogModels /
+// freeModels / disabledModels 预迁移回退), 区别只在把全部 id 置为同一状态,
+// 并**一次 POST** 保存 —— 绝不能逐个模型发 N 次请求。
+// 只对通用 Provider 生效: 内置 cline/opencode 的行没有勾选框, 表头也不渲染按钮。
+async function toggleAllProviderModels(name, checked) {
+  const p = pvData[name] || {};
+  const entries = new Map((p.modelEntries || []).map(e => [e.id, !!e.enabled]));
+  (p.catalogModels || []).forEach(m => { if (!entries.has(m.id)) entries.set(m.id, !m.disabled); });
+  (p.freeModels || []).forEach(mid => { if (!entries.has(mid)) entries.set(mid, true); });
+  (p.disabledModels || []).forEach(mid => { if (!entries.has(mid)) entries.set(mid, false); });
+  if (!entries.size) { toast(name + ' 没有可勾选的模型', 'error'); return; }
+  entries.forEach((v, k) => entries.set(k, checked));
+  // 与 toggleProviderModel 相同: 整体回传 provider, 只剥离运行时态 runtime,
+  // 覆盖 models / migrated, 其余字段原样保留以免后端加字段时被漏删。
+  const existing = Object.assign({}, p);
+  delete existing.runtime;
+  existing.models = Array.from(entries, ([mid, enabled]) => ({ id: mid, enabled }));
+  existing.migrated = true;
+  try {
+    await api('POST', '/providers/update', { name, provider: existing });
+    toast((checked ? '已全选 ' : '已全不选 ') + name + ' 的 ' + entries.size + ' 个模型', 'success');
+    p.modelEntries = Array.from(entries, ([mid, enabled]) => ({ id: mid, enabled }));
+    (p.catalogModels || []).forEach(m => { m.disabled = !checked; });
+    renderOneCard(name);
+    try { await api('POST', '/providers/refresh', { name }); setTimeout(loadModelIndex, 8000); } catch (e2) { /* 目录回来后自动对齐 */ }
+  } catch (e) { toast('保存失败: ' + e.message, 'error'); }
 }
 
 function editProvider(n) {
