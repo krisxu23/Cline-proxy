@@ -191,7 +191,7 @@ mark{background:rgba(250,204,21,.4);color:inherit;border-radius:3px;padding:0 2p
 .pbadge.pb-off{background:rgba(248,113,113,.12);color:var(--danger);border:1px solid rgba(248,113,113,.35)}
 .pbadge.pb-info{background:rgba(34,211,238,.12);color:var(--accent);border:1px solid rgba(34,211,238,.32)}
 .pd{display:none;padding:14px 16px 16px;border-top:1px solid var(--border);background:var(--inset)}
-.pi.open .pd{display:block;animation:rise .22s ease both}
+.pi.open .pd{display:block}
 .pd-head{display:flex;align-items:center;justify-content:space-between;gap:10px;margin-bottom:11px;flex-wrap:wrap}
 .pd-head p{font-size:12px;color:var(--text2);margin:0}
 .pacts{display:flex;gap:7px;flex-wrap:wrap}
@@ -1598,6 +1598,11 @@ const pvOpenSet = {};
 // 请求序号: loadModelIndex 可能被多个 setTimeout(loadModelIndex, 3000/12000) 同时挂着,
 // 慢响应覆盖快响应的竞态靠它消掉 —— 只有最新一次请求的回调才允许写 pvData / 渲染。
 let mIdxSeq = 0;
+// 上一次整表渲染的数据签名。保存/勾选后会安排多个延迟刷新(3s/8s/10s), 目录内容
+// 没变时重建 DOM 只会重播展开动画、闪一下并把滚动位置打回顶部 —— 所以签名相同
+// 就跳过重建。出错占位时必须把它清空(见 loadModelIndex 的 catch), 否则错误页会
+// 挡住随后的同数据正常渲染。
+let pvRenderSig = '';
 
 async function loadModelIndex() {
   const s = ++mIdxSeq;
@@ -1608,6 +1613,7 @@ async function loadModelIndex() {
     renderModelIndex();
   } catch (e) {
     if (s !== mIdxSeq) return;   // 同样丢弃过期的错误占位, 不让旧失败覆盖新成功
+    pvRenderSig = '';            // DOM 已被错误占位替换, 下次成功必须真正重建
     _('modelIndex').innerHTML = fail(e, 'loadModelIndex()');
   }
 }
@@ -1675,10 +1681,20 @@ function renderModelIndex() {
     return a.localeCompare(b);
   });
   if (!names.length) {
+    pvRenderSig = '';
     box.innerHTML = '<div class="empty" style="padding:14px">暂无供应商, 在下方添加第一个通用 Provider</div>';
     _('modelIndexSummary').textContent = '0 个供应商';
     return;
   }
+  // 数据签名相同 → 跳过重建, 只把全局搜索的显隐重新套一遍(保持与搜索框一致)。
+  // 签名必须同时含数据与展开态: 只比数据的话, 外部改了 pvOpenSet 后再重绘会被
+  // 误判为"没变化"而跳过, 卡片的 open 类就丢渲染(渲染测试 [9] 锁的就是这个)。
+  const sig = JSON.stringify([names.map(n => pvData[n] || {}), pvOpenSet]);
+  if (sig === pvRenderSig) {
+    filterModelIndex(_('modelSearchBox') ? _('modelSearchBox').value : '');
+    return;
+  }
+  pvRenderSig = sig;
   let totalModels = 0, totalOn = 0, readyN = 0;
   names.forEach(n => {
     const p = pvData[n] || {};
@@ -2025,6 +2041,9 @@ async function saveProvider() {
   try {
     await api('POST', '/providers/update', body);
     toast('已保存 ' + name + '，正在拉取模型目录…', 'success');
+    // 保存成功即清空表单: 输入框里留着已保存的内容会让人分不清"还没保存"和"已保存"，
+    // 也容易在改名后误再点一次保存出第二条记录。清空后要填就是一次全新的添加。
+    resetProviderForm();
     pvOpenSet[name] = true;   // 保存后直接展开这张卡片, 用户当场看到结果
     loadModelIndex();
     // 保存后自动拉一次目录, 用户不需要再点「刷新目录」

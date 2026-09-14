@@ -279,6 +279,24 @@ check('bai 重绘后仍是 open', /class="pi open" data-id="bai"/.test(els.model
   els.modelIndex._html.slice(els.modelIndex._html.indexOf('data-id="bai"') - 30, els.modelIndex._html.indexOf('data-id="bai"') + 10));
 check('未展开的 cline 不带 open', !/class="pi open" data-id="cline"/.test(els.modelIndex._html));
 
+console.log('\\n[9b] 数据与展开态都未变时, 重绘不得重建 DOM(防整页闪烁)');
+pvData = SAMPLE;
+delete pvOpenSet.bai;
+renderModelIndex();
+// 在现有 DOM 内容上打标记: 若下一次 renderModelIndex 真的重建了 innerHTML,
+// 标记会消失; 若按签名跳过重建, 标记保留。保存/勾选后会安排 3s/8s/10s 多次
+// 延迟刷新, 重建会重播展开区动画(整页一闪一闪)并把滚动位置打回顶部。
+els.modelIndex.innerHTML = els.modelIndex._html + '<!--SIG-SENTINEL-->';
+renderModelIndex();
+check('数据与展开态未变时跳过重建', els.modelIndex._html.indexOf('SIG-SENTINEL') >= 0,
+  els.modelIndex._html.slice(-40));
+pvOpenSet.bai = true;
+renderModelIndex();
+check('展开态变化时仍会重建并带 open',
+  els.modelIndex._html.indexOf('SIG-SENTINEL') < 0 && /class="pi open" data-id="bai"/.test(els.modelIndex._html),
+  els.modelIndex._html.slice(0, 90));
+pvOpenSet.bai = false;   // 还原, 不影响后续用例
+
 console.log('\\n[10] 空数据兜底');
 pvData = {};
 renderModelIndex();
