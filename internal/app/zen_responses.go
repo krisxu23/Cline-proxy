@@ -204,9 +204,14 @@ func chatBodyToResponsesBody(chat map[string]any) map[string]any {
 		}
 	}
 	// max_tokens / max_completion_tokens -> max_output_tokens
+	// Responses 端点要求 max_output_tokens >= 16: 推理模型低于 16 的预算
+	// 没有意义, 上游直接 400 invalid_request_error, 这里钳到下限。
 	for _, key := range []string{"max_tokens", "max_completion_tokens"} {
 		if v, ok := chat[key]; ok {
 			if n := anyToInt(v); n > 0 {
+				if n < 16 {
+					n = 16
+				}
 				out["max_output_tokens"] = n
 			}
 			break

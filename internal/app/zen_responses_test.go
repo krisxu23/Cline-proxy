@@ -300,3 +300,25 @@ func TestZenResponsesFlavorLearnAndPersist(t *testing.T) {
 	}
 	_ = kit.WriteFileAtomicDefault // 引用避免在某些构建配置下的 unused 报错
 }
+
+func TestChatBodyToResponsesBody_MaxTokensClamp(t *testing.T) {
+	// 上游要求 max_output_tokens >= 16, 小值必须钳到下限
+	for _, in := range []int{1, 8, 15} {
+		out := chatBodyToResponsesBody(map[string]any{
+			"model":      "m",
+			"max_tokens": in,
+			"messages":   []any{map[string]any{"role": "user", "content": "hi"}},
+		})
+		if out["max_output_tokens"] != 16 {
+			t.Fatalf("max_tokens=%d 应钳到 16, got %v", in, out["max_output_tokens"])
+		}
+	}
+	// 合法值不受影响
+	out := chatBodyToResponsesBody(map[string]any{
+		"model": "m", "max_tokens": 400,
+		"messages": []any{map[string]any{"role": "user", "content": "hi"}},
+	})
+	if out["max_output_tokens"] != 400 {
+		t.Fatalf("max_tokens=400 不应被改动, got %v", out["max_output_tokens"])
+	}
+}
