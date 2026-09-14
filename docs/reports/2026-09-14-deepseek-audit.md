@@ -206,3 +206,40 @@
 - **工作树完整性**：审计全程 HEAD `914c1a9`，`git status --porcelain` 为空。lead 在复现 V1 后已 `git checkout` 还原并复核。
 - **一次流程风险已被拦截**：某角色在交卷时把一条前端缺陷直接移交给修复工去改代码（审计阶段不应写代码），lead 已下达 HOLD 指令叫停，并确认工作树未被污染——否则另一个角色"改坏代码→验证→还原→证明 git 干净"的取证链条会当场失效。
 - **未能实测的部分**：贝洛奇（并发）因未配置 Go 环境，其全部结论为静态核对；卜宕机/高见远/贾思敏/颜好看/许清楚的部分条目为阅读所得，未经 lead 逐条复核（本报告已用"复核"列标注）。
+
+---
+
+## 9. 修复落地记录（2026-09-14，commit `2fca091`）
+
+本报告的全部 P0/P1 已落地，P2 大部分落地，P3 择要落地。落地过程中**又发现并修掉了两个本报告未覆盖的更深问题**，一并记录在此。
+
+### 9.1 修复实施期新发现（不在原报告内）
+
+| 新发现 | 严重度 | 说明 |
+|---|---|---|
+| **全仓 4 处日志轮转在 Windows 上一直是静默失效的** | **比原报告更严重** | 原报告只说"主日志没有运行时轮转"。实际是 `proxy.go`(主日志/流日志)、`stats.go`、`logs.go` 四处都在 `os.O_APPEND` 句柄上调 `file.Truncate(0)`，而 **Windows 下 O_APPEND 句柄拿不到 `GENERIC_WRITE`，截断返回 `Access is denied`**，每处的 `if err == nil` 兜底把错误吞了。已在真实 Windows 环境实测复现（探针输出 `truncate ...: Access is denied.`），统一改为 `os.Truncate(path, 0)`。 |
+| **`poolSnapshot()` 曾被留在"故意写坏的负向验证版本"上** | 阻断 | 实施 `poolSnapshot` 的写手在做负向验证时被限流打断，盘上留下的是**锁外裸读**的版本——代码编译得过、测试也绿，**但竞态根本没修**，只是从 `loadPool()` 挪进了 `poolSnapshot()`。只有逐行读才抓得住。 |
+
+### 9.2 落地清单
+
+- **P0-1 协议层测试**：新增 `responses_test.go`(500 行) / `protocol_convert_test.go`(374 行) / `compact_test.go`(218 行)。
+- **P0-2 日志轮转**：`logFanout` 改为带锁结构并在写入路径维护上限；4 处截断点统一改 `os.Truncate`；新增 `log_rotate_test.go`（3 条断言 + 负向验证）。
+- **P0-3 节点凭据入日志**：`nodes.go` 两处改用 `nodeDisplayName()`。
+- **P1-3 账号池竞态**：新增 `poolSnapshot()` 持锁深拷贝，9 处只读点改走它（`admin.go` / `zen.go` / `proxy.go`），抽出 `loadPoolLocked()`；新增 `pool_race_test.go`（负向验证稳定报 `WARNING: DATA RACE`）。
+- **P1-4**：`closeNodeBoxTimed` 改为先持 `nodeMu` 摘句柄置 nil 再锁外 Close。
+- **P1-7**：CI 在构建前算版本并 `-X` 注入 `buildVersion`（实测 `/health` 已从 `go-1.1` 变为注入值）。
+- **P1-8**：`main.go` 增加常驻 `errCh` 监听，启动失败不再被静默吞掉。
+- **P1-9**：令牌引导页区分"未带令牌"与"令牌无效"，后者回显提示并回填输入（真机冒烟已验证两种分支）。
+- **P1-11**：`kit` 增加 `os.UserConfigDir()` 回退与 `DataPathError()` 供上层感知。
+- **P2**：`/health` 的 `status` 改为综合判定 + 新增 `exitReachable`/`exitProbed` + `exitReady`→`serverRegistered`；退出补 `flushPoolLocked()`+`saveUsageLedger()`；11 个后台 ticker 接入 `appRootCtx`；前端测试进 CI；`<mark>` 残留；`renderOneCard` 的 `CSS.escape`；导出账号改走统一 `apiResponse` 信封；模型同步失败刷屏抑制。
+- **P3**：Docker 非 root 用户；compose 端口只绑 `127.0.0.1`；Release 生成 sha256；网关密钥改 `crypto/rand`。
+
+### 9.3 已知未修（明确记录，不静默跳过）
+
+| 项 | 原因 |
+|---|---|
+| `internal/providers/clinepass.go` 的 `recoveryLoop` 未接退出信号 | `package providers` 跨包访问不到 `appRootCtx`；为"整洁"引入跨包依赖是负收益。Go 中泄漏的 ticker 协程不阻止进程退出（`GracefulExit` 后即 `os.Exit(0)`），故列为已知项。 |
+| 日志无 level、无请求关联键 | 改动面大（需要中间件往 context 注入请求 ID 并贯穿各转发路径），收益低于成本，本轮不做。 |
+| `admin_html.go` 的部分 UX 细化（label 关联、窄屏 toast、删除进度、文案统一等） | 低危项，本轮优先保证了正确性类修复。 |
+| `kit.LastDataPathError` / `proxyListenAddress` 等启动期写、运行期读的全局量未加锁 | 写入只发生在启动或极端失败路径，读发生在启动后；未构成运行期竞态。 |
+

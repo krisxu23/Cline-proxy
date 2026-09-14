@@ -296,11 +296,33 @@ Model:    同上
 - **路由决策头**：每个响应带 `X-Proxy-Route`，标注 `upstream` / `model` / `failover`，排查路由一目了然
 - **token 统计**：每请求 JSONL 落盘（`data/zen-stats.jsonl`），按账号/上游/模型聚合，后台实时展示
 - **请求日志**：`data/requests.jsonl` 记录每次请求；运行日志写在 `data/cline-proxy.log`（追加模式，桌面形态同样落盘）
+- **日志自轮转**：`cline-proxy.log` / `cline-proxy-stream.log` / `zen-stats.jsonl` / `requests.jsonl` 都在**写入路径上**维护大小上限（主日志 10 MiB），超限即截断成空只保留最近内容——长期不重启也不会把磁盘写满。
 - **出口治理**：后台 **🌐 出口代理与节点** —— 代理策略、代理列表、订阅、节点列表与连通检测、限流防御、上下文压缩都在此页
 - **thinking 透传**：Anthropic 协议下上游 `reasoning_content` 自动转为 `thinking` 内容块（流式 + 非流式）
 - **SSE 稳健性**：上游流无任何 choices 时自动补一个空 chunk 收尾，避免客户端报 "Provider returned no completion choices"
 - **熔断与自愈**：上游级熔断（连续 5xx/408/429 触发，窗口过期后半开探测，探测失败立即重跳闸；4xx 客户端错误不计入）→ key/账号级冷却（ClinePass key 与 Cline 账号命中 429 独立冷却，成功自动清零）→ 模型级路由（前缀显式分流，付费/未知模型明确拒绝）
-- **多平台 CI/CD**：GitHub Actions 自动构建多平台二进制；Release 按语义版本递增
+- **多平台 CI/CD**：GitHub Actions 自动构建多平台二进制；Release 按语义版本递增，并附带 `sha256` 校验值
+
+### 健康检查 `GET /health`
+
+无需鉴权（供探针/编排使用），返回 JSON：
+
+| 字段 | 含义 |
+|---|---|
+| `status` | 综合判定。**不是恒为 `ok`**：只要订阅里确实有节点、也已经探测过、但可达数为 0，就报 `degraded`（避免"出口池全死但健康检查一直说 ok"这种静默故障）。没配订阅或尚未探测完仍报 `ok`——未知不等于不可用 |
+| `version` | 构建时注入的版本号（CI 用 `git describe` 注入）。**用于区分两个版本**，不再恒为 `go-1.1` |
+| `activeAccounts` | Cline 账号池里状态为 `active` 的账号数 |
+| `nodePool` | 当前出口隧道数（订阅展开并成功建箱后的节点数） |
+| `exitReachable` / `exitProbed` | 最近一次连通检测里判定可达的出口数 / 已探测数。这两个数字以前只写进日志，现在可被机器读取 |
+| `subNodes` | 订阅展开后的节点总数 |
+| `lastSubFetch` | 订阅缓存文件最近写入时间（Unix 毫秒）。**注意**：订阅抓取失败时会保留旧缓存，所以它只能反映"上次成功刷新的时间"，不代表本次抓取成功 |
+| `serverRegistered` | HTTP server 是否已注册。（此字段原名 `exitReady`，但它只表示 `appServer != nil`，与"能否优雅退出"无关，会误导排障，已改名） |
+| `logBytes` | 主日志当前字节数（配合自轮转，该值应有封顶） |
+| `dropped` | 请求日志因缓冲满被丢弃的条数 |
+
+```bash
+curl -s http://127.0.0.1:3457/health
+```
 
 ## 项目结构
 
