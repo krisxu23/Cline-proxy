@@ -40,7 +40,7 @@
 
 - **无控制台黑窗口**：GUI 子系统构建，启动即进桌面形态
 - **管理窗口**：自动弹出独立应用窗口渲染 Web 后台（无地址栏、独立任务栏图标）
-- **系统托盘**：右下角托盘图标，右键菜单含 4 项——「打开管理界面」「打开数据目录」（用资源管理器打开 `data/`，日志/配置/令牌都在这里）「导出诊断包」（把 `/health` 快照、日志尾部、节点概览打包成 `data/diag-<时间戳>.zip` 便于排障）「退出」
+- **系统托盘**：右键菜单含 4 项——「打开管理界面」「打开数据目录」（资源管理器打开 `data/`）「导出诊断包」（打包日志与运行状态到 `data/diag-<时间戳>.zip`）「退出」
 - **重复双击**：端口被占时自动并入已在运行的实例，直接弹出管理窗口
 - **启动失败**：弹窗提示原因（如端口占用，可换端口）
 - **完整性校验**：发布包未签名，Windows SmartScreen 可能拦截。下载后比对 Release 页的 `cline-proxy-windows-amd64.exe.sha256`：
@@ -99,7 +99,7 @@ go run -tags "with_quic,with_grpc,with_utls" . -start
 
 `/admin/api/*` 全部需要访问令牌。令牌在首次启动时自动生成并落盘到 `data/admin-token`，重启不变。三种传递方式：
 
-> 令牌文件权限：**Windows 不实现数字权限位**，落盘后实测仍是 644，配置里的 `0600` 不会生效。请勿把 `data/` 目录放在共享或可被其他用户读取的位置。
+> Windows 不实现数字权限位，令牌文件落盘后仍是默认权限。请勿把 `data/` 目录放在共享或可被其他用户读取的位置。
 
 | 方式 | 用法 |
 |---|---|
@@ -107,7 +107,7 @@ go run -tags "with_quic,with_grpc,with_utls" . -start
 | 请求头 | `X-Admin-Token: <token>` 或 `Authorization: Bearer <token>` |
 | Cookie | `admin_token=<token>` |
 
-同时管理接口**不再返回 CORS 头**，并会拒绝带公网 `Origin` 的请求。这两条是必需的：只加令牌不够 —— 没有它们，用户浏览器里打开的任意网页都能 `fetch` 本机管理接口并读走全部账号 refreshToken 与上游 API Key（防火墙拦不住，因为请求确实发自本机）。
+管理接口不返回 CORS 头，并拒绝带公网 `Origin` 的请求——否则用户浏览器里打开的任意网页都能 `fetch` 本机管理接口，读走全部账号 refreshToken 与上游 API Key。
 
 > 需要局域网访问时请显式 `-host 0.0.0.0`，并确保 `data/admin-token` 不随镜像或日志外泄。
 
@@ -226,13 +226,13 @@ curl -H "X-Admin-Token: $TOKEN" http://127.0.0.1:3457/admin/api/clinepass/models
 
 把任意 OpenAI 兼容站点挂进网关，用 `provider:model` 直选。在后台 **🔌 通用 Provider（OpenAI 兼容上游）** 里填写，或直接改 `.zen-config.json` 的 `providers` 段。
 
-免费模型判定（**没有 `pricing` 开关**）：网关**不识别 `pricing` 这个配置键**——旧文档写的 `"pricing": true` 会被 JSON 解析静默丢弃，配了等于没配。当前免费模型完全由**白名单**决定：
+免费模型由显式开关决定，按上游是否提供模型目录选择配置方式：
 
-- 有目录的上游（`catalog: true`，默认开启；Google 上游自动强制开启）：目录拉取后在面板「🔌 通用 Provider」页**逐个勾选**哪些模型免费；
-- 无目录的上游（如 B.AI）：直接把模型名写进 `freeModels` 白名单；
-- 二者也可叠加（`catalog: true` + `freeModels`）：以白名单为主，上游下架的模型自动剔除。
+- 提供目录的上游（`catalog: true`；Google 上游自动强制开启）：目录拉取后在面板「🔌 通用 Provider」页逐个勾选免费模型；
+- 不提供目录的上游（如 B.AI）：把模型名写进 `freeModels` 白名单；
+- 两者可叠加（`catalog: true` + `freeModels`）：白名单优先，上游已下架的模型自动剔除。
 
-> `freeModels` 仅作为一次性迁移输入：面板写入显式开关后会覆盖它，请求路径不再单独读它。`catalog` 的作用是拿到模型清单与连通性，**不直接决定**某个模型是否免费。上游目录里若带价格字段，网关会解析但不据其自动判定免费。
+> `catalog` 用于拉取模型清单与连通性，不据目录价格自动判定免费；上游目录若带价格字段，网关会解析但不以此判定免费。
 
 面板上的操作：**保存 Provider**、**🔍 连通测试**（对指定模型发一次最小请求）、**🔄 刷新目录**；列表里显示每个 provider 的 `目录 N · 免费 N · 可聊 N` 与最近一次错误。目录在启动时立即拉取、之后每 15 分钟刷新一次；目录为空时请求路径会按 1 分钟退避自行重试。
 
@@ -259,7 +259,7 @@ curl -H "X-Admin-Token: $TOKEN" http://127.0.0.1:3457/admin/api/clinepass/models
 }
 ```
 
-Google（Gemini）上游**只需填 Base URL + API Key**：目录地址、鉴权方言、以及 thought-signature 回填与重放，全部由网关按 hostname 自动推导。鉴权是**按目标路径择一**发送的——OpenAI 兼容路径发 `Authorization: Bearer`，Google 原生目录路径（`/v1beta/models`）只发 `x-goog-api-key`；两条路径都发会被上游回 401 并盖住真实错误，所以网关不会同时发。面板与配置文件里**不接受、也不需要处理** `modelsUrl` / `modelsKeyHeader` 这类键——照旧文档配了也会被静默忽略。历史工具调用的 thought-signature 缺失时网关自动回填跳过哨兵，上游拒绝已缓存签名时自动用哨兵重放一次。
+Google（Gemini）上游只需填 Base URL + API Key：目录地址与鉴权方言由网关按 hostname 自动推导——OpenAI 兼容路径发 `Authorization: Bearer`，Google 原生目录路径（`/v1beta/models`）发 `x-goog-api-key`。历史工具调用的 thought-signature 缺失时自动回填跳过哨兵，上游拒绝已缓存签名时自动用哨兵重放一次。
 
 ## 配置客户端
 
@@ -296,7 +296,7 @@ Model:    同上
 - **路由决策头**：每个响应带 `X-Proxy-Route`，标注 `upstream` / `model` / `failover`，排查路由一目了然
 - **token 统计**：每请求 JSONL 落盘（`data/zen-stats.jsonl`），按账号/上游/模型聚合，后台实时展示
 - **请求日志**：`data/requests.jsonl` 记录每次请求；运行日志写在 `data/cline-proxy.log`（追加模式，桌面形态同样落盘）
-- **日志自轮转**：`cline-proxy.log` / `cline-proxy-stream.log` / `zen-stats.jsonl` / `requests.jsonl` 都在**写入路径上**维护大小上限（主日志 10 MiB），超限即截断成空只保留最近内容——长期不重启也不会把磁盘写满。
+- **日志自轮转**：`cline-proxy.log` / `cline-proxy-stream.log` / `zen-stats.jsonl` / `requests.jsonl` 按大小自动轮转（主日志 10 MiB，超限截断只保留最近内容）。
 - **出口治理**：后台 **🌐 出口代理与节点** —— 代理策略、代理列表、订阅、节点列表与连通检测、限流防御、上下文压缩都在此页
 - **thinking 透传**：Anthropic 协议下上游 `reasoning_content` 自动转为 `thinking` 内容块（流式 + 非流式）
 - **SSE 稳健性**：上游流无任何 choices 时自动补一个空 chunk 收尾，避免客户端报 "Provider returned no completion choices"
@@ -305,24 +305,24 @@ Model:    同上
 
 ### 健康检查 `GET /health`
 
-无需鉴权（供探针/编排使用），返回 JSON：
-
-| 字段 | 含义 |
-|---|---|
-| `status` | 综合判定。**不是恒为 `ok`**：只要订阅里确实有节点、也已经探测过、但可达数为 0，就报 `degraded`（避免"出口池全死但健康检查一直说 ok"这种静默故障）。没配订阅或尚未探测完仍报 `ok`——未知不等于不可用 |
-| `version` | 构建时注入的版本号（CI 用 `git describe` 注入）。**用于区分两个版本**，不再恒为 `go-1.1` |
-| `activeAccounts` | Cline 账号池里状态为 `active` 的账号数 |
-| `nodePool` | 当前出口隧道数（订阅展开并成功建箱后的节点数） |
-| `exitReachable` / `exitProbed` | 最近一次连通检测里判定可达的出口数 / 已探测数。这两个数字以前只写进日志，现在可被机器读取 |
-| `subNodes` | 订阅展开后的节点总数 |
-| `lastSubFetch` | 订阅缓存文件最近写入时间（Unix 毫秒）。**注意**：订阅抓取失败时会保留旧缓存，所以它只能反映"上次成功刷新的时间"，不代表本次抓取成功 |
-| `serverRegistered` | HTTP server 是否已注册。（此字段原名 `exitReady`，但它只表示 `appServer != nil`，与"能否优雅退出"无关，会误导排障，已改名） |
-| `logBytes` | 主日志当前字节数（配合自轮转，该值应有封顶） |
-| `dropped` | 请求日志因缓冲满被丢弃的条数 |
+无需鉴权（供探针/编排使用）：
 
 ```bash
 curl -s http://127.0.0.1:3457/health
 ```
+
+| 字段 | 含义 |
+|---|---|
+| `status` | `ok` / `degraded`。配置了订阅、已探测、且可达出口为 0 时报 `degraded`；未配置订阅或尚未探测完报 `ok` |
+| `version` | 构建时注入的版本号 |
+| `activeAccounts` | 账号池中 `active` 状态的账号数 |
+| `nodePool` | 当前出口隧道数 |
+| `exitReachable` / `exitProbed` | 最近一次连通检测中可达 / 已探测的出口数 |
+| `subNodes` | 订阅展开后的节点总数 |
+| `lastSubFetch` | 订阅缓存最近一次成功写入时间（Unix 毫秒） |
+| `serverRegistered` | HTTP server 是否已注册 |
+| `logBytes` | 主日志当前字节数 |
+| `dropped` | 请求日志因缓冲满被丢弃的条数 |
 
 ## 项目结构
 
