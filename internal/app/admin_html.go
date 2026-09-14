@@ -18,12 +18,12 @@ const adminHTML = `<!DOCTYPE html>
   --status-expired-bg:rgba(248,113,113,.14);
   --btn-primary-bg:linear-gradient(135deg,#0ea5e9,#22d3ee);--btn-primary-hover:linear-gradient(135deg,#0284c7,#0ea5e9);
   --btn-success-bg:linear-gradient(135deg,#059669,#34d399);--btn-success-hover:linear-gradient(135deg,#047857,#059669);
-  --radius:14px;--radius-sm:9px;
+  --radius:14px;--radius-sm:9px;--font-mono:var(--font-mono);
 }
 [data-theme="light"]{
   --bg:#f3f5fa;--bg2:#ffffff;--bg3:#eef1f7;--panel:rgba(255,255,255,.7);--inset:rgba(15,23,42,.05);
   --border:rgba(15,23,42,.12);--border-strong:rgba(15,23,42,.26);
-  --text:#0f172a;--text2:#57617a;--text3:#8a94ab;
+  --text:#0f172a;--text2:#57617a;--text3:#67718a;
   --accent:#0891b2;--accent2:#059669;--amber:#b45309;--danger:#dc2626;
   --accent-grad:linear-gradient(135deg,#0891b2,#059669);
   --glow:0 0 0 1px rgba(8,145,178,.22),0 6px 24px rgba(8,145,178,.10);
@@ -39,7 +39,7 @@ body::before{content:'';position:fixed;inset:0;z-index:-1;background:
   radial-gradient(900px 500px at 85% -10%,rgba(34,211,238,.09),transparent 60%),
   radial-gradient(800px 500px at -10% 110%,rgba(52,211,153,.07),transparent 60%),
   var(--bg);pointer-events:none}
-.mono,code{font-family:'JetBrains Mono','Cascadia Code','Fira Code',Consolas,monospace;font-size:12px}
+.mono,code{font-family:var(--font-mono);font-size:12px}
 
 /* ===== 布局 ===== */
 .layout{display:flex;min-height:100vh}
@@ -49,12 +49,12 @@ body::before{content:'';position:fixed;inset:0;z-index:-1;background:
 .sidebar h1 .brand-name{background:var(--accent-grad);-webkit-background-clip:text;background-clip:text;-webkit-text-fill-color:transparent}
 .sidebar h1 .theme-toggle{margin-left:auto;padding:4px 8px}
 .sidebar h1 span{color:var(--accent)}
-.nav-item{display:flex;align-items:center;gap:10px;padding:9px 12px;border-radius:10px;cursor:pointer;color:var(--text2);transition:.18s;font-size:13.5px;margin-bottom:2px;position:relative}
+.nav-item{display:flex;align-items:center;gap:10px;padding:9px 12px;border-radius:var(--radius-sm);cursor:pointer;color:var(--text2);transition:.18s;font-size:13.5px;margin-bottom:2px;position:relative}
 .nav-item .nav-ico{width:18px;text-align:center;font-size:15px;filter:saturate(.8)}
 .nav-item:hover{color:var(--text);background:rgba(148,163,184,.09)}
 .nav-item.active{color:var(--text);background:linear-gradient(90deg,rgba(34,211,238,.16),rgba(34,211,238,.05));font-weight:600}
 .nav-item.active::before{content:'';position:absolute;left:-10px;top:20%;bottom:20%;width:3px;border-radius:3px;background:var(--accent-grad);box-shadow:0 0 12px rgba(34,211,238,.6)}
-.sidebar-footer{margin-top:auto;padding:12px 8px 4px;font-size:11.5px;color:var(--text3);border-top:1px solid var(--border)}
+.sidebar-footer{margin-top:auto;padding:12px 8px 4px;font-size:12px;color:var(--text3);border-top:1px solid var(--border)}
 .sidebar-footer a{color:var(--accent);text-decoration:none}
 .main{flex:1;padding:26px 34px 60px;min-width:0;max-width:1500px;margin:0 auto;width:100%}
 h2{font-size:21px;margin-bottom:18px;font-weight:700;letter-spacing:.01em}
@@ -93,7 +93,7 @@ h2{font-size:21px;margin-bottom:18px;font-weight:700;letter-spacing:.01em}
 .table-wrap{overflow-x:auto}
 table{width:100%;border-collapse:collapse}
 th,td{text-align:left;padding:10px 14px;border-bottom:1px solid var(--border);font-size:13px;white-space:nowrap}
-th{color:var(--text2);font-weight:600;font-size:11.5px;text-transform:uppercase;letter-spacing:.06em}
+th{color:var(--text2);font-weight:600;font-size:12px;text-transform:uppercase;letter-spacing:.06em}
 tbody tr{transition:.12s}
 tbody tr:hover{background:rgba(148,163,184,.06)}
 tbody tr:last-child td{border-bottom:none}
@@ -129,7 +129,7 @@ input::placeholder,textarea::placeholder{color:var(--text3)}
 input:focus,textarea:focus,select:focus{border-color:var(--accent);box-shadow:0 0 0 3px rgba(34,211,238,.15)}
 /* 键盘聚焦给统一可见反馈; 输入框已有 box-shadow 指示, 这里再补一层 outline 兜底 */
 :focus-visible{outline:2px solid var(--accent);outline-offset:2px}
-textarea{resize:vertical;min-height:84px;font-family:'JetBrains Mono','Cascadia Code',Consolas,monospace;font-size:12px}
+textarea{resize:vertical;min-height:84px;font-family:var(--font-mono);font-size:12px}
 select{cursor:pointer;appearance:none;background-image:linear-gradient(45deg,transparent 50%,var(--text2) 50%),linear-gradient(135deg,var(--text2) 50%,transparent 50%);background-position:calc(100% - 18px) 55%,calc(100% - 13px) 55%;background-size:5px 5px;background-repeat:no-repeat;padding-right:32px}
 .form-row{display:flex;gap:14px;align-items:flex-end;margin-bottom:14px;flex-wrap:wrap}
 .form-row .field{flex:1;min-width:180px}
@@ -145,7 +145,7 @@ select{cursor:pointer;appearance:none;background-image:linear-gradient(45deg,tra
 .hint strong{color:var(--text)}
 
 /* ===== Toast ===== */
-.toast{position:fixed;top:22px;right:22px;padding:12px 20px;border-radius:12px;color:#fff;z-index:9999;opacity:0;transform:translateY(-12px) scale(.97);transition:.3s cubic-bezier(.2,.9,.3,1.2);font-size:13px;max-width:420px;backdrop-filter:blur(12px);border:1px solid rgba(255,255,255,.14);box-shadow:0 12px 40px rgba(2,6,23,.5);white-space:pre-line}
+.toast{position:fixed;top:22px;right:22px;padding:12px 20px;border-radius:var(--radius);color:#fff;z-index:9999;opacity:0;transform:translateY(-12px) scale(.97);transition:.3s cubic-bezier(.2,.9,.3,1.2);font-size:13px;max-width:420px;backdrop-filter:blur(12px);border:1px solid rgba(255,255,255,.14);box-shadow:0 12px 40px rgba(2,6,23,.5);white-space:pre-line}
 .toast.show{opacity:1;transform:none}
 .toast.success{background:rgba(5,150,105,.92)}
 .toast.error{background:rgba(220,38,38,.92)}
@@ -158,12 +158,12 @@ select{cursor:pointer;appearance:none;background-image:linear-gradient(45deg,tra
 .empty{padding:30px;text-align:center;color:var(--text2)}
 .empty-state{padding:44px 20px;text-align:center;color:var(--text2)}
 .empty-state .icon{font-size:40px;margin-bottom:10px;display:block;opacity:.8}
-.key-display{background:var(--inset);padding:9px 13px;border-radius:var(--radius-sm);border:1px solid var(--border);font-family:'JetBrains Mono','Cascadia Code',Consolas,monospace;font-size:12px;word-break:break-all;cursor:pointer;transition:.15s}
+.key-display{background:var(--inset);padding:9px 13px;border-radius:var(--radius-sm);border:1px solid var(--border);font-family:var(--font-mono);font-size:12px;word-break:break-all;cursor:pointer;transition:.15s}
 .key-display:hover{background:rgba(34,211,238,.08);border-color:var(--accent)}
 /* .copy-icon 现在渲染成 <button>, 需要清掉原生按钮样式, 视觉上保持原 span 观感 */
 .copy-icon{cursor:pointer;color:var(--text2);padding:2px 6px;border-radius:4px;border:0;background:none;font:inherit;line-height:1}
 .copy-icon:hover{color:var(--text);background:var(--bg3)}
-.model-tag{display:inline-block;padding:2px 9px;border-radius:6px;font-size:11px;background:rgba(148,163,184,.1);color:var(--text2);margin:2px;letter-spacing:.02em}
+.model-tag{display:inline-block;padding:2px 9px;border-radius:6px;font-size:12px;background:rgba(148,163,184,.1);color:var(--text2);margin:2px;letter-spacing:.02em}
 .model-tag.free{border:1px solid rgba(52,211,153,.5);color:var(--accent2);background:rgba(52,211,153,.08)}
 .model-tag.pass{border:1px solid rgba(245,158,11,.5);color:var(--amber);background:rgba(245,158,11,.08)}
 /* 搜索命中高亮: 文本先 esc 再插 <mark>, 不会引入 XSS */
@@ -180,13 +180,13 @@ mark{background:rgba(250,204,21,.4);color:inherit;border-radius:3px;padding:0 2p
 .ps .pl>div{min-width:0}
 .pchev{width:14px;flex:none;text-align:center;color:var(--text3);font-size:9px;line-height:1;transition:transform .2s cubic-bezier(.4,0,.2,1)}
 .pi.open .pchev{transform:rotate(90deg)}
-.pav{width:36px;height:36px;flex:none;display:grid;place-items:center;border-radius:10px;border:1px solid var(--border);background:rgba(148,163,184,.09);font-weight:700;font-size:15px;font-family:'Inter',system-ui,sans-serif}
+.pav{width:36px;height:36px;flex:none;display:grid;place-items:center;border-radius:var(--radius-sm);border:1px solid var(--border);background:rgba(148,163,184,.09);font-weight:700;font-size:15px;font-family:'Inter',system-ui,sans-serif}
 .pav.builtin{background:rgba(34,211,238,.12);border-color:rgba(34,211,238,.32);color:var(--accent)}
 .ps h3{font-size:14.5px;font-weight:600;letter-spacing:.01em;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-.pmeta{margin-top:3px;display:flex;flex-wrap:wrap;align-items:center;font-size:11.5px;color:var(--text3);font-family:'JetBrains Mono','Cascadia Code',Consolas,monospace;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.pmeta{margin-top:3px;display:flex;flex-wrap:wrap;align-items:center;font-size:12px;color:var(--text3);font-family:var(--font-mono);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .pmeta>*{display:inline-flex;align-items:center;flex:none}
 .pmeta>*:not(:last-child)::after{content:'·';margin:0 7px;color:var(--border-strong)}
-.pbadge{display:inline-flex;align-items:center;gap:6px;padding:3px 11px;border-radius:999px;font-size:11.5px;font-weight:600;white-space:nowrap;font-family:inherit;max-width:260px;overflow:hidden;text-overflow:ellipsis}
+.pbadge{display:inline-flex;align-items:center;gap:6px;padding:3px 11px;border-radius:999px;font-size:12px;font-weight:600;white-space:nowrap;font-family:inherit;max-width:260px;overflow:hidden;text-overflow:ellipsis}
 .pbadge.pb-on{background:rgba(52,211,153,.13);color:var(--accent2);border:1px solid rgba(52,211,153,.35)}
 .pbadge.pb-off{background:rgba(248,113,113,.12);color:var(--danger);border:1px solid rgba(248,113,113,.35)}
 .pbadge.pb-info{background:rgba(34,211,238,.12);color:var(--accent);border:1px solid rgba(34,211,238,.32)}
@@ -199,9 +199,9 @@ mark{background:rgba(250,204,21,.4);color:inherit;border-radius:3px;padding:0 2p
 .theme-toggle:hover{color:var(--text);background:rgba(148,163,184,.16)}
 [data-theme="dark"] .theme-toggle .light-label{display:none}
 body:not([data-theme="dark"]) .theme-toggle .dark-label{display:none}
-.probe-pill{font-size:11px;color:var(--text3)}
-.oauth-card{border:1px solid var(--border);border-radius:12px;padding:16px;background:rgba(148,163,184,.05);margin-top:14px}
-.stat-mini{font-family:'JetBrains Mono',Consolas,monospace;font-size:12px;color:var(--text2)}
+.probe-pill{font-size:12px;color:var(--text3)}
+.oauth-card{border:1px solid var(--border);border-radius:var(--radius);padding:16px;background:rgba(148,163,184,.05);margin-top:14px}
+.stat-mini{font-family:var(--font-mono);font-size:12px;color:var(--text2)}
 
 /* ===== 响应式 ===== */
 @media (max-width:980px){
@@ -256,7 +256,7 @@ body:not([data-theme="dark"]) .theme-toggle .dark-label{display:none}
     <div class="form-row">
       <div class="field"><label>客户端 API 地址（Base URL）</label>
         <div style="display:flex;gap:6px">
-          <input type="text" id="dashApiBase" readonly onclick="this.select()" style="font-family:'JetBrains Mono',Consolas,monospace">
+          <input type="text" id="dashApiBase" readonly onclick="this.select()" style="font-family:var(--font-mono)">
           <button class="btn btn-sm" onclick="copyText(_('dashApiBase').value)" style="flex:none">📋</button>
         </div>
       </div>
@@ -303,7 +303,7 @@ body:not([data-theme="dark"]) .theme-toggle .dark-label{display:none}
     <button class="btn btn-sm" onclick="loadAccounts()">🔄 刷新</button>
   </div>
 </div>
-<div class="hint" style="margin:-4px 0 16px;padding:11px 14px;border:1px solid var(--border);border-radius:10px;background:rgba(148,163,184,.05)">
+<div class="hint" style="margin:-4px 0 16px;padding:11px 14px;border:1px solid var(--border);border-radius:var(--radius-sm);background:rgba(148,163,184,.05)">
   ℹ️ <strong style="color:var(--text)">Tokens</strong>为本代理本地统计（输入+输出，上游返回 usage 时精确，否则按请求体估算），用于估算离官方限流还有多远；⚡ 测试按钮发起真实探测请求；↻ 重置按钮会<strong style="color:var(--text)">探测上游限流状态</strong>：若上游仍限流则保持冷却并提示恢复时间，探测通过才解除冷却并重置今日统计。
 </div>
 <div class="section">
@@ -327,7 +327,7 @@ body:not([data-theme="dark"]) .theme-toggle .dark-label{display:none}
     <div class="form-row">
       <div class="field"><label>账号文件保存地址</label>
         <div style="display:flex;gap:6px">
-          <input type="text" id="acctPoolPath" readonly onclick="this.select()" style="font-family:'JetBrains Mono',Consolas,monospace">
+          <input type="text" id="acctPoolPath" readonly onclick="this.select()" style="font-family:var(--font-mono)">
           <button class="btn btn-sm" onclick="copyText(_('acctPoolPath').value)" style="flex:none">📋</button>
         </div>
       </div>
@@ -376,7 +376,7 @@ body:not([data-theme="dark"]) .theme-toggle .dark-label{display:none}
     <div class="form-row">
       <div class="field">
         <label>Refresh Token *</label>
-        <input type="text" id="tokenInput" placeholder="粘贴 refreshToken" style="font-family:'JetBrains Mono',Consolas,monospace">
+        <input type="text" id="tokenInput" placeholder="粘贴 refreshToken" style="font-family:var(--font-mono)">
       </div>
       <div class="field">
         <label>邮箱（可选，留空自动生成）</label>
@@ -427,7 +427,7 @@ body:not([data-theme="dark"]) .theme-toggle .dark-label{display:none}
 
 <div id="tab-models" class="tab-panel" style="display:none">
 <h2>🧠 模型列表</h2>
-<div class="hint" style="margin:-4px 0 16px;padding:11px 14px;border:1px solid var(--border);border-radius:10px;background:rgba(148,163,184,.05)">
+<div class="hint" style="margin:-4px 0 16px;padding:11px 14px;border:1px solid var(--border);border-radius:var(--radius-sm);background:rgba(148,163,184,.05)">
   ℹ️ 前缀仅用于区分来源: <strong style="color:var(--text)">cline/</strong> 走 Cline 账号池, <strong style="color:var(--text)">zen/</strong> 走 opencode 上游, <strong style="color:var(--text)">provider名:</strong> 走对应的通用 Provider。请求时携带带前缀的名称, 网关会自动还原为上游原始模型名。点击供应商卡片即可展开/收起它的全部模型。
 </div>
 <div class="section">
@@ -438,7 +438,7 @@ body:not([data-theme="dark"]) .theme-toggle .dark-label{display:none}
     <div class="form-row">
       <div class="field"><label>Cline 池默认模型</label>
         <div style="display:flex;gap:6px;align-items:center">
-          <select id="settingDefModel" style="flex:1;font-family:'JetBrains Mono',Consolas,monospace"></select>
+          <select id="settingDefModel" style="flex:1;font-family:var(--font-mono)"></select>
           <button class="btn btn-sm btn-primary" onclick="saveDefaultModel()">💾 保存</button>
         </div>
       </div>
@@ -507,7 +507,7 @@ body:not([data-theme="dark"]) .theme-toggle .dark-label{display:none}
         </div>
       </div>
       <div class="field" style="flex:1.4;min-width:300px"><label>客户端调用示例</label>
-        <input id="arExample" readonly onclick="this.select()" style="font-family:'JetBrains Mono',Consolas,monospace">
+        <input id="arExample" readonly onclick="this.select()" style="font-family:var(--font-mono)">
       </div>
     </div>
     <p class="hint" style="margin:0">改名后点「保存」即可：旧名字下的勾选会自动迁移到新名字，已发布给客户端的旧模型名仍然可用（兼容保留）。</p>
@@ -591,10 +591,10 @@ body:not([data-theme="dark"]) .theme-toggle .dark-label{display:none}
   <div class="section-body">
     <div class="form-row" style="margin-top:14px">
       <div class="field"><label>冷却中的候选</label>
-        <div id="arCoolingBox" style="border:1px solid var(--border);border-radius:10px;background:var(--inset);min-height:42px"></div>
+        <div id="arCoolingBox" style="border:1px solid var(--border);border-radius:var(--radius-sm);background:var(--inset);min-height:42px"></div>
       </div>
       <div class="field"><label>永久剔除的候选</label>
-        <div id="arPermBox" style="border:1px solid var(--border);border-radius:10px;background:var(--inset);min-height:42px;max-height:220px;overflow-y:auto"></div>
+        <div id="arPermBox" style="border:1px solid var(--border);border-radius:var(--radius-sm);background:var(--inset);min-height:42px;max-height:220px;overflow-y:auto"></div>
       </div>
     </div>
   </div>
@@ -713,12 +713,12 @@ body:not([data-theme="dark"]) .theme-toggle .dark-label{display:none}
     <div class="form-row">
       <div class="field"><label style="display:flex;align-items:center;justify-content:space-between">节点列表
         <button type="button" id="ocCheckBtn" class="btn" style="padding:3px 10px;font-size:12px" onclick="refreshOcNodes()">连通检测</button></label>
-        <div id="ocNodesBox" style="max-height:190px;overflow-y:auto;border:1px solid var(--border);border-radius:10px;background:var(--inset)"></div>
+        <div id="ocNodesBox" style="max-height:190px;overflow-y:auto;border:1px solid var(--border);border-radius:var(--radius-sm);background:var(--inset)"></div>
       </div>
     </div>
     <div class="form-row">
       <div class="field"><label>代理冷却</label>
-        <div id="ocCooldownBox" style="max-height:190px;overflow-y:auto;border:1px solid var(--border);border-radius:10px;background:var(--inset);min-height:42px"></div>
+        <div id="ocCooldownBox" style="max-height:190px;overflow-y:auto;border:1px solid var(--border);border-radius:var(--radius-sm);background:var(--inset);min-height:42px"></div>
       </div>
     </div>
     <div class="form-actions"><button class="btn btn-primary" onclick="saveOcConfig()">💾 保存出口配置</button></div>
@@ -968,8 +968,8 @@ async function loadAccounts() {
         '<td>' + esc(a.email) + '</td>' +
         '<td><span class="status ' + escAttr(a.status) + '"><span class="status-dot ' + escAttr(a.status) + '"></span>' + esc(sn[a.status] || a.status) + '</span>' + statusExtra + '</td>' +
           '<td title="今日 ' + fmtNum(a.tokensToday) + ' / 累计 ' + fmtNum(a.tokensTotal) + ' tokens（上游返回 usage 时精确，否则为估算值）">' + fmtTokens(a.tokensToday) + ' / ' + fmtTokens(a.tokensTotal) + '</td>' +
-        '<td class="mono" style="font-size:11px">' + lu + '</td>' +
-        '<td class="mono" style="font-size:11px">' + cr + '</td>' +
+        '<td class="mono" style="font-size:12px">' + lu + '</td>' +
+        '<td class="mono" style="font-size:12px">' + cr + '</td>' +
         '<td style="white-space:nowrap">' +
           '<button class="btn btn-sm" onclick="testAccount(\'' + escJs(a.accountId) + '\', this)" title="测试账号是否可用（成功会清除冷却/过期状态）">⚡</button> ' +
           '<button class="btn btn-sm" onclick="resetAccount(\'' + escJs(a.accountId) + '\', this)" title="检测限流并解除：探测上游，若仍限流则保持冷却并提示恢复时间">↻</button> ' +
@@ -1160,7 +1160,7 @@ async function generateKey() {
     const d = await api('POST', '/keys/generate');
     const key = d.data.key;
     _('keyGenResult').innerHTML =
-      '<div style="background:rgba(52,211,153,.08);border:1px solid rgba(52,211,153,.4);border-radius:10px;padding:12px">' +
+      '<div style="background:rgba(52,211,153,.08);border:1px solid rgba(52,211,153,.4);border-radius:var(--radius-sm);padding:12px">' +
         '<div style="color:var(--accent2);font-weight:600;margin-bottom:8px">✓ 新密钥已生成（点击复制）</div>' +
         '<div class="key-display" onclick="copyText(\'' + escJs(key) + '\')">' + esc(key) + '</div>' +
       '</div>';
@@ -1205,14 +1205,14 @@ async function loadLogs() {
       const route = (ROUTE_LABEL[l.route] || l.route || '-') + (l.exit ? ' · ' + l.exit : '');
       const st = l.status || 0;
       return '<tr>' +
-        '<td class="mono" style="font-size:11px">' + t + '</td>' +
-        '<td class="mono" style="font-size:11px">' + esc(l.client || '-') + '</td>' +
+        '<td class="mono" style="font-size:12px">' + t + '</td>' +
+        '<td class="mono" style="font-size:12px">' + esc(l.client || '-') + '</td>' +
         '<td>' + esc(l.method || '-') + '</td>' +
-        '<td class="mono" style="font-size:11px">' + esc(l.path || '-') + '</td>' +
+        '<td class="mono" style="font-size:12px">' + esc(l.path || '-') + '</td>' +
         '<td class="mono" style="font-size:12px">' + esc(l.model || '-') + '</td>' +
         '<td><span class="model-tag">' + esc(route) + '</span></td>' +
         '<td style="font-weight:600;color:' + STATUS_CLASS(st) + '">' + st + '</td>' +
-        '<td class="mono" style="font-size:11px">' + (l.durationMs != null ? l.durationMs + ' ms' : '-') + '</td>' +
+        '<td class="mono" style="font-size:12px">' + (l.durationMs != null ? l.durationMs + ' ms' : '-') + '</td>' +
       '</tr>';
     }).join('');
     tbody.innerHTML = html;
@@ -1277,8 +1277,8 @@ function addHeaderRow() {
   const tbody = _('headersTableBody');
   const tr = document.createElement('tr');
   tr.innerHTML =
-    '<td><input type="text" class="header-key" placeholder="Header-Name" style="font-size:12px;font-family:monospace"></td>' +
-    '<td><input type="text" class="header-val" placeholder="value" style="font-size:12px;font-family:monospace"></td>' +
+    '<td><input type="text" class="header-key" placeholder="Header-Name" style="font-size:12px;font-family:var(--font-mono)"></td>' +
+    '<td><input type="text" class="header-val" placeholder="value" style="font-size:12px;font-family:var(--font-mono)"></td>' +
     '<td><button class="btn btn-sm btn-danger" onclick="this.closest(\'tr\').remove()">✕</button></td>';
   tbody.appendChild(tr);
 }
@@ -1385,8 +1385,8 @@ async function loadConfig() {
       const tbody = _('headersTableBody');
       tbody.innerHTML = Object.entries(c.headers).map(([k, v]) =>
         '<tr>' +
-          '<td><input type="text" class="header-key" value="' + escAttr(k) + '" style="font-size:12px;font-family:monospace;width:100%"></td>' +
-          '<td><input type="text" class="header-val" value="' + escAttr(v) + '" style="font-size:12px;font-family:monospace;width:100%"></td>' +
+          '<td><input type="text" class="header-key" value="' + escAttr(k) + '" style="font-size:12px;font-family:var(--font-mono);width:100%"></td>' +
+          '<td><input type="text" class="header-val" value="' + escAttr(v) + '" style="font-size:12px;font-family:var(--font-mono);width:100%"></td>' +
           '<td><button class="btn btn-sm btn-danger" onclick="this.closest(\'tr\').remove()">✕</button></td>' +
         '</tr>'
       ).join('');
@@ -1464,7 +1464,7 @@ function renderCooldowns(cd, direct) {
     '<div style="display:flex;align-items:center;gap:9px;padding:6px 12px;font-size:12.5px;border-bottom:1px solid rgba(148,163,184,.07)">' +
     '<span style="flex:none">🧊</span>' +
     '<span style="flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">' + esc(k) + '</span>' +
-    '<span style="flex:none;font-size:11px;color:var(--text3)">冷却至 ' + esc(cd[k]) + '</span></div>'
+    '<span style="flex:none;font-size:12px;color:var(--text3)">冷却至 ' + esc(cd[k]) + '</span></div>'
   ).join('');
 }
 
@@ -1476,7 +1476,7 @@ function renderOcSubs() {
     return;
   }
   el.innerHTML = ocSubsArr.map((u, i) =>
-    '<div style="display:flex;align-items:center;gap:10px;padding:8px 12px;background:rgba(148,163,184,.06);border:1px solid var(--border);border-radius:10px">' +
+    '<div style="display:flex;align-items:center;gap:10px;padding:8px 12px;background:rgba(148,163,184,.06);border:1px solid var(--border);border-radius:var(--radius-sm)">' +
     '<span style="flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:13px">' + u.replace(/</g, '&lt;') + '</span>' +
     '<button type="button" class="btn" style="flex:none;padding:4px 10px;font-size:12px" onclick="delOcSub(' + i + ')">删除</button></div>'
   ).join('');
@@ -1519,14 +1519,14 @@ async function loadOcNodes() {
       const upBad = upNames.filter(u => !ups[u]);
       return '<div style="display:flex;align-items:center;gap:9px;padding:5px 12px;font-size:12.5px;border-bottom:1px solid rgba(148,163,184,.07)">' +
       '<span style="flex:none" title="' + escAttr(iconTitle(n)) + '">' + icon(n) + '</span>' +
-      '<span style="flex:none;min-width:58px;color:var(--text3);font-family:monospace">' + esc(n.type) + '</span>' +
+      '<span style="flex:none;min-width:58px;color:var(--text3);font-family:var(--font-mono)">' + esc(n.type) + '</span>' +
       '<span style="flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">' + esc(n.name) + '</span>' +
-      (upOk.length ? '<span style="flex:none;font-size:10.5px;color:#16a34a;border:1px solid currentColor;border-radius:4px;padding:0 5px" title="已探测: 该出口到这些上游可达">✓ ' + esc(upOk.join(',')) + '</span>' : '') +
-      (upBad.length ? '<span style="flex:none;font-size:10.5px;color:#f87171;border:1px solid currentColor;border-radius:4px;padding:0 5px" title="已探测: 该出口到这些上游不通(选节点时会跳过)">✕ ' + esc(upBad.join(',')) + '</span>' : '') +
-      (regions.length ? '<span style="flex:none;font-size:10.5px;color:#16a34a;border:1px solid currentColor;border-radius:4px;padding:0 5px" title="该出口已验证可用于地区受限模型">🌍 ' + esc(regions.join(',')) + '</span>' : '') +
-      '<span style="flex:none;font-size:11px;color:var(--text3)">' + n.source + '</span></div>';
+      (upOk.length ? '<span style="flex:none;font-size:12px;color:var(--accent2);border:1px solid currentColor;border-radius:4px;padding:0 5px" title="已探测: 该出口到这些上游可达">✓ ' + esc(upOk.join(',')) + '</span>' : '') +
+      (upBad.length ? '<span style="flex:none;font-size:12px;color:var(--danger);border:1px solid currentColor;border-radius:4px;padding:0 5px" title="已探测: 该出口到这些上游不通(选节点时会跳过)">✕ ' + esc(upBad.join(',')) + '</span>' : '') +
+      (regions.length ? '<span style="flex:none;font-size:12px;color:var(--accent2);border:1px solid currentColor;border-radius:4px;padding:0 5px" title="该出口已验证可用于地区受限模型">🌍 ' + esc(regions.join(',')) + '</span>' : '') +
+      '<span style="flex:none;font-size:12px;color:var(--text3)">' + n.source + '</span></div>';
     }).join('') +
-    '<div style="padding:6px 12px;font-size:11px;color:var(--text3)">共 ' + list.length + ' 个出口 · 🟢 可达 ' + okN + ' · 🔴 不可达 ' + failN + ' · ⛔ 未运行 ' + deadN + ' · ⚪ 未检测 ' + unkN + ' · 🌍 可用于地区受限模型 ' + regionN + '<br>✓/✕ 是该出口到各上游的可达性(逐节点 TLS 握手探测, 按上游名); ✕ 的节点在请求该上游时会被自动跳过; ⛔ 是配置无效或实例未就绪, 需要修订阅源'
+    '<div style="padding:6px 12px;font-size:12px;color:var(--text3)">共 ' + list.length + ' 个出口 · 🟢 可达 ' + okN + ' · 🔴 不可达 ' + failN + ' · ⛔ 未运行 ' + deadN + ' · ⚪ 未检测 ' + unkN + ' · 🌍 可用于地区受限模型 ' + regionN + '<br>✓/✕ 是该出口到各上游的可达性(逐节点 TLS 握手探测, 按上游名); ✕ 的节点在请求该上游时会被自动跳过; ⛔ 是配置无效或实例未就绪, 需要修订阅源'
       + (ocChecking ? '<br>🔍 连通检测进行中, 图标与计数将在检测完成后更新…' : '') + '</div>';
   } catch (e) { _('ocNodesBox').innerHTML = fail(e, 'loadOcNodes()'); }
 }
@@ -1781,23 +1781,23 @@ function providerCardBody(n, p, stat) {
       const st = MODEL_STYLE[m.status] || MODEL_STYLE.unknown;
       const cost = COST_LABEL[m.cost] || m.cost || '';
       const synced = m.syncedAt ? new Date(m.syncedAt).toLocaleTimeString('zh-CN') : '-';
-      return '<tr data-mrow data-row-search="' + escAttr(disp) + '"><td class="mrow-label" style="text-align:left;font-family:monospace">' + esc(disp) + '</td>' +
+      return '<tr data-mrow data-row-search="' + escAttr(disp) + '"><td class="mrow-label" style="text-align:left;font-family:var(--font-mono)">' + esc(disp) + '</td>' +
         '<td>' + (cost ? '<span class="model-tag' + (m.cost === 'free' ? ' free' : '') + '">' + esc(cost) + '</span>' : '<span style="color:var(--text3)">-</span>') + '</td>' +
         '<td><span class="model-tag" style="' + st.css + '">' + st.label + '</span>' +
           (m.requiresStream ? '<span class="model-tag" title="该模型需要流式响应">流式</span>' : '') + '</td>' +
-        '<td style="font-size:11.5px;color:var(--text3);min-width:66px;text-align:right">' + synced + '</td>' +
+        '<td style="font-size:12px;color:var(--text3);min-width:66px;text-align:right">' + synced + '</td>' +
         '<td><button type="button" class="copy-icon" aria-label="复制 ' + escAttr(disp) + '" onclick="copyText(\'' + escJs(disp) + '\')">📋</button></td></tr>';
     }
     if (n === 'opencode') {
       const disp = 'zen/' + m.id;
-      return '<tr data-mrow data-row-search="' + escAttr(disp) + '"><td class="mrow-label" style="text-align:left;font-family:monospace">' + esc(disp) + '</td>' +
+      return '<tr data-mrow data-row-search="' + escAttr(disp) + '"><td class="mrow-label" style="text-align:left;font-family:var(--font-mono)">' + esc(disp) + '</td>' +
         '<td style="font-size:12.5px">' + fmtNum(m.context || 0) + '</td>' +
         '<td style="font-size:12.5px">' + fmtNum(m.output || 0) + '</td>' +
         '<td><button type="button" class="copy-icon" aria-label="复制 ' + escAttr(disp) + '" onclick="copyText(\'' + escJs(disp) + '\')">📋</button></td></tr>';
     }
     const disp = n + ':' + m.id;
     return '<tr data-mrow data-row-search="' + escAttr(disp) + '"><td><input type="checkbox" data-pv="' + escAttr(n) + '" data-model="' + escAttr(m.id) + '"' + (m.on ? ' checked' : '') + ' onchange="toggleProviderModel(this)"></td>' +
-      '<td class="mrow-label" style="text-align:left;font-family:monospace">' + esc(disp) + '</td>' +
+      '<td class="mrow-label" style="text-align:left;font-family:var(--font-mono)">' + esc(disp) + '</td>' +
       '<td><button type="button" class="copy-icon" aria-label="复制 ' + escAttr(disp) + '" onclick="copyText(\'' + escJs(disp) + '\')">📋</button></td></tr>';
   }).join('');
 
@@ -1811,8 +1811,8 @@ function providerCardBody(n, p, stat) {
     note = 'zen 免费目录, 每 10 分钟自动同步; 用 zen/ 前缀调用。';
   } else {
     head = '<tr><th style="width:44px">启用</th><th style="text-align:left">模型 ID' +
-      '<button type="button" class="btn btn-sm" style="margin-left:10px;padding:2px 10px;font-size:11.5px" onclick="toggleAllProviderModels(\'' + escJs(n) + '\',true)">全选</button>' +
-      '<button type="button" class="btn btn-sm" style="margin-left:6px;padding:2px 10px;font-size:11.5px" onclick="toggleAllProviderModels(\'' + escJs(n) + '\',false)">全不选</button>' +
+      '<button type="button" class="btn btn-sm" style="margin-left:10px;padding:2px 10px;font-size:12px" onclick="toggleAllProviderModels(\'' + escJs(n) + '\',true)">全选</button>' +
+      '<button type="button" class="btn btn-sm" style="margin-left:6px;padding:2px 10px;font-size:12px" onclick="toggleAllProviderModels(\'' + escJs(n) + '\',false)">全不选</button>' +
       '</th><th style="width:44px"></th></tr>';
     note = '用 ' + n + ':模型名 调用; 勾选决定它是否对网关发布。';
   }
@@ -2151,13 +2151,13 @@ function renderRouter() {
         meta.push(models.length + ' 个可用模型');
         if (chosen) meta.push('已选 ' + picked + ' 个');
         return '<label style="display:flex;align-items:center;gap:10px;padding:9px 12px;'
-          + 'border:1px solid var(--border);border-radius:10px;background:var(--inset);cursor:pointer">'
+          + 'border:1px solid var(--border);border-radius:var(--radius-sm);background:var(--inset);cursor:pointer">'
           + '<input type="checkbox" data-prov="' + escAttr(p.name) + '"' + (chosen ? ' checked' : '') + '>'
           + '<span style="flex:1;display:flex;align-items:center;gap:10px;min-width:0;flex-wrap:wrap">'
           + '<strong>' + esc(p.display || p.name) + '</strong>'
           + (p.builtin ? '<span class="model-tag" style="opacity:.8">内置上游</span>' : '')
           + '<span style="color:var(--text3);font-size:12px">' + esc(meta.join(' · ')) + '</span>'
-          + (bad.length ? '<span style="color:#f87171;font-size:12px">' + esc(bad.join('，')) + '</span>' : '')
+          + (bad.length ? '<span style="color:var(--danger);font-size:12px">' + esc(bad.join('，')) + '</span>' : '')
           + '</span></label>';
       }).join('');
     }
@@ -2182,7 +2182,7 @@ function renderRouter() {
             + '<code>' + esc(label) + '</code><span style="color:var(--text3)">' + esc(ctx) + '</span></label>';
         }).join('') || '<div style="padding:8px 10px;color:var(--text3);font-size:12px">该供应商暂无可用模型（先点上面的「刷新全部目录」）</div>';
         const pname = p.display || p.name;
-        return '<div style="margin-bottom:10px;border:1px solid var(--border);border-radius:10px;overflow:hidden">'
+        return '<div style="margin-bottom:10px;border:1px solid var(--border);border-radius:var(--radius-sm);overflow:hidden">'
           + '<div style="padding:8px 12px;display:flex;align-items:center;gap:8px;background:rgba(148,163,184,.05);font-size:13px">'
           + '<strong>' + esc(pname) + '</strong>'
           + '<span style="color:var(--text3);font-weight:normal">已选 ' + picked + ' / ' + models.length + '</span>'
@@ -2299,8 +2299,8 @@ async function validateRouter() {
 function showRouterResult(kind, msg, problems) {
   const el = _('arResult');
   if (!el) return;
-  const color = kind === 'ok' ? '#4ade80' : (kind === 'warn' ? '#fbbf24' : '#f87171');
-  el.innerHTML = '<div style="padding:10px 12px;border-radius:10px;border:1px solid ' + color
+  const color = kind === 'ok' ? 'var(--accent2)' : (kind === 'warn' ? 'var(--amber)' : 'var(--danger)');
+  el.innerHTML = '<div style="padding:10px 12px;border-radius:var(--radius-sm);border:1px solid ' + color
     + ';background:var(--inset);font-size:13px;color:' + color + '">' + esc(msg) + '</div>'
     + (problems && problems.length
       ? '<ul style="margin:8px 0 0 18px;font-size:12.5px;color:var(--text2)">'
@@ -2361,7 +2361,7 @@ function renderRouterUsage(d) {
       ? rows.map(r => {
           const limit = r.limit ? (r.limit + '（剩 ' + r.remaining + '）') : '<span style="color:var(--text3)">不限</span>';
           return '<tr><td><code>' + esc(r.key) + '</code></td><td>' + r.req + '</td><td>' + r.ok
-            + '</td><td>' + (r.fail ? '<span style="color:#f87171">' + r.fail + '</span>' : '0') + '</td><td>' + limit + '</td></tr>';
+            + '</td><td>' + (r.fail ? '<span style="color:var(--danger)">' + r.fail + '</span>' : '0') + '</td><td>' + limit + '</td></tr>';
         }).join('')
       : '<tr><td colspan="5" class="empty">今天还没有调用记录</td></tr>';
   }
@@ -2463,7 +2463,7 @@ function statBreakdown(byKey, note) {
   const rows = keys.map(k => {
     const e = byKey[k] || {};
     const pt = e.promptTokens || 0, ct = e.completionTokens || 0;
-    return '<tr><td style="text-align:left;font-family:monospace">' + esc(k) + '</td><td>' + fmtNum(e.requests || 0) +
+    return '<tr><td style="text-align:left;font-family:var(--font-mono)">' + esc(k) + '</td><td>' + fmtNum(e.requests || 0) +
       '</td><td>' + fmtNum(pt) + '</td><td>' + fmtNum(ct) + '</td><td><strong>' + fmtNum(pt + ct) + '</strong></td></tr>';
   }).join('');
   return '<table><thead><tr><th style="text-align:left">' + esc(note || '名称') + '</th><th>请求数</th><th>输入 tokens</th><th>输出 tokens</th><th>合计</th></tr></thead><tbody>' +
