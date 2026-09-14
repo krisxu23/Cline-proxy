@@ -728,8 +728,14 @@ func startProviderRefresher() {
 		refreshOnce()
 		t := time.NewTicker(providerCatalogRefresh)
 		defer t.Stop()
-		for range t.C {
-			refreshOnce()
+		for {
+			select {
+			case <-t.C:
+				refreshOnce()
+			case <-appRootCtx.Done():
+				// 收到退出信号: 停止 provider 目录刷新协程, 让进程能够真正停下。
+				return
+			}
 		}
 	}()
 }

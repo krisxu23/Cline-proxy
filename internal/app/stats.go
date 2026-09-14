@@ -350,12 +350,14 @@ func recordZenStats(rec zenStatsRecord) {
 			statsFile.Write(append(b, '\n'))
 		}
 		// 轮转: 超过上限则截断成空, 只保留最近记录(与 cline-proxy.log / requests.jsonl 同思路)。
+		// 必须用 os.Truncate 而不是句柄级 Truncate: statsFile 是 O_APPEND 打开的,
+		// Windows 下该句柄没有 GENERIC_WRITE, 句柄级截断会 "Access is denied"。
 		if st, serr := statsFile.Stat(); serr == nil && st.Size() > maxZenStatsBytes {
-			if terr := statsFile.Truncate(0); terr == nil {
-				if _, serr := statsFile.Seek(0, io.SeekStart); serr != nil {
-					log.Printf("zen-stats: seek 失败: %v", serr)
-				}
-			} else {
+			tp := statsFilePath
+			if tp == "" {
+				tp = kit.ResolveDataPath("zen-stats.jsonl")
+			}
+			if terr := os.Truncate(tp, 0); terr != nil {
 				log.Printf("zen-stats: truncate 失败: %v", terr)
 			}
 		}

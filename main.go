@@ -88,15 +88,23 @@ func runDesktop(host string, port int) {
 
 	select {
 	case err := <-errCh:
-		// 服务起不来: 已有实例在跑就并入它的托盘+窗口, 否则弹窗报错
-		if isServiceAlive(adminPanelBase(port)) {
-			app.OpenAdminWindow(adminURL)
-			app.RunTray(adminURL)
+		// 1.2s 内就拿到结果: 服务起不来且没有其他实例在跑, 直接弹窗报错;
+		// 否则(成功, 或端口被已有实例占用)继续往下走正常进入流程。
+		if err != nil && !isServiceAlive(adminPanelBase(port)) {
+			msgboxFail(err)
 			return
 		}
-		msgboxFail(err)
 	case <-time.After(1200 * time.Millisecond): // 等端口就绪再开窗口
 	}
+	// 常驻兜底: StartProxy 可能在 1.2s 之后才失败(例如 sing-box 节点初始化
+	// 要数秒), 那时窗口已开、errCh 也没人读, 错误会被静默吞掉——而 GUI 无控制台,
+	// 用户什么都看不到。这里一直监听, 收到非 nil 错误且当前没有其他实例在跑,
+	// 就弹窗告知。成功(nil)或端口被已有实例占用则忽略。
+	go func() {
+		if err := <-errCh; err != nil && !isServiceAlive(adminPanelBase(port)) {
+			msgboxFail(err)
+		}
+	}()
 	go app.OpenAdminWindow(adminURL)
 	app.RunTray(adminURL)
 }

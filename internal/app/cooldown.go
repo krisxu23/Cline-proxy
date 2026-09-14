@@ -177,8 +177,14 @@ func startCooldownJanitor() {
 	go func() {
 		t := time.NewTicker(10 * time.Minute)
 		defer t.Stop()
-		for range t.C {
-			clearExpiredCandidateCooldowns()
+		for {
+			select {
+			case <-t.C:
+				clearExpiredCandidateCooldowns()
+			case <-appRootCtx.Done():
+				// 收到退出信号: 停止候选冷却清理协程, 让进程能够真正停下。
+				return
+			}
 		}
 	}()
 }

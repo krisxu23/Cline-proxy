@@ -16,6 +16,14 @@ RUN apk add --no-cache ca-certificates tzdata
 WORKDIR /app
 COPY --from=builder /build/cline-proxy .
 
+# 以非 root 用户运行(安全加固): 固定 uid/gid=10001, 并把 /app(含数据目录)
+# 的所有权交还给该用户。容器仍监听 0.0.0.0(见下方 CMD), 与 USER 切换无关。
+RUN addgroup -S -g 10001 appuser \
+ && adduser -S -u 10001 -G appuser appuser \
+ && mkdir -p /app/data \
+ && chown -R appuser:appuser /app
+USER appuser
+
 EXPOSE 3457
 
 # 健康检查: 直接打进程内 /health(无需令牌, 只回状态)。容器编排据此判定就绪/存活。

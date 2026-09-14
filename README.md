@@ -40,9 +40,16 @@
 
 - **无控制台黑窗口**：GUI 子系统构建，启动即进桌面形态
 - **管理窗口**：自动弹出独立应用窗口渲染 Web 后台（无地址栏、独立任务栏图标）
-- **系统托盘**：右下角托盘图标，右键可「打开管理界面 / 退出」
+- **系统托盘**：右下角托盘图标，右键菜单含 4 项——「打开管理界面」「打开数据目录」（用资源管理器打开 `data/`，日志/配置/令牌都在这里）「导出诊断包」（把 `/health` 快照、日志尾部、节点概览打包成 `data/diag-<时间戳>.zip` 便于排障）「退出」
 - **重复双击**：端口被占时自动并入已在运行的实例，直接弹出管理窗口
 - **启动失败**：弹窗提示原因（如端口占用，可换端口）
+- **完整性校验**：发布包未签名，Windows SmartScreen 可能拦截。下载后比对 Release 页的 `cline-proxy-windows-amd64.exe.sha256`：
+
+  ```powershell
+  certutil -hashfile cline-proxy-windows-amd64.exe SHA256
+  ```
+
+  输出与 `.sha256` 文件内容一致再运行。
 
 命令行功能照常可用（终端直跑会回挂控制台）：
 
@@ -90,7 +97,9 @@ go run -tags "with_quic,with_grpc,with_utls" . -start
 
 ### 管理后台访问控制
 
-`/admin/api/*` 全部需要访问令牌。令牌在首次启动时自动生成并落盘到 `data/admin-token`（0600），重启不变。三种传递方式：
+`/admin/api/*` 全部需要访问令牌。令牌在首次启动时自动生成并落盘到 `data/admin-token`，重启不变。三种传递方式：
+
+> 令牌文件权限：**Windows 不实现数字权限位**，落盘后实测仍是 644，配置里的 `0600` 不会生效。请勿把 `data/` 目录放在共享或可被其他用户读取的位置。
 
 | 方式 | 用法 |
 |---|---|
@@ -183,7 +192,7 @@ api.cline.bot  opencode.ai/zen  api.cline.bot   你配置的任意上游
 - 支持 vmess / vless / trojan / ss / hy2 / tuic / hysteria / anytls / ssh / shadowtls / snell 节点链接直接粘贴——内嵌 sing-box 把每个节点转成本地出口，轮询与冷却机制与普通代理一致
 - **连通检测参与选路**：检测判定为不可达的节点不再被轮询，网络错误会让该出口短暂冷却，避免重试反复撞上同一个坏节点
 - **地区受限模型**：部分模型（如 `muse-spark-1.3-contributor-free`）只对特定出口地区开放。这类模型会单独校验每个节点，节点列表中通过的带 🌍 标记；请求该模型时只走通过校验的节点
-- **订阅链接**：后台填订阅地址，保存即抓取、每 6 小时自动刷新，支持 sing-box JSON / Clash YAML / base64 节点列表三种格式，节点并入代理池统一轮询，缓存落盘重启即用
+- **订阅链接**：后台填订阅地址，保存即抓取、默认**每 30 分钟**自动刷新（间隔可在面板调整，范围 1 分钟–30 天，改完即生效无需重启），支持 sing-box JSON / Clash YAML / base64 节点列表三种格式，节点并入代理池统一轮询，缓存落盘重启即用
 - 节点列表实时展示协议 / 名称 / 来源 / 就绪状态与连通检测结果
 
 ### 3. ClinePass 订阅池
@@ -217,13 +226,13 @@ curl -H "X-Admin-Token: $TOKEN" http://127.0.0.1:3457/admin/api/clinepass/models
 
 把任意 OpenAI 兼容站点挂进网关，用 `provider:model` 直选。在后台 **🔌 通用 Provider（OpenAI 兼容上游）** 里填写，或直接改 `.zen-config.json` 的 `providers` 段。
 
-免费判定有三种模式，按上游目录的特点选：
+免费模型判定（**没有 `pricing` 开关**）：网关**不识别 `pricing` 这个配置键**——旧文档写的 `"pricing": true` 会被 JSON 解析静默丢弃，配了等于没配。当前免费模型完全由**白名单**决定：
 
-| 模式 | 配置 | 适用 |
-|---|---|---|
-| 按目录价格 | `catalog: true` + `pricing: true` | 目录里带价格的上游（如 OpenRouter），价格为 0 即免费 |
-| 白名单 | 只填 `freeModels` | 目录里没有价格信息的上游（如 B.AI） |
-| 白名单 + 目录校验 | `catalog: true` + `freeModels` | 白名单为主，但希望上游下架模型后自动剔除 |
+- 有目录的上游（`catalog: true`，默认开启；Google 上游自动强制开启）：目录拉取后在面板「🔌 通用 Provider」页**逐个勾选**哪些模型免费；
+- 无目录的上游（如 B.AI）：直接把模型名写进 `freeModels` 白名单；
+- 二者也可叠加（`catalog: true` + `freeModels`）：以白名单为主，上游下架的模型自动剔除。
+
+> `freeModels` 仅作为一次性迁移输入：面板写入显式开关后会覆盖它，请求路径不再单独读它。`catalog` 的作用是拿到模型清单与连通性，**不直接决定**某个模型是否免费。上游目录里若带价格字段，网关会解析但不据其自动判定免费。
 
 面板上的操作：**保存 Provider**、**🔍 连通测试**（对指定模型发一次最小请求）、**🔄 刷新目录**；列表里显示每个 provider 的 `目录 N · 免费 N · 可聊 N` 与最近一次错误。目录在启动时立即拉取、之后每 15 分钟刷新一次；目录为空时请求路径会按 1 分钟退避自行重试。
 
@@ -235,17 +244,11 @@ curl -H "X-Admin-Token: $TOKEN" http://127.0.0.1:3457/admin/api/clinepass/models
     "openrouter": {
       "baseUrl": "https://openrouter.ai/api/v1",
       "apiKey": "sk-or-...",
-      "catalog": true,
-      "pricing": true
+      "catalog": true
     },
     "gemini": {
       "baseUrl": "https://generativelanguage.googleapis.com/v1beta/openai",
-      "apiKey": "AIza...",
-      "catalog": true,
-      "pricing": false,
-      "modelsUrl": "https://generativelanguage.googleapis.com/v1beta/models",
-      "modelsKeyHeader": "x-goog-api-key",
-      "freeModels": ["gemini-3.8-flash", "gemini-3.7-flash"]
+      "apiKey": "AIza..."
     },
     "bai": {
       "baseUrl": "https://api.b.ai/v1",
@@ -256,7 +259,7 @@ curl -H "X-Admin-Token: $TOKEN" http://127.0.0.1:3457/admin/api/clinepass/models
 }
 ```
 
-Gemini 需要额外两个字段：`modelsUrl` 指向原生目录（`/v1beta/models`），`modelsKeyHeader` 填 `x-goog-api-key`（该端点不使用 `Authorization: Bearer`）。Gemini 的 thought-signature 由网关自动处理：历史工具调用的签名缺失时回填跳过哨兵，上游拒绝已缓存签名时自动用哨兵重放一次。
+Google（Gemini）上游**只需填 Base URL + API Key**：目录地址、鉴权方言、以及 thought-signature 回填与重放，全部由网关按 hostname 自动推导。鉴权是**按目标路径择一**发送的——OpenAI 兼容路径发 `Authorization: Bearer`，Google 原生目录路径（`/v1beta/models`）只发 `x-goog-api-key`；两条路径都发会被上游回 401 并盖住真实错误，所以网关不会同时发。面板与配置文件里**不接受、也不需要处理** `modelsUrl` / `modelsKeyHeader` 这类键——照旧文档配了也会被静默忽略。历史工具调用的 thought-signature 缺失时网关自动回填跳过哨兵，上游拒绝已缓存签名时自动用哨兵重放一次。
 
 ## 配置客户端
 

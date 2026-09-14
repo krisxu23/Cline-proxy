@@ -213,17 +213,23 @@ func refreshSubsLoop(subs []string) {
 	last := time.Now()
 	t := time.NewTicker(time.Minute)
 	defer t.Stop()
-	for range t.C {
-		if time.Since(last) < subsRefreshInterval() {
-			continue
-		}
-		cfg := getZenConfig()
-		if len(cfg.Subs) == 0 {
+	for {
+		select {
+		case <-t.C:
+			if time.Since(last) < subsRefreshInterval() {
+				continue
+			}
+			cfg := getZenConfig()
+			if len(cfg.Subs) == 0 {
+				last = time.Now()
+				continue
+			}
+			resolveSubscriptions(cfg.Subs)
 			last = time.Now()
-			continue
+		case <-appRootCtx.Done():
+			// 收到退出信号: 停止订阅刷新协程, 让进程能够真正停下。
+			return
 		}
-		resolveSubscriptions(cfg.Subs)
-		last = time.Now()
 	}
 }
 

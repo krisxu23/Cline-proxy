@@ -210,9 +210,9 @@ func routeModel(id string) string {
 // zen 熔断降级前用它判断可行性: 池内无可用账号时降级只会立即失败,
 // 此时保持 zen 路由继续尝试上游是更优选择。
 func clinePoolReady() bool {
-	p := loadPool()
+	snap := poolSnapshot()
 	now := time.Now()
-	for _, a := range p.Accounts {
+	for _, a := range snap.Accounts {
 		if a.Status == "active" {
 			return true
 		}
@@ -928,15 +928,22 @@ func startZenModelsRefresher() {
 			time.Sleep(time.Minute)
 		}
 		ticker := time.NewTicker(10 * time.Minute)
-		for range ticker.C {
-			cfg := getZenConfig()
-			if !cfg.Enabled {
-				continue
-			}
-			if added, err := syncZenModels(); err != nil {
-				log.Printf("zen model sync: failed (%v)", err)
-			} else if added > 0 {
-				log.Printf("zen model sync: %d new models from official feed", added)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ticker.C:
+				cfg := getZenConfig()
+				if !cfg.Enabled {
+					continue
+				}
+				if added, err := syncZenModels(); err != nil {
+					log.Printf("zen model sync: failed (%v)", err)
+				} else if added > 0 {
+					log.Printf("zen model sync: %d new models from official feed", added)
+				}
+			case <-appRootCtx.Done():
+				// 收到退出信号: 停止模型同步协程, 让进程能够真正停下。
+				return
 			}
 		}
 	}()

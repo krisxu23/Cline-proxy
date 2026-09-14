@@ -247,8 +247,14 @@ func startHeadersAutoSync() {
 		run()
 		t := time.NewTicker(headersAutoSyncInterval)
 		defer t.Stop()
-		for range t.C {
-			run()
+		for {
+			select {
+			case <-t.C:
+				run()
+			case <-appRootCtx.Done():
+				// 收到退出信号: 停止请求头自动对齐协程, 让进程能够真正停下。
+				return
+			}
 		}
 	}()
 }

@@ -90,6 +90,9 @@ func StartProxy(host string, port int) error {
 	defer appRootCancel()
 
 	p := loadPool()
+	// 这里刻意用 loadPool() 而不是 poolSnapshot(): 本段在 StartProxy 的启动序列里,
+	// 服务与各后台循环都还没起来, 不存在并发写方; 而且下面要把 *Account 指针交给
+	// refreshAccountToken 去原地刷新 token, 快照(值拷贝)满足不了这个需求。
 	activeCount := 0
 	for _, a := range p.Accounts {
 		if a.Status == "active" {
@@ -157,7 +160,9 @@ func StartProxy(host string, port int) error {
 	apiKeyHandler := func(next http.HandlerFunc) http.HandlerFunc {
 		return corsHandler(func(w http.ResponseWriter, r *http.Request) {
 			// Allow requests without key if no keys configured
-			p := loadPool()
+			// 走 poolSnapshot: p.Keys 会被 addAccount / 生成密钥路径在持 poolMu 时
+			// append(可能触发底层数组重分配), 而这段是每个网关请求都跑的中间件。
+			p := poolSnapshot()
 			if len(p.Keys) == 0 {
 				next(w, r)
 				return
@@ -309,7 +314,7 @@ func StartProxy(host string, port int) error {
 			return
 		}
 
-		if activeCount == 0 && len(loadPool().Accounts) == 0 {
+		if activeCount == 0 && len(poolSnapshot().Accounts) == 0 {
 			writeJSON(w, http.StatusServiceUnavailable, map[string]any{
 				"error": map[string]string{
 					"message": "No Cline accounts in pool. Add one in the admin panel (/admin/), or use *-free / cline-pass/* models.",
@@ -453,7 +458,7 @@ func StartProxy(host string, port int) error {
 	fmt.Printf("  http://%s/v1\n", addr)
 	fmt.Println("  API Key: any value")
 	fmt.Printf("  Model:   %s (auto-detected)\n", getDefaultModel())
-	fmt.Printf("  Accounts: %d total, %d active\n", len(loadPool().Accounts), activeCount)
+	fmt.Printf("  Accounts: %d total, %d active\n", len(poolSnapshot().Accounts), activeCount)
 	fmt.Println(strings.Repeat("-", 58))
 	fmt.Println("  管理后台(链接已含访问令牌, 直接打开即可):")
 	fmt.Printf("    %s\n", panelURL)
@@ -477,11 +482,14 @@ func StartProxy(host string, port int) error {
 }
 
 // healthInfo 把网关自身健康指标并入 /health 响应。除了"有几个账号可用",
-// 还要能回答"网关自己还好吗": 出口节点池、能否优雅退出、订阅刷新时间、
-// 日志体积与丢弃计数都在这一并暴露。
+// 还要能回答"网关自己还好吗": 出口节点池、出口实际可达数、能否优雅退出、
+// 订阅刷新时间、日志体积与丢弃计数都在这一并暴露。
+//
+// status 不再是硬编码的 "ok": 此前出口池几乎全死(实测 24/3958 可达)时它仍回 ok,
+// 于是"托盘亮着、面板打得开、所有上游请求都在失败"成了最典型的静默故障。
+// 现在只要订阅里确实有节点、也探测过, 但可达数为 0, 就报 degraded。
 func healthInfo(activeCount int) map[string]any {
 	info := map[string]any{
-		"status":         "ok",
 		"version":        buildVersion,
 		"activeAccounts": activeCount,
 	}
@@ -492,8 +500,23 @@ func healthInfo(activeCount int) map[string]any {
 	info["nodePool"] = len(nodePorts)
 	nodeMu.Unlock()
 
-	// exitReady: 优雅退出收口已就绪(server 已注册、信号监听已建立)。
-	info["exitReady"] = appServer != nil
+	// exitReachable / exitProbed: 最近一次健康检测里判定可达的出口数 / 已探测数。
+	// 这两个数字以前只写进日志(「增强检测完成(48 并发), 24/3958 个出口可达」),
+	// 导致运维拿不到"出口还有几个活着"的机器可读信号。
+	nodeHealthMu.Lock()
+	reachable, probed := 0, len(nodeHealth)
+	for _, st := range nodeHealth {
+		if st.Ok {
+			reachable++
+		}
+	}
+	nodeHealthMu.Unlock()
+	info["exitReachable"] = reachable
+	info["exitProbed"] = probed
+
+	// serverRegistered: HTTP server 是否已注册(此前叫 exitReady, 但它只表示
+	// appServer != nil, 与"能否优雅退出"无关, 名字会误导排障)。
+	info["serverRegistered"] = appServer != nil
 
 	// lastSubFetch: 订阅缓存文件最近一次写入时间(订阅刷新成功即落盘)。
 	if st, err := os.Stat(kit.ResolveDataPath("subs_cache.json")); err == nil {
@@ -503,7 +526,17 @@ func healthInfo(activeCount int) map[string]any {
 	}
 
 	// subNodes: 订阅展开后的节点数。
-	info["subNodes"] = len(subNodeKeysSnapshot())
+	subNodes := len(subNodeKeysSnapshot())
+	info["subNodes"] = subNodes
+
+	// status: 综合判定。只有"订阅里确实有节点、且已经探测过、但一个都不通"才算
+	// degraded; 没配订阅或还没探测完仍是 ok(unknown ≠ 不可用)。
+	switch {
+	case subNodes > 0 && probed > 0 && reachable == 0:
+		info["status"] = "degraded"
+	default:
+		info["status"] = "ok"
+	}
 
 	// logBytes: 主日志文件当前大小(诊断磁盘占用)。
 	if st, err := os.Stat(kit.ResolveDataPath("cline-proxy.log")); err == nil {
@@ -559,16 +592,27 @@ func initLogFile() {
 		return
 	}
 	truncated := false
-	if st, serr := f.Stat(); serr == nil && st.Size() > maxLogBytes {
-		if terr := f.Truncate(0); terr == nil {
-			// Windows 的 Truncate 不会把写偏移归零, O_APPEND 下下一次写会在
-			// 文件中间留出一段空字节, 必须显式 Seek 回文件头。
-			if _, serr := f.Seek(0, io.SeekStart); serr == nil {
+	initialSize := int64(0)
+	if st, serr := f.Stat(); serr == nil {
+		initialSize = st.Size()
+		if initialSize > maxLogBytes {
+			// 必须用 os.Truncate(path) 而不是 f.Truncate(0): Windows 下 O_APPEND
+			// 句柄没有 GENERIC_WRITE, 句柄级 Truncate 必然 Access denied ——
+			// 这正是"启动期截断从来没生效过"的根因。
+			if terr := os.Truncate(path, 0); terr == nil {
 				truncated = true
+				initialSize = 0
 			}
 		}
 	}
-	log.SetOutput(logFanout{f, os.Stderr})
+	// 用指针而不是值: logFanout 现在带 mutex, 值传递会复制锁(go vet 也会报)。
+	// file/path/size 交给它之后, 运行期的轮转就在写入路径上自动完成。
+	log.SetOutput(&logFanout{
+		dsts: []io.Writer{f, os.Stderr},
+		file: f,
+		path: path,
+		size: initialSize,
+	})
 	if truncated {
 		log.Printf("log file 超过 %d MiB, 已截断(只保留最近内容)", maxLogBytes>>20)
 	}
@@ -578,13 +622,54 @@ func initLogFile() {
 // logFanout 逐目标分发日志, 单个目标写入失败不影响其它目标。
 // 桌面模式(GUI 子系统, 双击启动)下 os.Stderr 句柄无效, io.MultiWriter
 // 会在首个 writer 出错时短路, 导致文件日志一并丢失, 故不走 MultiWriter。
-type logFanout []io.Writer
+//
+// 除分发外, 它还在**写入路径上**维护主日志文件的大小上限: 累计写入超过
+// maxLogBytes 就把文件截断成空。这一点是关键 —— 早期实现只在启动时检查
+// 一次, 于是"长期不重启"等于"日志无上限"; 而订阅源返回异常内容时, 一次
+// 刷新就能吐出几千行(实测两轮刷新各 ~4600 行), 足以把磁盘写满。
+// 现在与 writeStreamLog 的语义对齐(后者本来就在每次写入时检查)。
+type logFanout struct {
+	mu   sync.Mutex
+	dsts []io.Writer
+	file *os.File // 需要做大小检查与截断的目标(主日志文件), 可为 nil
+	path string   // 主日志文件路径, 供 os.Truncate 使用(见 truncateIfNeeded)
+	size int64    // 当前文件已写入字节数(含本次启动前已有内容)
+}
 
-func (w logFanout) Write(p []byte) (int, error) {
-	for _, dst := range w {
+func (w *logFanout) Write(p []byte) (int, error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	for _, dst := range w.dsts {
 		dst.Write(p)
 	}
+	w.size += int64(len(p))
+	w.truncateIfNeeded()
 	return len(p), nil
+}
+
+// truncateIfNeeded 在持锁状态下调用: 超过上限则清空并写入一条醒目标记。
+// 注意这里**绝不能走 log.Printf** —— 那会重入 Write 造成死锁, 所以直接写文件。
+//
+// 为什么用 os.Truncate(path) 而不是 w.file.Truncate(0):
+// Windows 下以 os.O_APPEND 打开的句柄只获得 FILE_APPEND_DATA 权限, 句柄级
+// Truncate(SetEndOfFile) 会直接返回 "Access is denied"。而本仓库所有日志截断点
+// (主日志、流日志、stats、请求日志)都开在 O_APPEND 句柄上并带 `if err == nil`
+// 兜底 —— 于是"轮转"在 Windows 上**一直是静默失效**的。os.Truncate 自己开一个
+// 不带 O_APPEND 的句柄, 两个平台都可靠。
+// 也正因为句柄是 O_APPEND, 截断后无需 Seek: 每次写都会自动落到文件末尾(=0)。
+func (w *logFanout) truncateIfNeeded() {
+	if w.file == nil || w.size <= maxLogBytes {
+		return
+	}
+	if err := os.Truncate(w.path, 0); err != nil {
+		return
+	}
+	marker := fmt.Sprintf("log file 超过 %d MiB, 已截断(只保留最近内容)\n", maxLogBytes>>20)
+	if _, err := w.file.WriteString(marker); err != nil {
+		w.size = 0
+		return
+	}
+	w.size = int64(len(marker))
 }
 
 // ============================================================================
@@ -622,9 +707,14 @@ func doGracefulShutdown() {
 		// 2) 请求日志: 把 channel 里已入队的尽量刷出去; 超时也不阻塞退出
 		//    (超时意味着写协程卡死, 强行退出比无限等待更可取)。
 		closeReqLogsTimed(3 * time.Second)
-		// 3) sing-box 节点: 释放端口与句柄。nodeBox 为 nil(如跳过节点盒的测试)时直接跳过。
+		// 3) 账号池与用量账本: 这两份数据平时靠后台 ticker / flush channel 批量落盘,
+		//    退出时若还没轮到, 就会丢掉最后 ≤30s 的 token 计数与用量 —— 而它们正是
+		//    用户此刻在面板上看着的数字。两者内部各自加锁, 可直接调用。
+		flushPoolLocked()
+		saveUsageLedger()
+		// 4) sing-box 节点: 释放端口与句柄。nodeBox 为 nil(如跳过节点盒的测试)时直接跳过。
 		closeNodeBoxTimed(3 * time.Second)
-		// 4) 流式诊断日志句柄。
+		// 5) 流式诊断日志句柄。
 		closeStreamLog()
 	})
 }
@@ -644,13 +734,24 @@ func closeReqLogsTimed(timeout time.Duration) {
 }
 
 // closeNodeBoxTimed 在超时内关闭 sing-box 节点盒; 超时则放弃等待。
+//
+// 必须先持 nodeMu 把句柄"摘下来"再锁外 Close:
+//   - 退出可能与订阅刷新触发的 syncNodeBox 交错(那条 ticker 在收到退出信号前
+//     仍会跑), 而 syncNodeBox 是在 nodeMu 下读写 nodeBox 的, 无锁读属于数据竞争;
+//   - 摘下并置 nil 之后, 并发的 syncNodeBox 在替换阶段会看到 nodeBox != prevBox,
+//     从而走"丢弃本次新实例"的分支 —— 正是退出时想要的语义, 也避免了同一个
+//     Box 被 Close 两次。
 func closeNodeBoxTimed(timeout time.Duration) {
-	if nodeBox == nil {
+	nodeMu.Lock()
+	box := nodeBox
+	nodeBox = nil
+	nodeMu.Unlock()
+	if box == nil {
 		return
 	}
 	done := make(chan struct{})
 	go func() {
-		nodeBox.Close()
+		box.Close()
 		close(done)
 	}()
 	select {
@@ -674,24 +775,26 @@ var (
 	streamLogFile *os.File
 )
 
+// streamLogFileName 流式诊断日志文件名。截断需要按路径重新开句柄(见 writeStreamLog),
+// 所以抽成常量而不是内联字面量, 避免两处写法漂移。
+const streamLogFileName = "cline-proxy-stream.log"
+
 func writeStreamLog(line string) {
 	streamLogMu.Lock()
 	defer streamLogMu.Unlock()
 	if streamLogFile == nil {
-		f, err := os.OpenFile(kit.ResolveDataPath("cline-proxy-stream.log"), os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
+		f, err := os.OpenFile(kit.ResolveDataPath(streamLogFileName), os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
 		if err != nil {
 			return
 		}
 		streamLogFile = f
 	}
-	// 超过上限则截断成空, 只保留最近内容(与 cline-proxy.log 的 rotate 思路一致)。
+	// 超过上限则截断成空, 只保留最近内容(与 cline-proxy.log 的轮转思路一致)。
 	if st, serr := streamLogFile.Stat(); serr == nil && st.Size() > maxLogBytes {
-		if terr := streamLogFile.Truncate(0); terr == nil {
-			// Windows 下 Truncate 不归零写偏移, O_APPEND 下需显式 Seek 回文件头。
-			if _, serr := streamLogFile.Seek(0, io.SeekStart); serr != nil {
-				log.Printf("streamlog: seek 失败: %v", serr)
-			}
-		} else {
+		// 必须用 os.Truncate 而不是句柄级 Truncate: O_APPEND 句柄在 Windows 上
+		// 拿不到 GENERIC_WRITE, 句柄级截断会 "Access is denied" —— 旧实现因此
+		// 一直静默失效(详见 logFanout.truncateIfNeeded 的注释)。
+		if terr := os.Truncate(kit.ResolveDataPath(streamLogFileName), 0); terr != nil {
 			log.Printf("streamlog: truncate 失败: %v", terr)
 		}
 	}
@@ -938,7 +1041,7 @@ func clineHeaders(token, sessionID string) http.Header {
 // accounts, so each retry naturally rotates — while non-retryable 4xx
 // errors return immediately. Attempts are bounded by the pool size.
 func callClineAPIFailover(ctx context.Context, params map[string]any, stream bool) (*http.Response, *Account, error) {
-	total := len(loadPool().Accounts)
+	total := len(poolSnapshot().Accounts)
 	if total < 1 {
 		total = 1
 	}
@@ -2005,7 +2108,8 @@ func handleAnthropicMessages(w http.ResponseWriter, r *http.Request) {
 	}
 
 	activeCount := 0
-	p := loadPool()
+	// 请求热路径: 必须走 poolSnapshot, 否则与 pickAccount 持 poolMu 改 a.Status 并发。
+	p := poolSnapshot()
 	for _, a := range p.Accounts {
 		if a.Status == "active" {
 			activeCount++

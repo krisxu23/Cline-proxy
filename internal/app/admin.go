@@ -5,8 +5,11 @@ import (
 	"cline-go-proxy/internal/cline"
 	"cline-go-proxy/internal/kit"
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"html/template"
 	"io"
 	"log"
 	"net/http"
@@ -99,7 +102,7 @@ func registerAdminRoutes(mux *http.ServeMux) {
 	})
 }
 
-// adminTokenPromptHTML 无令牌访问 /admin/ 时返回的引导页。
+// renderAdminTokenPrompt 无令牌访问 /admin/ 时返回的引导页。
 //
 // 此前 /admin/ 对任何本地进程都返回完整 121KB 外壳(含全部前端 JS), 同机多账号
 // 共享场景等于把管理界面裸暴露。现在只有带有效令牌才回完整外壳, 否则回这段几百
@@ -109,8 +112,20 @@ func registerAdminRoutes(mux *http.ServeMux) {
 // 2026-09-13 用户实测反馈"程序打不开了, 打开显示这个"后, 在提示页上补了一个
 // 令牌输入框: 用户从 data/admin-token 复制内容粘进来即可进入, 不必再手工拼
 // ?token= 地址。同时把会话 Cookie 改成 180 天长效(见 adminCookieMaxAge),
-// 修掉"关一次浏览器就要求重新带令牌"的体验问题。
-const adminTokenPromptHTML = `<!DOCTYPE html>
+// 修掉"关一次浏览器就要求重新带令牌"的体验问题。现在还会区分"没带令牌"与"令牌无效":
+// mismatch=true 时提示页显示"访问令牌无效，请重新输入"并回填输入内容。
+//
+// 现在区分两种失败: 完全没带令牌(mismatch=false, 干净引导页) vs 带了令牌但校验没过
+// (mismatch=true, 明确提示"访问令牌无效，请重新输入"并把用户刚输入的内容回填到输入框,
+// 避免让他重新手抄一遍)。retain 是用户上一次输入(通常来自 URL ?token= 或旧 Cookie 值),
+// 回填前必须过一遍 HTML 转义, 否则令牌里的 " < > & 会破坏属性、造成注入。
+func renderAdminTokenPrompt(mismatch bool, retain string) string {
+	var errBanner, val string
+	if mismatch {
+		errBanner = `<p style="margin:0 0 14px;padding:10px 12px;border-radius:8px;color:#fca5a5;background:rgba(220,38,38,.12);border:1px solid rgba(220,38,38,.45)"><b>访问令牌无效，请重新输入。</b></p>`
+		val = template.HTMLEscapeString(retain)
+	}
+	return `<!DOCTYPE html>
 <html lang="zh">
 <head>
 <meta charset="utf-8">
@@ -122,8 +137,9 @@ const adminTokenPromptHTML = `<!DOCTYPE html>
 <h1>管理后台需要访问令牌</h1>
 <p>本页面未携带有效的访问令牌, 因此只返回这段引导, 不加载完整管理界面(含全部前端脚本)。</p>
 <p><b>程序在正常运行</b> —— 这不是启动失败。双击 exe 自动弹出的窗口、以及托盘「打开管理界面」打开的地址, 都已自带令牌, 用那些入口打开不会看到本页。</p>
+` + errBanner + `
 <form onsubmit="var v=document.getElementById('tk').value.replace(/\s+/g,'');if(v){location.href='/admin/?token='+encodeURIComponent(v);}return false;">
-<input id="tk" type="password" autocomplete="off" placeholder="粘贴 data/admin-token 文件内容">
+<input id="tk" type="password" autocomplete="off" placeholder="粘贴 data/admin-token 文件内容" value="` + val + `">
 <button type="submit">进入管理界面</button>
 </form>
 <p>令牌位置(任选其一):</p>
@@ -131,6 +147,7 @@ const adminTokenPromptHTML = `<!DOCTYPE html>
 <p>2. 托盘菜单「打开数据目录」可直接定位到该文件。</p>
 <p>令牌校验通过后会种下 <b>180 天有效</b> 的会话 Cookie(HttpOnly), 之后直接打开 <code>/admin/</code> 无需再带 token; 更换令牌后旧 Cookie 自动失效。</p>
 </main></body></html>`
+}
 
 func adminStaticHandler(w http.ResponseWriter, r *http.Request) {
 	if r.URL.Path == "/admin/" || r.URL.Path == "/admin" {
@@ -139,21 +156,29 @@ func adminStaticHandler(w http.ResponseWriter, r *http.Request) {
 		// 同机多账号共享场景下等于把管理界面裸暴露。现在改为: 没令牌只回一个
 		// 几百字节的「请附带令牌」提示页, 带令牌才回完整外壳。
 		ok := false
+		var provided string
+		var mismatch bool
 		if token := loadOrCreateAdminToken(); token != "" {
-			if provided := adminTokenFrom(r); provided != "" && tokenEqual(provided, token) {
-				ok = true
-				// 令牌来自查询参数时种下会话 Cookie, 后续同源请求自动携带。
-				// Max-Age 必设(见 adminCookieMaxAge 注释): 会话级 Cookie 随浏览器
-				// 关闭失效, 用户重开浏览器就会撞上提示页。
-				if strings.TrimSpace(r.URL.Query().Get("token")) != "" {
-					http.SetCookie(w, &http.Cookie{
-						Name:     adminTokenCookie,
-						Value:    token,
-						Path:     "/",
-						MaxAge:   adminCookieMaxAge,
-						HttpOnly: true,
-						SameSite: http.SameSiteStrictMode,
-					})
+			if provided = adminTokenFrom(r); provided != "" {
+				if tokenEqual(provided, token) {
+					ok = true
+					// 令牌来自查询参数时种下会话 Cookie, 后续同源请求自动携带。
+					// Max-Age 必设(见 adminCookieMaxAge 注释): 会话级 Cookie 随浏览器
+					// 关闭失效, 用户重开浏览器就会撞上提示页。
+					if strings.TrimSpace(r.URL.Query().Get("token")) != "" {
+						http.SetCookie(w, &http.Cookie{
+							Name:     adminTokenCookie,
+							Value:    token,
+							Path:     "/",
+							MaxAge:   adminCookieMaxAge,
+							HttpOnly: true,
+							SameSite: http.SameSiteStrictMode,
+						})
+					}
+				} else {
+					// 带了令牌但校验没过: 不是"没令牌", 要明确告诉用户令牌无效并回填输入,
+					// 别让他重新手抄一遍(见 renderAdminTokenPrompt)。
+					mismatch = true
 				}
 			}
 		}
@@ -163,9 +188,10 @@ func adminStaticHandler(w http.ResponseWriter, r *http.Request) {
 			w.Write([]byte(adminHTML))
 			return
 		}
-		// 无令牌: 返回小提示页(非 401, 否则双击 exe 后浏览器首次访问看不到任何内容)。
+		// 无令牌 / 令牌失效: 返回小提示页。mismatch=true 时提示页显示"访问令牌无效"并回填输入
+		// (非 401, 否则双击 exe 后浏览器首次访问看不到任何内容)。
 		w.WriteHeader(http.StatusOK)
-		w.Write([]byte(adminTokenPromptHTML))
+		w.Write([]byte(renderAdminTokenPrompt(mismatch, provided)))
 		return
 	}
 	http.NotFound(w, r)
@@ -183,7 +209,7 @@ func handleAdminAccounts(w http.ResponseWriter, r *http.Request) {
 		Data: map[string]any{
 			"accounts":  accounts,
 			"total":     len(accounts),
-			"poolIndex": loadPool().CurrentIdx,
+			"poolIndex": poolSnapshot().CurrentIdx,
 		},
 	})
 }
@@ -223,7 +249,7 @@ func handleAdminAccountAdd(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if req.Email == "" {
-		req.Email = fmt.Sprintf("user_%d", len(loadPool().Accounts)+1)
+		req.Email = fmt.Sprintf("user_%d", len(poolSnapshot().Accounts)+1)
 	}
 
 	acc := &Account{
@@ -995,8 +1021,8 @@ func mutateProxyConfig(fn func(cfg *proxyConfigData)) {
 
 // GET /admin/api/keys
 func handleAdminGetKeys(w http.ResponseWriter, r *http.Request) {
-	p := loadPool()
-	writeAPI(w, http.StatusOK, apiResponse{Success: true, Data: map[string]any{"keys": p.Keys}})
+	snap := poolSnapshot()
+	writeAPI(w, http.StatusOK, apiResponse{Success: true, Data: map[string]any{"keys": snap.Keys}})
 }
 
 // POST /admin/api/keys/generate
@@ -1005,7 +1031,14 @@ func handleAdminGenerateKey(w http.ResponseWriter, r *http.Request) {
 		writeAPI(w, http.StatusMethodNotAllowed, apiResponse{Error: "method not allowed"})
 		return
 	}
-	key := fmt.Sprintf("cline_%x_%x", time.Now().UnixMilli(), time.Now().UnixNano()%1000000)
+	// 此前用 UnixMilli/UnixNano 拼令牌, 时间可预测、相邻请求极易被猜出。
+	// 改为 32 字节密码学随机 + hex, 不可预测。
+	kb := make([]byte, 32)
+	if _, err := rand.Read(kb); err != nil {
+		writeAPI(w, http.StatusInternalServerError, apiResponse{Error: "生成密钥失败: " + err.Error()})
+		return
+	}
+	key := "cline_" + hex.EncodeToString(kb)
 	p := loadPool()
 	poolMu.Lock()
 	p.Keys = append(p.Keys, key)
@@ -1215,9 +1248,9 @@ func handleAdminStats(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	p := loadPool()
+	snap := poolSnapshot()
 	active, cooldown, expired := 0, 0, 0
-	for _, a := range p.Accounts {
+	for _, a := range snap.Accounts {
 		switch a.Status {
 		case "active":
 			active++
@@ -1231,7 +1264,7 @@ func handleAdminStats(w http.ResponseWriter, r *http.Request) {
 	writeAPI(w, http.StatusOK, apiResponse{
 		Success: true,
 		Data: map[string]any{
-			"total":    len(p.Accounts),
+			"total":    len(snap.Accounts),
 			"active":   active,
 			"cooldown": cooldown,
 			"expired":  expired,
@@ -1247,19 +1280,17 @@ func handleAccountsExport(w http.ResponseWriter, r *http.Request) {
 		writeAPI(w, http.StatusMethodNotAllowed, apiResponse{Error: "method not allowed"})
 		return
 	}
-	p := loadPool()
-	items := make([]map[string]any, 0, len(p.Accounts))
-	for _, a := range p.Accounts {
+	snap := poolSnapshot()
+	items := make([]map[string]any, 0, len(snap.Accounts))
+	for _, a := range snap.Accounts {
 		items = append(items, map[string]any{
 			"refreshToken": a.RefreshToken,
 			"email":        a.Email,
 		})
 	}
-	data, _ := json.MarshalIndent(items, "", "  ")
-	w.Header().Set("Content-Type", "application/json; charset=utf-8")
-	w.Header().Set("Content-Disposition", `attachment; filename="cline-accounts-export.json"`)
-	w.WriteHeader(http.StatusOK)
-	w.Write(data)
+	// 走统一的 apiResponse 信封, 前端 exportAccounts() 即可复用 api() 的错误处理/超时/中断,
+	// 不再各自裸写 fetch。前端拿到 data 后自行构造 Blob 触发下载。
+	writeAPI(w, http.StatusOK, apiResponse{Success: true, Data: items})
 }
 
 // GET /admin/api/logs 最近请求日志（对话/调用历史）

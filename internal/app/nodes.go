@@ -475,8 +475,15 @@ func checkAllNodeHealth() {
 func startNodeHealthLoop() {
 	t := time.NewTicker(30 * time.Minute)
 	go func() {
-		for range t.C {
-			checkAllNodeHealth()
+		defer t.Stop()
+		for {
+			select {
+			case <-t.C:
+				checkAllNodeHealth()
+			case <-appRootCtx.Done():
+				// 收到退出信号: 停止复检协程, 让进程能够真正停下。
+				return
+			}
 		}
 	}()
 }
@@ -512,7 +519,7 @@ func buildNodeParts(entries []any) (ports map[string]int, inbounds, outbounds, r
 			// 直接跳过 → 面板上全部节点永久停在"未检测"。校验只做 box.New 不建连,
 			// 成本极低, 逐节点剔除即可。
 			if verr := validateOutboundEntry(ob); verr != nil {
-				log.Printf("  node %d(%s): 出站无效已剔除: %v", i+1, subEntryKey(v), verr)
+				log.Printf("  node %d(%s): 出站无效已剔除: %v", i+1, nodeDisplayName(subEntryKey(v)), verr)
 				continue
 			}
 			port, err = freeLocalPort()
@@ -524,7 +531,7 @@ func buildNodeParts(entries []any) (ports map[string]int, inbounds, outbounds, r
 		case map[string]any:
 			hasMap = true
 			if verr := validateOutboundEntry(v); verr != nil {
-				log.Printf("  node %d(%s): 出站无效已剔除: %v", i+1, subEntryKey(v), verr)
+				log.Printf("  node %d(%s): 出站无效已剔除: %v", i+1, nodeDisplayName(subEntryKey(v)), verr)
 				continue
 			}
 			port, err = freeLocalPort()

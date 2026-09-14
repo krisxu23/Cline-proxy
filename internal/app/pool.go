@@ -61,6 +61,9 @@ func poolFlusherLoop() {
 			if poolDirty.Swap(false) {
 				flushPoolLocked()
 			}
+		case <-appRootCtx.Done():
+			// 收到退出信号: 停止后台落盘协程, 让进程能够真正停下。
+			return
 		}
 	}
 }
@@ -80,7 +83,7 @@ func markPoolDirty() {
 // 供关键状态变更(账号增删、token 刷新、cooldown 切换)使用。
 func flushPoolLocked() {
 	poolMu.Lock()
-	defer poolMu.Unlock()
+	// savePoolLocked 内部会释放 poolMu 并完成写盘。
 	savePoolLocked()
 }
 
@@ -90,15 +93,22 @@ func flushPoolLocked() {
 func loadPool() *AccountPool {
 	poolMu.Lock()
 	defer poolMu.Unlock()
+	loadPoolLocked()
+	return pool
+}
 
+// loadPoolLocked 假定调用方已持有 poolMu, 负责在 pool 尚未初始化时从磁盘载入。
+// 与 loadPool 拆开是为了让 poolSnapshot 等在持锁状态下复用同一套载入逻辑,
+// 而无需二次加锁(否则会死锁)。
+func loadPoolLocked() {
 	if pool != nil {
-		return pool
+		return
 	}
 
 	data, err := os.ReadFile(poolPath)
 	if err != nil {
 		pool = &AccountPool{Accounts: []*Account{}, Keys: []string{}}
-		return pool
+		return
 	}
 
 	var p AccountPool
@@ -109,7 +119,7 @@ func loadPool() *AccountPool {
 		log.Printf("pool parse failed (%s): %v; quarantining and starting with empty pool", poolPath, err)
 		quarantineBadConfig(poolPath)
 		pool = &AccountPool{Accounts: []*Account{}, Keys: []string{}}
-		return pool
+		return
 	}
 
 	if p.Accounts == nil {
@@ -127,7 +137,58 @@ func loadPool() *AccountPool {
 		defaultModel = p.DefaultModel
 		modelsMu.Unlock()
 	}
-	return pool
+}
+
+// poolSnapshotAccount 是只读调用方需要的账号字段子集(深拷贝载体)。
+// 只带调用方真正读取的字段, 避免把 AccessToken 等可写字段一并暴露成可共享对象。
+type poolSnapshotAccount struct {
+	AccountID     string
+	Email         string
+	RefreshToken  string
+	Status        string
+	CooldownUntil time.Time
+}
+
+// poolSnapshotData 账号池的只读深拷贝快照(见 poolSnapshot)。
+type poolSnapshotData struct {
+	CurrentIdx int
+	Keys       []string
+	Accounts   []poolSnapshotAccount
+}
+
+// poolSnapshot 返回账号池的只读深拷贝快照。
+//
+// 与 modelsCacheSnapshot / getZenConfig().clone() / statsAgg.clone() 同款设计:
+// 在持 poolMu 期间把当前 pool 的状态克隆进一份与全局隔离的快照, 锁外返回快照,
+// 调用方在锁外读取不会产生与写方(refreshAccountToken / pickAccount / addAccount
+// 等持 poolMu 的写)的数据竞争。
+//
+// 此前调用方(admin 的 stats / export、zen 的 clinePoolReady 等)直接 loadPool()
+// 拿到共享 *AccountPool 后在锁外读 p.Accounts[i].Status 等字段, 与持 poolMu 的写方
+// 并发 —— pickAccount 是每请求都走的选号热路径, 因此这是真竞态, -race 能稳定复现。
+// 改成走 poolSnapshot 后彻底消掉。
+//
+// 注意: 本函数内部会取 poolMu, 绝对不要在已经持有 poolMu 的代码块里调用它。
+func poolSnapshot() poolSnapshotData {
+	poolMu.Lock()
+	// 复用在持锁前提下的载入逻辑, 不能调 loadPool()(它会再取一次 poolMu, 直接死锁)。
+	loadPoolLocked()
+	s := poolSnapshotData{
+		CurrentIdx: pool.CurrentIdx,
+		Keys:       append([]string(nil), pool.Keys...),
+		Accounts:   make([]poolSnapshotAccount, 0, len(pool.Accounts)),
+	}
+	for _, a := range pool.Accounts {
+		s.Accounts = append(s.Accounts, poolSnapshotAccount{
+			AccountID:     a.AccountID,
+			Email:         a.Email,
+			RefreshToken:  a.RefreshToken,
+			Status:        a.Status,
+			CooldownUntil: a.CooldownUntil,
+		})
+	}
+	poolMu.Unlock()
+	return s
 }
 
 // setDefaultModel 持久化默认模型：更新内存全局(由 modelsMu 保护)并写入账号池文件
@@ -149,23 +210,41 @@ func setDefaultModel(modelID string) {
 	savePool()
 }
 
+// savePool 把当前 pool 落盘。持池锁只做 json.Marshal(纯内存、很快), 随后释放
+// 池锁, 真正耗时的磁盘 IO(temp+fsync+rename)交给 poolSaveMu, 不再阻塞热路径
+// pickAccount 抢同一把池锁 → 消除 p99 延迟尖刺。落盘的是锁内那一刻的快照,
+// "写的是最新状态"语义不退化: 即使写盘期间其它写方继续改 pool, 落盘内容仍然是
+// 本次 marshal 时的一致视图。
 func savePool() {
 	poolMu.Lock()
-	defer poolMu.Unlock()
-	savePoolLocked()
-}
-
-// savePoolLocked 持久化账号池；调用方必须已经持有 poolMu。
-func savePoolLocked() {
-	poolSaveMu.Lock()
-	defer poolSaveMu.Unlock()
-
 	data, err := json.MarshalIndent(pool, "", "  ")
+	poolMu.Unlock()
 	if err != nil {
 		// marshal 失败绝不能落盘: 写 nil 会清空账号池, 宁可保留旧文件。
 		log.Printf("Failed to marshal accounts: %v", err)
 		return
 	}
+	poolSaveMu.Lock()
+	defer poolSaveMu.Unlock()
+	if err := kit.WriteFileAtomicDefault(poolPath, data); err != nil {
+		log.Printf("Failed to save accounts: %v", err)
+	}
+}
+
+// savePoolLocked 调用方已持 poolMu 时使用的落盘入口: 在锁内完成 marshal 得到
+// 字节, 释放池锁, 再由 poolSaveMu 承接磁盘 IO。注意: 调用后 poolMu 已被本函数
+// 释放, 调用方不得再访问共享字段, 也不得再次 poolMu.Unlock()。
+func savePoolLocked() {
+	data, err := json.MarshalIndent(pool, "", "  ")
+	if err != nil {
+		// marshal 失败绝不能落盘: 写 nil 会清空账号池, 宁可保留旧文件。
+		log.Printf("Failed to marshal accounts: %v", err)
+		poolMu.Unlock()
+		return
+	}
+	poolMu.Unlock()
+	poolSaveMu.Lock()
+	defer poolSaveMu.Unlock()
 	if err := kit.WriteFileAtomicDefault(poolPath, data); err != nil {
 		log.Printf("Failed to save accounts: %v", err)
 	}
@@ -186,8 +265,8 @@ func removeAccount(accountID string) bool {
 	for i, a := range p.Accounts {
 		if a.AccountID == accountID {
 			p.Accounts = append(p.Accounts[:i], p.Accounts[i+1:]...)
+			// savePoolLocked 内部会释放 poolMu, 之后不要再访问共享字段。
 			savePoolLocked()
-			poolMu.Unlock()
 			return true
 		}
 	}
@@ -261,8 +340,8 @@ func refreshAccountToken(acc *Account) error {
 			acc.LastReason = reason
 			log.Printf("  account %s refresh failed (%v), cooldown 5m", acc.AccountID, err)
 		}
+		// savePoolLocked 内部会释放 poolMu, 之后不要再访问共享字段。
 		savePoolLocked()
-		poolMu.Unlock()
 		return fmt.Errorf("token refresh failed: %w", err)
 	}
 
@@ -275,8 +354,8 @@ func refreshAccountToken(acc *Account) error {
 	acc.Status = "active"
 	acc.CooldownUntil = time.Time{}
 	acc.LastReason = ""
+	// savePoolLocked 内部会释放 poolMu, 之后不要再访问共享字段。
 	savePoolLocked()
-	poolMu.Unlock()
 	return nil
 }
 
@@ -406,8 +485,8 @@ func markAccountCooldown(acc *Account, reason string, duration time.Duration) {
 	acc.Status = "cooldown"
 	acc.CooldownUntil = time.Now().Add(duration)
 	acc.LastReason = reason
+	// savePoolLocked 内部会释放 poolMu, 之后不要再访问共享字段。
 	savePoolLocked()
-	poolMu.Unlock()
 }
 
 // bumpUsage 递增本地成功调用计数（含今日计数），自动处理跨日重置。
@@ -442,8 +521,8 @@ func resetTodayUsage(acc *Account) {
 	acc.UsageCountToday = 0
 	acc.TokensDate = time.Now().Format("2006-01-02")
 	acc.TokensToday = 0
+	// savePoolLocked 内部会释放 poolMu, 之后不要再访问共享字段。
 	savePoolLocked()
-	poolMu.Unlock()
 }
 
 // recordAccountTokens 记录账号本次请求消耗的 token（prompt+completion），

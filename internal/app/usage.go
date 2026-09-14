@@ -242,8 +242,14 @@ func startUsageLedger() {
 	go func() {
 		t := time.NewTicker(usageFlushInterval)
 		defer t.Stop()
-		for range t.C {
-			saveUsageLedger()
+		for {
+			select {
+			case <-t.C:
+				saveUsageLedger()
+			case <-appRootCtx.Done():
+				// 收到退出信号: 停止用量账本落盘协程, 让进程能够真正停下。
+				return
+			}
 		}
 	}()
 }

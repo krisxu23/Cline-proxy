@@ -1222,15 +1222,17 @@ async function loadLogs() {
 // ========== 导出账号 ==========
 async function exportAccounts() {
   try {
-    const res = await fetch(API + '/accounts/export');
-    if (!res.ok) throw new Error('HTTP ' + res.status);
-    const blob = await res.blob();
+    // 走后端统一的 apiResponse 信封(见 handleAccountsExport), 这样能复用 api() 的
+    // 超时/中断处理与"人话"错误文案, 不再自己裸写 fetch。
+    const r = await api('GET', '/accounts/export');
+    const items = r.data || [];
+    const blob = new Blob([JSON.stringify(items, null, 2)], { type: 'application/json;charset=utf-8' });
     const url = URL.createObjectURL(blob);
     const a = document.createElement('a');
     a.href = url; a.download = 'cline-accounts-export.json';
     document.body.appendChild(a); a.click(); document.body.removeChild(a);
     URL.revokeObjectURL(url);
-    toast('账号已导出（JSON）', 'success');
+    toast('账号已导出（JSON，' + items.length + ' 条）', 'success');
   } catch (e) { toast('导出失败: ' + e.message, 'error'); }
 }
 
@@ -1743,7 +1745,9 @@ function psKey(e, n) {
 // 找不到对应节点(首次渲染还没建好)时退回整表重建, 保证不丢渲染。
 function renderOneCard(n) {
   const p = pvData[n] || {};
-  const card = document.querySelector ? document.querySelector('#modelIndex .pi[data-id="' + escAttr(n) + '"]') : null;
+  // data-id 在 HTML 里用 escAttr 写入, 经 innerHTML 解析后实际值就是裸 n; CSS 选择器必须用 CSS.escape,
+  // 用 escAttr 会把 " 转成 &quot; 字面量, 导致含 " 的 provider id 查询失败。
+  const card = document.querySelector ? document.querySelector('#modelIndex .pi[data-id="' + CSS.escape(n) + '"]') : null;
   if (card) {
     card.outerHTML = providerCard(n, p);
   } else {
@@ -1841,6 +1845,12 @@ function filterModelIndex(q) {
         }
       } else {
         a.classList.toggle('open', !!pvOpenSet[a.dataset.id]);
+        // 清空搜索时必须在这里显式还原标题。q 为空时 hit 恒为 true(见上面 hit 的取值逻辑),
+        // 所有卡片都走这个分支, 下方那个"未命中"分支里的清除逻辑永远不会执行 ——
+        // 于是上一轮搜索留下的 mark 高亮会一直挂在标题上, 直到整表重绘。
+        // 注意: 本文件是 Go 原始字符串, 注释里不要出现反引号, 否则会提前终止字符串。
+        const h3 = a.querySelector ? a.querySelector('h3') : null;
+        if (h3 && h3.dataset && h3.dataset.nameLabel != null) h3.innerHTML = esc(h3.dataset.nameLabel);
       }
       shown++;
     } else {

@@ -307,15 +307,22 @@ func updateCompactState(sessionID string, summary, recent string) {
 
 func cleanupCompactStates() {
 	ticker := time.NewTicker(30 * time.Minute)
-	for range ticker.C {
-		compactStatesMu.Lock()
-		cutoff := time.Now().Add(-24 * time.Hour)
-		for k, v := range compactStates {
-			if v.updated.Before(cutoff) {
-				delete(compactStates, k)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ticker.C:
+			compactStatesMu.Lock()
+			cutoff := time.Now().Add(-24 * time.Hour)
+			for k, v := range compactStates {
+				if v.updated.Before(cutoff) {
+					delete(compactStates, k)
+				}
 			}
+			compactStatesMu.Unlock()
+		case <-appRootCtx.Done():
+			// 收到退出信号: 停止状态清理协程, 让进程能够真正停下。
+			return
 		}
-		compactStatesMu.Unlock()
 	}
 }
 

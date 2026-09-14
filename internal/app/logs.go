@@ -141,15 +141,12 @@ func writeReqLog(l RequestLog) {
 		return
 	}
 	// 轮转与追加串行, 消除旧实现"截断竞态丢行/半行"的问题。
+	// 必须用 os.Truncate 而不是句柄级 Truncate: reqLogFile 是 O_APPEND 打开的,
+	// Windows 下该句柄没有 GENERIC_WRITE, 句柄级截断会 "Access is denied",
+	// 旧代码因此把轮转失败误判成"文件句柄坏了"并反复 close+重开。
 	if st, err := reqLogFile.Stat(); err == nil && st.Size() > maxReqLogsFile {
-		if err := reqLogFile.Truncate(0); err != nil {
+		if err := os.Truncate(reqLogsFile, 0); err != nil {
 			log.Printf("reqlog: truncate failed: %v", err)
-			reqLogFile.Close()
-			reqLogFile = nil
-			return
-		}
-		if _, err := reqLogFile.Seek(0, io.SeekStart); err != nil {
-			log.Printf("reqlog: seek failed: %v", err)
 			reqLogFile.Close()
 			reqLogFile = nil
 			return

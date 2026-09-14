@@ -204,12 +204,16 @@ func indexByte(s string, b byte) int {
 	return -1
 }
 
-func syncModelsOnce() {
+// syncModelsOnce 同步一次官方模型目录。返回的错误交给调用方记录,
+// 这样后台刷新循环可以在连续失败时做刷屏抑制, 而按需路径(ensureModelsFresh)
+// 仍照常打印每条失败 —— 同步逻辑本身(取锁/标记 syncing/调 syncRecommendedModels/
+// 成功日志)一行未改。
+func syncModelsOnce() error {
 	initModelsCache()
 	modelsMu.Lock()
 	if modelsSyncing {
 		modelsMu.Unlock()
-		return
+		return nil
 	}
 	modelsSyncing = true
 	modelsMu.Unlock()
@@ -221,14 +225,14 @@ func syncModelsOnce() {
 
 	added, err := syncRecommendedModels()
 	if err != nil {
-		log.Printf("  model sync: failed (%v), using cached list", err)
-		return
+		return err
 	}
 	if added > 0 {
 		log.Printf("  model sync: %d new free models from official feed", added)
 	} else {
 		log.Printf("  model sync: %d free models up to date", len(getFreeModels()))
 	}
+	return nil
 }
 
 func getDefaultModel() string {
@@ -300,8 +304,15 @@ func startModelsRefresher() {
 	go func() {
 		syncModelsOnce()
 		ticker := time.NewTicker(modelsRefreshInterval)
-		for range ticker.C {
-			syncModelsOnce()
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ticker.C:
+				syncModelsOnce()
+			case <-appRootCtx.Done():
+				// 收到退出信号: 停止模型刷新协程, 让进程能够真正停下。
+				return
+			}
 		}
 	}()
 }

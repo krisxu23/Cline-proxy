@@ -8,9 +8,13 @@ services:
     container_name: cline-proxy
     restart: unless-stopped
     ports:
-      - "3457:3457"
+      # 只监听本机回环, 不暴露到全网段。容器内仍由 CMD 的 -host 0.0.0.0 监听,
+      # 端口映射是宿主机侧的限制, 二者不冲突。
+      - "127.0.0.1:3457:3457"
     # 监听地址由 Dockerfile 的 CMD 传入 -host 0.0.0.0 保证宿主机可访问 3457；
-    # 不要改回 127.0.0.1，否则容器外端口映射不可达。
+    # 不要改回 127.0.0.1, 否则容器外端口映射不可达。
+    # 注意: 镜像已改为非 root 用户(uid/gid=10001)运行, 若用 bind 挂载 ./data,
+    # 请确保其对本机 uid 10001 可写(例如 `sudo chown -R 10001:10001 ./data`)。
     volumes:
       - ./data:/app/data
       - ./override.md:/app/override.md:ro

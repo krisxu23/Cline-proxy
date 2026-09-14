@@ -48,6 +48,16 @@ jobs:
           CLINE_PROXY_SKIP_NODEBOX: '1'
         run: go test -race -count=1 -tags with_quic,with_grpc,with_utls ./internal/...
 
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Frontend admin render test
+        # scripts/admin-render-test.js 是纯 Node 零依赖的渲染冒烟测试(104+ 断言),
+        # 覆盖 admin_html.go 嵌入的 2300+ 行管理后台 HTML/JS。前端改坏必须让 CI 红。
+        run: node scripts/admin-render-test.js
+
   build:
     name: Build ${{ matrix.target }}
     needs: test
@@ -102,6 +112,18 @@ jobs:
         with:
           go-version: '1.26'
 
+      - name: Compute build version
+        id: ver
+        shell: bash
+        # 版本必须在此处(构建前)就算出, 否则 release job 才生成 tag 时构建拿不到。
+        # 取最近 tag + commit 偏移; 无 tag 时回退到 commit hash, 保证任何构建都可区分。
+        run: |
+          set -euo pipefail
+          git fetch --tags --force || true
+          VER=$(git describe --tags --always --dirty 2>/dev/null || echo "dev")
+          echo "version=$VER" >> "$GITHUB_OUTPUT"
+          echo "Build version: $VER"
+
       - name: Build binary
         env:
           GOOS: ${{ matrix.goos }}
@@ -110,13 +132,15 @@ jobs:
         shell: bash
         # 构建标签开启 sing-box 的 QUIC(hysteria/hysteria2/tuic)、grpc 传输与
         # uTLS 指纹支持; 缺省构建不含这些协议栈。
-        # naive 出站依赖 Chromium cronet 原生库, 与纯 Go 交叉编译不兼容, 不启用
+        # naive 出站依赖 Chromium cronet 原生库, 与纯 Go 交叉编译不兼容, 不启用。
+        # buildVersion 注入后 /health(version) 可区分不同构建。
         run: |
           if [ "${{ matrix.gui }}" = "true" ]; then
             LDFLAGS="-s -w -H=windowsgui"
           else
             LDFLAGS="-s -w"
           fi
+          LDFLAGS="$LDFLAGS -X cline-go-proxy/internal/app.buildVersion=${{ steps.ver.outputs.version }}"
           go build -tags with_quic,with_grpc,with_utls -ldflags="$LDFLAGS" -o cline-proxy-${{ matrix.target }}${{ matrix.ext }} .
 
       - name: Upload artifact
@@ -141,6 +165,21 @@ jobs:
           path: artifacts
           pattern: cline-proxy-*
 
+      - name: Generate sha256 checksums
+        shell: bash
+        # 发布包未签名(41.7MB exe 会被 SmartScreen 拦), 用户需要完整性校验手段。
+        # 生成每份产物平行的 .sha256 文件 + 一份汇总 checksums.txt。
+        run: |
+          set -euo pipefail
+          cd artifacts
+          : > ../checksums.txt
+          find . -type f -name 'cline-proxy-*' | sort | while read -r f; do
+            h=$(sha256sum "$f" | cut -d' ' -f1)
+            echo "$h  ${f#./}" >> ../checksums.txt
+            echo "$h" > "$f.sha256"
+          done
+          cat ../checksums.txt
+
       - name: Generate semantic release tag
         id: tag
         run: |
@@ -162,7 +201,9 @@ jobs:
         with:
           tag_name: ${{ steps.tag.outputs.tag }}
           name: ${{ steps.tag.outputs.tag }}
-          files: artifacts/cline-proxy-*/*
+          files: |
+            artifacts/cline-proxy-*/*
+            checksums.txt
           generate_release_notes: true
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
