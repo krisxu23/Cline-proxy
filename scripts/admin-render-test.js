@@ -486,24 +486,41 @@ ocRegions = [];
 renderExitRegions();
 check('取消勾选后告警消失', els.ocRegionBox._html.indexOf('所选地区当前没有出口') < 0);
 
-// 3) 订阅默认收起: 只显示主机名, 完整地址与删除按钮要点开才出现
+// 3) 订阅区整体折叠: 默认收起(toggle 按钮 + 条数摘要), 展开后单条链接平铺显示
+//    (完整地址 + 抓取状态 + 删除按钮) —— 不做逐条折叠。
 const SUB_URL = 'https://misub.bursaonline.eu/920731/rq?clash';
-Object.keys(ocSubOpen).forEach(k => delete ocSubOpen[k]);
 ocSubsArr = [SUB_URL];
 ocSubsStatus = {};
 ocSubsStatus[SUB_URL] = '🟢 09-14 19:23 · 98 节点';
+ocSubsAreaOpen = false;
 renderOcSubs();
-const subCollapsed = els.ocSubsList._html;
-check('订阅收起: 显示主机名', subCollapsed.indexOf('misub.bursaonline.eu') >= 0, subCollapsed.slice(0, 160));
-check('订阅收起: 不出现完整路径', subCollapsed.indexOf('/920731/rq') < 0, subCollapsed.slice(0, 200));
-check('订阅收起: 带抓取状态与节点数', subCollapsed.indexOf('98 节点') >= 0);
-check('订阅收起: 无删除按钮', subCollapsed.indexOf('delOcSub(') < 0);
-toggleOcSub(0);
+check('默认收起: 列表不渲染(避免长平铺)', els.ocSubsList._html === '', els.ocSubsList._html.slice(0, 120));
+check('默认收起: 区域容器隐藏', els.ocSubsArea.style.display === 'none', String(els.ocSubsArea.style.display));
+check('默认收起: 按钮显示 展开', els.ocSubsToggle._text === '展开', els.ocSubsToggle._text);
+check('摘要显示订阅条数', els.ocSubsSummary._text === '1 条订阅', els.ocSubsSummary._text);
+toggleOcSubsArea();
 const subOpen = els.ocSubsList._html;
-check('展开后显示完整地址', subOpen.indexOf(SUB_URL) >= 0);
+check('展开后显示完整地址', subOpen.indexOf(SUB_URL) >= 0, subOpen.slice(0, 160));
+check('展开后带抓取状态与节点数', subOpen.indexOf('98 节点') >= 0);
 check('展开后出现删除按钮', subOpen.indexOf('delOcSub(0)') >= 0);
-toggleOcSub(0);
-check('再点一次收回(完整地址消失)', els.ocSubsList._html.indexOf(SUB_URL) < 0);
+check('展开后是无点击折叠的平铺行(无 toggleOcSub)', subOpen.indexOf('toggleOcSub') < 0);
+check('展开后区域容器显示', els.ocSubsArea.style.display === '', String(els.ocSubsArea.style.display));
+check('展开后按钮显示 收起', els.ocSubsToggle._text === '收起', els.ocSubsToggle._text);
+toggleOcSubsArea();
+check('再点一次整区收回(完整地址消失)', els.ocSubsList._html.indexOf(SUB_URL) < 0);
+check('收回后按钮回到 展开', els.ocSubsToggle._text === '展开', els.ocSubsToggle._text);
+// 无订阅时摘要给出明确文案
+ocSubsArr = [];
+renderOcSubs();
+check('无订阅时摘要为 暂无订阅', els.ocSubsSummary._text === '暂无订阅', els.ocSubsSummary._text);
+// 有订阅但尚未抓取: 摘要要带出来(收起时不至于看不到)
+ocSubsArr = [SUB_URL];
+ocSubsStatus = {};
+renderOcSubs();
+check('未抓取时摘要提示 · 未抓取', els.ocSubsSummary._text === '1 条订阅 · 未抓取', els.ocSubsSummary._text);
+ocSubsAreaOpen = false;   // 还原为默认收起, 不影响后续用例
+renderOcSubs();
+ocSubsArr = [];
 
 console.log('\\n' + (FAILS === 0 ? '=== ALL PASS ===' : '=== ' + FAILS + ' FAILURES ==='));
 process.exit(FAILS === 0 ? 0 : 1);

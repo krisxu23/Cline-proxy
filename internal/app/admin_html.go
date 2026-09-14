@@ -700,15 +700,22 @@ body:not([data-theme="dark"]) .theme-toggle .dark-label{display:none}
       </div>
     </div>
     <div class="form-row">
-      <div class="field"><label>订阅链接</label>
-        <div id="ocSubsList" style="display:flex;flex-direction:column;gap:6px;margin-bottom:var(--sp-2)"></div>
-        <div style="display:flex;gap:var(--sp-2)">
-          <input id="ocSubNew" placeholder="https://订阅地址" style="flex:1" />
-          <input id="ocSubRefresh" type="number" min="1" max="43200" title="自动刷新间隔（分钟）" placeholder="30" style="width:96px;flex:none" />
-          <span style="align-self:center;font-size:var(--fs-xs);color:var(--text3);flex:none">分钟刷新</span>
-          <button type="button" onclick="addOcSub()" style="flex:none;padding:9px 14px">添加</button>
+      <div class="field">
+        <label style="display:flex;align-items:center;gap:var(--sp-2)">
+          <span>订阅链接</span>
+          <button type="button" class="btn" id="ocSubsToggle" style="flex:none;padding:2px 8px;font-size:var(--fs-xs)" onclick="toggleOcSubsArea()">展开</button>
+          <span id="ocSubsSummary" style="font-weight:400;font-size:var(--fs-xs);color:var(--text3)"></span>
+        </label>
+        <div id="ocSubsArea" style="display:none">
+          <div id="ocSubsList" style="display:flex;flex-direction:column;gap:6px;margin-bottom:var(--sp-2)"></div>
+          <div style="display:flex;gap:var(--sp-2)">
+            <input id="ocSubNew" placeholder="https://订阅地址" style="flex:1" />
+            <input id="ocSubRefresh" type="number" min="1" max="43200" title="自动刷新间隔（分钟）" placeholder="30" style="width:96px;flex:none" />
+            <span style="align-self:center;font-size:var(--fs-xs);color:var(--text3);flex:none">分钟刷新</span>
+            <button type="button" onclick="addOcSub()" style="flex:none;padding:9px 14px">添加</button>
+          </div>
+          <div class="hint" id="ocSubsInfo" style="margin-top:6px;font-size:var(--fs-xs);color:var(--text3);white-space:pre-wrap"></div>
         </div>
-        <div class="hint" id="ocSubsInfo" style="margin-top:6px;font-size:var(--fs-xs);color:var(--text3);white-space:pre-wrap"></div>
       </div>
     </div>
     <div class="form-row">
@@ -1474,41 +1481,46 @@ function renderCooldowns(cd, direct) {
 }
 
 let ocSubsArr = [];
-// 订阅链接默认收起(只显示主机名+抓取状态), 点击展开显示完整地址与删除按钮
-const ocSubOpen = {};
 let ocSubsStatus = {};
+// 订阅区整体折叠: 订阅多时平铺太长, 整块收起只留一行摘要; 单条链接仍是平铺样式
+// (完整地址 + 抓取状态 + 删除), 不做逐条折叠 —— 展开后与以前的显示一致。
+let ocSubsAreaOpen = false;
+
+function toggleOcSubsArea() {
+  ocSubsAreaOpen = !ocSubsAreaOpen;
+  renderOcSubs();
+}
+
 function renderOcSubs() {
-  const el = _('ocSubsList');
-  if (!el) return;
-  if (!ocSubsArr.length) {
-    el.innerHTML = '<div style="font-size:var(--fs-xs);color:var(--text3);padding:2px 0">暂无订阅, 在下方添加; 保存后自动抓取并按设定的刷新间隔更新, 支持 sing-box JSON / Clash YAML / base64 节点列表</div>';
+  const list = _('ocSubsList');
+  const area = _('ocSubsArea');
+  const btn = _('ocSubsToggle');
+  const sum = _('ocSubsSummary');
+  const n = ocSubsArr.length;
+  if (btn) btn.textContent = ocSubsAreaOpen ? '收起' : '展开';
+  if (sum) {
+    // 收起时把"有没有抓取过"也带进摘要, 否则折叠状态会把未抓取这件事藏起来。
+    const anyStatus = ocSubsArr.some(u => ocSubsStatus[u]);
+    sum.textContent = n ? (n + ' 条订阅' + (anyStatus ? '' : ' · 未抓取')) : '暂无订阅';
+  }
+  if (area && area.style) area.style.display = ocSubsAreaOpen ? '' : 'none';
+  if (!list) return;
+  if (!ocSubsAreaOpen) {
+    // 收起时不渲染长列表: 区域里只剩标签行的摘要, 页面高度与订阅条数无关。
+    list.innerHTML = '';
     return;
   }
-  el.innerHTML = ocSubsArr.map((u, i) => {
-    const open = !!ocSubOpen[u];
+  if (!n) {
+    list.innerHTML = '<div style="font-size:var(--fs-xs);color:var(--text3);padding:2px 0">暂无订阅, 在下方添加; 保存后自动抓取并按设定的刷新间隔更新, 支持 sing-box JSON / Clash YAML / base64 节点列表</div>';
+    return;
+  }
+  list.innerHTML = ocSubsArr.map((u, i) => {
     const st = ocSubsStatus[u] || '';
-    let host = u;
-    try { host = new URL(u).host || u; } catch (e) { /* 非法 URL 时退回原文 */ }
-    return '<div style="border:1px solid var(--border);border-radius:var(--radius-sm);background:rgba(148,163,184,.06);overflow:hidden">' +
-      '<div style="display:flex;align-items:center;gap:9px;padding:var(--sp-2) var(--sp-3);cursor:pointer" onclick="toggleOcSub(' + i + ')">' +
-        '<span style="flex:none;width:11px;color:var(--text3)">' + (open ? '▾' : '▸') + '</span>' +
-        '<span style="flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">' + esc(host) + '</span>' +
-        (st ? '<span style="flex:none;font-size:var(--fs-xs);color:var(--text3);white-space:nowrap">' + esc(st) + '</span>' : '') +
-      '</div>' +
-      (open
-        ? '<div style="padding:var(--sp-2) var(--sp-3);display:flex;align-items:center;gap:10px;border-top:1px solid rgba(148,163,184,.10)">' +
-            '<span style="flex:1;font-size:var(--fs-xs);font-family:var(--font-mono);word-break:break-all;color:var(--text2)">' + esc(u) + '</span>' +
-            '<button type="button" class="btn" style="flex:none;padding:4px 10px;font-size:var(--fs-xs)" onclick="event.stopPropagation();delOcSub(' + i + ')">删除</button>' +
-          '</div>'
-        : '') +
-    '</div>';
+    return '<div style="display:flex;align-items:center;gap:10px;padding:var(--sp-2) var(--sp-3);background:rgba(148,163,184,.06);border:1px solid var(--border);border-radius:var(--radius-sm)">' +
+      '<span style="flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:var(--fs-base)">' + esc(u) + '</span>' +
+      (st ? '<span style="flex:none;font-size:var(--fs-xs);color:var(--text3);white-space:nowrap">' + esc(st) + '</span>' : '') +
+      '<button type="button" class="btn" style="flex:none;padding:4px 10px;font-size:var(--fs-xs)" onclick="delOcSub(' + i + ')">删除</button></div>';
   }).join('');
-}
-function toggleOcSub(i) {
-  const u = ocSubsArr[i];
-  if (!u) return;
-  if (ocSubOpen[u]) delete ocSubOpen[u]; else ocSubOpen[u] = true;
-  renderOcSubs();
 }
 function addOcSub() {
   const u = _('ocSubNew').value.trim();
