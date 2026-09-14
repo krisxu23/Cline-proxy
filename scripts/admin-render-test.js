@@ -409,7 +409,7 @@ check('card 为 null 时安全返回', (function () { try { filterCardModels('ba
 console.log('\\n[17] 显式盲区: 以下交互函数本脚本未执行');
 const UNCOVERED = ['filterModelIndex', 'filterCardModels', 'toggleProviderModel', 'toggleModel',
   'saveProvider', 'editProvider', 'delProvider', 'testProviderByName', 'refreshOneCatalog',
-  'refreshModels', 'refreshOcModels', 'saveOcConfig', 'loadOcNodes', 'loadOcStats', 'loadAccounts',
+  'refreshModels', 'refreshOcModels', 'saveOcConfig', 'loadOcRegions', 'loadOcStats', 'loadAccounts',
   'saveHeaders', 'saveRouter', 'renderRouter', 'switchTab', 'copyText', 'api', 'toast'];
 const missing = UNCOVERED.filter(fn => !new RegExp('\\\\bfunction\\\\s+' + fn + '\\\\b|\\\\bconst\\\\s+' + fn + '\\\\s*=').test(script));
 check('盲区清单里的函数都仍存在于源码(别让人以为已删掉)', missing.length === 0, '缺失: ' + JSON.stringify(missing));
@@ -442,6 +442,68 @@ check('catalog 空: 手工模型仍不丢', pm5.some(m => m.id==='private-2') &&
 pvData = { hand: hand };
 renderModelIndex();
 check('卡片渲染含手工私有模型行', els.modelIndex._html.indexOf('private-1') >= 0 && els.modelIndex._html.indexOf('data-row-search="hand:private-1"') >= 0, '');
+
+console.log('\\n[19] 出口地区勾选面板 + 订阅折叠(替换节点列表)');
+// 1) 地区面板: 7 个固定地区, 未勾选=不限制
+ocRegionStats = [
+  { id: 'us', label: '美国', total: 120, ok: 30 },
+  { id: 'jp', label: '日本', total: 80, ok: 12 },
+  { id: 'tw', label: '台湾', total: 40, ok: 8 },
+  { id: 'hk', label: '香港', total: 60, ok: 20 },
+  { id: 'sg', label: '新加坡', total: 50, ok: 15 },
+  { id: 'eu', label: '欧洲', total: 200, ok: 40 },
+  { id: 'other', label: '其他地区', total: 3000, ok: 5 }
+];
+ocRegions = [];
+renderExitRegions();
+const rbHtml = els.ocRegionBox._html;
+check('地区面板渲染 7 个复选框', rbHtml.split('type="checkbox"').length - 1 === 7,
+  '实际 ' + (rbHtml.split('type="checkbox"').length - 1));
+check('每个地区显示 可用/共', rbHtml.indexOf('可用 30 / 共 120') >= 0);
+check('未勾选时提示不限制', rbHtml.indexOf('未勾选 = 使用全部地区出口') >= 0);
+check('面板不再罗列单个节点(无 exitIp 字段)', rbHtml.indexOf('exitIp') < 0 && rbHtml.indexOf('latencyMs') < 0);
+
+// 2) 勾选: 单选 / 多选 / 清除
+toggleExitRegion('us', true);
+check('勾选美国 -> ocRegions=[us]', ocRegions.length === 1 && ocRegions[0] === 'us', JSON.stringify(ocRegions));
+check('勾选后提示仅使用所选地区', els.ocRegionBox._html.indexOf('仅使用: 美国') >= 0);
+toggleExitRegion('tw', true);
+check('多选: 美国+台湾(保持界面顺序)', ocRegions.join(',') === 'us,tw', JSON.stringify(ocRegions));
+check('多选提示含两个地区', els.ocRegionBox._html.indexOf('仅使用: 美国、台湾') >= 0);
+toggleExitRegion('us', false);
+check('取消美国后只剩台湾', ocRegions.join(',') === 'tw', JSON.stringify(ocRegions));
+toggleExitRegion('', false);
+check('清除限制后为空(不限制)', ocRegions.length === 0);
+check('清除后回到不限制文案', els.ocRegionBox._html.indexOf('未勾选 = 使用全部地区出口') >= 0);
+
+// 2b) 勾了地区但该地区出口数为 0 时要显式告警(后端此时会临时回退全部出口)
+ocRegionStats = ocRegionStats.map(r => r.id === 'us' ? { id: 'us', label: '美国', total: 0, ok: 0 } : r);
+ocRegions = [];
+toggleExitRegion('us', true);
+const warnHtml = els.ocRegionBox._html;
+check('所选地区出口数为 0 时给红色告警', warnHtml.indexOf('所选地区当前没有出口') >= 0, warnHtml.slice(0, 200));
+ocRegions = [];
+renderExitRegions();
+check('取消勾选后告警消失', els.ocRegionBox._html.indexOf('所选地区当前没有出口') < 0);
+
+// 3) 订阅默认收起: 只显示主机名, 完整地址与删除按钮要点开才出现
+const SUB_URL = 'https://misub.bursaonline.eu/920731/rq?clash';
+Object.keys(ocSubOpen).forEach(k => delete ocSubOpen[k]);
+ocSubsArr = [SUB_URL];
+ocSubsStatus = {};
+ocSubsStatus[SUB_URL] = '🟢 09-14 19:23 · 98 节点';
+renderOcSubs();
+const subCollapsed = els.ocSubsList._html;
+check('订阅收起: 显示主机名', subCollapsed.indexOf('misub.bursaonline.eu') >= 0, subCollapsed.slice(0, 160));
+check('订阅收起: 不出现完整路径', subCollapsed.indexOf('/920731/rq') < 0, subCollapsed.slice(0, 200));
+check('订阅收起: 带抓取状态与节点数', subCollapsed.indexOf('98 节点') >= 0);
+check('订阅收起: 无删除按钮', subCollapsed.indexOf('delOcSub(') < 0);
+toggleOcSub(0);
+const subOpen = els.ocSubsList._html;
+check('展开后显示完整地址', subOpen.indexOf(SUB_URL) >= 0);
+check('展开后出现删除按钮', subOpen.indexOf('delOcSub(0)') >= 0);
+toggleOcSub(0);
+check('再点一次收回(完整地址消失)', els.ocSubsList._html.indexOf(SUB_URL) < 0);
 
 console.log('\\n' + (FAILS === 0 ? '=== ALL PASS ===' : '=== ' + FAILS + ' FAILURES ==='));
 process.exit(FAILS === 0 ? 0 : 1);

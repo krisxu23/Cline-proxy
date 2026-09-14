@@ -461,9 +461,14 @@ func checkAllNodeHealth() {
 			nodeHealthMu.Lock()
 			nodeHealth[key] = nodeHealthState{Ok: ok, At: time.Now(), Result: r}
 			nodeHealthMu.Unlock()
+			// 记下实测出口国家: 地区过滤依赖它, 落盘后重启仍可用(见 exit_region.go)
+			rememberNodeCountry(key, r.ExitCountry)
 		}(k)
 	}
 	wg.Wait()
+	persistNodeCountries()
+	// 整批检测完再失效一次出口列表缓存(逐节点失效会把缓存打穿)
+	invalidateExitListCache()
 	log.Printf("  nodes: 增强检测完成(%d 并发), %d/%d 个出口可达", workers, okCount, len(keys))
 	// 连通性刷新后, 同步刷新地区受限模型的节点能力标记, 以及
 	// "节点 × 每个上游"的可达性矩阵(后者用于选节点时跳过到该上游不通的节点)。
@@ -653,6 +658,7 @@ type nodeView struct {
 	ExitIP      string `json:"exitIp,omitempty"`
 	ExitCountry string `json:"exitCountry,omitempty"`
 	ExitASNorg  string `json:"exitAsnOrg,omitempty"`
+	Region      string `json:"region,omitempty"` // 地区 ID(us/jp/tw/hk/sg/eu/other), 见 exit_region.go
 	SpeedBPS    int64  `json:"speedBps,omitempty"`
 	IsStalled   bool   `json:"isStalled"`
 	MITMRisk    bool   `json:"mitmRisk"`
@@ -736,6 +742,7 @@ func withHealthResult(v nodeView, key string) nodeView {
 		v.IsWarp = r.IsWarp
 		v.NetworkType = r.NetworkType
 	}
+	v.Region = nodeExitRegion(key)
 	return v
 }
 

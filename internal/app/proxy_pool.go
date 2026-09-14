@@ -113,7 +113,8 @@ func effectiveProxyList() []string {
 	list := make([]string, 0, len(cfg.Proxies)+len(cfg.Subs)*4)
 	list = append(list, cfg.Proxies...)
 	list = append(list, subNodeKeysSnapshot()...)
-	return list
+	// 地区过滤: 用户在设置页勾选地区后, 全网关出站只走所选地区的出口。
+	return filterByExitRegion(list)
 }
 
 // nodeDialable 节点出口是否已就绪(普通代理恒为可拨)

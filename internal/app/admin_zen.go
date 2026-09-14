@@ -25,6 +25,8 @@ func handleZenConfig(w http.ResponseWriter, r *http.Request) {
 		"proxies":         cfg.Proxies,
 		"subs":            cfg.Subs,
 		"exitMode":        cfg.ExitMode,
+		"enabledRegions":  cfg.EnabledRegions,
+		"regionSummary":   exitRegionSummary(),
 		"dnsMode":         cfg.DNSMode,
 		"dnsCustom":       cfg.DNSCustomDNS,
 		"rescueDirect":    rescueDirectEnabled(),
@@ -74,6 +76,7 @@ func handleZenConfigUpdate(w http.ResponseWriter, r *http.Request) {
 		Proxies         []string `json:"proxies"`
 		Subs            []string `json:"subs"`
 		ExitMode        *string  `json:"exitMode"`
+		EnabledRegions  []string `json:"enabledRegions"`
 		DNSMode         *string  `json:"dnsMode"`
 		DNSCustom       *string  `json:"dnsCustom"`
 		RescueDirect    *bool    `json:"rescueDirect"`
@@ -156,6 +159,17 @@ func handleZenConfigUpdate(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		next.ExitMode = *patch.ExitMode
+	}
+	if patch.EnabledRegions != nil {
+		// 只允许 7 个已知地区; 空数组 = 清除限制(全部地区可用)。
+		// 未知 ID 直接 400, 避免拼错导致"勾了但一个出口都不剩"这种静默故障。
+		for _, id := range patch.EnabledRegions {
+			if !validExitRegion(strings.ToLower(strings.TrimSpace(id))) {
+				writeAPI(w, http.StatusBadRequest, apiResponse{Error: "地区无效: " + id + "（可选: us/jp/tw/hk/sg/eu/other）"})
+				return
+			}
+		}
+		next.EnabledRegions = normalizeExitRegions(patch.EnabledRegions)
 	}
 	if patch.SubsRefreshMins != nil {
 		mins := *patch.SubsRefreshMins

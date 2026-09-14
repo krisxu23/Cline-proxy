@@ -712,9 +712,9 @@ body:not([data-theme="dark"]) .theme-toggle .dark-label{display:none}
       </div>
     </div>
     <div class="form-row">
-      <div class="field"><label style="display:flex;align-items:center;justify-content:space-between">节点列表
+      <div class="field"><label style="display:flex;align-items:center;justify-content:space-between">出口地区（勾选后全网关只走所选地区的出口）
         <button type="button" id="ocCheckBtn" class="btn" style="padding:3px 10px;font-size:var(--fs-xs)" onclick="refreshOcNodes()">连通检测</button></label>
-        <div id="ocNodesBox" style="max-height:190px;overflow-y:auto;border:1px solid var(--border);border-radius:var(--radius-sm);background:var(--inset)"></div>
+        <div id="ocRegionBox" style="border:1px solid var(--border);border-radius:var(--radius-sm);background:var(--inset)"></div>
       </div>
     </div>
     <div class="form-row">
@@ -883,7 +883,7 @@ function switchTab(name) {
   if (name === 'accounts') { loadAccounts(); loadConfig(); }
   if (name === 'models') { loadModelIndex(); }
   if (name === 'router') { loadRouter(); }
-  if (name === 'settings') { loadKeys(); loadConfig(); loadOcConfig(); loadOcNodes(); }
+  if (name === 'settings') { loadKeys(); loadConfig(); loadOcConfig(); }
   if (name === 'logs') loadLogs();
 }
 
@@ -1422,8 +1422,10 @@ async function loadOcConfig() {
     if (_('ocDnsCustom')) _('ocDnsCustom').value = c.dnsCustom || '';
     if (_('ocRescue')) _('ocRescue').value = (c.rescueDirect === false) ? 'false' : 'true';
     _('ocSubRefresh').value = c.subsRefreshMins || 30;
-    if (_('dashExitMode')) _('dashExitMode').value = (c.exitMode === 'direct') ? '直连（不走节点）' : '节点出口（走节点列表）';
-    loadOcNodes();
+    if (_('dashExitMode')) _('dashExitMode').value = (c.exitMode === 'direct') ? '直连（不走节点）' : '节点出口（按所选地区）';
+    if (Array.isArray(c.enabledRegions)) ocRegions = c.enabledRegions.slice();
+    ocRegionStats = c.regionSummary || [];
+    renderExitRegions();
     _('ocStrategy').value = c.proxyStrategy || 'round_robin';
     _('ocMaxConc').value = c.maxConcurrency || 8;
     _('ocRetries').value = c.retries || 3;
@@ -1442,8 +1444,10 @@ async function loadOcConfig() {
     renderCooldowns(rt.proxyCooldowns || {}, c.exitMode === 'direct');
     const ss = rt.subsStatus || {};
     const sk = Object.keys(ss);
+    ocSubsStatus = ss;
+    renderOcSubs();
     _('ocSubsInfo').textContent = sk.length
-      ? sk.map(k => k + ' → ' + ss[k]).join('\n')
+      ? ''
       : '订阅尚未抓取';
   } catch (e) { console.warn('opencode 配置加载失败:', e && e.message); }
 }
@@ -1470,17 +1474,41 @@ function renderCooldowns(cd, direct) {
 }
 
 let ocSubsArr = [];
+// 订阅链接默认收起(只显示主机名+抓取状态), 点击展开显示完整地址与删除按钮
+const ocSubOpen = {};
+let ocSubsStatus = {};
 function renderOcSubs() {
   const el = _('ocSubsList');
+  if (!el) return;
   if (!ocSubsArr.length) {
     el.innerHTML = '<div style="font-size:var(--fs-xs);color:var(--text3);padding:2px 0">暂无订阅, 在下方添加; 保存后自动抓取并按设定的刷新间隔更新, 支持 sing-box JSON / Clash YAML / base64 节点列表</div>';
     return;
   }
-  el.innerHTML = ocSubsArr.map((u, i) =>
-    '<div style="display:flex;align-items:center;gap:10px;padding:var(--sp-2) var(--sp-3);background:rgba(148,163,184,.06);border:1px solid var(--border);border-radius:var(--radius-sm)">' +
-    '<span style="flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:var(--fs-base)">' + u.replace(/</g, '&lt;') + '</span>' +
-    '<button type="button" class="btn" style="flex:none;padding:4px 10px;font-size:var(--fs-xs)" onclick="delOcSub(' + i + ')">删除</button></div>'
-  ).join('');
+  el.innerHTML = ocSubsArr.map((u, i) => {
+    const open = !!ocSubOpen[u];
+    const st = ocSubsStatus[u] || '';
+    let host = u;
+    try { host = new URL(u).host || u; } catch (e) { /* 非法 URL 时退回原文 */ }
+    return '<div style="border:1px solid var(--border);border-radius:var(--radius-sm);background:rgba(148,163,184,.06);overflow:hidden">' +
+      '<div style="display:flex;align-items:center;gap:9px;padding:var(--sp-2) var(--sp-3);cursor:pointer" onclick="toggleOcSub(' + i + ')">' +
+        '<span style="flex:none;width:11px;color:var(--text3)">' + (open ? '▾' : '▸') + '</span>' +
+        '<span style="flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">' + esc(host) + '</span>' +
+        (st ? '<span style="flex:none;font-size:var(--fs-xs);color:var(--text3);white-space:nowrap">' + esc(st) + '</span>' : '') +
+      '</div>' +
+      (open
+        ? '<div style="padding:var(--sp-2) var(--sp-3);display:flex;align-items:center;gap:10px;border-top:1px solid rgba(148,163,184,.10)">' +
+            '<span style="flex:1;font-size:var(--fs-xs);font-family:var(--font-mono);word-break:break-all;color:var(--text2)">' + esc(u) + '</span>' +
+            '<button type="button" class="btn" style="flex:none;padding:4px 10px;font-size:var(--fs-xs)" onclick="event.stopPropagation();delOcSub(' + i + ')">删除</button>' +
+          '</div>'
+        : '') +
+    '</div>';
+  }).join('');
+}
+function toggleOcSub(i) {
+  const u = ocSubsArr[i];
+  if (!u) return;
+  if (ocSubOpen[u]) delete ocSubOpen[u]; else ocSubOpen[u] = true;
+  renderOcSubs();
 }
 function addOcSub() {
   const u = _('ocSubNew').value.trim();
@@ -1495,41 +1523,81 @@ function delOcSub(i) {
   renderOcSubs();
 }
 
-async function loadOcNodes() {
+// ============ 出口地区勾选 ============
+//
+// 设置页不再逐个罗列节点: 后端按实测出口国家把出口归到 7 个地区, 这里只渲染
+// 地区级勾选。勾选后全网关(zen / cline 池 / 通用 Provider / 订阅抓取)的出站
+// 只走所选地区的出口; 不勾选 = 不限制。
+const exitRegionDefs = [
+  { id: 'us', label: '美国' },
+  { id: 'jp', label: '日本' },
+  { id: 'tw', label: '台湾' },
+  { id: 'hk', label: '香港' },
+  { id: 'sg', label: '新加坡' },
+  { id: 'eu', label: '欧洲' },
+  { id: 'other', label: '其他地区' }
+];
+let ocRegions = [];      // 已勾选地区 ID
+let ocRegionStats = [];  // 后端统计: [{id,label,total,ok}]
+let ocRegionActive = false; // 后端检测进行中标记(仅用于提示文案)
+
+function renderExitRegions() {
+  const box = _('ocRegionBox');
+  if (!box) return;
+  const stats = {};
+  ocRegionStats.forEach(s => { stats[s.id] = s; });
+  const rows = exitRegionDefs.map(def => {
+    const s = stats[def.id] || { total: 0, ok: 0 };
+    const on = ocRegions.indexOf(def.id) >= 0;
+    return '<label style="display:flex;align-items:center;gap:10px;padding:7px 12px;border-bottom:1px solid rgba(148,163,184,.07);cursor:pointer">' +
+      '<input type="checkbox" style="flex:none" ' + (on ? 'checked' : '') +
+        ' onchange="toggleExitRegion(\'' + def.id + '\', this.checked)" />' +
+      '<span style="flex:1">' + def.label + '</span>' +
+      '<span style="flex:none;font-size:var(--fs-xs);color:var(--text3)">可用 ' + (s.ok || 0) + ' / 共 ' + (s.total || 0) + '</span>' +
+      '</label>';
+  }).join('');
+  const chosen = exitRegionDefs.filter(d => ocRegions.indexOf(d.id) >= 0).map(d => d.label);
+  let chosenTotal = 0, chosenOk = 0;
+  ocRegions.forEach(id => { const s = stats[id]; if (s) { chosenTotal += s.total || 0; chosenOk += s.ok || 0; } });
+  const tail = chosen.length
+    ? '<div style="padding:7px 12px;font-size:var(--fs-xs);display:flex;align-items:center;gap:8px">' +
+        '<span style="flex:1;color:var(--accent2)">仅使用: ' + esc(chosen.join('、')) + '（' + chosenOk + ' 可用 / ' + chosenTotal + ' 个出口）</span>' +
+        '<button type="button" class="btn" style="flex:none;padding:2px 9px;font-size:var(--fs-xs)" onclick="toggleExitRegion(\'\', false)">清除限制</button></div>'
+    : '<div style="padding:7px 12px;font-size:var(--fs-xs);color:var(--text3)">未勾选 = 使用全部地区出口（不限制）</div>';
+  // 勾了地区但一个出口都没有: 明确告警 —— 后端此时会临时回退全部出口以保证可用,
+  // 不提示的话用户会以为限制生效了。
+  const emptyWarn = (chosen.length && chosenTotal === 0)
+    ? '<div style="padding:7px 12px 0;font-size:var(--fs-xs);color:var(--danger)">所选地区当前没有出口：请点「连通检测」获取各出口的国家（结果会记住，重启不丢），或先取消勾选</div>'
+    : '';
+  box.innerHTML = rows + tail + emptyWarn +
+    '<div style="padding:0 12px 9px;font-size:var(--fs-xs);color:var(--text3);line-height:1.6">' +
+    '地区按连通检测实测的出口国家归类；<b>未检测或无法判定国家的出口归入「其他地区」</b>，手填的代理同理。' +
+    '勾选后请点下方「💾 保存出口配置」生效' + (ocChecking ? '；连通检测进行中，计数会自动刷新…' : '') +
+    '</div>';
+}
+
+// toggleExitRegion 勾选/取消一个地区; id 为空表示"清除限制"。
+function toggleExitRegion(id, checked) {
+  if (!id) {
+    ocRegions = [];
+  } else if (checked) {
+    if (ocRegions.indexOf(id) < 0) ocRegions.push(id);
+  } else {
+    ocRegions = ocRegions.filter(r => r !== id);
+  }
+  ocRegions = exitRegionDefs.filter(d => ocRegions.indexOf(d.id) >= 0).map(d => d.id);
+  renderExitRegions();
+}
+
+// loadOcRegions 只刷新地区统计(不再拉取全部节点, 设置页因此更轻)
+async function loadOcRegions() {
   try {
-    const d = await api('GET', '/opencode/nodes');
-    const list = d.data || [];
-    if (!list.length) {
-      _('ocNodesBox').innerHTML = '<div style="padding:10px 12px;font-size:var(--fs-xs);color:var(--text3)">'
-        + (ocChecking ? '连通检测进行中, 完成后列表自动恢复…' : '暂无出口节点, 在上方添加代理/节点链接或订阅') + '</div>';
-      return;
-    }
-    const okN = list.filter(n => n.health === 'ok').length;
-    const failN = list.filter(n => n.health === 'fail').length;
-    const deadN = list.filter(n => !n.running).length;
-    const unkN = list.length - okN - failN - deadN;
-    const icon = n => n.health === 'ok' ? '🟢' : (n.health === 'fail' ? '🔴' : (n.running ? '⚪' : '⛔'));
-    const iconTitle = n => !n.running ? '未运行: 出站配置无效(已被剔除)或 sing-box 实例未就绪, 因此从未被测'
-      : (n.health === 'ok' ? '可达' : (n.health === 'fail' ? '不可达' : '尚未检测'));
-    const regionN = list.filter(n => (n.regions || []).length).length;
-    _('ocNodesBox').innerHTML = list.map(n => {
-      const regions = (n.regions || []).map(r => r.replace(/-free$/, ''));
-      const ups = n.upstreams || {};
-      const upNames = Object.keys(ups);
-      const upOk = upNames.filter(u => ups[u]);
-      const upBad = upNames.filter(u => !ups[u]);
-      return '<div style="display:flex;align-items:center;gap:9px;padding:5px 12px;font-size:var(--fs-sm);border-bottom:1px solid rgba(148,163,184,.07)">' +
-      '<span style="flex:none" title="' + escAttr(iconTitle(n)) + '">' + icon(n) + '</span>' +
-      '<span style="flex:none;min-width:58px;color:var(--text3);font-family:var(--font-mono)">' + esc(n.type) + '</span>' +
-      '<span style="flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">' + esc(n.name) + '</span>' +
-      (upOk.length ? '<span style="flex:none;font-size:var(--fs-xs);color:var(--accent2);border:1px solid currentColor;border-radius:4px;padding:0 5px" title="已探测: 该出口到这些上游可达">✓ ' + esc(upOk.join(',')) + '</span>' : '') +
-      (upBad.length ? '<span style="flex:none;font-size:var(--fs-xs);color:var(--danger);border:1px solid currentColor;border-radius:4px;padding:0 5px" title="已探测: 该出口到这些上游不通(选节点时会跳过)">✕ ' + esc(upBad.join(',')) + '</span>' : '') +
-      (regions.length ? '<span style="flex:none;font-size:var(--fs-xs);color:var(--accent2);border:1px solid currentColor;border-radius:4px;padding:0 5px" title="该出口已验证可用于地区受限模型">🌍 ' + esc(regions.join(',')) + '</span>' : '') +
-      '<span style="flex:none;font-size:var(--fs-xs);color:var(--text3)">' + n.source + '</span></div>';
-    }).join('') +
-    '<div style="padding:6px 12px;font-size:var(--fs-xs);color:var(--text3)">共 ' + list.length + ' 个出口 · 🟢 可达 ' + okN + ' · 🔴 不可达 ' + failN + ' · ⛔ 未运行 ' + deadN + ' · ⚪ 未检测 ' + unkN + ' · 🌍 可用于地区受限模型 ' + regionN + '<br>✓/✕ 是该出口到各上游的可达性(逐节点 TLS 握手探测, 按上游名); ✕ 的节点在请求该上游时会被自动跳过; ⛔ 是配置无效或实例未就绪, 需要修订阅源'
-      + (ocChecking ? '<br>🔍 连通检测进行中, 图标与计数将在检测完成后更新…' : '') + '</div>';
-  } catch (e) { _('ocNodesBox').innerHTML = fail(e, 'loadOcNodes()'); }
+    const d = await api('GET', '/opencode/config');
+    const c = d.data || {};
+    if (Array.isArray(c.enabledRegions)) ocRegions = c.enabledRegions.slice();
+    ocRegionStats = c.regionSummary || [];
+    renderExitRegions();
+  } catch (e) { console.warn('地区统计加载失败:', e && e.message); }
 }
 
 let ocChecking = false;
@@ -1541,12 +1609,13 @@ async function refreshOcNodes() {
   if (btn) { btn.disabled = true; btn.textContent = '检测中…'; }
   try { await api('POST', '/opencode/nodes/check'); toast('连通检测已启动, 结果将在 1~2 分钟内陆续刷新', 'success'); }
   catch (e) { toast('连通检测启动失败: ' + e.message, 'error'); }
-  await loadOcNodes();
-  [15, 35, 60, 90].forEach(sec => setTimeout(loadOcNodes, sec * 1000));
+  renderExitRegions();
+  await loadOcRegions();
+  [15, 35, 60, 90].forEach(sec => setTimeout(loadOcRegions, sec * 1000));
   setTimeout(() => {
     ocChecking = false;
     if (btn) { btn.disabled = false; btn.textContent = old || '连通检测'; }
-    loadOcNodes();
+    loadOcRegions();
   }, 95 * 1000);
 }
 
@@ -1565,6 +1634,7 @@ async function saveOcConfig() {
     proxies: proxies,
     subs: ocSubsArr,
     exitMode: _('ocExitMode').value,
+    enabledRegions: ocRegions,
     dnsMode: _('ocDnsMode') ? _('ocDnsMode').value : 'doh-ali',
     dnsCustom: _('ocDnsCustom') ? _('ocDnsCustom').value.trim() : '',
     rescueDirect: _('ocRescue') ? _('ocRescue').value === 'true' : true,
