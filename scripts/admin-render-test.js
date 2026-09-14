@@ -361,10 +361,10 @@ check('cline 已下架行渲染出「已下架」', /已下架[^<]*[<]/.test(car
 check('cline 说明含上次同步时间', /上次同步 2026\\/9\\/13/.test(cardHtml('cline')),
   (cardHtml('cline').match(/上次同步[^<]*/) || ['未找到'])[0]);
 check('opencode 上下文列显示 1,000,000', cardHtml('opencode').includes('1,000,000'),
-  (cardHtml('opencode').match(/<td style="font-size:12.5px">[^<]*[<]/g) || []).join(' | '));
+  (cardHtml('opencode').match(/<td style="font-size:var\\(--fs-sm\\)">[^<]*[<]/g) || []).join(' | '));
 check('opencode 最大输出列显示 65,536', cardHtml('opencode').includes('65,536'));
-check('opencode 每行都有两个数值列', (cardHtml('opencode').match(/font-size:12.5px/g) || []).length === 4,
-  (cardHtml('opencode').match(/font-size:12.5px/g) || []).length + ' 个');
+check('opencode 每行都有两个数值列', (cardHtml('opencode').match(/font-size:var\\(--fs-sm\\)/g) || []).length === 4,
+  (cardHtml('opencode').match(/font-size:var\\(--fs-sm\\)/g) || []).join(' | '));
 check('每行 data-mrow 数量 = 模型数',
   (cardHtml('bai').match(/data-mrow/g) || []).length === 2 &&
   (cardHtml('cline').match(/data-mrow/g) || []).length === 2 &&
