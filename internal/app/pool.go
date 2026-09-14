@@ -218,6 +218,9 @@ func setDefaultModel(modelID string) {
 func savePool() {
 	poolMu.Lock()
 	data, err := json.MarshalIndent(pool, "", "  ")
+	// 数据文件路径在锁内取: 后台刷盘协程与测试会分别读/写这个全局,
+	// 统一由 poolMu 串行(否则 -race 报 pool_test 写 vs 刷盘协程读)。
+	path := poolPath
 	poolMu.Unlock()
 	if err != nil {
 		// marshal 失败绝不能落盘: 写 nil 会清空账号池, 宁可保留旧文件。
@@ -226,7 +229,7 @@ func savePool() {
 	}
 	poolSaveMu.Lock()
 	defer poolSaveMu.Unlock()
-	if err := kit.WriteFileAtomicDefault(poolPath, data); err != nil {
+	if err := kit.WriteFileAtomicDefault(path, data); err != nil {
 		log.Printf("Failed to save accounts: %v", err)
 	}
 }
@@ -236,6 +239,8 @@ func savePool() {
 // 释放, 调用方不得再访问共享字段, 也不得再次 poolMu.Unlock()。
 func savePoolLocked() {
 	data, err := json.MarshalIndent(pool, "", "  ")
+	// 同 savePool: 路径必须在释放 poolMu 之前取到, 与改写它的测试同步。
+	path := poolPath
 	if err != nil {
 		// marshal 失败绝不能落盘: 写 nil 会清空账号池, 宁可保留旧文件。
 		log.Printf("Failed to marshal accounts: %v", err)
@@ -245,9 +250,17 @@ func savePoolLocked() {
 	poolMu.Unlock()
 	poolSaveMu.Lock()
 	defer poolSaveMu.Unlock()
-	if err := kit.WriteFileAtomicDefault(poolPath, data); err != nil {
+	if err := kit.WriteFileAtomicDefault(path, data); err != nil {
 		log.Printf("Failed to save accounts: %v", err)
 	}
+}
+
+// poolPathValue 读数据文件路径。生产环境 poolPath 只在包初始化时写一次,
+// 但后台刷盘协程与测试都会访问它, 统一走 poolMu 避免数据竞争。
+func poolPathValue() string {
+	poolMu.Lock()
+	defer poolMu.Unlock()
+	return poolPath
 }
 
 func addAccount(acc *Account) {

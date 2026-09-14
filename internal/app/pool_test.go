@@ -14,7 +14,7 @@ import (
 // 不会出现"写到一半被强杀留下半个 JSON"的半截文件。
 func TestSavePoolAtomic(t *testing.T) {
 	dir := t.TempDir()
-	poolPath = filepath.Join(dir, ".cline-accounts.json")
+	setPoolPathForTest(filepath.Join(dir, ".cline-accounts.json"))
 
 	poolMu.Lock()
 	pool = &AccountPool{
@@ -26,7 +26,7 @@ func TestSavePoolAtomic(t *testing.T) {
 
 	savePool()
 
-	data, err := os.ReadFile(poolPath)
+	data, err := os.ReadFile(poolPathValue())
 	if err != nil {
 		t.Fatalf("pool file not written: %v", err)
 	}
@@ -46,7 +46,7 @@ func TestSavePoolAtomic(t *testing.T) {
 // 加了 -race 才有意义(捕获 data race)。见报告"本机无法验证的部分"。
 func TestSetDefaultModelConcurrent(t *testing.T) {
 	dir := t.TempDir()
-	poolPath = filepath.Join(dir, ".cline-accounts.json")
+	setPoolPathForTest(filepath.Join(dir, ".cline-accounts.json"))
 
 	poolMu.Lock()
 	pool = &AccountPool{Accounts: []*Account{}, Keys: []string{}}
@@ -101,7 +101,7 @@ func TestSetDefaultModelConcurrent(t *testing.T) {
 // 多 goroutine 并发读 acc.AccessToken/ExpiresAt 在 poolMu 保护下无数据竞争。
 func TestEnsureAccountTokenConcurrentValid(t *testing.T) {
 	dir := t.TempDir()
-	poolPath = filepath.Join(dir, ".cline-accounts.json")
+	setPoolPathForTest(filepath.Join(dir, ".cline-accounts.json"))
 	poolMu.Lock()
 	pool = &AccountPool{Accounts: []*Account{}, Keys: []string{}}
 	poolMu.Unlock()
@@ -146,7 +146,7 @@ func TestEnsureAccountTokenConcurrentValid(t *testing.T) {
 // 死锁/panic。网络调用经 refreshAccountTokenFn stub 掉(见任务书允许"把网络调用 stub 掉")。
 func TestEnsureAccountTokenConcurrentRefresh(t *testing.T) {
 	dir := t.TempDir()
-	poolPath = filepath.Join(dir, ".cline-accounts.json")
+	setPoolPathForTest(filepath.Join(dir, ".cline-accounts.json"))
 	poolMu.Lock()
 	pool = &AccountPool{Accounts: []*Account{}, Keys: []string{}}
 	poolMu.Unlock()
@@ -191,4 +191,48 @@ func TestEnsureAccountTokenConcurrentRefresh(t *testing.T) {
 	if tok, _ := ensureAccountToken(acc); tok != "workos:fresh" {
 		t.Fatalf("final token=%q want workos:fresh", tok)
 	}
+}
+
+// setPoolPathForTest 改数据文件路径: 与落盘路径共用 poolMu, 避免测试写全局
+// 与后台刷盘协程读全局之间的数据竞争(CI -race 曾报 pool_test.go:17 vs pool.go 刷盘)。
+func setPoolPathForTest(path string) {
+	poolMu.Lock()
+	poolPath = path
+	poolMu.Unlock()
+}
+
+// TestPoolPathAccessIsSynchronized 回归: poolPath 的写(测试/初始化)必须与
+// 后台刷盘协程的读(ticker 触发的 savePoolLocked)同步在 poolMu 上。
+// 该用例本身不断言业务, 靠 -race 判定: 走锁则干净, 任一侧裸访问即报
+// "WARNING: DATA RACE"。CI 的 go test (race) 曾因 pool_test.go 直接赋值
+// poolPath 而红。
+func TestPoolPathAccessIsSynchronized(t *testing.T) {
+	dir := t.TempDir()
+	orig := poolPathValue()
+	defer setPoolPathForTest(orig)
+
+	poolMu.Lock()
+	pool = &AccountPool{Accounts: []*Account{{AccountID: "r1", Status: "active"}}, Keys: []string{"r1"}}
+	poolMu.Unlock()
+
+	stop := make(chan struct{})
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() { // 模拟后台刷盘协程: 反复触发落盘(内部会读 poolPath)
+		defer wg.Done()
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+				markPoolDirty()
+				time.Sleep(time.Millisecond)
+			}
+		}
+	}()
+	for i := 0; i < 50; i++ { // 模拟测试切数据目录
+		setPoolPathForTest(filepath.Join(dir, ".cline-accounts.json"))
+	}
+	close(stop)
+	wg.Wait()
 }

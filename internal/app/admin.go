@@ -1093,7 +1093,7 @@ func handleAdminConfig(w http.ResponseWriter, r *http.Request) {
 		"apiBase":      localOrigin(),
 		"strategy":     cfg.Strategy,
 		"version":      buildVersion,
-		"poolPath":     poolPath,
+		"poolPath":     poolPathValue(),
 		"defaultModel": getDefaultModel(),
 		"headers":      cfg.Headers,
 		"headersAuto":  cfg.HeadersAuto,
