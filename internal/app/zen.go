@@ -599,6 +599,16 @@ func callZenAPI(ctx context.Context, params map[string]any, stream bool) (*http.
 	// 拨号层需要知道目标模型: 地区受限模型只走通过地区校验的出口节点
 	ctx = context.WithValue(ctx, ctxKeyZenModel, zenModelIDOf(params))
 
+	// Responses 专用模型(muse-*-free 家族等): 上游只在 /responses 端点提供
+	// 服务, chat/completions 会被后端崩成 500。已登记的模型直接走 Responses
+	// 形态, 响应在这里翻译回 chat 格式, 对上层调用方完全透明。
+	// 注意用 body["model"](buildZenBody 已解析为 zen ID), 未注册模型也能命中。
+	zenResolvedModel, _ := body["model"].(string)
+	useRespAPI := zenUseResponsesAPI(zenResolvedModel)
+	if useRespAPI {
+		body = chatBodyToResponsesBody(body)
+	}
+
 	bodyJSON, err := json.Marshal(body)
 	if err != nil {
 		return nil, 0, fmt.Errorf("marshal zen body: %w", err)
@@ -627,6 +637,7 @@ func callZenAPI(ctx context.Context, params map[string]any, stream bool) (*http.
 	delay := time.Second
 	rateLimited := 0
 	regionRetried := false // 地区拒绝最多主动换出口重试一次, 避免 hopeless 模型烧光重试
+	respTried := false     // Responses 端点自适应回退每次请求只试一次
 
 	for attempt := 0; ; attempt++ {
 		// 客户端已断开(超时/取消): 立即停止, 再重试也没有人接收结果。
@@ -637,6 +648,9 @@ func callZenAPI(ctx context.Context, params map[string]any, stream bool) (*http.
 		// 官方地址失败后自然落到 CDN 镜像。
 		base := baseURLs[attempt%len(baseURLs)]
 		endpoint := base + "/chat/completions"
+		if useRespAPI {
+			endpoint = base + "/responses"
+		}
 		req, err := http.NewRequestWithContext(ctx, "POST", endpoint, bytes.NewReader(bodyJSON))
 		if err != nil {
 			return nil, rateLimited, fmt.Errorf("create zen request: %w", err)
@@ -688,6 +702,17 @@ func callZenAPI(ctx context.Context, params map[string]any, stream bool) (*http.
 		if resp.StatusCode == http.StatusOK {
 			markZenSuccess()
 			recordZenModelResult(zenModelIDOf(params), false)
+			if useRespAPI {
+				if stream {
+					resp = wrapResponsesStreamToChat(resp, zenResolvedModel)
+				} else {
+					converted, cerr := convertResponsesResponseToChat(resp, zenResolvedModel)
+					if cerr != nil {
+						return nil, rateLimited, fmt.Errorf("zen responses convert: %w", cerr)
+					}
+					resp = converted
+				}
+			}
 			return resp, rateLimited, nil
 		}
 
@@ -736,14 +761,25 @@ func callZenAPI(ctx context.Context, params map[string]any, stream bool) (*http.
 			return nil, rateLimited, &zenUpstreamError{Status: resp.StatusCode, Body: kit.Truncate(bodyBytes, 500)}
 		}
 
-		// 5xx: 冷却本次真实出口换下一个重试, 不退避 —— 上游 500 常与出口
-		// 线路相关, 换一个出口就是全新的机会。
-		if resp.StatusCode >= http.StatusInternalServerError && attempt < retries {
-			cooldownActualExit(ctx, 2*time.Minute)
-			log.Printf("  zen upstream %d via %s, retry %d/%d via next exit (next endpoint: %s)",
-				resp.StatusCode, describeExitRaw(reqExitKey(ctx)), attempt+1, retries,
-				baseURLs[(attempt+1)%len(baseURLs)])
-			continue
+		// 5xx: 先给 Responses 端点一次自适应回退的机会(上游把"该模型只在
+		// /responses 提供"崩成 500), 再冷却本次真实出口换下一个重试, 不退避
+		// —— 上游 500 常与出口线路相关, 换一个出口就是全新的机会。
+		if resp.StatusCode >= http.StatusInternalServerError {
+			if !useRespAPI && !respTried {
+				respTried = true
+				if alt := tryZenResponsesFallback(ctx, base, body, stream, client); alt != nil {
+					markZenSuccess()
+					recordZenModelResult(zenModelIDOf(params), false)
+					return alt, rateLimited, nil
+				}
+			}
+			if attempt < retries {
+				cooldownActualExit(ctx, 2*time.Minute)
+				log.Printf("  zen upstream %d via %s, retry %d/%d via next exit (next endpoint: %s)",
+					resp.StatusCode, describeExitRaw(reqExitKey(ctx)), attempt+1, retries,
+					baseURLs[(attempt+1)%len(baseURLs)])
+				continue
+			}
 		}
 
 		markZenFailOnStatus(resp.StatusCode)
