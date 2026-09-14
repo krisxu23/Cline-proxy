@@ -605,8 +605,12 @@ func callZenAPI(ctx context.Context, params map[string]any, stream bool) (*http.
 	// 注意用 body["model"](buildZenBody 已解析为 zen ID), 未注册模型也能命中。
 	zenResolvedModel, _ := body["model"].(string)
 	useRespAPI := zenUseResponsesAPI(zenResolvedModel)
+	// reasoning_effort 会被 buildZenBody 删除(chat 端点上上游不接受), 这里
+	// 先留存, 供 Responses 形态使用。
+	reasoningEffort := zenReasoningEffortOf(params)
 	if useRespAPI {
 		body = chatBodyToResponsesBody(body)
+		applyResponsesReasoning(body, reasoningEffort)
 	}
 
 	bodyJSON, err := json.Marshal(body)
@@ -767,7 +771,9 @@ func callZenAPI(ctx context.Context, params map[string]any, stream bool) (*http.
 		if resp.StatusCode >= http.StatusInternalServerError {
 			if !useRespAPI && !respTried {
 				respTried = true
-				if alt := tryZenResponsesFallback(ctx, base, body, stream, client); alt != nil {
+				altBody := chatBodyToResponsesBody(body)
+				applyResponsesReasoning(altBody, reasoningEffort)
+				if alt := tryZenResponsesFallback(ctx, base, altBody, stream, client); alt != nil {
 					markZenSuccess()
 					recordZenModelResult(zenModelIDOf(params), false)
 					return alt, rateLimited, nil

@@ -322,3 +322,36 @@ func TestChatBodyToResponsesBody_MaxTokensClamp(t *testing.T) {
 		t.Fatalf("max_tokens=400 不应被改动, got %v", out["max_output_tokens"])
 	}
 }
+
+func TestApplyResponsesReasoning(t *testing.T) {
+	// 客户端指定: 原样尊重
+	for _, eff := range []string{"minimal", "low", "medium", "high", "xhigh", "HIGH"} {
+		b := map[string]any{}
+		applyResponsesReasoning(b, eff)
+		r, _ := b["reasoning"].(map[string]any)
+		if r == nil || r["effort"] != strings.ToLower(eff) {
+			t.Fatalf("effort=%s 应透传(小写化), got %v", eff, b["reasoning"])
+		}
+	}
+	// 未指定或非法: 默认 low —— 上游默认 high 会把预算全烧在推理上, 正文为空
+	for _, eff := range []string{"", "   ", "bogus"} {
+		b := map[string]any{}
+		applyResponsesReasoning(b, eff)
+		r, _ := b["reasoning"].(map[string]any)
+		if r == nil || r["effort"] != "low" {
+			t.Fatalf("effort=%q 应回落 low, got %v", eff, b["reasoning"])
+		}
+	}
+}
+
+func TestZenReasoningEffortOf(t *testing.T) {
+	if got := zenReasoningEffortOf(map[string]any{"reasoning_effort": "high"}); got != "high" {
+		t.Fatalf("下划线写法应被识别, got %q", got)
+	}
+	if got := zenReasoningEffortOf(map[string]any{"reasoningEffort": "medium"}); got != "medium" {
+		t.Fatalf("驼峰写法应被识别, got %q", got)
+	}
+	if got := zenReasoningEffortOf(map[string]any{}); got != "" {
+		t.Fatalf("未指定应返回空, got %q", got)
+	}
+}

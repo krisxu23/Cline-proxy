@@ -62,8 +62,8 @@ func TestZenResponsesFallbackEndToEnd(t *testing.T) {
 	withTestZenBaseURL(t, srv.URL)
 
 	params := map[string]any{
-		"model":     "xmodel-free",
-		"messages":  []any{map[string]any{"role": "user", "content": "hi"}},
+		"model":      "xmodel-free",
+		"messages":   []any{map[string]any{"role": "user", "content": "hi"}},
 		"max_tokens": 16,
 	}
 	resp, _, err := callZenAPI(context.Background(), params, false)
@@ -99,6 +99,52 @@ func TestZenResponsesFallbackEndToEnd(t *testing.T) {
 	}
 	if respHits.Load() != 2 {
 		t.Fatalf("/responses 应被击中 2 次, 实际 %d", respHits.Load())
+	}
+}
+
+func TestZenResponsesStaticRouteBodyShape(t *testing.T) {
+	// 回归: 静态规则模型(未登记但命中 muse-*-free)直接走 /responses 时,
+	// 请求体必须是完整转换后的形态 —— input 非空、max_output_tokens 就位、
+	// reasoning.effort 落地。此前因重复调用转换函数(把已经是 Responses 形态
+	// 的体再当 chat 体转一次), input 被转成空数组, 上游回 400
+	// "`input` must be non-empty"。
+	resetZenResponsesFlavorState(t, t.TempDir()+"/zen-responses-only.json")
+
+	var got map[string]any
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/responses" {
+			t.Errorf("静态规则模型应直打 /responses, 实际 %s", r.URL.Path)
+		}
+		json.NewDecoder(r.Body).Decode(&got)
+		w.Header().Set("Content-Type", "application/json")
+		w.Write([]byte(`{"id":"r","model":"m","output":[{"type":"message","content":[{"type":"output_text","text":"ok"}]}],"usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2}}`))
+	}))
+	defer srv.Close()
+	withTestZenBaseURL(t, srv.URL)
+
+	resp, _, err := callZenAPI(context.Background(), map[string]any{
+		"model":      "muse-static-free",
+		"messages":   []any{map[string]any{"role": "user", "content": "hi"}},
+		"max_tokens": 300,
+	}, false)
+	if err != nil {
+		t.Fatalf("调用失败: %v", err)
+	}
+	resp.Body.Close()
+
+	input, _ := got["input"].([]any)
+	if len(input) != 1 {
+		t.Fatalf("input 必须非空且含 1 条消息, got %#v (完整体: %#v)", got["input"], got)
+	}
+	if got["max_output_tokens"] != float64(300) {
+		t.Fatalf("max_output_tokens 应为 300, got %#v", got["max_output_tokens"])
+	}
+	reasoning, _ := got["reasoning"].(map[string]any)
+	if reasoning == nil || reasoning["effort"] != "low" {
+		t.Fatalf("未指定 effort 时应默认 low, got %#v", got["reasoning"])
+	}
+	if _, hasMessages := got["messages"]; hasMessages {
+		t.Fatal("发出前不应残留 chat 形态的 messages 字段")
 	}
 }
 

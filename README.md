@@ -184,7 +184,7 @@ api.cline.bot  opencode.ai/zen  api.cline.bot   你配置的任意上游
 - **多端点**：官方源 + 3 个 CDN 镜像共 4 个 API 端点（官方在前），重试与模型同步自动跨端点轮换
 - **模型同步**：每 10 分钟自动同步官方模型列表；付费 zen 模型显式 400 拒绝
 - **上游错误**：4xx 状态码原样返回（例如 `403 RegionError` 对客户端可见），网络错误与 5xx 归一为 502
-- **Responses 专用模型**：`muse-*` 家族的免费模型（`muse-spark-1.2/1.3-contributor-free` 等）在上游只提供 OpenAI Responses 接口——直接请求 `chat/completions` 会被上游后端崩成 500。网关对这类模型自动改走上游 `/v1/responses` 端点，请求体与响应（含流式）双向翻译回 chat 格式，对客户端完全透明；tool_calls 工具调用链路与 usage 统计不受影响。此类模型为推理型，`max_tokens` 建议给足（1000+），否则推理把预算耗尽后正文为空
+- **Responses 专用模型**：`muse-*` 家族的免费模型（`muse-spark-1.2/1.3-contributor-free` 等）在上游只提供 OpenAI Responses 接口——直接请求 `chat/completions` 会被上游后端崩成 500。网关对这类模型自动改走上游 `/v1/responses` 端点，请求体与响应（含流式）双向翻译回 chat 格式，对客户端完全透明；tool_calls 工具调用链路与 usage 统计不受影响。翻译时 `max_tokens` 会补足上游下限（<16 会被拒），推理强度默认降到 `low`（客户端可用 `reasoning_effort` 覆盖为 minimal/low/medium/high/xhigh）——这是推理型模型，effort 不压低时容易把预算全花在思考上导致正文为空，建议 `max_tokens` 给到 512 以上
 - **上下文压缩**：按 opencode 官方算法做摘要压缩（尾部预算 → 锚定摘要模板 → 重组会话）
 
 出口（后台 **🌐 出口代理与节点**）：

@@ -606,16 +606,42 @@ func wrapResponsesStreamToChat(resp *http.Response, model string) *http.Response
 	return synthesizeChatSSEResponse(pr)
 }
 
+// applyResponsesReasoning 把 chat 侧的 reasoning_effort 映射为 Responses 的
+// reasoning.effort。客户端未指定(或值非法)时默认 low。
+//
+// 原因: 该模型上游默认 effort=high, 对简单提问也会把全部 max_output_tokens
+// 烧在推理上 —— 预算 800 时正文为空(实测), 客户端以为模型坏了。降到 low
+// 后推理占用大幅缩小, 同样的预算就能拿到正文; 客户端若显式传了
+// reasoning_effort 则尊重其选择。
+func applyResponsesReasoning(body map[string]any, effort string) {
+	eff := strings.ToLower(strings.TrimSpace(effort))
+	switch eff {
+	case "minimal", "low", "medium", "high", "xhigh":
+	default:
+		eff = "low"
+	}
+	body["reasoning"] = map[string]any{"effort": eff}
+}
+
+// zenReasoningEffortOf 从 chat 请求参数里取客户端指定的推理强度(两种写法)。
+func zenReasoningEffortOf(params map[string]any) string {
+	for _, key := range []string{"reasoning_effort", "reasoningEffort"} {
+		if v, ok := params[key].(string); ok && strings.TrimSpace(v) != "" {
+			return v
+		}
+	}
+	return ""
+}
+
 // tryZenResponsesFallback chat/completions 吃 500 时的自适应回退: 用同一出口、
 // 同一会话身份向 /responses 发一次等价请求。成功 -> 登记该模型为 Responses
 // 专用(持久化)并返回合成好的 chat 形态响应; 失败 -> 返回 nil, 调用方继续
 // 原有的换出口重试流程。
-func tryZenResponsesFallback(ctx context.Context, base string, chatBody map[string]any, stream bool, client *http.Client) *http.Response {
-	modelID, _ := chatBody["model"].(string)
+func tryZenResponsesFallback(ctx context.Context, base string, respBody map[string]any, stream bool, client *http.Client) *http.Response {
+	modelID, _ := respBody["model"].(string)
 	if modelID == "" || zenChatOnlyKnown(modelID) {
 		return nil
 	}
-	respBody := chatBodyToResponsesBody(chatBody)
 	raw, err := json.Marshal(respBody)
 	if err != nil {
 		return nil
