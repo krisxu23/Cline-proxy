@@ -41,10 +41,10 @@ func cloneStrings(in []string) []string {
 
 // providerHeaderSpec / providerAPIKey / providerModelEntry / zenCompactConfig
 // 都是纯值类型, 复制即深拷贝, 无需逐个展开。
-func (h providerHeaderSpec) clone() providerHeaderSpec   { return h }
-func (k providerAPIKey) clone() providerAPIKey           { return k }
-func (m providerModelEntry) clone() providerModelEntry   { return m }
-func (c zenCompactConfig) clone() zenCompactConfig       { return c }
+func (h providerHeaderSpec) clone() providerHeaderSpec { return h }
+func (k providerAPIKey) clone() providerAPIKey         { return k }
+func (m providerModelEntry) clone() providerModelEntry { return m }
+func (c zenCompactConfig) clone() zenCompactConfig     { return c }
 
 func (c providerConfig) clone() providerConfig {
 	out := c
@@ -112,6 +112,14 @@ func (c *zenConfigData) clone() *zenConfigData {
 		out.Routes = make(map[string][]string, len(c.Routes))
 		for k, v := range c.Routes {
 			out.Routes[k] = cloneStrings(v)
+		}
+	}
+	if c.Combos != nil {
+		out.Combos = make(map[string]*comboDef, len(c.Combos))
+		for k, v := range c.Combos {
+			cp := *v
+			cp.Targets = append([]comboTarget(nil), v.Targets...)
+			out.Combos[k] = &cp
 		}
 	}
 	if c.CooldownMs != nil {

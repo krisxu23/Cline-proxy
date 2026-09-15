@@ -141,6 +141,10 @@ func resolveRouteChain(model string) (cands []routeCandidate, matched bool, errM
 			return expandRouteList(id, list), true, ""
 		}
 	}
+	// 组合模型(P1-13): 名字即模型, 策略层已把目标排好序, 直接作为候选链。
+	if cands, ok := resolveCombo(id); ok && len(cands) > 0 {
+		return cands, true, ""
+	}
 	if !isAutoRouterAlias(id) {
 		return nil, false, ""
 	}
@@ -459,6 +463,8 @@ func routeAliasNames() []string {
 			}
 		}
 	}
+	// 组合模型也是对外模型名(P1-13), 一并暴露进 /v1/models。
+	rest = append(rest, comboNames()...)
 	sort.Strings(rest)
 	for _, s := range rest {
 		add(s)

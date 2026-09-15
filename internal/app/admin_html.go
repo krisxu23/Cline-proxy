@@ -602,6 +602,38 @@ body:not([data-theme="dark"]) .theme-toggle .dark-label{display:none}
 </div>
 </div>
 
+<div class="section">
+  <div class="section-title">🧩 组合模型（虚拟模型，自动路由）</div>
+  <div class="section-body">
+    <p class="hint">把多家供应商的模型合成一个对外模型名：客户端只填组合名，网关按策略自动在目标间路由/回退。
+    策略：priority=按声明顺序（谁靠前先用谁）｜round_robin=轮流打头均摊用量｜weighted=按权重加权打头。
+    组合名会出现在 /v1/models 里，客户端可直接使用；失败自动换下一站（继承冷却与健康规则）。</p>
+    <div style="display:flex;gap:var(--sp-2);flex-wrap:wrap;align-items:flex-end;margin-bottom:10px">
+      <div><div class="hint" style="margin-bottom:2px">组合名（不能含空格）</div>
+        <input id="comboName" placeholder="例如 free-mix" style="width:180px" /></div>
+      <div><div class="hint" style="margin-bottom:2px">策略</div>
+        <select id="comboStrategy" style="width:140px">
+          <option value="priority">priority 顺序</option>
+          <option value="round_robin">round_robin 轮转</option>
+          <option value="weighted">weighted 加权</option>
+        </select></div>
+      <div style="flex:1;min-width:260px"><div class="hint" style="margin-bottom:2px">目标（每行一个：upstream:model[:权重]，如 zen/mimo-v2.5-free 或 cline:*）</div>
+        <input id="comboTargets" placeholder="zen/mimo-v2.5-free&#10;cline:*&#10;clinepass/glm-5.3-flash:20" style="width:100%" /></div>
+      <button class="btn btn-success" onclick="saveCombo()">💾 保存组合</button>
+    </div>
+    <div id="comboProblems" style="color:var(--amber);font-size:var(--fs-xs);margin-bottom:8px;white-space:pre-wrap"></div>
+    <div id="combosList"></div>
+    <div style="margin-top:12px;border-top:1px solid var(--border);padding-top:10px">
+      <div class="hint" style="margin-bottom:4px">🔎 路由预演（不发请求，试算这个名字会走哪些站、哪些被跳过）</div>
+      <div style="display:flex;gap:var(--sp-2)">
+        <input id="previewModel" placeholder="组合名 / 别名 / zen:xxx 等任意模型名" style="flex:1" onkeydown="if(event.key==='Enter'){previewRoute();}" />
+        <button class="btn" onclick="previewRoute()">预演</button>
+      </div>
+      <div id="previewResult" style="margin-top:8px;font-size:var(--fs-xs)"></div>
+    </div>
+  </div>
+</div>
+
 <div id="tab-settings" class="tab-panel" style="display:none">
 <h2>⚙️ 设置</h2>
 
@@ -1348,6 +1380,91 @@ async function showLogDetail(i) {
 }
 
 function closeLogDetail() { _('logDetailPanel').style.display = 'none'; }
+
+// ========== 组合模型 (P1-13) ==========
+
+const COMBO_STRATEGY_LABEL = { priority: '顺序', round_robin: '轮转', weighted: '加权', '': '顺序' };
+
+async function loadCombos() {
+  const box = _('combosList');
+  try {
+    const d = await api('GET', '/combos');
+    const combos = d.data.combos || [];
+    if (!combos.length) { box.innerHTML = '<div class="hint">还没有组合。按上面的表单创建第一个组合模型。</div>'; return; }
+    box.innerHTML = combos.map(c => {
+      const targets = (c.targets || []).map(t => {
+        const w = t.weight ? ':' + t.weight : '';
+        return esc((t.upstream || '') + ':' + (t.model || '') + w);
+      }).join('<span style="color:var(--text3)"> → </span>');
+      return '<div style="display:flex;align-items:center;gap:10px;padding:var(--sp-2) var(--sp-3);background:rgba(148,163,184,.06);border:1px solid var(--border);border-radius:var(--radius-sm);margin-bottom:6px">' +
+        '<span class="model-tag" style="flex:none">' + esc(c.name) + '</span>' +
+        '<span style="flex:none;font-size:var(--fs-xs);color:var(--text3)">[' + esc(COMBO_STRATEGY_LABEL[c.strategy] || c.strategy) + ']</span>' +
+        '<span class="mono" style="flex:1;font-size:var(--fs-xs);overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="' + esc(targets) + '">' + targets + '</span>' +
+        '<button class="btn" style="flex:none;padding:4px 10px;font-size:var(--fs-xs)" onclick="previewRoute(\'' + esc(c.name) + '\')">预演</button>' +
+        '<button class="btn" style="flex:none;padding:4px 10px;font-size:var(--fs-xs);color:var(--danger)" onclick="deleteCombo(\'' + esc(c.name) + '\')">删除</button>' +
+      '</div>';
+    }).join('');
+  } catch (e) { box.innerHTML = '<div class="hint">' + fail(e, 'loadCombos()') + '</div>'; }
+}
+
+async function saveCombo() {
+  const name = _('comboName').value.trim();
+  const strategy = _('comboStrategy').value;
+  const raw = _('comboTargets').value.trim();
+  _('comboProblems').textContent = '';
+  if (!name || !raw) { _('comboProblems').textContent = '组合名与目标都不能为空'; return; }
+  const targets = raw.split('\n').map(line => {
+    const parts = line.trim().split(':').map(s => s.trim());
+    const t = { upstream: parts[0] || '', model: parts[1] || '' };
+    if (parts[2]) t.weight = parseInt(parts[2], 10) || 0;
+    return t;
+  }).filter(t => t.upstream && t.model);
+  try {
+    await api('POST', '/combos/save', { name: name, strategy: strategy, targets: targets });
+    toast('组合已保存: ' + name, 'success');
+    _('comboName').value = ''; _('comboTargets').value = '';
+    loadCombos(); loadRouterSelection && loadRouterSelection();
+  } catch (e) {
+    // 后端把具体问题(目录缺模型等)放在错误消息里, 原样展示
+    _('comboProblems').textContent = (e && e.message) || String(e);
+  }
+}
+
+async function deleteCombo(name) {
+  if (!confirm('删除组合 ' + name + ' ?')) return;
+  try {
+    await api('POST', '/combos/delete', { name: name });
+    toast('已删除: ' + name, 'success');
+    loadCombos();
+  } catch (e) { toast((e && e.message) || String(e), 'error'); }
+}
+
+async function previewRoute(name) {
+  const box = _('previewResult');
+  const model = name || _('previewModel').value.trim();
+  if (!model) { box.innerHTML = '<span style="color:var(--amber)">请先填模型名</span>'; return; }
+  try {
+    const d = await api('GET', '/router/preview?model=' + encodeURIComponent(model));
+    const r = d.data || {};
+    if (!r.matched) {
+      box.innerHTML = '<div style="color:var(--amber)">无法解析模型名 ' + esc(model) + (r.error ? ': ' + esc(r.error) : '') + '</div>';
+      return;
+    }
+    const mark = h => {
+      if (h.decision === 'skipped') return '<span style="color:var(--text3)">⏭ 跳过</span>';
+      if (h.decision === 'first_tried') return '<span style="color:var(--accent2)">🥇 首选</span>';
+      return '<span style="color:var(--text3)">↩️ 兜底</span>';
+    };
+    box.innerHTML = '<div style="margin-bottom:4px">按顺序尝试 ' + (r.hops || []).length + ' 站' +
+      (r.winner ? ' · 首选 <span class="mono">' + esc(r.winner) + '</span>' : '') + '</div>' +
+      (r.hops || []).map(h =>
+        '<div style="padding:3px 0;border-bottom:1px solid rgba(148,163,184,.08)">' +
+        mark(h) + ' <span class="mono">' + esc(h.upstream + ':' + h.model) + '</span>' +
+        (h.reason ? ' <span style="color:var(--amber)">' + esc(h.reason) + '</span>' : '') +
+        (h.context ? ' <span style="color:var(--text3)">ctx ' + h.context + '</span>' : '') +
+        '</div>').join('');
+  } catch (e) { box.innerHTML = '<span style="color:var(--danger)">' + esc(String(e && e.message || e)) + '</span>'; }
+}
 
 // ========== 导出账号 ==========
 async function exportAccounts() {

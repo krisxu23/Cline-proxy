@@ -257,6 +257,7 @@ type zenConfigData struct {
 	Compaction      zenCompactConfig          `json:"compaction"`
 	Providers       map[string]providerConfig `json:"providers,omitempty"`  // 通用 OpenAI 兼容上游
 	Routes          map[string][]string       `json:"routes,omitempty"`     // 路由别名 -> 有序候选链(如 free-best)
+	Combos          map[string]*comboDef      `json:"combos,omitempty"`     // 组合模型: 名字 -> 定义(虚拟模型, 按策略自动路由)
 	CooldownMs      map[string]int64          `json:"cooldownMs,omitempty"` // 候选层冷却时长覆盖(按错误类别)
 	Usage           zenUsageConfig            `json:"usage"`                // 每日配额账本
 	Router          zenRouterConfig           `json:"router"`               // 自动路由模型名与参与范围
