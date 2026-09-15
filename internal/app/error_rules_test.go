@@ -3,7 +3,10 @@ package app
 // 错误规则表与流式保活的测试 (P1-10 / P1-11)。
 
 import (
+	"bytes"
+	"net/http"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -49,54 +52,80 @@ func TestClassifyCandidateFailureGeoBlock(t *testing.T) {
 	}
 }
 
-func TestHeartbeatReaderInjectsOnSilence(t *testing.T) {
-	// 上游 500ms 才出一字节, 心跳 50ms: 期间应注入至少一个保活帧
-	frame := []byte("data: {\"heartbeat\":true}\n\n")
-	slow := &slowReader{delay: 500 * time.Millisecond, chunks: [][]byte{[]byte("data: {\"real\":1}\n\n")}}
-	h := newHeartbeatReader(slow, 50*time.Millisecond, func() []byte { return frame })
-	defer h.Close()
+// mockFlushWriter 实现 http.ResponseWriter + http.Flusher, 供输出侧心跳测试。
+// 写出的字节累积到 buf(带锁, 心跳泵与测试主线程并发写)。
+type mockFlushWriter struct {
+	mu     sync.Mutex
+	buf    bytes.Buffer
+	header http.Header
+	code   int
+}
 
-	buf := make([]byte, 4096)
-	var got strings.Builder
+func (m *mockFlushWriter) Header() http.Header {
+	if m.header == nil {
+		m.header = http.Header{}
+	}
+	return m.header
+}
+func (m *mockFlushWriter) Write(p []byte) (int, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.buf.Write(p)
+}
+func (m *mockFlushWriter) WriteHeader(code int) { m.code = code }
+func (m *mockFlushWriter) Flush()               {}
+func (m *mockFlushWriter) String() string {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.buf.String()
+}
+
+func TestSSEHeartbeatInjectsOnIdle(t *testing.T) {
+	// 心跳 50ms: 距上次真实写出超过间隔时, 向客户端补一个保活帧; 真实数据随后到达。
+	mw := &mockFlushWriter{}
+	hb := newSSEHeartbeat(mw, mw, 50*time.Millisecond, func() []byte { return []byte("data: {\"heartbeat\":true}\n\n") })
+	defer hb.Close()
+
+	// 开局静默 200ms(不写真实数据)→ 期间至少注入一个心跳帧。
 	deadline := time.Now().Add(3 * time.Second)
-	for time.Now().Before(deadline) {
-		n, err := h.Read(buf)
-		got.Write(buf[:n])
-		if err != nil || strings.Contains(got.String(), "real") {
-			break
-		}
+	for time.Now().Before(deadline) && !strings.Contains(mw.String(), "heartbeat") {
+		time.Sleep(10 * time.Millisecond)
 	}
-	out := got.String()
-	if !strings.Contains(out, "heartbeat") {
-		t.Fatalf("静默期应注入保活帧, got %q", out)
+	if !strings.Contains(mw.String(), "heartbeat") {
+		t.Fatalf("静默期应注入保活帧, got %q", mw.String())
 	}
-	if !strings.Contains(out, "real") {
-		t.Fatalf("真实数据不能丢, got %q", out)
+	// 写一条真实帧, 内容必须完整出现在客户端流里(心跳只发往客户端, 与真实帧互不截断)。
+	hb.writeFlush([]byte("data: {\"real\":1}\n\n"))
+	if !strings.Contains(mw.String(), "real") {
+		t.Fatalf("真实数据不能丢, got %q", mw.String())
 	}
 }
 
-func TestHeartbeatReaderNoInjectMidLine(t *testing.T) {
-	// 上游先发半行(data: {...)再长时间静默: 保活帧不得插进行中间。
-	// (半行之前的静默期注入保活帧是合法且期望的行为 —— 流开始时必然在行边界。)
-	frame := []byte("data: {\"heartbeat\":true}\n\n")
-	slow := &slowReader{delay: 500 * time.Millisecond, chunks: [][]byte{[]byte("data: {\"partial\":"), []byte("1}\n\n")}}
-	h := newHeartbeatReader(slow, 50*time.Millisecond, func() []byte { return frame })
-	defer h.Close()
+func TestSSEHeartbeatNeverCorruptsRealFrames(t *testing.T) {
+	// 核心回归(2026-09-15 事故): 心跳绝不能插进真实帧字节中间。输出侧设计天然成立 ——
+	// 心跳与真实帧各自是独立 Write, 且全程同一把锁串行。这里用"一个被拆成两半的巨型
+	// 帧"模拟分片传输: 中间有静默期(心跳会来), 两半拼起来必须是原样的合法 JSON 帧。
+	mw := &mockFlushWriter{}
+	hb := newSSEHeartbeat(mw, mw, 30*time.Millisecond, func() []byte { return []byte("data: {\"heartbeat\":true}\n\n") })
+	defer hb.Close()
 
-	buf := make([]byte, 4096)
-	var got strings.Builder
-	deadline := time.Now().Add(3 * time.Second)
-	for time.Now().Before(deadline) {
-		n, err := h.Read(buf)
-		got.Write(buf[:n])
-		if err != nil || strings.Contains(got.String(), "1}\n\n") {
-			break
-		}
+	half := `data: {"id":"chatcmpl-x","choices":[{"delta":{"content":"AB`
+	rest := `CD"}}]}` + "\n\n"
+	hb.writeFlush([]byte(half))
+	// 事件中途静默 120ms(远超 30ms 心跳间隔): 新语义下心跳**不得**出现在两半之间
+	// —— 这正是旧 heartbeatReader 截帧事故的反向断言(旧实现在这里必插帧)。
+	time.Sleep(120 * time.Millisecond)
+	hb.writeFlush([]byte(rest))
+	out := mw.String()
+	if !strings.Contains(out, half) || !strings.Contains(out, rest) {
+		t.Fatalf("两半必须原样出现在输出里, got %q", out)
 	}
-	out := got.String()
-	// 关键断言: 半行与续行必须原样拼接成完整行 —— 这证明没有帧被插进行中间。
-	if !strings.Contains(out, "data: {\"partial\":1}\n\n") {
-		t.Fatalf("半行+续行必须原样拼接(不得插入保活帧), got %q", out)
+	if iHalf, iHb := strings.Index(out, half), strings.Index(out, "heartbeat"); iHb >= 0 && iHb > iHalf {
+		t.Fatalf("事件中途不得插入心跳帧(旧截帧缺陷回归), got %q", out)
+	}
+	joined := half + rest
+	if !strings.Contains(out, joined) {
+		t.Fatalf("两半之间不得有任何字节(心跳/空白), 真实帧必须完整连续, got %q", out)
 	}
 }
 

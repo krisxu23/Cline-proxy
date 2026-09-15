@@ -1,113 +1,156 @@
 package app
 
-// 流式保活 (P1-11, 参照 OmniRoute 的 sseHeartbeat):
+// 流式保活 (P1-11, 参照 OmniRoute 的 sseHeartbeat / earlyStreamKeepalive, MIT):
 //
 // 上游"接了单但迟迟不出字"(排队/推理中/网络卡)时, 客户端会把静默当成挂死。
-// 心跳的注入点是**读上游的环节**: 上游静默超过间隔时, 向客户端发出一个
-// 协议合法的空 delta 帧(OpenAI 形状), 让客户端知道链路活着。
 //
-// 正确性要点: 只在"行边界"(上一段数据以 \n 结尾, 或还没有任何数据)注入,
-// 绝不把保活帧插进一行 SSE 的中间; 注入的帧与正文同走一个写出通道,
-// 客户端按普通空 delta 处理, 无需感知。
+// 关键教训(2026-09-15 bai:qwen3.8-flash 事故): 心跳**绝不能**注入到"上游→中继"
+// 的输入字节流里。旧实现用 heartbeatReader 包装上游 body, 在分片传输一个巨型
+// JSON 帧(实测含 C2PA _manifest 的图片响应, 单帧几十 KB 分多次 TCP 到达)时,
+// 某个分片恰好以 \n 结尾 → 边界判定为真 → 15s 静默里把心跳帧**插进帧中间** →
+// 中继按 \n 切行时把"半帧 + 心跳 + 半帧"黏成非法单行丢弃, 整条流被掏空, 客户端
+// 最终拿到裸 _manifest JSON 报 "Bad control character"。
+//
+// 正确做法(本文件, 与 OmniRoute 一致): 心跳只发往**客户端输出侧**, 由中继维护
+// "距上次向客户端成功写出真实字节的空闲计时", 到点写一个协议合法的空 delta 帧。
+// 上游字节流全程不掺任何心跳, 从根上杜绝截帧。首字节未到(上游完全静默)同样覆盖:
+// 计时从流开始就起算, 一个真实字节都没写出时照样按时发心跳。
+//
+// 边界规则: 心跳只允许插在 **SSE 事件边界**(输出以空行结尾, 或尚未输出任何字节)。
+// 事件中间的静默(上一笔写出以单个 \n 结尾, 如 event: 行)继续等待, 宁可不发 ——
+// 这是旧 heartbeatReader"末字节 \n 即边界"误判(半帧恰好以 \n 结尾)的根治版。
 
 import (
-	"io"
+	"net/http"
 	"sync"
 	"time"
 )
 
-// heartbeatReader 包装上游响应体: 上游静默超过 interval 时, 向读者注入
-// frame() 生成的保活帧。frame 必须返回完整的 SSE 帧(含结尾空行)。
-type heartbeatReader struct {
-	src      io.Reader
+// sseHeartbeat 输出侧保活器: 包一层 ResponseWriter 的写入, 事件边界上的空闲
+// 超过 interval 时向客户端写 frame()。写与 flush 全程持锁(ResponseWriter 非并发安全)。
+// interval<=0 时为直通(不启动定时, write/flush 原样透传)。
+type sseHeartbeat struct {
+	mu       sync.Mutex
+	w        http.ResponseWriter
+	flusher  http.Flusher
 	interval time.Duration
 	frame    func() []byte
 
-	ch   chan []byte
-	done chan struct{}
-	once sync.Once
-
-	// boundary 只由读协程(Read)维护: 上一段数据是否以 \n 结尾。
-	// 只有行边界才允许注入(见上)。
-	boundary bool
+	last     time.Time
+	boundary bool // 输出当前是否停在 SSE 事件边界
+	prev     byte // 最近一次写出的最后一个字节(判定跨笔写出的 \n\n)
+	closed   bool
+	done     chan struct{}
+	once     sync.Once
 }
 
-func newHeartbeatReader(src io.Reader, interval time.Duration, frame func() []byte) io.ReadCloser {
-	h := &heartbeatReader{
-		src:      src,
+func newSSEHeartbeat(w http.ResponseWriter, flusher http.Flusher, interval time.Duration, frame func() []byte) *sseHeartbeat {
+	h := &sseHeartbeat{
+		w:        w,
+		flusher:  flusher,
 		interval: interval,
 		frame:    frame,
-		ch:       make(chan []byte, 8),
+		last:     time.Now(),
+		boundary: true, // 流开始时必然在边界(尚无输出)
 		done:     make(chan struct{}),
-		boundary: true, // 流开始时必然在边界
 	}
-	go h.pump()
+	if interval > 0 {
+		go h.pump()
+	}
 	return h
 }
 
-func (h *heartbeatReader) pump() {
-	defer close(h.ch)
-	buf := make([]byte, 8192)
+// track 更新"事件边界"判定(假定调用方已持锁): 输出的最后两个字节都是 \n 才算边界。
+// 单笔不足两字节时用上一笔的末字节补齐, 从而正确识别 "…\n" + "\n" 的跨笔空行。
+func (h *sseHeartbeat) track(b []byte) {
+	if len(b) == 0 {
+		return
+	}
+	last := b[len(b)-1]
+	var second byte
+	if len(b) >= 2 {
+		second = b[len(b)-2]
+	} else {
+		second = h.prev
+	}
+	h.boundary = second == '\n' && last == '\n'
+	h.prev = last
+}
+
+// writeLocked 向客户端写一段字节并刷新空闲计时与边界状态(调用方须已持锁)。
+func (h *sseHeartbeat) writeLocked(b []byte) (int, error) {
+	h.last = time.Now()
+	h.track(b)
+	if h.closed {
+		return 0, nil
+	}
+	return h.w.Write(b)
+}
+
+// pump 周期性检查空闲: 事件边界上距上次写出超过 interval 就补一帧心跳(并刷新
+// last, 避免上游持续静默时连发)。非边界(事件中途)继续等, 宁可不发。Close 后停止。
+func (h *sseHeartbeat) pump() {
+	t := time.NewTicker(h.interval)
+	defer t.Stop()
 	for {
-		n, err := h.src.Read(buf)
-		if n > 0 {
-			b := make([]byte, n)
-			copy(b, buf[:n])
-			select {
-			case h.ch <- b:
-			case <-h.done:
-				return
+		select {
+		case <-t.C:
+			h.mu.Lock()
+			if !h.closed && h.boundary && time.Since(h.last) >= h.interval {
+				if b := h.frame(); len(b) > 0 {
+					_, _ = h.writeLocked(b)
+					h.flush_() // 已持锁, 走无锁版本(公共 flush() 会二次加锁死锁)
+				}
 			}
-		}
-		if err != nil {
+			h.mu.Unlock()
+		case <-h.done:
 			return
 		}
 	}
 }
 
-func (h *heartbeatReader) Read(p []byte) (int, error) {
-	if len(p) == 0 {
-		return 0, nil
-	}
-	timer := time.NewTimer(h.interval)
-	defer timer.Stop()
-	for {
-		select {
-		case b, ok := <-h.ch:
-			if !ok {
-				return 0, io.EOF
-			}
-			// 更新行边界标记(只看本段最后一个字节)
-			if n := len(b); n > 0 {
-				h.boundary = b[n-1] == '\n'
-			}
-			return copy(p, b), nil
-		case <-timer.C:
-			// 上游静默到期: 只有在行边界才注入保活帧;
-			// 行中间的静默继续等(下一轮 timer 重新计时)。
-			if h.boundary {
-				return copy(p, h.frame()), nil
-			}
-			timer.Reset(h.interval)
-		case <-h.done:
-			// 上游被关闭(客户端断开/超时): 排干剩余数据后 EOF。
-			select {
-			case b, ok := <-h.ch:
-				if !ok {
-					return 0, io.EOF
-				}
-				return copy(p, b), nil
-			default:
-				return 0, io.EOF
-			}
-		}
+// write 向客户端写真实数据并刷新空闲计时。Close 后为 no-op(客户端已断开)。
+func (h *sseHeartbeat) write(b []byte) (int, error) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.writeLocked(b)
+}
+
+// flush 单独刷新(紧跟 write 之后)。持锁保证与 pump 的心跳写不交错。
+func (h *sseHeartbeat) flush() {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.flush_()
+}
+
+// flush_ 假定调用方已持锁。
+func (h *sseHeartbeat) flush_() {
+	if h.flusher != nil {
+		h.flusher.Flush()
 	}
 }
 
-// Close 停止保活(不影响底层 src —— 底层由调用方负责关闭)。
-func (h *heartbeatReader) Close() error {
+// writeFlush 写真实数据并立即刷新(合并一次加锁)。
+func (h *sseHeartbeat) writeFlush(b []byte) (int, error) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if h.closed {
+		h.last = time.Now()
+		h.track(b)
+		return 0, nil
+	}
+	n, err := h.writeLocked(b)
+	h.flush_()
+	return n, err
+}
+
+// Close 停止保活并置 closed, 使后续 write/flush 与在途 pump 都不再写客户端。
+// 不关闭上游(底层 body 由中继的 defer 负责)。
+func (h *sseHeartbeat) Close() {
+	h.mu.Lock()
+	h.closed = true
+	h.mu.Unlock()
 	h.once.Do(func() { close(h.done) })
-	return nil
 }
 
 // streamHeartbeatInterval 保活间隔; 0 = 关闭。
@@ -122,5 +165,5 @@ func streamHeartbeatInterval() time.Duration {
 }
 
 // openAIHeartbeatFrame OpenAI 形状的保活帧: 一个没有任何内容的 delta chunk,
-// 所有 OpenAI 协议客户端都会安全忽略。
+// 所有 OpenAI 协议客户端都会安全忽略。只发往客户端, 不掺进上游字节流。
 var openAIHeartbeatFrame = []byte("data: {\"choices\":[{\"index\":0,\"delta\":{}}]}\n\n")

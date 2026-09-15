@@ -1432,21 +1432,22 @@ func handleStreamResponseWithUsage(w http.ResponseWriter, upstream *http.Respons
 		return
 	}
 
-	// 流式保活(P1-11): 上游静默超过间隔时注入空 delta 帧, 防止客户端把
-	// "上游排队/推理中"当成挂死。行边界注入, 协议合法, 客户端无需感知。
 	// 上游流空闲保护(P2, 参照 OmniRoute 的流式 idle 机制): 正文阶段挂起时
 	// 主动断开, 由收尾逻辑合成 finish/[DONE], 避免客户端无限等待。
 	idleRC := newIdleAbortReader(upstream.Body, streamIdleTimeout())
 	defer idleRC.Close()
 
-	src := io.Reader(idleRC)
-	if iv := streamHeartbeatInterval(); iv > 0 {
-		src = newHeartbeatReader(idleRC, iv, func() []byte { return openAIHeartbeatFrame })
-	}
 	// 控制字符清洗放在行切分之前(见 controlSanitizingReader 注释)。
-	src = &controlSanitizingReader{src: src}
-
+	// 注意: 这里**不再**包 heartbeatReader —— 心跳已移到输出侧(见下), 绝不能在
+	// 上游字节流里掺任何帧, 否则会把分片传输的巨型 JSON 帧拦腰截断(实测事故)。
+	src := io.Reader(&controlSanitizingReader{src: idleRC})
 	reader := bufio.NewReader(src)
+
+	// 流式保活(P1-11, 输出侧, 参照 OmniRoute 的 earlyStreamKeepalive): 距上次向
+	// 客户端写出真实字节超过间隔时, 向客户端写一个协议合法的空 delta 帧。心跳与
+	// 上游数据是两条永不相交的流 —— 从根上杜绝旧 heartbeatReader 的截帧缺陷。
+	hb := newSSEHeartbeat(w, flusher, streamHeartbeatInterval(), func() []byte { return openAIHeartbeatFrame })
+	defer hb.Close()
 
 	// 形态判定(P2, 参照 OmniRoute open-sse/utils/jsonToSse.ts):
 	// 上游可能忽略 stream:true 直接回完整 JSON, 或按 NDJSON 逐行回 JSON。
@@ -1457,15 +1458,15 @@ func handleStreamResponseWithUsage(w http.ResponseWriter, upstream *http.Respons
 			// NDJSON 模式: 逐行转 data: 帧
 			log.Printf("%s", sseSynthesisLog("NDJSON", len(firstLine)))
 			if frame, ok := ndjsonLineToSSE(firstLine); ok {
-				w.Write(frame)
+				hb.writeFlush(frame)
 			}
 			for {
 				line, lerr := reader.ReadString('\n')
 				if t := strings.TrimSpace(line); t != "" {
 					if frame, ok := ndjsonLineToSSE(t); ok {
-						w.Write(frame)
+						hb.writeFlush(frame)
 					} else if t == "[DONE]" {
-						w.Write([]byte("data: [DONE]\n\n"))
+						hb.writeFlush([]byte("data: [DONE]\n\n"))
 					}
 				}
 				if lerr != nil {
@@ -1473,10 +1474,9 @@ func handleStreamResponseWithUsage(w http.ResponseWriter, upstream *http.Respons
 				}
 			}
 			if b, mErr := json.Marshal(protocol.EmptyOpenAIChunk("").Payload); mErr == nil {
-				w.Write([]byte("data: " + string(b) + "\n\n"))
+				hb.writeFlush([]byte("data: " + string(b) + "\n\n"))
 			}
-			w.Write([]byte("data: [DONE]\n\n"))
-			flusher.Flush()
+			hb.writeFlush([]byte("data: [DONE]\n\n"))
 			return
 		}
 		// 多行 JSON body: 缓冲全部后解析合成
@@ -1484,8 +1484,7 @@ func handleStreamResponseWithUsage(w http.ResponseWriter, upstream *http.Respons
 		body := append([]byte(firstLine), rest...)
 		if sse, ok := synthesizeOpenAISSEFromJSON(body); ok {
 			log.Printf("%s", sseSynthesisLog("完整 JSON body", len(body)))
-			w.Write(sse)
-			flusher.Flush()
+			hb.writeFlush(sse)
 			if onUsage != nil {
 				var parsed map[string]any
 				if json.Unmarshal(body, &parsed) == nil {
@@ -1496,9 +1495,9 @@ func handleStreamResponseWithUsage(w http.ResponseWriter, upstream *http.Respons
 			}
 			return
 		}
-		// 合不成: 退回原逻辑(把首行放回处理)
+		// 合不成: 交给主循环按坏行门卫处理(不再原样透传裸 JSON)
 		if _, ok := ndjsonLineToSSE(firstLine); !ok {
-			log.Printf("  stream: 上游返回无法识别的非 SSE 数据(%d 字节首行), 按原样透传", len(firstLine))
+			log.Printf("  stream: 上游返回无法识别的非 SSE 数据(%d 字节首行), 将按坏行丢弃而非透传", len(firstLine))
 		}
 	} else if ferr == nil {
 		// 首行是正常 SSE: 先处理它, 再进入主循环
@@ -1510,12 +1509,10 @@ func handleStreamResponseWithUsage(w http.ResponseWriter, upstream *http.Respons
 				if payload != "" && payload != "[DONE]" {
 					var obj map[string]any
 					if json.Unmarshal([]byte(payload), &obj) == nil {
-						w.Write([]byte("data: " + payload + "\n\n"))
-						flusher.Flush()
+						hb.writeFlush([]byte("data: " + payload + "\n\n"))
 					}
 				} else if payload == "[DONE]" {
-					w.Write([]byte("data: [DONE]\n\n"))
-					flusher.Flush()
+					hb.writeFlush([]byte("data: [DONE]\n\n"))
 				}
 			}
 		}
@@ -1526,12 +1523,12 @@ func handleStreamResponseWithUsage(w http.ResponseWriter, upstream *http.Respons
 	lastModel := ""    // 用于兜底 chunk 的 model 字段
 	for {
 		line, err := reader.ReadString('\n')
-		if err != nil {
-			if err == io.EOF {
-				if line != "" {
-					w.Write([]byte(line + "\n"))
-				}
-			}
+		// EOF 时残行(最后一帧不带换行)也要走统一处理, 不能裸写回客户端。
+		if err != nil && err != io.EOF {
+			break
+		}
+		residual := err == io.EOF && strings.TrimRight(line, "\r\n") != ""
+		if err == io.EOF && !residual {
 			break
 		}
 
@@ -1540,20 +1537,24 @@ func handleStreamResponseWithUsage(w http.ResponseWriter, upstream *http.Respons
 		if strings.HasPrefix(line, "data:") {
 			payload := strings.TrimSpace(line[5:])
 			if payload == "" {
-				w.Write([]byte(line + "\n\n"))
-				flusher.Flush()
+				hb.writeFlush([]byte(line + "\n\n"))
+				if residual {
+					break
+				}
 				continue
 			}
 			if payload == "[DONE]" {
 				// 上游结束但从未给出 finish_reason: 补一个终止 chunk
 				if !sawFinish {
 					if b, mErr := json.Marshal(protocol.EmptyOpenAIChunk(lastModel).Payload); mErr == nil {
-						w.Write([]byte("data: " + string(b) + "\n\n"))
+						hb.write([]byte("data: " + string(b) + "\n\n"))
 					}
 				}
 				sawDone = true
-				w.Write([]byte(line + "\n\n"))
-				flusher.Flush()
+				hb.writeFlush([]byte(line + "\n\n"))
+				if residual {
+					break
+				}
 				continue
 			}
 
@@ -1570,10 +1571,16 @@ func handleStreamResponseWithUsage(w http.ResponseWriter, upstream *http.Respons
 						log.Printf("  stream: 上游 data 行含非法控制字符, 已清洗救回(%d 字节)", len(payload))
 					} else {
 						log.Printf("  stream: 丢弃无法解析的上游 data 行(%d 字节): %q", len(payload), kit.Truncate(payload, 120))
+						if residual {
+							break
+						}
 						continue
 					}
 				} else {
 					log.Printf("  stream: 丢弃无法解析的上游 data 行(%d 字节): %q", len(payload), kit.Truncate(payload, 120))
+					if residual {
+						break
+					}
 					continue
 				}
 			}
@@ -1602,38 +1609,97 @@ func handleStreamResponseWithUsage(w http.ResponseWriter, upstream *http.Respons
 					sawFinish = true
 				}
 				if normBytes, err := json.Marshal(normalized); err == nil {
-					w.Write([]byte("data: " + string(normBytes) + "\n\n"))
-					flusher.Flush()
+					hb.writeFlush([]byte("data: " + string(normBytes) + "\n\n"))
+					if residual {
+						break
+					}
 					continue
 				}
 			}
 		}
 
-		w.Write([]byte(line + "\n"))
-		flusher.Flush()
+		// 非 data 行: 只透传 SSE 合法帧结构(空行分隔符 / event: / id: / retry: /
+		// 注释行)。其余一律视为损坏内容 —— 先按 NDJSON 转帧抢救, 抢救不动就丢弃。
+		// 旧实现把任意非 data 行原样写回客户端, 裸 _manifest 分片和黏合帧正是这样
+		// 直达客户端报 "Bad control character" 的(2026-09-15 事故复盘)。
+		if line == "" {
+			hb.writeFlush([]byte("\n"))
+			if residual {
+				break
+			}
+			continue
+		}
+		if strings.HasPrefix(line, "event:") || strings.HasPrefix(line, "id:") ||
+			strings.HasPrefix(line, "retry:") || strings.HasPrefix(line, ":") {
+			hb.writeFlush([]byte(line + "\n"))
+			if residual {
+				break
+			}
+			continue
+		}
+		if frame, ok := ndjsonLineToSSE(line); ok {
+			hb.writeFlush(frame)
+			if residual {
+				break
+			}
+			continue
+		}
+		log.Printf("  stream: 丢弃非 SSE 帧的上游损坏行(%d 字节): %q", len(line), kit.Truncate(line, 120))
+		if residual {
+			break
+		}
 	}
 
 	// 上游断流未发 [DONE](或发 [DONE] 前无 finish_reason): 合成收尾,
 	// 避免客户端报 "Stream ended without finish_reason" 或挂起等待。
 	if !sawFinish {
 		if b, mErr := json.Marshal(protocol.EmptyOpenAIChunk(lastModel).Payload); mErr == nil {
-			w.Write([]byte("data: " + string(b) + "\n\n"))
-			flusher.Flush()
+			hb.write([]byte("data: " + string(b) + "\n\n"))
 		}
 	}
 	if !sawDone {
-		w.Write([]byte("data: [DONE]\n\n"))
-		flusher.Flush()
+		hb.write([]byte("data: [DONE]\n\n"))
 	}
+	hb.flush()
 }
 
 func handleNonStreamResponseWithUsage(w http.ResponseWriter, upstream *http.Response, onUsage func(map[string]any)) {
-	var raw map[string]any
-	if err := json.NewDecoder(upstream.Body).Decode(&raw); err != nil {
+	// 非流式响应同样要过控制字符清洗 —— 此前只有流式路径有清洗器, 于是上游
+	// (实测 B.AI 图片响应的 C2PA _manifest)忽略 stream:true 直接回完整 JSON,
+	// 或流式被掏空退化成裸 body 时, 字符串里的裸控制字符会原样直达客户端,
+	// 报 "Bad control character in string literal"(2026-09-15 事故次生缺陷)。
+	rawBody, readErr := io.ReadAll(io.LimitReader(upstream.Body, providerResponseMaxBytes+1))
+	if readErr != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]any{
-			"error": map[string]string{"message": err.Error(), "type": "parse_error"},
+			"error": map[string]string{"message": readErr.Error(), "type": "parse_error"},
 		})
 		return
+	}
+	if len(rawBody) > providerResponseMaxBytes {
+		writeJSON(w, http.StatusBadGateway, map[string]any{
+			"error": map[string]string{"message": "upstream response exceeds size limit", "type": "api_error"},
+		})
+		return
+	}
+	var raw map[string]any
+	if err := json.Unmarshal(rawBody, &raw); err != nil {
+		// 直解失败: 先做位置感知清洗(字符串内裸控制字符→空格)再重试, 与流式坏行
+		// 门卫同一判定。救不回才报错 —— 此时报错也优于把含裸控制字符的坏 JSON 透传。
+		if fixed, ok := sanitizeJSONControlChars(rawBody); ok {
+			if err2 := json.Unmarshal(fixed, &raw); err2 == nil {
+				log.Printf("  nonstream: 上游 JSON 含非法控制字符, 已清洗救回(%d 字节)", len(rawBody))
+			} else {
+				writeJSON(w, http.StatusInternalServerError, map[string]any{
+					"error": map[string]string{"message": err.Error(), "type": "parse_error"},
+				})
+				return
+			}
+		} else {
+			writeJSON(w, http.StatusInternalServerError, map[string]any{
+				"error": map[string]string{"message": err.Error(), "type": "parse_error"},
+			})
+			return
+		}
 	}
 
 	if onUsage != nil {
