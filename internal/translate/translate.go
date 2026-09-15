@@ -3,10 +3,19 @@
 // 仓库根 NOTICE)。注册表语义与其 registry.ts 一致: register(from, to, reqFn,
 // respFn) 后按 "from:to" 取用。
 //
+// **接线状态(重要, R2 审计 F4)**: 本包目前是"预铺基础设施", 生产调用点为零,
+// 仅被自身测试消费 —— 中继仍走 internal/app 内的既有转换路径。计划随移植
+// 批次⑤接入; 在此之前请勿删除, 但引用本包能力时须先补真实调用链与端到端
+// 用例。勿与旧包 internal/app/translate 混淆: 旧包是"注册表 + 出站体形态
+// 不变量校验"(防重复转换事故, 已在生产使用), 本包是"协议格式互转实现"。
+//
 // 已注册方向:
 //
 //	openai → claude(请求方向): OpenAIChatToClaudeRequest
-//	响应方向与 gemini 将按批次继续移植(参照源码快照见工作区
+//	openai → gemini(请求方向): OpenAIChatToGeminiRequest
+//	响应方向: ClaudeResponseToOpenAIChat / ClaudeSSEToOpenAISSE /
+//	          GeminiResponseToOpenAIChat / GeminiSSEToOpenAISSE
+//	响应方向与其余组合将按批次继续移植(参照源码快照见工作区
 //	omniroute-translator-ref/, 随本声明保留 MIT 版权)。
 //
 // 与上游参照实现的**有意差异**(均为 OmniRoute 特有的供应商分支, 不适用于

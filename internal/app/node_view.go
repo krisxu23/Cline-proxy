@@ -127,7 +127,7 @@ func withHealthResult(v nodeView, key string) nodeView {
 		v.DownBytes = tc.down.Load()
 	}
 	v.Blacklisted = nodeManuallyBlacklisted(key)
-	if best, dup := exitFoldDupOf[key]; dup {
+	if best, dup := exitFoldDupTarget(key); dup { // 加锁访问器: 裸读会与重算并发竞争(F1)
 		v.DuplicateOf = best
 	}
 	v.Region = nodeExitRegion(key)

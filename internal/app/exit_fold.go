@@ -80,9 +80,13 @@ func nodeFoldedDuplicate(key string) bool {
 	return ok
 }
 
-// exitFoldCount 当前折叠副本数量(面板信号)。
-func exitFoldCount() int {
+// exitFoldDupTarget 折叠表的线程安全读取入口: 返回该 key 所在出口组的主力 key。
+// recomputeExitFold 会在 exitFoldMu 下**整体替换** exitFoldDupOf, 任何读方都
+// 必须经本函数(或自己套 RLock) —— 直接裸读 map 与替换并发即数据竞争
+// (2026-09-15 R2 审计 F1: node_view.go 面板路径曾裸读)。
+func exitFoldDupTarget(key string) (string, bool) {
 	exitFoldMu.RLock()
 	defer exitFoldMu.RUnlock()
-	return len(exitFoldDupOf)
+	best, ok := exitFoldDupOf[key]
+	return best, ok
 }

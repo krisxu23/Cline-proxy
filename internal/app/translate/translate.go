@@ -21,7 +21,12 @@
 //	           不得残留 chat 形状的 messages / max_tokens / max_completion_tokens。
 //	chat:      必须有 model 与非空 messages; 不得残留 responses 的 input。
 //	anthropic: 必须有 model、非空 messages、正整数 max_tokens;
-//	           不得残留 responses 的 input。
+//	           不得残留 responses 形状字段 input。
+//
+// 与 internal/translate 的分工(R2 审计 F4): 本包是**注册表与出站校验**(已接
+// 生产, 由 zen.go / zen_responses.go 消费); internal/translate 是 OmniRoute
+// open-sse/translator 的**格式互转实现**(批次⑤预铺, 尚未接线)。两包同名
+// 不同路径、职责不同, 引用时以完整 import 路径为准。
 package translate
 
 import (
@@ -56,6 +61,8 @@ func RegisterRequest(from, to Kind, fn func(map[string]any) map[string]any) {
 
 // HasRequest 该方向是否注册了转换实现。
 func HasRequest(from, to Kind) bool {
+	reqMu.Lock()
+	defer reqMu.Unlock()
 	return requestFn[key{from, to}] != nil
 }
 
@@ -68,7 +75,11 @@ func TranslateRequest(from, to Kind, body map[string]any) map[string]any {
 	if from == to {
 		return body
 	}
-	if fn := requestFn[key{from, to}]; fn != nil {
+	// 读注册表必须与 RegisterRequest 互斥(与 F1 同类: 裸读 map 并发注册即竞争)。
+	reqMu.Lock()
+	fn := requestFn[key{from, to}]
+	reqMu.Unlock()
+	if fn != nil {
 		return fn(body)
 	}
 	// 未注册方向: 原样返回并让出站校验兜底 —— 宁可上游报错, 也不在这里猜。
@@ -77,6 +88,8 @@ func TranslateRequest(from, to Kind, body map[string]any) map[string]any {
 
 // RegisteredDirections 已注册的转换方向(诊断/测试用, 排序后返回)。
 func RegisteredDirections() []string {
+	reqMu.Lock()
+	defer reqMu.Unlock()
 	out := make([]string, 0, len(requestFn))
 	for k := range requestFn {
 		out = append(out, string(k.from)+"→"+string(k.to))

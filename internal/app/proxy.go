@@ -1449,6 +1449,108 @@ func handleStreamResponseWithUsage(w http.ResponseWriter, upstream *http.Respons
 	hb := newSSEHeartbeat(w, flusher, streamHeartbeatInterval(), func() []byte { return openAIHeartbeatFrame })
 	defer hb.Close()
 
+	// 统一行处理器(F2 收敛): 主循环与"首行是正常 SSE"共用**同一份**实现,
+	// 并以闭包更新循环状态(sawFinish/sawDone/lastModel)。返回 true 表示
+	// 残行(residual)处理完毕、读取应结束。旧实现在首行分支里养了一份
+	// "精简版"循环体 —— 不走 normalize、不记 usage、不更新 sawDone(首行即
+	// [DONE] 时收尾会重复补终止帧)、坏行静默吞掉 —— 同一逻辑两份实现必然
+	// 漂移(R2 审计 F2), 现收敛为单一实现。
+	sawFinish := false // 上游是否已发过 finish_reason
+	sawDone := false   // 上游是否已发过 [DONE]
+	lastModel := ""    // 用于兜底 chunk 的 model 字段
+	handleLine := func(line string, residual bool) bool {
+		line = strings.TrimRight(line, "\r\n")
+		if strings.HasPrefix(line, "data:") {
+			payload := strings.TrimSpace(line[5:])
+			if payload == "" {
+				hb.writeFlush([]byte(line + "\n\n"))
+				return residual
+			}
+			if payload == "[DONE]" {
+				// 上游结束但从未给出 finish_reason: 补一个终止 chunk
+				if !sawFinish {
+					if b, mErr := json.Marshal(protocol.EmptyOpenAIChunk(lastModel).Payload); mErr == nil {
+						hb.write([]byte("data: " + string(b) + "\n\n"))
+					}
+				}
+				sawDone = true
+				hb.writeFlush([]byte(line + "\n\n"))
+				return residual
+			}
+
+			// Try to normalize the response
+			var obj map[string]any
+			if err := json.Unmarshal([]byte(payload), &obj); err != nil {
+				// 坏行门卫(P2 修复): 上游会送来两类脏 JSON ——
+				//   1) 被截断/交错的行(实测 {"choices"0}],...);
+				//   2) 字符串里夹裸控制字符的行(实测 _manifest/C2PA 图片元数据,
+				//      报 "Bad control character in string literal")。
+				// 先尝试清洗控制字符后重试(能救回来就不丢内容), 仍失败才丢弃。
+				if fixed, ok := sanitizeJSONControlChars([]byte(payload)); ok {
+					if err := json.Unmarshal(fixed, &obj); err == nil {
+						log.Printf("  stream: 上游 data 行含非法控制字符, 已清洗救回(%d 字节)", len(payload))
+					} else {
+						log.Printf("  stream: 丢弃无法解析的上游 data 行(%d 字节): %q", len(payload), kit.Truncate(payload, 120))
+						return residual
+					}
+				} else {
+					log.Printf("  stream: 丢弃无法解析的上游 data 行(%d 字节): %q", len(payload), kit.Truncate(payload, 120))
+					return residual
+				}
+			}
+			// Some Cline responses wrap in {data: {...}} —— 先解包裹再记 usage:
+			// 旧顺序先查外层 obj["usage"], 导致包裹形态的 usage 永远漏记
+			// (Dashboard 少账, F2 收敛时一并修正)。
+			if data, ok := obj["data"]; ok {
+				if d, ok := data.(map[string]any); ok {
+					if _, hasChoices := d["choices"]; hasChoices {
+						obj = d
+					}
+					if _, hasID := d["id"]; hasID {
+						obj = d
+					}
+				}
+			}
+			if onUsage != nil {
+				if u, ok := obj["usage"].(map[string]any); ok && len(u) > 0 {
+					onUsage(u)
+				}
+			}
+			if m, ok := obj["model"].(string); ok && m != "" {
+				lastModel = m
+			}
+			normalized := normalizeOpenAIResponse(obj)
+			if !sawFinish && protocol.HasStopSignal(normalized) { // 跨协议终止判定(OmniRoute checkIfStopSignal 等价)
+				sawFinish = true
+			}
+			if normBytes, err := json.Marshal(normalized); err == nil {
+				hb.writeFlush([]byte("data: " + string(normBytes) + "\n\n"))
+				return residual
+			}
+			// normalize 序列化失败: 继续落入下方非 data 分支尝试 NDJSON 抢救(与旧实现一致)
+		}
+
+		// 非 data 行: 只透传 SSE 合法帧结构(空行分隔符 / event: / id: / retry: /
+		// 注释行)。其余一律视为损坏内容 —— 先按 NDJSON 转帧抢救, 抢救不动就丢弃。
+		// 旧实现把任意非 data 行原样写回客户端, 裸 _manifest 分片和黏合帧正是这样
+		// 直达客户端报 "Bad control character" 的(2026-09-15 事故复盘)。
+		if line == "" {
+			hb.writeFlush([]byte("\n"))
+			return residual
+		}
+		if strings.HasPrefix(line, "event:") || strings.HasPrefix(line, "id:") ||
+			strings.HasPrefix(line, "retry:") || strings.HasPrefix(line, ":") {
+			hb.writeFlush([]byte(line + "\n"))
+			return residual
+		}
+		if frame, ok := ndjsonLineToSSE(line); ok {
+			hb.writeFlush(frame)
+			return residual
+		}
+		log.Printf("  stream: 丢弃非 SSE 帧的上游损坏行(%d 字节): %q", len(line), kit.Truncate(line, 120))
+		return residual
+	}
+
 	// 形态判定(P2, 参照 OmniRoute open-sse/utils/jsonToSse.ts):
 	// 上游可能忽略 stream:true 直接回完整 JSON, 或按 NDJSON 逐行回 JSON。
 	// 这两类都不是 SSE —— 原样透传会让客户端报 "JSON parsing failed"。
@@ -1500,27 +1602,11 @@ func handleStreamResponseWithUsage(w http.ResponseWriter, upstream *http.Respons
 			log.Printf("  stream: 上游返回无法识别的非 SSE 数据(%d 字节首行), 将按坏行丢弃而非透传", len(firstLine))
 		}
 	} else if ferr == nil {
-		// 首行是正常 SSE: 先处理它, 再进入主循环
-		if frame := firstLine; strings.TrimSpace(frame) != "" {
-			// 复用主循环逻辑: 写入 reader 前部不可行, 这里直接解析一次
-			line := strings.TrimRight(frame, "\r\n")
-			if strings.HasPrefix(line, "data:") {
-				payload := strings.TrimSpace(line[5:])
-				if payload != "" && payload != "[DONE]" {
-					var obj map[string]any
-					if json.Unmarshal([]byte(payload), &obj) == nil {
-						hb.writeFlush([]byte("data: " + payload + "\n\n"))
-					}
-				} else if payload == "[DONE]" {
-					hb.writeFlush([]byte("data: [DONE]\n\n"))
-				}
-			}
-		}
+		// 首行是正常 SSE: 走统一实现处理一次再进主循环(F2 修复点 —— 此处
+		// 旧代码是独立的精简版循环体, 现收敛)。
+		handleLine(firstLine, false)
 	}
 
-	sawFinish := false // 上游是否已发过 finish_reason
-	sawDone := false   // 上游是否已发过 [DONE]
-	lastModel := ""    // 用于兜底 chunk 的 model 字段
 	for {
 		line, err := reader.ReadString('\n')
 		// EOF 时残行(最后一帧不带换行)也要走统一处理, 不能裸写回客户端。
@@ -1531,121 +1617,7 @@ func handleStreamResponseWithUsage(w http.ResponseWriter, upstream *http.Respons
 		if err == io.EOF && !residual {
 			break
 		}
-
-		line = strings.TrimRight(line, "\r\n")
-
-		if strings.HasPrefix(line, "data:") {
-			payload := strings.TrimSpace(line[5:])
-			if payload == "" {
-				hb.writeFlush([]byte(line + "\n\n"))
-				if residual {
-					break
-				}
-				continue
-			}
-			if payload == "[DONE]" {
-				// 上游结束但从未给出 finish_reason: 补一个终止 chunk
-				if !sawFinish {
-					if b, mErr := json.Marshal(protocol.EmptyOpenAIChunk(lastModel).Payload); mErr == nil {
-						hb.write([]byte("data: " + string(b) + "\n\n"))
-					}
-				}
-				sawDone = true
-				hb.writeFlush([]byte(line + "\n\n"))
-				if residual {
-					break
-				}
-				continue
-			}
-
-			// Try to normalize the response
-			var obj map[string]any
-			if err := json.Unmarshal([]byte(payload), &obj); err != nil {
-				// 坏行门卫(P2 修复): 上游会送来两类脏 JSON ——
-				//   1) 被截断/交错的行(实测 {"choices"0}],...);
-				//   2) 字符串里夹裸控制字符的行(实测 _manifest/C2PA 图片元数据,
-				//      报 "Bad control character in string literal")。
-				// 先尝试清洗控制字符后重试(能救回来就不丢内容), 仍失败才丢弃。
-				if fixed, ok := sanitizeJSONControlChars([]byte(payload)); ok {
-					if err := json.Unmarshal(fixed, &obj); err == nil {
-						log.Printf("  stream: 上游 data 行含非法控制字符, 已清洗救回(%d 字节)", len(payload))
-					} else {
-						log.Printf("  stream: 丢弃无法解析的上游 data 行(%d 字节): %q", len(payload), kit.Truncate(payload, 120))
-						if residual {
-							break
-						}
-						continue
-					}
-				} else {
-					log.Printf("  stream: 丢弃无法解析的上游 data 行(%d 字节): %q", len(payload), kit.Truncate(payload, 120))
-					if residual {
-						break
-					}
-					continue
-				}
-			}
-			{
-				if onUsage != nil {
-					if u, ok := obj["usage"].(map[string]any); ok && len(u) > 0 {
-						onUsage(u)
-					}
-				}
-				// Some Cline responses wrap in {data: {...}}
-				if data, ok := obj["data"]; ok {
-					if d, ok := data.(map[string]any); ok {
-						if _, hasChoices := d["choices"]; hasChoices {
-							obj = d
-						}
-						if _, hasID := d["id"]; hasID {
-							obj = d
-						}
-					}
-				}
-				if m, ok := obj["model"].(string); ok && m != "" {
-					lastModel = m
-				}
-				normalized := normalizeOpenAIResponse(obj)
-				if !sawFinish && protocol.HasStopSignal(normalized) { // 跨协议终止判定(OmniRoute checkIfStopSignal 等价)
-					sawFinish = true
-				}
-				if normBytes, err := json.Marshal(normalized); err == nil {
-					hb.writeFlush([]byte("data: " + string(normBytes) + "\n\n"))
-					if residual {
-						break
-					}
-					continue
-				}
-			}
-		}
-
-		// 非 data 行: 只透传 SSE 合法帧结构(空行分隔符 / event: / id: / retry: /
-		// 注释行)。其余一律视为损坏内容 —— 先按 NDJSON 转帧抢救, 抢救不动就丢弃。
-		// 旧实现把任意非 data 行原样写回客户端, 裸 _manifest 分片和黏合帧正是这样
-		// 直达客户端报 "Bad control character" 的(2026-09-15 事故复盘)。
-		if line == "" {
-			hb.writeFlush([]byte("\n"))
-			if residual {
-				break
-			}
-			continue
-		}
-		if strings.HasPrefix(line, "event:") || strings.HasPrefix(line, "id:") ||
-			strings.HasPrefix(line, "retry:") || strings.HasPrefix(line, ":") {
-			hb.writeFlush([]byte(line + "\n"))
-			if residual {
-				break
-			}
-			continue
-		}
-		if frame, ok := ndjsonLineToSSE(line); ok {
-			hb.writeFlush(frame)
-			if residual {
-				break
-			}
-			continue
-		}
-		log.Printf("  stream: 丢弃非 SSE 帧的上游损坏行(%d 字节): %q", len(line), kit.Truncate(line, 120))
-		if residual {
+		if handleLine(line, residual) {
 			break
 		}
 	}

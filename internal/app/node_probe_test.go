@@ -116,13 +116,17 @@ func TestProbeNodeSpeedReadsBodyBeforeCancel(t *testing.T) {
 		w.WriteHeader(http.StatusOK)
 		chunk := make([]byte, 64<<10)
 		for sent := 0; sent < total; sent += len(chunk) {
+			// sleep 放在**每块写入之前**(含首块): 若实现回归为"Do 返回即
+			// cancel", 首块尚无任何字节进入客户端缓冲, cancel 后必测出 0
+			// 吞吐, 用例立即变红。旧写法(sleep 在写后)首块可能已入缓冲,
+			// 对旧 bug 复现偏弱(R2 审计 F7)。
+			time.Sleep(5 * time.Millisecond) // 拉开传输时间, 保证 cancel 抢在体完成前
 			if _, err := w.Write(chunk); err != nil {
 				return
 			}
 			if f, ok := w.(http.Flusher); ok {
 				f.Flush()
 			}
-			time.Sleep(5 * time.Millisecond) // 拉开传输时间, 保证 cancel 抢在体完成前
 		}
 	}))
 	defer srv.Close()

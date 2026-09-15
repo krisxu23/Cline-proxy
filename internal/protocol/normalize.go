@@ -75,13 +75,6 @@ func normalizeMsg(msg map[string]any) map[string]any {
 	return out
 }
 
-// HasChoices reports whether a parsed SSE payload carries a non-empty
-// choices array. Used to decide whether an empty fallback chunk is needed.
-func HasChoices(obj map[string]any) bool {
-	choices, ok := obj["choices"].([]any)
-	return ok && len(choices) > 0
-}
-
 // HasStopSignal 跨协议终止判定(参照 OmniRoute 的 checkIfStopSignal, MIT;
 // Go 侧实现)。中继用它决定"上游是不是已经结束了" —— 只认 OpenAI 的
 // finish_reason 时, 混入其它协议终止形态的上游会让网关一直等到超时:

@@ -32,6 +32,7 @@ func handleZenConfig(w http.ResponseWriter, r *http.Request) {
 		"rescueDirect":        rescueDirectEnabled(),
 		"subsRefreshMins":     cfg.SubsRefreshMins,
 		"proxyStrategy":       cfg.ProxyStrategy,
+		"streamIdleSecs":      cfg.StreamIdleSecs,
 		"stickySessions":      cfg.StickySessions,
 		"nodeExcludeKeywords": cfg.NodeExcludeKeywords,
 		"maxConcurrency":      cfg.MaxConcurrency,
@@ -86,6 +87,7 @@ func handleZenConfigUpdate(w http.ResponseWriter, r *http.Request) {
 		RescueDirect        *bool     `json:"rescueDirect"`
 		SubsRefreshMins     *int      `json:"subsRefreshMins"`
 		ProxyStrategy       *string   `json:"proxyStrategy"`
+		StreamIdleSecs      *int      `json:"streamIdleSecs"`
 		MaxConcurrency      *int      `json:"maxConcurrency"`
 		Retries             *int      `json:"retries"`
 		Failover            *bool     `json:"failover"`
@@ -197,6 +199,15 @@ func handleZenConfigUpdate(w http.ResponseWriter, r *http.Request) {
 	}
 	if patch.ProxyStrategy != nil && *patch.ProxyStrategy != "" {
 		next.ProxyStrategy = *patch.ProxyStrategy
+	}
+	if patch.StreamIdleSecs != nil {
+		// 0 = 恢复默认(90 秒); 上限 1800 防手滑配成"永久挂起"。
+		secs := *patch.StreamIdleSecs
+		if secs < 0 || secs > 1800 {
+			writeAPI(w, http.StatusBadRequest, apiResponse{Error: "流空闲上限需在 0~1800 秒之间（0=默认90秒）"})
+			return
+		}
+		next.StreamIdleSecs = secs
 	}
 	if patch.MaxConcurrency != nil && *patch.MaxConcurrency > 0 {
 		next.MaxConcurrency = *patch.MaxConcurrency
