@@ -65,7 +65,7 @@ func assignStablePort(key string) (int, bool, error) {
 	loadNodeStablePorts()
 	nodeStableMu.Lock()
 	defer nodeStableMu.Unlock()
-	if old, ok := nodeStablePorts[key]; ok && old > 0 && tcpPortFree(old) {
+	if old, ok := nodeStablePorts[key]; ok && old > 0 && !portReservedByService(old) && tcpPortFree(old) {
 		return old, true, nil
 	}
 	p, err := freeNodePortInRange()
@@ -106,6 +106,39 @@ const (
 	nodePortMax = 49000
 )
 
+// 服务端口保留集合(P2 修复): 管理页/API 的监听端口(如 3457)落在本区间内,
+// 若被节点入站抢占, 管理页会"无法访问"。由 StartProxy 启动时登记。
+var (
+	reservedPortMu sync.Mutex
+	reservedPorts  = map[int]bool{}
+)
+
+// reserveServicePort 登记服务保留端口, 节点入站分配永远避开。
+func reserveServicePort(port int) {
+	if port <= 0 {
+		return
+	}
+	reservedPortMu.Lock()
+	defer reservedPortMu.Unlock()
+	reservedPorts[port] = true
+	// 已写进稳定端口表的记录一并清除(升级后首次启动的自愈)
+	loadNodeStablePorts()
+	nodeStableMu.Lock()
+	for k, p := range nodeStablePorts {
+		if reservedPorts[p] {
+			delete(nodeStablePorts, k)
+		}
+	}
+	nodeStableMu.Unlock()
+}
+
+// portReservedByService 该端口是否为服务保留端口。
+func portReservedByService(port int) bool {
+	reservedPortMu.Lock()
+	defer reservedPortMu.Unlock()
+	return reservedPorts[port]
+}
+
 // tcpPortFree 探测本地端口是否可用(尝试监听后立即释放)。
 func tcpPortFree(port int) bool {
 	l, err := net.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", port))
@@ -120,6 +153,9 @@ func tcpPortFree(port int) bool {
 func freeNodePortInRange() (int, error) {
 	for attempt := 0; attempt < 64; attempt++ {
 		p := nodePortMin + rand.Intn(nodePortMax-nodePortMin+1)
+		if portReservedByService(p) {
+			continue
+		}
 		if tcpPortFree(p) {
 			return p, nil
 		}

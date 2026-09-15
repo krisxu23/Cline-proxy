@@ -109,6 +109,9 @@ func StartProxy(host string, port int) error {
 	log.Printf("Loaded %d active accounts from pool", activeCount)
 
 	freePort(port)
+	// 服务端口登记(P2 修复): 管理页/API 端口必须避开节点入站分配区间,
+	// 否则节点池构建可能抢走 3457 → 管理页"无法访问"。
+	reserveServicePort(port)
 
 	// 出口基础设施必须先于一切网络任务就绪: 模型同步/目录刷新等启动即发起
 	// 请求, 若此时节点未就绪, 首批请求会走 catch-all 直连(大陆 IP), 而共享
@@ -116,7 +119,10 @@ func StartProxy(host string, port int) error {
 	// 便永远 403。
 	initRegionModels()
 	syncNodeBox()
-	loadSubCache()
+	// 订阅缓存恢复异步化(P2 修复): 它会触发一次全量节点构建(4400 节点
+	// 逐个 box.New 校验, 需要数分钟)。同步执行会把 HTTP 服务启动堵在后面,
+	// 管理页长时间"无法访问"(实测事故)。后台构建, 期间请求走 catch-all 直连。
+	go loadSubCache()
 	if subs := getZenConfig().Subs; len(subs) > 0 {
 		go refreshSubsLoop(subs)
 	}
