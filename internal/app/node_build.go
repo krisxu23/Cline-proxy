@@ -28,27 +28,46 @@ func stringEntries(entries []any) []any {
 }
 
 // buildNodeParts 为每个节点条目分配本地端口并生成 sing-box 配置部件
+// nodeBuildItem 构建中间产物: 校验/解析完成的出站, 端口在最后统一分配。
+type nodeBuildItem struct {
+	key  string
+	name string
+	ob   map[string]any
+	port int // 0 = 待分配
+}
+
+// buildNodeParts 两阶段构建(P2 修复):
+//
+//	阶段 A(慢, 分钟级): 解析 + 过滤 + 逐节点 sing-box 校验 —— 不碰端口;
+//	阶段 B(快, 秒级): 端口分配 + inbound/outbound/rule 组装, 紧贴 Start。
+//
+// 旧实现边校验边分配端口, "分配→bind"窗口长达数分钟 —— 这期间其它进程
+// (乃至本进程出站连接)可能占用端口, sing-box bind 必败。实测事故链的
+// 收口修复。
+//
+// 端口分配两轮: 先复用稳定记录(订阅更新端口不漂移), 再顺序扫描补齐。
+// 顺序分配 + 构建内 used 集合保证同批端口绝对唯一 —— 旧随机分配在
+// 4269 次选择里按生日悖论必然自撞(实测每次重建都死在随机的某个 inbound)。
 func buildNodeParts(entries []any) (ports map[string]int, inbounds, outbounds, rules []map[string]any, hasMap bool) {
 	ports = map[string]int{}
-	// 按 key 去重(P2 修复): 同一节点(链接去名后相同, 或订阅 tag 相同)可能在
-	// 多个订阅源里重复出现。稳定端口下"同 key → 同端口", 重复条目会造成
-	// 两个 inbound 监听同一端口 → 实例 Start 必败 → 全池瘫痪(实测事故)。
-	// 旧随机端口时代只是冗余, 稳定端口时代是致命的, 必须在这里收敛。
+	// 阶段 A: 按 key 去重 + 解析 + 校验(同一节点可能在多个订阅源重复出现,
+	// 稳定端口下重复条目 = 同端口两个 inbound, 必须收敛)。
+	items := make([]nodeBuildItem, 0, len(entries))
 	seenBuild := map[string]bool{}
 	for i, e := range entries {
+		var key, name string
 		var ob map[string]any
-		var key string
-		var port int
 		var err error
 		switch v := e.(type) {
 		case string:
 			key = nodeLocalKey(v)
+			name = nodeDisplayName(v)
 			if seenBuild[key] {
 				continue
 			}
 			seenBuild[key] = true
-			if nodeExcludedByFilter(nodeDisplayName(v)) {
-				log.Printf("  node %d(%s): 命中排除关键词已跳过", i+1, nodeDisplayName(v))
+			if nodeExcludedByFilter(name) {
+				log.Printf("  node %d(%s): 命中排除关键词已跳过", i+1, name)
 				continue
 			}
 			ob, err = nodeOutbound(v, fmt.Sprintf("out-%d", i))
@@ -62,29 +81,23 @@ func buildNodeParts(entries []any) (ports map[string]int, inbounds, outbounds, r
 			// 直接跳过 → 面板上全部节点永久停在"未检测"。校验只做 box.New 不建连,
 			// 成本极低, 逐节点剔除即可。
 			if verr := validateOutboundEntry(ob); verr != nil {
-				log.Printf("  node %d(%s): 出站无效已剔除: %v", i+1, nodeDisplayName(subEntryKey(v)), verr)
-				continue
-			}
-			key = nodeLocalKey(v)
-			// 稳定端口(P2): 优先复用历史分配, 订阅更新不再漂移端口
-			port, _, err = assignStablePort(key)
-			if err != nil {
-				log.Printf("  node %d: 分配本地端口失败: %v", i+1, err)
+				log.Printf("  node %d(%s): 出站无效已剔除: %v", i+1, name, verr)
 				continue
 			}
 		case map[string]any:
 			key = subEntryKey(v)
+			name = subNodeDisplayName(key)
 			if seenBuild[key] {
 				continue
 			}
 			seenBuild[key] = true
-			if nodeExcludedByFilter(subNodeDisplayName(key)) {
-				log.Printf("  node %d(%s): 命中排除关键词已跳过", i+1, subNodeDisplayName(key))
+			if nodeExcludedByFilter(name) {
+				log.Printf("  node %d(%s): 命中排除关键词已跳过", i+1, name)
 				continue
 			}
 			hasMap = true
 			if verr := validateOutboundEntry(v); verr != nil {
-				log.Printf("  node %d(%s): 出站无效已剔除: %v", i+1, nodeDisplayName(subEntryKey(v)), verr)
+				log.Printf("  node %d(%s): 出站无效已剔除: %v", i+1, name, verr)
 				continue
 			}
 			cp := map[string]any{"tag": fmt.Sprintf("out-%d", i)}
@@ -94,28 +107,66 @@ func buildNodeParts(entries []any) (ports map[string]int, inbounds, outbounds, r
 				}
 			}
 			ob = cp
-			// 稳定端口(P2): 订阅出站同样复用历史端口, 跨更新不漂移
-			port, _, err = assignStablePort(key)
-			if err != nil {
-				log.Printf("  node %d: 分配本地端口失败: %v", i+1, err)
-				continue
-			}
 		default:
 			continue
 		}
-		tag := ob["tag"].(string)
 		sanitizeOutboundTLS(ob)
+		items = append(items, nodeBuildItem{key: key, name: name, ob: ob})
+	}
+
+	// 阶段 B: 端口分配(此刻离 Start 只差毫秒级) + 部件组装。
+	used := map[int]bool{}
+	// 第一轮: 稳定记录复用(订阅更新端口不漂移)。
+	for idx := range items {
+		if p := stablePortOf(items[idx].key, used); p != 0 {
+			items[idx].port = p
+			used[p] = true
+		}
+	}
+	// 第二轮: 顺序扫描补齐(同批绝对唯一)。
+	for idx := range items {
+		if items[idx].port != 0 {
+			continue
+		}
+		p, err := allocateNodePortSequential(used)
+		if err != nil {
+			log.Printf("  node(%s): 分配本地端口失败已跳过: %v", items[idx].name, err)
+			continue
+		}
+		items[idx].port = p
+	}
+	recordStablePorts(portsFromItems(items))
+	persistNodeStablePorts()
+
+	n := 0
+	for _, it := range items {
+		if it.port == 0 {
+			continue
+		}
+		tag := it.ob["tag"].(string)
 		inbounds = append(inbounds, map[string]any{
-			"type": "mixed", "tag": fmt.Sprintf("in-%d", i),
-			"listen": "127.0.0.1", "listen_port": port,
+			"type": "mixed", "tag": fmt.Sprintf("in-%d", n),
+			"listen": "127.0.0.1", "listen_port": it.port,
 		})
-		outbounds = append(outbounds, ob)
+		outbounds = append(outbounds, it.ob)
 		rules = append(rules, map[string]any{
-			"action": "route", "inbound": []string{fmt.Sprintf("in-%d", i)}, "outbound": tag,
+			"action": "route", "inbound": []string{fmt.Sprintf("in-%d", n)}, "outbound": tag,
 		})
-		ports[key] = port
+		ports[it.key] = it.port
+		n++
 	}
 	return ports, inbounds, outbounds, rules, hasMap
+}
+
+// portsFromItems 收集已分配端口(key -> port), 供稳定表批量落盘。
+func portsFromItems(items []nodeBuildItem) map[string]int {
+	out := map[string]int{}
+	for _, it := range items {
+		if it.port != 0 {
+			out[it.key] = it.port
+		}
+	}
+	return out
 }
 
 // startNodeInstance 组装并创建 sing-box 实例(不 Start)

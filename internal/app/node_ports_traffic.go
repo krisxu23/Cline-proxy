@@ -34,6 +34,7 @@ var (
 	nodeStableMu     sync.Mutex
 	nodeStablePorts  map[string]int // nodeLocalKey -> 上次分配的端口
 	nodeStableLoaded bool
+	nodePortAllocMu  sync.Mutex // 顺序分配器游标互斥
 )
 
 // loadNodeStablePorts 惰性加载持久化的端口分配。
@@ -137,6 +138,54 @@ func portReservedByService(port int) bool {
 	reservedPortMu.Lock()
 	defer reservedPortMu.Unlock()
 	return reservedPorts[port]
+}
+
+// stablePortOf 查询某 key 的稳定端口记录; 记录不存在/被服务保留/与本批
+// 已分配冲突/当前被占, 都返回 0(走顺序分配)。
+func stablePortOf(key string, used map[int]bool) int {
+	loadNodeStablePorts()
+	nodeStableMu.Lock()
+	p, ok := nodeStablePorts[key]
+	nodeStableMu.Unlock()
+	if !ok || p <= 0 || portReservedByService(p) || used[p] || !tcpPortFree(p) {
+		return 0
+	}
+	return p
+}
+
+// recordStablePorts 批量写入稳定端口记录(不落盘, 由调用方统一 persist)。
+func recordStablePorts(m map[string]int) {
+	loadNodeStablePorts()
+	nodeStableMu.Lock()
+	defer nodeStableMu.Unlock()
+	for k, p := range m {
+		nodeStablePorts[k] = p
+	}
+}
+
+// nodePortCursor 顺序分配游标: 全进程递增, 避免随机分配的生日碰撞
+// (4269 次随机选 29001 端口 → 期望 ~314 对重复, 实测每次重建必死)。
+var nodePortCursor = nodePortMin
+
+// allocateNodePortSequential 在 [nodePortMin,nodePortMax] 里顺序扫描,
+// 跳过服务保留/本批已用/被占端口, 返回第一个可用者并标记 used。
+func allocateNodePortSequential(used map[int]bool) (int, error) {
+	nodePortAllocMu.Lock()
+	defer nodePortAllocMu.Unlock()
+	span := nodePortMax - nodePortMin + 1
+	for i := 0; i < span; i++ {
+		nodePortCursor++
+		if nodePortCursor > nodePortMax {
+			nodePortCursor = nodePortMin
+		}
+		p := nodePortCursor
+		if used[p] || portReservedByService(p) || !tcpPortFree(p) {
+			continue
+		}
+		used[p] = true
+		return p, nil
+	}
+	return 0, fmt.Errorf("no free node port in [%d,%d]", nodePortMin, nodePortMax)
 }
 
 // tcpPortFree 探测本地端口是否可用(尝试监听后立即释放)。
