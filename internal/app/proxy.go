@@ -367,6 +367,9 @@ func StartProxy(host string, port int) error {
 			// 上游 4xx 原样透传, 其余(网络错误 / 5xx)统一 502。
 			// 此前一律回 500, 客户端因此看不出"是模型不存在"还是"被限流"。
 			status = upstreamErrorStatus(err)
+			if tr := traceFrom(r.Context()); tr != nil {
+				tr.SetError(errClassForStatus(status), err.Error())
+			}
 			writeJSON(w, status, map[string]any{
 				"error": map[string]string{"message": err.Error(), "type": "api_error"},
 			})
@@ -930,6 +933,10 @@ func handleZenChat(w http.ResponseWriter, r *http.Request, params map[string]any
 		log.Printf("  zen api error: %v", err)
 		tracker.rec.RateLimited = rateLimited
 		status := zenErrorStatus(err)
+		// 请求轨迹: 直连路径的失败也要落"错误类别 + 消息", 否则面板只能看到裸状态码。
+		if tr := traceFrom(r.Context()); tr != nil {
+			tr.SetError(errClassForStatus(status), err.Error())
+		}
 		writeJSON(w, status, map[string]any{
 			"error": map[string]string{"message": err.Error(), "type": "api_error"},
 		})
@@ -941,6 +948,8 @@ func handleZenChat(w http.ResponseWriter, r *http.Request, params map[string]any
 	tracker.rec.Status = resp.StatusCode
 
 	usageFn := func(u map[string]any) {
+		// 镜像进请求轨迹(多协议字段名归一; 与 stats 记账互不影响)。
+		tracker.trace.ObserveUsage(u)
 		if pt, ok := u["prompt_tokens"].(float64); ok {
 			tracker.rec.CompletionTokens += int(pt) - tracker.rec.PromptTokens
 			if tracker.rec.CompletionTokens < 0 {
