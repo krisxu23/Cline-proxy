@@ -8,6 +8,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"cline-go-proxy/internal/translate"
 )
 
 func TestNodeExcludedByFilter(t *testing.T) {
@@ -204,5 +206,122 @@ func TestProbeStreamFirstEvent(t *testing.T) {
 	nb.Close()
 	if string(got) != raw {
 		t.Fatalf("接回的响应体必须与原文一致:\n got=%q\nwant=%q", string(got), raw)
+	}
+}
+
+func TestOpenAIChatToGeminiRequest(t *testing.T) {
+	body := map[string]any{
+		"model":       "gemini-2.0-flash",
+		"max_tokens":  float64(2048),
+		"temperature": float64(0.5),
+		"stop":        "END",
+		"messages": []any{
+			map[string]any{"role": "system", "content": "你是助手"},
+			map[string]any{"role": "user", "content": []any{
+				map[string]any{"type": "text", "text": "看图"},
+				map[string]any{"type": "image_url", "image_url": map[string]any{
+					"url": "data:image/jpeg;base64,BBBB",
+				}},
+			}},
+			map[string]any{"role": "assistant", "content": "", "tool_calls": []any{
+				map[string]any{"id": "call_1", "function": map[string]any{
+					"name": "get_weather", "arguments": `{"city":"北京"}`,
+				}},
+			}},
+			map[string]any{"role": "tool", "tool_call_id": "get_weather", "content": "晴"},
+		},
+		"tools": []any{
+			map[string]any{"type": "function", "function": map[string]any{
+				"name": "get_weather", "description": "查天气",
+				"parameters": map[string]any{"type": "object"},
+			}},
+		},
+		"tool_choice": "auto",
+	}
+	out, err := translate.OpenAIChatToGeminiRequest("gemini-2.0-flash", body, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	si, _ := out["systemInstruction"].(map[string]any)
+	if len(si["parts"].([]any)) != 1 {
+		t.Fatalf("system 应映射为 systemInstruction: %v", out["systemInstruction"])
+	}
+	contents, _ := out["contents"].([]any)
+	if len(contents) != 3 {
+		t.Fatalf("应有 3 条 contents, got %d", len(contents))
+	}
+	c0 := contents[0].(map[string]any)
+	parts0 := c0["parts"].([]any)
+	p01, ok := parts0[1].(map[string]any)
+	if !ok || p01["inlineData"] == nil {
+		t.Fatalf("图片应映射为 inlineData: %v", parts0[1])
+	}
+	c1 := contents[1].(map[string]any)
+	if c1["role"] != "model" {
+		t.Fatalf("assistant 应映射为 model 轮: %v", c1["role"])
+	}
+	parts1 := c1["parts"].([]any)
+	p10, ok := parts1[0].(map[string]any)
+	if !ok || p10["functionCall"] == nil {
+		t.Fatalf("tool_calls 应映射为 functionCall(位于 parts[0]): %v", parts1)
+	}
+	c2 := contents[2].(map[string]any)
+	parts2 := c2["parts"].([]any)
+	p21, ok := parts2[1].(map[string]any)
+	if !ok || p21["functionResponse"] == nil {
+		t.Fatalf("tool 消息应映射为 functionResponse(位于 parts[1]): %v", parts2)
+	}
+	gc := out["generationConfig"].(map[string]any)
+	if gc["maxOutputTokens"] != 2048 || gc["temperature"] != float64(0.5) {
+		t.Fatalf("generationConfig 不符: %v", gc)
+	}
+	if ss, ok := gc["stopSequences"].([]any); !ok || ss[0] != "END" {
+		t.Fatalf("stop 应映射为 stopSequences: %v", gc["stopSequences"])
+	}
+	tools := out["tools"].([]any)[0].(map[string]any)
+	decls := tools["functionDeclarations"].([]any)
+	if decls[0].(map[string]any)["name"] != "get_weather" {
+		t.Fatalf("functionDeclarations 不符: %v", decls)
+	}
+}
+
+func TestGeminiResponseToOpenAIChat(t *testing.T) {
+	body := []byte(`{"candidates":[{"content":{"parts":[{"text":"结果"},{"functionCall":{"name":"f","args":{"x":1}}}]},"finishReason":"STOP"}],
+		"usageMetadata":{"promptTokenCount":8,"candidatesTokenCount":4,"totalTokenCount":12}}`)
+	out, err := translate.GeminiResponseToOpenAIChat(body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ch := out["choices"].([]any)[0].(map[string]any)
+	msg := ch["message"].(map[string]any)
+	if msg["content"] != "结果" {
+		t.Fatalf("content 不符: %v", msg)
+	}
+	tcs := msg["tool_calls"].([]any)
+	tc0, ok := tcs[0].(map[string]any)
+	if !ok {
+		t.Fatalf("tool_calls 元素应为对象: %v", tcs)
+	}
+	fn := tc0["function"].(map[string]any)
+	if fn["name"] != "f" {
+		t.Fatalf("functionCall 应映射为 tool_calls: %v", tcs)
+	}
+	if ch["finish_reason"] != "tool_calls" {
+		t.Fatalf("带 functionCall 时 finish 应为 tool_calls, got %v", ch["finish_reason"])
+	}
+}
+
+func TestGeminiSSEToOpenAISSE(t *testing.T) {
+	sse := "data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"你好\"}]}}]}\n" +
+		"data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"!\"}]},\"finishReason\":\"STOP\"}]}\n"
+	var sb strings.Builder
+	if err := translate.GeminiSSEToOpenAISSE(strings.NewReader(sse), &sb, "gemini-x"); err != nil {
+		t.Fatal(err)
+	}
+	out := sb.String()
+	for _, want := range []string{`"role":"assistant"`, "你好", `"finish_reason":"stop"`, "data: [DONE]"} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("SSE 缺少 %q:/n%s", want, out)
+		}
 	}
 }

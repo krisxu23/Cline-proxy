@@ -16,7 +16,7 @@ package translate
 
 import (
 	"encoding/json"
-	"fmt"
+	"errors"
 	"strings"
 	"sync"
 )
@@ -25,6 +25,7 @@ import (
 const (
 	FormatOpenAI = "openai"
 	FormatClaude = "claude"
+	FormatGemini = "gemini"
 )
 
 // RequestTranslator 把 from 格式的请求体翻译为 to 格式。
@@ -42,6 +43,12 @@ var (
 )
 
 func makeKey(from, to string) string { return from + ":" + to }
+
+// 哨兵错误: 空请求体 / 无可转换消息。
+var (
+	errNilBody     = errors.New("translate: nil request body")
+	errNilMessages = errors.New("translate: request has no convertible messages")
+)
 
 // Register 注册一个方向的翻译器(与 OmniRoute registry.ts 同名同义)。
 func Register(from, to string, reqFn RequestTranslator, respFn ResponseTranslator) {
@@ -80,7 +87,7 @@ func GetResponseTranslator(from, to string) ResponseTranslator {
 //   - stop → stop_sequences; reasoning_effort → thinking(enabled + 预算)。
 func OpenAIChatToClaudeRequest(model string, body map[string]any, stream bool) (map[string]any, error) {
 	if body == nil {
-		return nil, fmt.Errorf("translate: nil request body")
+		return nil, errNilBody
 	}
 	out := map[string]any{
 		"model":      model,
@@ -142,7 +149,7 @@ func OpenAIChatToClaudeRequest(model string, body map[string]any, stream bool) (
 		out["system"] = system
 	}
 	if len(messages) == 0 {
-		return nil, fmt.Errorf("translate: request has no convertible messages")
+		return nil, errNilMessages
 	}
 	out["messages"] = messages
 
@@ -321,4 +328,5 @@ func numOr(v any, def int) int {
 
 func init() {
 	Register(FormatOpenAI, FormatClaude, OpenAIChatToClaudeRequest, nil)
+	Register(FormatOpenAI, FormatGemini, OpenAIChatToGeminiRequest, nil)
 }
