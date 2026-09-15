@@ -13,7 +13,7 @@ import (
 )
 
 // zenConfigSchemaVersion 当前配置结构版本。
-const zenConfigSchemaVersion = 1
+const zenConfigSchemaVersion = 2
 
 // migrateZenConfig 把载入的配置迁移到当前版本。幂等: 已是最新版本时是 no-op。
 // 返回是否发生了实际变更(调用方据此决定是否重新落盘)。
@@ -63,6 +63,13 @@ func migrateZenConfig(cfg *zenConfigData) bool {
 			if cfg.RescueDirect == nil {
 				tr := true
 				cfg.RescueDirect = &tr
+				changed = true
+			}
+		case 2:
+			// v2: 流式保活间隔缺省 15 秒(一次性回填; 之后用户改成 0 表示关闭,
+			// 版本已就位不会再被迁移覆盖)。
+			if cfg.StreamHeartbeatSecs <= 0 {
+				cfg.StreamHeartbeatSecs = 15
 				changed = true
 			}
 		default:

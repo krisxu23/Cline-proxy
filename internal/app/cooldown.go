@@ -241,6 +241,11 @@ func classifyCandidateFailure(status int, body []byte) (string, string) {
 	if p := permanentRejectionReason(status, payload); p != "" {
 		return classPermanent, p
 	}
+	// 声明式规则表(P1-10): 正文特征优先于状态码 —— 状态码相同的 403 可能是
+	// 地区封锁(24h 长冷却)也可能是 key 被拒, 只看状态码会混为一谈。
+	if class, note := matchErrorRules(string(body)); class != "" {
+		return class, note
+	}
 	switch {
 	case status == 0:
 		return classTimeout, reason

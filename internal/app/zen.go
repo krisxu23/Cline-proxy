@@ -259,8 +259,11 @@ type zenConfigData struct {
 	Routes          map[string][]string       `json:"routes,omitempty"`     // 路由别名 -> 有序候选链(如 free-best)
 	Combos          map[string]*comboDef      `json:"combos,omitempty"`     // 组合模型: 名字 -> 定义(虚拟模型, 按策略自动路由)
 	CooldownMs      map[string]int64          `json:"cooldownMs,omitempty"` // 候选层冷却时长覆盖(按错误类别)
-	Usage           zenUsageConfig            `json:"usage"`                // 每日配额账本
-	Router          zenRouterConfig           `json:"router"`               // 自动路由模型名与参与范围
+	// StreamHeartbeatSecs 流式保活间隔(秒): 上游静默超过该时长时向客户端注入
+	// 空 delta 帧, 防止客户端把"上游排队/推理中"当成挂死。0 = 关闭。
+	StreamHeartbeatSecs int             `json:"streamHeartbeatSecs,omitempty"`
+	Usage               zenUsageConfig  `json:"usage"`  // 每日配额账本
+	Router              zenRouterConfig `json:"router"` // 自动路由模型名与参与范围
 }
 
 // zenEndpointMirrors 官方源之外的 CDN 镜像端点(实测镜像透传官方完整路径,须带 /v1)。
@@ -648,8 +651,15 @@ func callZenAPI(ctx context.Context, params map[string]any, stream bool) (*http.
 
 	zenStateMu.Lock()
 	sem := zenSem
-	sem <- struct{}{}
 	zenStateMu.Unlock()
+	// 并发准入(P1-12): 等待信号量必须感知请求取消 —— 客户端断开后继续在
+	// 队列里干等, 只会占住资源、放大排队延迟。此前是无 ctx 的阻塞式获取。
+	rateLimited := 0
+	select {
+	case sem <- struct{}{}:
+	case <-ctx.Done():
+		return nil, rateLimited, ctx.Err()
+	}
 	defer func() { <-sem }()
 
 	retries := cfg.Retries
@@ -665,7 +675,7 @@ func callZenAPI(ctx context.Context, params map[string]any, stream bool) (*http.
 	// 拖过客户端超时(实测 59~150s, 客户端 30s 就断开了)。退避只保留给
 	// 429 —— 那种才需要等限流窗口过去。
 	delay := time.Second
-	rateLimited := 0
+	rateLimited = 0
 	regionRetried := false // 地区拒绝最多主动换出口重试一次, 避免 hopeless 模型烧光重试
 	respTried := false     // Responses 端点自适应回退每次请求只试一次
 

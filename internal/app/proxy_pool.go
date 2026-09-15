@@ -264,7 +264,12 @@ func buildZenTransport() *http.Transport {
 		MaxIdleConns:        100,
 		MaxIdleConnsPerHost: 10,
 		IdleConnTimeout:     90 * time.Second,
-		DisableCompression:  false,
+		// 分层超时(P1-11): TLS 握手与响应头阶段单独设限, 不再依赖客户端
+		// 自己的超时兜底 —— 上游卡死握手/卡死响应头时, 网关能主动断开并
+		// 让链路换下一站。正文阶段不设限(流式回答可以持续很久)。
+		TLSHandshakeTimeout:   10 * time.Second,
+		ResponseHeaderTimeout: 120 * time.Second,
+		DisableCompression:    false,
 	}
 	t.DialContext = zenDialContext
 	// https 走 HTTP/2 + uTLS Chrome 指纹: 完整浏览器指纹(含 h2),避免 Go 原生指纹被 CF 风控

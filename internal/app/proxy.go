@@ -1305,7 +1305,14 @@ func handleStreamResponseWithUsage(w http.ResponseWriter, upstream *http.Respons
 		return
 	}
 
-	reader := bufio.NewReader(upstream.Body)
+	// 流式保活(P1-11): 上游静默超过间隔时注入空 delta 帧, 防止客户端把
+	// "上游排队/推理中"当成挂死。行边界注入, 协议合法, 客户端无需感知。
+	src := io.Reader(upstream.Body)
+	if iv := streamHeartbeatInterval(); iv > 0 {
+		src = newHeartbeatReader(upstream.Body, iv, func() []byte { return openAIHeartbeatFrame })
+	}
+
+	reader := bufio.NewReader(src)
 	sawFinish := false // 上游是否已发过 finish_reason
 	sawDone := false   // 上游是否已发过 [DONE]
 	lastModel := ""    // 用于兜底 chunk 的 model 字段
