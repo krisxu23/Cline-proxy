@@ -136,6 +136,9 @@ func checkAllNodeHealth() {
 	// 整批检测完再失效一次出口列表缓存(逐节点失效会把缓存打穿)
 	invalidateExitListCache()
 	log.Printf("  nodes: 增强检测完成(%d 并发), %d/%d 个出口可达", workers, okCount, len(keys))
+	// 出口级去重(P2, freesub 语义): 按最新结果折叠同出口 IP 的重复节点,
+	// 选路只保留每组最快的 —— 之后 nodeUsable 对折叠副本返回 false。
+	recomputeExitFold()
 	// 连通性刷新后, 同步刷新地区受限模型的节点能力标记, 以及
 	// "节点 × 每个上游"的可达性矩阵(后者用于选节点时跳过到该上游不通的节点)。
 	probeRegionModelsAsync()

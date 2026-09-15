@@ -107,6 +107,11 @@ type nodeTestResult struct {
 // 返回 nodeTestResult, 失败(节点不可达)时 Alive=false。
 // 所有节点出口都通过 sing-box mixed 入站暴露为本地 SOCKS5, 因此统一用
 // socks5ProxyURL(key) 建 SOCKS5 拨号客户端。
+//
+// 统一规则(P0 修复): 探测请求的 cancel 必须发生在响应体读尽并 Close 之后 ——
+// Go 里请求 ctx 一旦取消, 后续 Body.Read 立刻返回 context canceled, 哪怕
+// client.Do 已经成功返回。旧写法在 Do 之后马上 cancel(), 导致出口 IP 响应
+// 读不到、测速恒为 0 字节并一律判"断流", 节点明明活着却整体检测失败。
 func testNodeComprehensive(key string) nodeTestResult {
 	result := nodeTestResult{LatencyMs: 99999}
 
@@ -145,9 +150,11 @@ func testNodeComprehensive(key string) nodeTestResult {
 		}
 		req.Header.Set("User-Agent", "Go-http-client/2.0")
 		resp, err := client.Do(req)
-		cancel()
 		if err == nil {
 			resp.Body.Close()
+		}
+		cancel()
+		if err == nil {
 			if resp.StatusCode == http.StatusNoContent || resp.StatusCode == http.StatusOK {
 				result.Alive = true
 				result.LatencyMs = time.Since(t0).Milliseconds()
@@ -168,16 +175,14 @@ func testNodeComprehensive(key string) nodeTestResult {
 			continue
 		}
 		resp, err := client.Do(req)
-		cancel()
-		if err != nil || resp.StatusCode != http.StatusOK {
-			if resp != nil {
-				resp.Body.Close()
-			}
+		if err != nil {
+			cancel()
 			continue
 		}
-		body, err := io.ReadAll(io.LimitReader(resp.Body, 64<<10))
+		body, readErr := io.ReadAll(io.LimitReader(resp.Body, 64<<10))
 		resp.Body.Close()
-		if err != nil {
+		cancel()
+		if readErr != nil || resp.StatusCode != http.StatusOK {
 			continue
 		}
 		ip, country, asn, asnOrg, isp := parseIPEcho(u, body)
@@ -301,11 +306,13 @@ func probeNodeSpeed(client *http.Client) (int64, bool) {
 			continue
 		}
 		resp, err := client.Do(req)
-		cancel()
-		if err != nil || resp.StatusCode != http.StatusOK {
-			if resp != nil {
-				resp.Body.Close()
-			}
+		if err != nil {
+			cancel()
+			continue
+		}
+		if resp.StatusCode != http.StatusOK {
+			resp.Body.Close()
+			cancel()
 			continue
 		}
 		var downloaded int64
@@ -330,6 +337,7 @@ func probeNodeSpeed(client *http.Client) (int64, bool) {
 			}
 		}
 		resp.Body.Close()
+		cancel() // 读完才能取消: 提前 cancel 会让上面的 Read 恒报错, 测速恒为 0 并被误判断流
 		elapsed := time.Since(t0).Seconds()
 		if elapsed < 0.001 {
 			elapsed = 0.001

@@ -38,6 +38,9 @@ type nodeView struct {
 	UpBytes     int64 `json:"upBytes,omitempty"`
 	DownBytes   int64 `json:"downBytes,omitempty"`
 	Blacklisted bool  `json:"blacklisted,omitempty"` // 人工拉黑中
+	// DuplicateOf 同出口折叠(P2): 非空 = 该节点与 DuplicateOf 指向的节点
+	// 落在同一出口 IP, 且后者实测更快 —— 选路会跳过本节点。
+	DuplicateOf string `json:"duplicateOf,omitempty"`
 }
 
 // healthOf 节点最近一次连通检测结果
@@ -124,6 +127,9 @@ func withHealthResult(v nodeView, key string) nodeView {
 		v.DownBytes = tc.down.Load()
 	}
 	v.Blacklisted = nodeManuallyBlacklisted(key)
+	if best, dup := exitFoldDupOf[key]; dup {
+		v.DuplicateOf = best
+	}
 	v.Region = nodeExitRegion(key)
 	return v
 }

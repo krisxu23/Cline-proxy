@@ -236,7 +236,16 @@ func nodeUsable(p string) bool {
 	if !isNodeLink(p) {
 		return true
 	}
-	return healthOf(nodeLocalKey(p)) != "fail"
+	key := nodeLocalKey(p)
+	if healthOf(key) == "fail" {
+		return false
+	}
+	// 出口级去重(P2): 同出口 IP 的折叠副本不参与选路(主力仍健康时);
+	// 主力劣化后下一轮折叠会重新选举, 本节点自动转正。
+	if nodeFoldedDuplicate(key) {
+		return false
+	}
+	return true
 }
 
 // lastZenProxyIdx 最近一次选择的代理索引(日志用)

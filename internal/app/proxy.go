@@ -1357,7 +1357,14 @@ func handleStreamResponseWithUsage(w http.ResponseWriter, upstream *http.Respons
 
 			// Try to normalize the response
 			var obj map[string]any
-			if err := json.Unmarshal([]byte(payload), &obj); err == nil {
+			if err := json.Unmarshal([]byte(payload), &obj); err != nil {
+				// 坏行门卫(P2 修复): 不稳定节点/链路会送来被截断的 JSON
+				// (实测: {"choices"0}],...)。原样透传会让客户端直接报
+				// "JSON 解析失败"—— 必须丢弃并记录样本供诊断。
+				log.Printf("  stream: 丢弃无法解析的上游 data 行(%d 字节): %q", len(payload), kit.Truncate(payload, 120))
+				continue
+			}
+			{
 				if onUsage != nil {
 					if u, ok := obj["usage"].(map[string]any); ok && len(u) > 0 {
 						onUsage(u)

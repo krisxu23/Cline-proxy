@@ -95,3 +95,45 @@ func TestBuildNodePartsDropsBadStringLink(t *testing.T) {
 		t.Fatalf("留下的节点 method = %v, 期望 chacha20-ietf-poly1305", got)
 	}
 }
+
+// --- 测速取消时机回归(2026-09-15 审计) ---
+//
+// 旧实现 probeNodeSpeed 在 client.Do 返回后立刻 cancel(), 然后才读响应体。
+// Go 的语义: 请求 ctx 一旦取消, 后续 Body.Read 直接返回 context canceled。
+// 于是下载永远 0 字节 → 两个端点都"失败" → 返回 (0, true) → 每个活节点
+// 都被误判"断流"而记为不健康 —— 正是"网关跑起来了, 检测节点跑不起来/
+// 全部失败"的直接根因。
+//
+// 本用例不依赖真实节点: 起一个本地流式 HTTP 服务, 用裸 client 直接调
+// probeNodeSpeed。旧代码下必然断言失败(0 字节、stalled), 新代码下必须
+// 测到真实吞吐。
+func TestProbeNodeSpeedReadsBodyBeforeCancel(t *testing.T) {
+	const total = 2 << 20 // 2 MiB, 足够大到 Do 返回时体肯定没读完
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		chunk := make([]byte, 64<<10)
+		for sent := 0; sent < total; sent += len(chunk) {
+			if _, err := w.Write(chunk); err != nil {
+				return
+			}
+			if f, ok := w.(http.Flusher); ok {
+				f.Flush()
+			}
+			time.Sleep(5 * time.Millisecond) // 拉开传输时间, 保证 cancel 抢在体完成前
+		}
+	}))
+	defer srv.Close()
+
+	prev := nodeSpeedTestURLs
+	nodeSpeedTestURLs = []string{srv.URL + "/__down"}
+	t.Cleanup(func() { nodeSpeedTestURLs = prev })
+
+	client := &http.Client{Timeout: 30 * time.Second}
+	speed, stalled := probeNodeSpeed(client)
+	if stalled {
+		t.Fatalf("健康链路被判为断流(stalled): speed=%d —— 取消时机回归失败", speed)
+	}
+	if speed <= 0 {
+		t.Fatalf("吞吐应为正数, got %d(stalled=%v)", speed, stalled)
+	}
+}
