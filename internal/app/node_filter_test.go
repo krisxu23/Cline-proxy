@@ -4,6 +4,7 @@ package app
 
 import (
 	"encoding/json"
+	"io"
 	"strings"
 	"testing"
 	"time"
@@ -142,5 +143,62 @@ func TestSynthesizeSSEFromJSONBody(t *testing.T) {
 	// 形态判定
 	if !looksLikeJSONBody(`{"a":1}`) || looksLikeJSONBody("data: {}") || looksLikeJSONBody(": comment") {
 		t.Fatal("形态判定不符合预期")
+	}
+}
+
+func TestIdleAbortReaderAbortsOnStall(t *testing.T) {
+	// 上游只写一次就永久静默: 空闲上限内应正常返回, 超时后应报错并关闭上游
+	pr, pw := io.Pipe()
+	r := newIdleAbortReader(pr, 150*time.Millisecond)
+	defer r.Close()
+
+	go func() {
+		pw.Write([]byte("data: {}\n\n"))
+		// 之后不再写, 模拟上游挂起
+	}()
+
+	buf := make([]byte, 64)
+	n, err := r.Read(buf)
+	if err != nil || n == 0 {
+		t.Fatalf("首次读取应成功: n=%d err=%v", n, err)
+	}
+	start := time.Now()
+	_, err = r.Read(buf) // 上游静默 → 应在空闲上限附近报错
+	if err == nil {
+		t.Fatal("静默超时应返回错误")
+	}
+	if el := time.Since(start); el < 100*time.Millisecond || el > 2*time.Second {
+		t.Fatalf("中断时机异常: %v", el)
+	}
+	pw.Close()
+
+	// 幂等 Close 不应 panic
+	if err := r.Close(); err != nil {
+		t.Fatalf("Close 应幂等: %v", err)
+	}
+}
+
+func TestIdleAbortReaderPassesThroughActiveStream(t *testing.T) {
+	pr, pw := io.Pipe()
+	r := newIdleAbortReader(pr, 2*time.Second)
+	defer r.Close()
+	go func() {
+		for i := 0; i < 3; i++ {
+			pw.Write([]byte("x"))
+			time.Sleep(20 * time.Millisecond)
+		}
+		pw.Close()
+	}()
+	got := 0
+	buf := make([]byte, 8)
+	for {
+		n, err := r.Read(buf)
+		got += n
+		if err != nil {
+			break
+		}
+	}
+	if got != 3 {
+		t.Fatalf("活跃流不应被中断, 读到 %d 字节", got)
 	}
 }

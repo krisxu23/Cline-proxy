@@ -1434,9 +1434,14 @@ func handleStreamResponseWithUsage(w http.ResponseWriter, upstream *http.Respons
 
 	// 流式保活(P1-11): 上游静默超过间隔时注入空 delta 帧, 防止客户端把
 	// "上游排队/推理中"当成挂死。行边界注入, 协议合法, 客户端无需感知。
-	src := io.Reader(upstream.Body)
+	// 上游流空闲保护(P2, 参照 OmniRoute 的流式 idle 机制): 正文阶段挂起时
+	// 主动断开, 由收尾逻辑合成 finish/[DONE], 避免客户端无限等待。
+	idleRC := newIdleAbortReader(upstream.Body, streamIdleTimeout())
+	defer idleRC.Close()
+
+	src := io.Reader(idleRC)
 	if iv := streamHeartbeatInterval(); iv > 0 {
-		src = newHeartbeatReader(upstream.Body, iv, func() []byte { return openAIHeartbeatFrame })
+		src = newHeartbeatReader(idleRC, iv, func() []byte { return openAIHeartbeatFrame })
 	}
 	// 控制字符清洗放在行切分之前(见 controlSanitizingReader 注释)。
 	src = &controlSanitizingReader{src: src}

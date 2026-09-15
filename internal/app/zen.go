@@ -265,6 +265,9 @@ type zenConfigData struct {
 	// StickySessions 粘性会话(P2, Resin 思路): 开启后同一客户端来源 IP 在
 	// TTL(30 分钟)内复用同一出口节点, 服务于"同 IP 连续请求"的上游场景。
 	StickySessions bool `json:"stickySessions,omitempty"`
+	// StreamIdleSecs 上游流空闲上限(秒): 流中途连续无字节超过该值
+	// 即主动断开并收尾(0/缺省 = 90 秒), 防止客户端无限等待。
+	StreamIdleSecs int `json:"streamIdleSecs,omitempty"`
 	// NodeExcludeKeywords 节点名排除关键词(不区分大小写): 订阅节点显示名命中
 	// 任一关键词即不进入出口池(典型: 官网/过期/剩余流量 等信息位节点)。
 	NodeExcludeKeywords []string        `json:"nodeExcludeKeywords,omitempty"`
