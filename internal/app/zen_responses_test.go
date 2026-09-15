@@ -13,6 +13,57 @@ import (
 	"cline-go-proxy/internal/kit"
 )
 
+func TestNormalizeMuseSparkFinish(t *testing.T) {
+	muse := "muse-spark-1.3-contributor-free"
+	// 完成量远小于预算: 上游的 length 是"推理吃预算"的假截断 → 改写 stop
+	if got := normalizeMuseSparkFinish("length", muse, 270, 128000); got != "stop" {
+		t.Fatalf("完成量 270/128000 应改写为 stop, got %q", got)
+	}
+	// 真截断(>= 90% 预算): 保留 length, 客户端需要知道确实没写完
+	if got := normalizeMuseSparkFinish("length", muse, 125000, 128000); got != "length" {
+		t.Fatalf("完成量 125000/128000 应保留 length, got %q", got)
+	}
+	// 90% 边界: 不小于阈值就保留
+	if got := normalizeMuseSparkFinish("length", muse, 900, 1000); got != "length" {
+		t.Fatalf("900/1000 恰好 90%% 不小于阈值, 应保留 length, got %q", got)
+	}
+	// 非 muse 模型不参与归一(它们没有"推理吃预算"的行为)
+	if got := normalizeMuseSparkFinish("length", "mimo-v2.5-free", 5, 100); got != "length" {
+		t.Fatalf("非 muse 模型不应改写, got %q", got)
+	}
+	// 调用方没给预算: 无法判断真假, 不动
+	if got := normalizeMuseSparkFinish("length", muse, 5, 0); got != "length" {
+		t.Fatalf("无预算时不应改写, got %q", got)
+	}
+	// stop / tool_calls 不受影响
+	if got := normalizeMuseSparkFinish("stop", muse, 1, 1000); got != "stop" {
+		t.Fatalf("stop 不应被改写, got %q", got)
+	}
+}
+
+func TestResponsesToChatBodyMuseFakeLength(t *testing.T) {
+	// 端到端: 上游报 incomplete(max_output_tokens) 但完成量远小于预算 → stop
+	resp := map[string]any{
+		"id": "resp_f", "model": "muse-spark-1.3-contributor-free",
+		"output": []any{map[string]any{"type": "message", "content": []any{
+			map[string]any{"type": "output_text", "text": "complete answer"},
+		}}},
+		"incomplete_details": map[string]any{"reason": "max_output_tokens"},
+		"usage":              map[string]any{"input_tokens": 10, "output_tokens": float64(120), "total_tokens": 130},
+	}
+	out := responsesToChatBody(resp, 8000)
+	c0 := out["choices"].([]any)[0].(map[string]any)
+	if c0["finish_reason"] != "stop" {
+		t.Fatalf("完成量 120/8000 应归一为 stop, got %v", c0["finish_reason"])
+	}
+	// 无预算时保持透传
+	out2 := responsesToChatBody(resp)
+	c2 := out2["choices"].([]any)[0].(map[string]any)
+	if c2["finish_reason"] != "length" {
+		t.Fatalf("无预算时应保持 length, got %v", c2["finish_reason"])
+	}
+}
+
 func TestChatBodyToResponsesBody_Basic(t *testing.T) {
 	chat := map[string]any{
 		"model": "muse-spark-1.3-contributor-free",
@@ -37,8 +88,9 @@ func TestChatBodyToResponsesBody_Basic(t *testing.T) {
 	if out["instructions"] != "You are helpful." {
 		t.Fatalf("system 应转为 instructions: %v", out["instructions"])
 	}
-	if out["max_output_tokens"] != 64 {
-		t.Fatalf("max_tokens 应转 max_output_tokens=64, got %v", out["max_output_tokens"])
+	// muse 家族: 预算小于 512 会被抬到地板(推理先吃预算, 太小正文恒空)
+	if out["max_output_tokens"] != museSparkMinOutputTokens {
+		t.Fatalf("muse 模型 max_tokens=64 应抬到地板 %d, got %v", museSparkMinOutputTokens, out["max_output_tokens"])
 	}
 	if out["stream"] != true {
 		t.Fatal("stream=true 应保留")

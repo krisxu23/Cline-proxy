@@ -326,6 +326,10 @@ func callChainUpstream(ctx context.Context, cand routeCandidate, params map[stri
 	case upstreamCline:
 		resp, _, err := callClineAPIFailover(ctx, params, stream)
 		return resp, err
+	case upstreamClinePass:
+		// ClinePass 与 Cline 池是不同上游(独立 key 池与端点), 此前没接进候选链,
+		// 结果是"四类上游只能组合三类"; 补上后订阅模型可以真正参与自动路由。
+		return callClinePassChain(ctx, params, stream)
 	default:
 		p := providerByName(cand.Upstream)
 		if p == nil {

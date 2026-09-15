@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"sort"
 	"strings"
+	"time"
 )
 
 // 统一候选链 —— 把客户端给的模型名解析成一条有序的候选列表, 由调度层逐站尝试。
@@ -243,6 +244,14 @@ func candidateSkip(c routeCandidate) string {
 			return "cline 账号池无可用账号"
 		}
 		return ""
+	case upstreamClinePass:
+		if !clinePassReady() {
+			return "ClinePass 订阅池无可用 key"
+		}
+		if _, ok := clinePassModelByID(c.Model); !ok {
+			return "ClinePass 目录里没有该模型"
+		}
+		return ""
 	default:
 		cfg, ok := providerConfigFor(c.Upstream)
 		if !ok {
@@ -276,6 +285,73 @@ func describeRouteChain(alias string) map[string]any {
 		})
 	}
 	out["hops"] = hops
+	return out
+}
+
+// routeAliasContext 别名的上下文长度: 取候选池里最大的那一个。
+// 客户端(尤其 agent)会按 /v1/models 报的 context 决定何时压缩历史, 报小了会
+// 提前截断; 别名是"哪个站能用就用哪个", 所以按池内上限报才不误导。
+func routeAliasContext(alias string) int {
+	cands, matched, _ := resolveRouteChain(alias)
+	if !matched || len(cands) == 0 {
+		return 0
+	}
+	maxCtx := 0
+	for _, c := range cands {
+		if n := candidateContext(c); n > maxCtx {
+			maxCtx = n
+		}
+	}
+	return maxCtx
+}
+
+// candidateContext 单个候选的上下文长度; 查不到返回 0(调用方按"未知"处理)。
+func candidateContext(c routeCandidate) int {
+	if c.Upstream == upstreamZen {
+		if m, ok := resolveZenModel(c.Model); ok && m.Context > 0 {
+			return m.Context
+		}
+		return 0
+	}
+	if c.Model == clinePoolPlaceholder {
+		return 0 // 占位模型由默认模型决定, 这里无法确定
+	}
+	// cline 池与 ClinePass 共用订阅目录; 通用 provider 走自己的目录。
+	for _, m := range clinePassProvider().ListModels() {
+		if m.ID == c.Model && m.Context > 0 {
+			return m.Context
+		}
+	}
+	if p := providerByName(c.Upstream); p != nil {
+		for _, m := range freeModelsFor(c.Upstream, p) {
+			if m.ID == c.Model && m.ContextLength > 0 {
+				return m.ContextLength
+			}
+		}
+	}
+	return 0
+}
+
+// routeAliasModels 把别名(组合/虚拟模型)渲染成 /v1/models 的条目。
+// 没有这一步, 别名只能靠用户手抄 —— 客户端永远发现不了它。
+func routeAliasModels() []map[string]any {
+	var out []map[string]any
+	now := time.Now().UnixMilli()
+	for _, alias := range routeAliasNames() {
+		entry := map[string]any{
+			"id":       alias,
+			"object":   "model",
+			"created":  now,
+			"owned_by": "combo",
+			"source":   "route-alias",
+			"status":   "active",
+			"cost":     "mixed",
+		}
+		if ctx := routeAliasContext(alias); ctx > 0 {
+			entry["context"] = ctx
+		}
+		out = append(out, entry)
+	}
 	return out
 }
 

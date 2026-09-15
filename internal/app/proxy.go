@@ -232,6 +232,9 @@ func StartProxy(host string, port int) error {
 		}
 		// 合并通用 provider 免费模型
 		data = append(data, providerModelList()...)
+		// 合并路由别名(组合/虚拟模型): 客户端要能"发现"这些模型, 否则别名
+		// 只能靠用户手抄; context 取候选池上限, 避免客户端按偏小值提前压缩。
+		data = append(data, routeAliasModels()...)
 		writeJSON(w, http.StatusOK, map[string]any{"object": "list", "data": data})
 	})
 	mux.HandleFunc("/v1/models", modelsHandler)

@@ -204,13 +204,22 @@ func chatBodyToResponsesBody(chat map[string]any) map[string]any {
 		}
 	}
 	// max_tokens / max_completion_tokens -> max_output_tokens
-	// Responses 端点要求 max_output_tokens >= 16: 推理模型低于 16 的预算
-	// 没有意义, 上游直接 400 invalid_request_error, 这里钳到下限。
+	//
+	// 两道闸门(参照 OmniRoute 的 MUSE_SPARK_MIN_OUTPUT_TOKENS):
+	//   1) 上游硬下限 16: 低于 16 直接 400 invalid_request_error;
+	//   2) muse-spark 家族抬高到 512: 它的隐藏推理会先吃掉预算, 预算太小会让
+	//      正文恒为空(实测 300/800 都出不了正文), 客户端会以为模型坏了。
+	//      只在调用方给了预算且小于 512 时抬高; 没给预算就不合成(与上游默认一致)。
 	for _, key := range []string{"max_tokens", "max_completion_tokens"} {
 		if v, ok := chat[key]; ok {
 			if n := anyToInt(v); n > 0 {
 				if n < 16 {
 					n = 16
+				}
+				if n < museSparkMinOutputTokens {
+					if mid, _ := chat["model"].(string); isMuseSparkModel(mid) {
+						n = museSparkMinOutputTokens
+					}
 				}
 				out["max_output_tokens"] = n
 			}
@@ -307,7 +316,86 @@ func chatBodyToResponsesBody(chat map[string]any) map[string]any {
 // ============ 响应转换: Responses -> OpenAI chat ============
 
 // responsesToChatBody 把非流式 Responses 响应体翻译成 chat completions 响应体。
-func responsesToChatBody(r map[string]any) map[string]any {
+// museSparkMinOutputTokens muse-spark 家族的最小输出预算。
+//
+// 参照 OmniRoute 的 MUSE_SPARK_MIN_OUTPUT_TOKENS=512: 该家族会先把预算烧在
+// 不可见的服务端推理上, 预算太小则可见正文恒为空(我们实测 300 与 800 都是空正文),
+// 客户端会误判成"模型坏了"。只在调用方给了预算且小于该值时抬高。
+const museSparkMinOutputTokens = 512
+
+// isMuseSparkModel 是否 muse-spark 家族(该家族有若干上游特有的行为需要单独处理)。
+func isMuseSparkModel(modelID string) bool {
+	return strings.HasPrefix(strings.TrimSpace(modelID), "muse-spark")
+}
+
+// normalizeMuseSparkFinish 修正 muse-spark 的 finish_reason。
+//
+// 上游只要推理吃掉了一部分预算就报 finish_reason:"length", 哪怕可见回答已经完整
+// (OmniRoute 实测: 128000 预算的请求只产出约 270 tokens 也报 length)。OpenAI 协议
+// 客户端会把 length 当成"被截断" —— Claude Code 会直接以
+// "response exceeded the N output token maximum" 中止一次已经交付完的回答。
+//
+// 规则: 完成量明显小于请求预算(不足 90%)时改写 length → stop; 真正撞到预算上限的
+// 截断保持 length。请求方没给预算(无法判断)时不动。
+func normalizeMuseSparkFinish(finish, modelID string, completion, requestedBudget int) string {
+	if finish != "length" || requestedBudget <= 0 || !isMuseSparkModel(modelID) {
+		return finish
+	}
+	if completion < requestedBudget*9/10 {
+		return "stop"
+	}
+	return finish
+}
+
+// zenRequestedBudget 取客户端请求的输出预算(max_tokens / max_completion_tokens)。
+// 未给预算返回 0 —— muse 的假截断判定在无预算时不生效(无法区分真截断)。
+func zenRequestedBudget(params map[string]any) int {
+	for _, key := range []string{"max_tokens", "max_completion_tokens"} {
+		if v, ok := params[key]; ok {
+			switch n := v.(type) {
+			case float64:
+				if n > 0 {
+					return int(n)
+				}
+			case int:
+				if n > 0 {
+					return n
+				}
+			}
+		}
+	}
+	return 0
+}
+
+// usageFieldInt 从响应体的 usage 对象里取整数字段(兼容 float64 / int 两种解码形态)。
+func usageFieldInt(r map[string]any, keys ...string) (int, bool) {
+	u, ok := r["usage"].(map[string]any)
+	if !ok {
+		return 0, false
+	}
+	for _, k := range keys {
+		if v, exists := u[k]; exists {
+			switch n := v.(type) {
+			case float64:
+				return int(n), true
+			case int:
+				return n, true
+			}
+		}
+	}
+	return 0, false
+}
+
+// modelIDOfResponsesBody 取 Responses 响应体里的模型名。
+func modelIDOfResponsesBody(r map[string]any) string {
+	s, _ := r["model"].(string)
+	return s
+}
+
+// responsesToChatBody 把 Responses 响应体翻译成 chat completions 响应体。
+// 可选参数 requestedBudget 是客户端请求的 max_tokens, 用于判断 finish_reason
+// 是否属于"推理吃掉预算导致的假截断"(见 normalizeMuseSparkFinish)。
+func responsesToChatBody(r map[string]any, requestedBudget ...int) map[string]any {
 	model, _ := r["model"].(string)
 	var text strings.Builder
 	var toolCalls []any
@@ -357,6 +445,13 @@ func responsesToChatBody(r map[string]any) map[string]any {
 			finish = "length"
 		}
 	}
+	// muse-spark 的假截断修正(需要完成量, 所以放在 usage 解析之后)。
+	completion, _ := usageFieldInt(r, "output_tokens", "completion_tokens")
+	budget := 0
+	if len(requestedBudget) > 0 {
+		budget = requestedBudget[0]
+	}
+	finish = normalizeMuseSparkFinish(finish, modelIDOfResponsesBody(r), completion, budget)
 	// tool_calls 优先于 length: 截断前已经产生了完整的函数调用项,
 	// 客户端需要执行它, 报 length 会让客户端丢弃本该执行的工具调用。
 	if len(toolCalls) > 0 {
@@ -393,7 +488,9 @@ func responsesToChatBody(r map[string]any) map[string]any {
 // translateResponsesStreamToChat 把 /responses 的 SSE 事件流实时翻译成
 // chat completions 的 SSE 分块。事件覆盖: 文本增量、函数调用(声明+参数增量)、
 // 完成(usage/finish_reason)、失败。
-func translateResponsesStreamToChat(src io.Reader, dst io.Writer, model string) error {
+// translateResponsesStreamToChat 把 Responses 的 SSE 流逐事件翻译成 chat SSE 流。
+// requestedBudget 用于 muse-spark 的 finish_reason 假截断修正(见 normalizeMuseSparkFinish)。
+func translateResponsesStreamToChat(src io.Reader, dst io.Writer, model string, requestedBudget ...int) error {
 	reader := bufio.NewReaderSize(src, 64*1024)
 	writer := bufio.NewWriter(dst)
 
@@ -502,6 +599,7 @@ func translateResponsesStreamToChat(src io.Reader, dst io.Writer, model string) 
 				finishReason = "length"
 			}
 			usageOut := any(nil)
+			completion := 0
 			if resp, ok := ev["response"].(map[string]any); ok {
 				if u, ok := resp["usage"].(map[string]any); ok {
 					usageOut = map[string]any{
@@ -509,7 +607,17 @@ func translateResponsesStreamToChat(src io.Reader, dst io.Writer, model string) 
 						"completion_tokens": u["output_tokens"],
 						"total_tokens":      u["total_tokens"],
 					}
+					if n, isNum := u["output_tokens"].(float64); isNum {
+						completion = int(n)
+					}
 				}
+			}
+			if evType == "response.incomplete" {
+				budget := 0
+				if len(requestedBudget) > 0 {
+					budget = requestedBudget[0]
+				}
+				finishReason = normalizeMuseSparkFinish(finishReason, model, completion, budget)
 			}
 			final := map[string]any{
 				"choices": []any{map[string]any{
@@ -581,14 +689,20 @@ func synthesizeChatSSEResponse(pipeReader io.Reader) *http.Response {
 }
 
 // convertResponsesResponseToChat 非流式: 读 Responses 响应体, 翻译成 chat JSON 响应。
-func convertResponsesResponseToChat(resp *http.Response, fallbackModel string) (*http.Response, error) {
+// convertResponsesResponseToChat 非流式: 拉全响应体, 翻译回 chat completions 形状。
+// requestedBudget 透传给 finish_reason 归一(见 normalizeMuseSparkFinish)。
+func convertResponsesResponseToChat(resp *http.Response, fallbackModel string, requestedBudget ...int) (*http.Response, error) {
 	raw := kit.ReadBody(resp)
 	resp.Body.Close()
 	var parsed map[string]any
 	if err := json.Unmarshal([]byte(raw), &parsed); err != nil {
 		return nil, fmt.Errorf("decode zen responses body: %w", err)
 	}
-	out, err := json.Marshal(responsesToChatBody(parsed))
+	budget := 0
+	if len(requestedBudget) > 0 {
+		budget = requestedBudget[0]
+	}
+	out, err := json.Marshal(responsesToChatBody(parsed, budget))
 	if err != nil {
 		return nil, fmt.Errorf("marshal converted chat body: %w", err)
 	}
@@ -596,10 +710,12 @@ func convertResponsesResponseToChat(resp *http.Response, fallbackModel string) (
 }
 
 // wrapResponsesStreamToChat 流式: 把 Responses SSE 体翻译成 chat SSE 体。
-func wrapResponsesStreamToChat(resp *http.Response, model string) *http.Response {
+// wrapResponsesStreamToChat 流式: 把 Responses SSE 体翻译成 chat SSE 体。
+// requestedBudget 透传给 finish_reason 归一。
+func wrapResponsesStreamToChat(resp *http.Response, model string, requestedBudget ...int) *http.Response {
 	pr, pw := io.Pipe()
 	go func() {
-		err := translateResponsesStreamToChat(resp.Body, pw, model)
+		err := translateResponsesStreamToChat(resp.Body, pw, model, requestedBudget...)
 		resp.Body.Close()
 		pw.CloseWithError(err)
 	}()
@@ -637,7 +753,7 @@ func zenReasoningEffortOf(params map[string]any) string {
 // 同一会话身份向 /responses 发一次等价请求。成功 -> 登记该模型为 Responses
 // 专用(持久化)并返回合成好的 chat 形态响应; 失败 -> 返回 nil, 调用方继续
 // 原有的换出口重试流程。
-func tryZenResponsesFallback(ctx context.Context, base string, respBody map[string]any, stream bool, client *http.Client) *http.Response {
+func tryZenResponsesFallback(ctx context.Context, base string, respBody map[string]any, stream bool, client *http.Client, requestedBudget int) *http.Response {
 	modelID, _ := respBody["model"].(string)
 	if modelID == "" || zenChatOnlyKnown(modelID) {
 		return nil
@@ -677,9 +793,9 @@ func tryZenResponsesFallback(ctx context.Context, base string, respBody map[stri
 	log.Printf("  zen: model %s 只在 /responses 端点提供服务, 已自动切换并登记", modelID)
 	zenLearnResponsesOnly(modelID)
 	if stream {
-		return wrapResponsesStreamToChat(resp, modelID)
+		return wrapResponsesStreamToChat(resp, modelID, requestedBudget)
 	}
-	conv, err := convertResponsesResponseToChat(resp, modelID)
+	conv, err := convertResponsesResponseToChat(resp, modelID, requestedBudget)
 	if err != nil {
 		log.Printf("  zen: model %s /responses 响应转换失败: %v", modelID, err)
 		return nil

@@ -611,6 +611,8 @@ func callZenAPI(ctx context.Context, params map[string]any, stream bool) (*http.
 	// reasoning_effort 会被 buildZenBody 删除(chat 端点上上游不接受), 这里
 	// 先留存, 供 Responses 形态使用。
 	reasoningEffort := zenReasoningEffortOf(params)
+	// 客户端请求的输出预算: muse-spark 的 finish_reason 假截断判定需要它。
+	zenBudget := zenRequestedBudget(params)
 	if useRespAPI {
 		body = chatBodyToResponsesBody(body)
 		applyResponsesReasoning(body, reasoningEffort)
@@ -711,9 +713,9 @@ func callZenAPI(ctx context.Context, params map[string]any, stream bool) (*http.
 			recordZenModelResult(zenModelIDOf(params), false)
 			if useRespAPI {
 				if stream {
-					resp = wrapResponsesStreamToChat(resp, zenResolvedModel)
+					resp = wrapResponsesStreamToChat(resp, zenResolvedModel, zenBudget)
 				} else {
-					converted, cerr := convertResponsesResponseToChat(resp, zenResolvedModel)
+					converted, cerr := convertResponsesResponseToChat(resp, zenResolvedModel, zenBudget)
 					if cerr != nil {
 						return nil, rateLimited, fmt.Errorf("zen responses convert: %w", cerr)
 					}
@@ -776,7 +778,7 @@ func callZenAPI(ctx context.Context, params map[string]any, stream bool) (*http.
 				respTried = true
 				altBody := chatBodyToResponsesBody(body)
 				applyResponsesReasoning(altBody, reasoningEffort)
-				if alt := tryZenResponsesFallback(ctx, base, altBody, stream, client); alt != nil {
+				if alt := tryZenResponsesFallback(ctx, base, altBody, stream, client, zenBudget); alt != nil {
 					markZenSuccess()
 					recordZenModelResult(zenModelIDOf(params), false)
 					return alt, rateLimited, nil

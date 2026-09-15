@@ -1,8 +1,11 @@
 package app
 
 import (
+	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
 	"strings"
@@ -15,6 +18,94 @@ import (
 // ClinePass key pool. The upstream speaks OpenAI chat format, so the
 // existing stream converters (Anthropic events, Responses events) are
 // reused directly over the raw upstream response.
+
+// callClinePassChain 把 ClinePass provider 包成候选链要的 *http.Response 形态。
+//
+// 非流式: 上游 JSON 直接合成响应。
+// 流式: 用管道转发 provider 写出的 SSE, 但**先等首字节**再返回 —— 这样"首字节
+// 之前失败仍可换站"的 failover 语义与 zen/cline 一致(拿到 200+首包后才算命中)。
+func callClinePassChain(ctx context.Context, params map[string]any, stream bool) (*http.Response, error) {
+	cp := clinePassProvider()
+	if cp == nil {
+		return nil, fmt.Errorf("clinepass provider is not initialised")
+	}
+	model, _ := params["model"].(string)
+	req := paramsToChatRequest(params, model, stream)
+
+	if !stream {
+		resp, err := cp.Chat(ctx, req)
+		if err != nil {
+			return nil, err
+		}
+		raw, err := json.Marshal(resp.Body)
+		if err != nil {
+			return nil, fmt.Errorf("clinepass: encode response: %w", err)
+		}
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     http.Header{"Content-Type": []string{"application/json"}},
+			Body:       io.NopCloser(bytes.NewReader(raw)),
+		}, nil
+	}
+
+	pr, pw := io.Pipe()
+	errCh := make(chan error, 1)
+	go func() {
+		err := cp.ChatStream(ctx, req, pw, nil)
+		_ = pw.CloseWithError(err)
+		errCh <- err
+	}()
+
+	// 首字节门: 拿到第一段数据前失败 → 返回错误让链路换下一站。
+	buf := make([]byte, 4096)
+	n, err := pr.Read(buf)
+	if n == 0 {
+		select {
+		case e := <-errCh:
+			if e != nil {
+				return nil, e
+			}
+		default:
+		}
+		if err != nil {
+			return nil, fmt.Errorf("clinepass stream: %w", err)
+		}
+	}
+	return &http.Response{
+		StatusCode: http.StatusOK,
+		Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+		Body:       io.NopCloser(io.MultiReader(bytes.NewReader(buf[:n]), pr)),
+	}, nil
+}
+
+// clinePassReady ClinePass 订阅池是否至少有一个可用 key(active)。
+// 候选链用它判断"ClinePass 这一站现在能不能打", 全部冷却时直接跳过而不是白撞一次。
+func clinePassReady() bool {
+	cp := clinePassProvider()
+	if cp == nil {
+		return false
+	}
+	for _, st := range cp.KeyStatuses() {
+		if s, _ := st["status"].(string); s == "active" {
+			return true
+		}
+	}
+	return false
+}
+
+// clinePassModelByID 在 ClinePass 订阅目录里查模型(候选链校验/上下文长度用)。
+func clinePassModelByID(id string) (providers.ModelInfo, bool) {
+	cp := clinePassProvider()
+	if cp == nil {
+		return providers.ModelInfo{}, false
+	}
+	for _, m := range cp.ListModels() {
+		if m.ID == id {
+			return m, true
+		}
+	}
+	return providers.ModelInfo{}, false
+}
 
 func clinePassProvider() *providers.ClinePassProvider {
 	return getGateway().ClinePass

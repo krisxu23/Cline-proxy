@@ -451,7 +451,7 @@ func maybeCompact(ctx context.Context, params map[string]any, m *ZenModel, sessi
 			"content": "[Previous Conversation Summary]\n" + st.summary,
 		})
 	}
-	newMsgs = append(newMsgs, messages[sel.split:]...)
+	newMsgs = append(newMsgs, fixToolPairs(messages[sel.split:])...)
 
 	updateCompactState(sessionID, summary, strings.Join(sel.recent, "\n\n"))
 	params["messages"] = newMsgs
@@ -459,6 +459,121 @@ func maybeCompact(ctx context.Context, params map[string]any, m *ZenModel, sessi
 		changed:       true,
 		note:          fmt.Sprintf("[compacted via summary] summary_model=%s kept=%d msgs", summaryModel, len(messages)-sel.split),
 		compactTokens: estimateText(prompt) + estimateText(summary),
+	}
+}
+
+// fixToolPairs 修复压缩/截断后断裂的 tool 调用配对。
+//
+// OpenAI 协议的硬性要求: role=tool 的消息必须是"对前一条 assistant 的 tool_calls
+// 中某个 id 的回复"; 反过来, assistant 发起的每个 tool_call 也必须收到 tool 回复。
+// 按 split 切片重组很容易把配对砍断(assistant 留下了、tool 回复被切掉, 或反之),
+// 上游会直接 400 —— 这不是理论风险, 是压缩功能最常见的线上错误。
+//
+// 修复策略(两步, 均为确定性处理, 参照 OmniRoute contextManager 的 fixToolPairs):
+//  1. 丢弃"孤儿 tool 结果": tool_call_id 没有任何 assistant 声明过的 tool 消息;
+//  2. 修剪 assistant 的 tool_calls: 只保留收到了回复的那些; 若修完后该 assistant
+//     既没有 tool_calls 也没有非空 content(它唯一的价值就是那次调用), 整条丢弃。
+func fixToolPairs(msgs []any) []any {
+	if len(msgs) == 0 {
+		return msgs
+	}
+	// 第一遍: 收集所有 assistant 声明的 tool_call_id。
+	declared := map[string]bool{}
+	for _, mi := range msgs {
+		m, ok := mi.(map[string]any)
+		if !ok || strField(m, "role") != "assistant" {
+			continue
+		}
+		for _, id := range assistantToolCallIDs(m) {
+			declared[id] = true
+		}
+	}
+
+	// 第二遍: 丢孤儿 tool 结果, 记下存活的回复 id。
+	answered := map[string]bool{}
+	kept := make([]any, 0, len(msgs))
+	for _, mi := range msgs {
+		m, ok := mi.(map[string]any)
+		if !ok {
+			kept = append(kept, mi)
+			continue
+		}
+		if strField(m, "role") == "tool" {
+			id, _ := m["tool_call_id"].(string)
+			if !declared[id] {
+				continue // 孤儿: 对应的 assistant 已被切掉
+			}
+			answered[id] = true
+		}
+		kept = append(kept, m)
+	}
+
+	// 第三遍: 修剪 assistant 的未回复 tool_calls; 空壳 assistant 整条丢弃。
+	out := make([]any, 0, len(kept))
+	for _, mi := range kept {
+		m, ok := mi.(map[string]any)
+		if !ok || strField(m, "role") != "assistant" {
+			out = append(out, mi)
+			continue
+		}
+		tcs, _ := m["tool_calls"].([]any)
+		if len(tcs) == 0 {
+			out = append(out, m)
+			continue
+		}
+		live := make([]any, 0, len(tcs))
+		for _, tc := range tcs {
+			tcm, ok := tc.(map[string]any)
+			if !ok {
+				continue
+			}
+			id, _ := tcm["id"].(string)
+			if answered[id] {
+				live = append(live, tc)
+			}
+		}
+		if len(live) == len(tcs) {
+			out = append(out, m) // 配对完整, 原样保留
+			continue
+		}
+		if len(live) == 0 && contentEmpty(m) {
+			continue // 纯调用壳, 调用全没回复 → 整条没有意义
+		}
+		if len(live) > 0 {
+			m["tool_calls"] = live
+		} else {
+			delete(m, "tool_calls")
+		}
+		out = append(out, m)
+	}
+	return out
+}
+
+// assistantToolCallIDs 取 assistant 消息里全部 tool_call 的 id。
+func assistantToolCallIDs(m map[string]any) []string {
+	tcs, _ := m["tool_calls"].([]any)
+	ids := make([]string, 0, len(tcs))
+	for _, tc := range tcs {
+		if tcm, ok := tc.(map[string]any); ok {
+			if id, _ := tcm["id"].(string); id != "" {
+				ids = append(ids, id)
+			}
+		}
+	}
+	return ids
+}
+
+// contentEmpty assistant 是否没有可见内容(只有空串/数组)。
+func contentEmpty(m map[string]any) bool {
+	switch c := m["content"].(type) {
+	case nil:
+		return true
+	case string:
+		return strings.TrimSpace(c) == ""
+	case []any:
+		return len(c) == 0
+	default:
+		return false
 	}
 }
 
@@ -535,6 +650,8 @@ func fallbackTruncate(params map[string]any, m *ZenModel) compactOutcome {
 	for _, k := range kept {
 		out = append(out, k.msg)
 	}
+	// 截断同样会砍断 tool 配对(keep 是按预算挑的, 不是按配对挑的), 统一修复。
+	out = append(out[:1], fixToolPairs(out[1:])...)
 	params["messages"] = out
 	return compactOutcome{changed: true, note: "[compacted via truncation]"}
 }
