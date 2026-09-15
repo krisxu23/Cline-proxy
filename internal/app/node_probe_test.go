@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
 )
 
 // 本文件锁定 2026-09-13 一次线上事故的三条根因(证据见 cline-proxy.log 15:22:04):
