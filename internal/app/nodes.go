@@ -139,7 +139,15 @@ func nodeBoxSkipRequested() bool {
 // (startNodeInstance 内含 freeLocalPort / box.New)与 Start 都是可达秒级的 I/O,
 // 全部挪到锁外执行, 持锁期间不再阻塞任何读节点 / 取出口的请求。
 // 失败路径一律不改全局状态, 旧实例继续服务(§4 已确认 failKeepOld 性质不变)。
+// nodeBuildMu 重建互斥(P2 修复): syncNodeBox 的构建/启动阶段在 nodeMu 之外,
+// 两次并发 sync(订阅刷新 vs 面板操作)会同时 buildNodeParts 并复用同一批
+// 稳定端口 → 后启动的实例 bind 冲突。整个 sync 串行化, 该 bug 实测为
+// "节点全部 0 可用"事故的直接原因之一。
+var nodeBuildMu sync.Mutex
+
 func syncNodeBox() {
+	nodeBuildMu.Lock()
+	defer nodeBuildMu.Unlock()
 	// 普通测试进程: 跳过真实 sing-box 实例化(sing-box 后台 goroutine 自身有竞争, 见 nodeBoxSkipEnv)。
 	// 但若测试注入了 startNodeInstanceFn, 说明要走注入的错误/替身路径, 此时仍需放行(注入点不会真正实例化 sing-box)。
 	if nodeBoxSkipRequested() && !startNodeInstanceInjected {
@@ -169,6 +177,18 @@ func syncNodeBox() {
 	entries = append(entries, subNodes...)
 	subMu.Unlock()
 
+	// 空入口守卫(P2 修复): 手动节点与订阅节点都解析为空、但配置里来源仍在
+	// 时, 多半是订阅刷新的中间态(缓存清空/抓取中)。此时若照常重建, 会用
+	// 0 出口实例顶掉正在服务的实例 —— 探测循环因"没有可检测的出口"跳过,
+	// 面板全部 0 可用(实测事故)。仅当来源配置本身为空(用户真的清空了)
+	// 才允许 0 出口实例。
+	if len(entries) == 0 && len(cfg.Proxies) == 0 && len(cfg.Subs) == 0 {
+		// 来源确实为空: 允许 0 出口(用户主动清空)
+	} else if len(entries) == 0 {
+		log.Printf("  nodes: 节点来源仍在但解析结果为空(疑似订阅刷新中间态), 保留当前实例不重建")
+		nodeMu.Unlock()
+		return
+	}
 	var keys []string
 	for _, e := range entries {
 		if k := subEntryKey(e); k != "" {
@@ -250,7 +270,18 @@ func syncNodeBox() {
 	}
 	if err := instance.Start(); err != nil {
 		instance.Close()
+		// 自愈(P2 修复): Start 失败说明这批端口里有被占的(半启动实例/其它
+		// 进程), 把本次使用的稳定端口记录全部清除 —— 下次重建重新分配,
+		// 避免反复撞同一批坏端口(实测事故: 同一端口连续失败数小时)。
+		purgeStablePorts(ports)
 		failKeepOld(fmt.Errorf("启动失败: %v", err))
+		// 当前没有可用实例时, 30 秒后自动重试一次(给订阅刷新/端口释放留时间)
+		if len(prevPorts) == 0 && len(entries) > 0 {
+			go func() {
+				time.Sleep(30 * time.Second)
+				syncNodeBox()
+			}()
+		}
 		return
 	}
 

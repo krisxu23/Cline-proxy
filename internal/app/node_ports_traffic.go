@@ -76,6 +76,27 @@ func assignStablePort(key string) (int, bool, error) {
 	return p, false, nil
 }
 
+// purgeStablePorts 清除一批节点的稳定端口记录(Start 失败自愈: 这些端口
+// 可能被半启动实例或其它进程占用, 下次重建应重新分配而不是复用)。
+func purgeStablePorts(ports map[string]int) {
+	if len(ports) == 0 {
+		return
+	}
+	loadNodeStablePorts()
+	nodeStableMu.Lock()
+	defer nodeStableMu.Unlock()
+	bad := map[int]bool{}
+	for _, p := range ports {
+		bad[p] = true
+	}
+	for k, p := range nodeStablePorts {
+		if bad[p] {
+			delete(nodeStablePorts, k)
+		}
+	}
+	persistNodeStablePorts()
+}
+
 // tcpPortFree 探测本地端口是否可用(尝试监听后立即释放)。
 func tcpPortFree(port int) bool {
 	l, err := net.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", port))
