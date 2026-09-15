@@ -1,0 +1,22 @@
+本仓库包含对以下开源项目**机制与算法**的移植（Go 重写，非逐行复制）：
+
+1) OmniRoute — https://github.com/diegosouzapw/OmniRoute
+   License: MIT
+   Copyright (c) OmniRoute contributors
+   移植的机制（对应上游 TypeScript 实现 → 本仓库 Go 实现）：
+     - 请求日志/决策轨迹（上游 RequestLoggerV2 / decisionTrace）
+     - 错误规则表（上游 errorConfig / providerErrorRules）
+     - 出站体形态校验与协议翻译注册表（上游 translator 层）
+     - 配置 schemaVersion 迁移纪律（上游 db/migrations 纪律）
+     - 健康总览 {state,score,signals,issues}（上游 ProviderHealthAutopilotCard）
+     - SSE 数据清洗与「非 SSE 上游响应流式化」
+       （上游 open-sse/utils/jsonToSse.ts、src/lib/sseTextTransform.ts）
+       本仓库对应：internal/app/json_to_sse.go、internal/app/proxy.go 的
+       controlSanitizingReader 与合成/NDJSON 分支
+
+2) easy_proxies / Resin / mihomo / glider / Sub-Store —— 仅借鉴公开文档描述的
+   设计思路（前两者仓库无 LICENSE，未复制任何代码），对应 internal/app/exit_select.go、
+   exit_fold.go、node_ports_traffic.go、logrotate.go。
+
+MIT License 全文见 https://opensource.org/licenses/MIT
+在本项目分发时，上述 MIT 部分的版权声明与许可文本随本 NOTICE 一并保留。

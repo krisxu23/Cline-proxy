@@ -1,6 +1,9 @@
 
 ## 致谢
 
+- [diegosouzapw/OmniRoute](https://github.com/diegosouzapw/OmniRoute)（MIT）—— 本项目的路由/日志/错误规则/协议翻译/SSE 数据处理多处机制以其为参照并做了 Go 侧移植；MIT 版权声明见仓库根目录 `NOTICE`
+
+
 出口选路、节点池与订阅处理的设计参考了以下优秀项目（思路借鉴，代码均为原创实现）：
 
 - [jasonwong1991/easy_proxies](https://github.com/jasonwong1991/easy_proxies) —— sing-box 节点池管理（健康检查/黑名单/GeoIP 路由/订阅热重载）

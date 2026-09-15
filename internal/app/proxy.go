@@ -871,6 +871,127 @@ func setRouteHeader(w http.ResponseWriter, upstream, model, failover string) {
 	w.Header().Set("X-Proxy-Route", v)
 }
 
+// controlSanitizingReader / sanitizeJSONControlChars 说明(方案参照 OmniRoute
+// 的 SSE 数据清洗思路, MIT; Go 侧实现):
+//
+// JSON 对裸控制字符的宽容度是**分位置**的 —— 字符串外部: \t \n \r 是合法
+// 空白; 字符串内部: 所有 < 0x20 的字符(含 TAB)都非法。实测上游(C2PA 图片
+// 元数据)会在字符串里塞裸控制字符, 既让解析失败, 又会被行切分当成换行把一条
+// JSON 劈成多行, 后半段没有 "data:" 前缀遂走"原样透传"直达客户端, 客户端报
+// "Bad control character in string literal"。因此在**行切分之前**按位置清洗。
+// 必须跟踪字符串状态, 否则会把字符串内的 TAB 漏掉(实测回归)。
+
+// controlSanitizingReader 在读取层做位置感知的控制字符清洗。
+// 状态跨 Read 调用保持(中继为单读者串行使用, 无需加锁)。
+type controlSanitizingReader struct {
+	src      io.Reader
+	inString bool
+	escaped  bool
+}
+
+func (r *controlSanitizingReader) Read(p []byte) (int, error) {
+	n, err := r.src.Read(p)
+	for i := 0; i < n; i++ {
+		c := p[i]
+		if r.inString {
+			if r.escaped {
+				r.escaped = false
+				continue
+			}
+			switch c {
+			case '\\':
+				r.escaped = true
+			case '"':
+				r.inString = false
+			default:
+				if c < 0x20 {
+					p[i] = ' '
+				}
+			}
+			continue
+		}
+		if c == '"' {
+			r.inString = true
+			continue
+		}
+		if c < 0x20 && c != '\t' && c != '\n' && c != '\r' {
+			p[i] = ' '
+		}
+	}
+	return n, err
+}
+
+// sanitizeJSONControlChars 同上, 作用于已切好的一段文本(兜底路径)。
+func sanitizeJSONControlChars(b []byte) ([]byte, bool) {
+	inStr, esc, dirty := false, false, false
+	for _, c := range b {
+		if inStr {
+			if esc {
+				esc = false
+				continue
+			}
+			switch c {
+			case '\\':
+				esc = true
+			case '"':
+				inStr = false
+			default:
+				if c < 0x20 {
+					dirty = true
+				}
+			}
+			continue
+		}
+		if c == '"' {
+			inStr = true
+			continue
+		}
+		if c < 0x20 && c != '\t' && c != '\n' && c != '\r' {
+			dirty = true
+		}
+	}
+	if !dirty {
+		return b, false
+	}
+	out := make([]byte, len(b))
+	inStr, esc = false, false
+	for i, c := range b {
+		if inStr {
+			if esc {
+				out[i] = c
+				esc = false
+				continue
+			}
+			switch c {
+			case '\\':
+				out[i] = c
+				esc = true
+			case '"':
+				out[i] = c
+				inStr = false
+			default:
+				if c < 0x20 {
+					out[i] = ' '
+				} else {
+					out[i] = c
+				}
+			}
+			continue
+		}
+		if c == '"' {
+			out[i] = c
+			inStr = true
+			continue
+		}
+		if c < 0x20 && c != '\t' && c != '\n' && c != '\r' {
+			out[i] = ' '
+			continue
+		}
+		out[i] = c
+	}
+	return out, true
+}
+
 func writeJSON(w http.ResponseWriter, status int, data any) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
@@ -1317,8 +1438,84 @@ func handleStreamResponseWithUsage(w http.ResponseWriter, upstream *http.Respons
 	if iv := streamHeartbeatInterval(); iv > 0 {
 		src = newHeartbeatReader(upstream.Body, iv, func() []byte { return openAIHeartbeatFrame })
 	}
+	// 控制字符清洗放在行切分之前(见 controlSanitizingReader 注释)。
+	src = &controlSanitizingReader{src: src}
 
 	reader := bufio.NewReader(src)
+
+	// 形态判定(P2, 参照 OmniRoute open-sse/utils/jsonToSse.ts):
+	// 上游可能忽略 stream:true 直接回完整 JSON, 或按 NDJSON 逐行回 JSON。
+	// 这两类都不是 SSE —— 原样透传会让客户端报 "JSON parsing failed"。
+	// 首行探测: 非 data:/event:/注释 且以 { [ 开头 → 走合成路径。
+	if firstLine, ferr := reader.ReadString('\n'); looksLikeJSONBody(firstLine) {
+		if json.Valid([]byte(strings.TrimSpace(firstLine))) {
+			// NDJSON 模式: 逐行转 data: 帧
+			log.Printf("%s", sseSynthesisLog("NDJSON", len(firstLine)))
+			if frame, ok := ndjsonLineToSSE(firstLine); ok {
+				w.Write(frame)
+			}
+			for {
+				line, lerr := reader.ReadString('\n')
+				if t := strings.TrimSpace(line); t != "" {
+					if frame, ok := ndjsonLineToSSE(t); ok {
+						w.Write(frame)
+					} else if t == "[DONE]" {
+						w.Write([]byte("data: [DONE]\n\n"))
+					}
+				}
+				if lerr != nil {
+					break
+				}
+			}
+			if b, mErr := json.Marshal(protocol.EmptyOpenAIChunk("").Payload); mErr == nil {
+				w.Write([]byte("data: " + string(b) + "\n\n"))
+			}
+			w.Write([]byte("data: [DONE]\n\n"))
+			flusher.Flush()
+			return
+		}
+		// 多行 JSON body: 缓冲全部后解析合成
+		rest, _ := io.ReadAll(io.LimitReader(reader, jsonBodyMaxBytes))
+		body := append([]byte(firstLine), rest...)
+		if sse, ok := synthesizeOpenAISSEFromJSON(body); ok {
+			log.Printf("%s", sseSynthesisLog("完整 JSON body", len(body)))
+			w.Write(sse)
+			flusher.Flush()
+			if onUsage != nil {
+				var parsed map[string]any
+				if json.Unmarshal(body, &parsed) == nil {
+					if u, ok := parsed["usage"].(map[string]any); ok && len(u) > 0 {
+						onUsage(u)
+					}
+				}
+			}
+			return
+		}
+		// 合不成: 退回原逻辑(把首行放回处理)
+		if _, ok := ndjsonLineToSSE(firstLine); !ok {
+			log.Printf("  stream: 上游返回无法识别的非 SSE 数据(%d 字节首行), 按原样透传", len(firstLine))
+		}
+	} else if ferr == nil {
+		// 首行是正常 SSE: 先处理它, 再进入主循环
+		if frame := firstLine; strings.TrimSpace(frame) != "" {
+			// 复用主循环逻辑: 写入 reader 前部不可行, 这里直接解析一次
+			line := strings.TrimRight(frame, "\r\n")
+			if strings.HasPrefix(line, "data:") {
+				payload := strings.TrimSpace(line[5:])
+				if payload != "" && payload != "[DONE]" {
+					var obj map[string]any
+					if json.Unmarshal([]byte(payload), &obj) == nil {
+						w.Write([]byte("data: " + payload + "\n\n"))
+						flusher.Flush()
+					}
+				} else if payload == "[DONE]" {
+					w.Write([]byte("data: [DONE]\n\n"))
+					flusher.Flush()
+				}
+			}
+		}
+	}
+
 	sawFinish := false // 上游是否已发过 finish_reason
 	sawDone := false   // 上游是否已发过 [DONE]
 	lastModel := ""    // 用于兜底 chunk 的 model 字段
@@ -1358,11 +1555,22 @@ func handleStreamResponseWithUsage(w http.ResponseWriter, upstream *http.Respons
 			// Try to normalize the response
 			var obj map[string]any
 			if err := json.Unmarshal([]byte(payload), &obj); err != nil {
-				// 坏行门卫(P2 修复): 不稳定节点/链路会送来被截断的 JSON
-				// (实测: {"choices"0}],...)。原样透传会让客户端直接报
-				// "JSON 解析失败"—— 必须丢弃并记录样本供诊断。
-				log.Printf("  stream: 丢弃无法解析的上游 data 行(%d 字节): %q", len(payload), kit.Truncate(payload, 120))
-				continue
+				// 坏行门卫(P2 修复): 上游会送来两类脏 JSON ——
+				//   1) 被截断/交错的行(实测 {"choices"0}],...);
+				//   2) 字符串里夹裸控制字符的行(实测 _manifest/C2PA 图片元数据,
+				//      报 "Bad control character in string literal")。
+				// 先尝试清洗控制字符后重试(能救回来就不丢内容), 仍失败才丢弃。
+				if fixed, ok := sanitizeJSONControlChars([]byte(payload)); ok {
+					if err := json.Unmarshal(fixed, &obj); err == nil {
+						log.Printf("  stream: 上游 data 行含非法控制字符, 已清洗救回(%d 字节)", len(payload))
+					} else {
+						log.Printf("  stream: 丢弃无法解析的上游 data 行(%d 字节): %q", len(payload), kit.Truncate(payload, 120))
+						continue
+					}
+				} else {
+					log.Printf("  stream: 丢弃无法解析的上游 data 行(%d 字节): %q", len(payload), kit.Truncate(payload, 120))
+					continue
+				}
 			}
 			{
 				if onUsage != nil {
