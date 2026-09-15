@@ -234,6 +234,8 @@ type zenCompactConfig struct {
 }
 
 type zenConfigData struct {
+	// SchemaVersion 配置结构版本, 由 migrateZenConfig 链式升级(见 config_migrate.go)。
+	SchemaVersion   int                       `json:"schemaVersion,omitempty"`
 	Enabled         bool                      `json:"enabled"`
 	Key             string                    `json:"key"`
 	BaseURL         string                    `json:"baseURL"`                  // 主端点(兼容旧配置字段)
@@ -484,7 +486,25 @@ func loadZenConfig() *zenConfigData {
 	for name, pc := range cfg.Providers {
 		cfg.Providers[name] = normalizeProviderConfig(pc)
 	}
+	// schema 迁移链(P1-14): 载入即升级到当前版本; 发生实际变更时落盘一次,
+	// 避免每次启动都重复迁移。
+	if migrateZenConfig(cfg) {
+		if err := kit.WriteFileAtomicDefault(path, mustJSONIndent(cfg)); err != nil {
+			log.Printf("zen config: 迁移结果落盘失败(下次启动会重试): %v", err)
+		} else {
+			log.Printf("zen config: schema 已迁移并落盘 (v%d)", cfg.SchemaVersion)
+		}
+	}
 	return cfg
+}
+
+// mustJSONIndent 缩进序列化; 失败返回 nil(调用方需判空)。
+func mustJSONIndent(v any) []byte {
+	b, err := json.MarshalIndent(v, "", "  ")
+	if err != nil {
+		return nil
+	}
+	return b
 }
 
 func saveZenConfig() {

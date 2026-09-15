@@ -67,6 +67,8 @@ func registerAdminRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("/admin/api/accounts/export", adminAuth(handleAccountsExport))
 	mux.HandleFunc("/admin/api/logs", adminAuth(handleRequestLogs))
 	mux.HandleFunc("/admin/api/logs/trace", adminAuth(handleLogTrace))
+	mux.HandleFunc("/admin/api/config/export", adminAuth(handleConfigExport))
+	mux.HandleFunc("/admin/api/config/import", adminAuth(handleConfigImport))
 	mux.HandleFunc("/admin/api/keys", adminAuth(handleAdminGetKeys))
 	mux.HandleFunc("/admin/api/keys/generate", adminAuth(handleAdminGenerateKey))
 	mux.HandleFunc("/admin/api/keys/delete", adminAuth(handleAdminDeleteKey))
@@ -1405,4 +1407,104 @@ func handleLogTrace(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeAPI(w, http.StatusOK, apiResponse{Success: true, Data: map[string]any{"trace": d}})
+}
+
+// ============ 配置整体导出 / 导入 (P2-25) ============
+
+// configBackupFiles 参与整体备份的配置文件(白名单: 不含日志/统计/缓存/令牌)。
+// 注意其中两个含敏感凭据(refreshToken / API key), 导出文件务必妥善保管。
+var configBackupFiles = []string{
+	".zen-config.json",     // zen/上游/路由/压缩等主配置
+	".proxy-config.json",   // 代理监听与网关 key
+	".cline-accounts.json", // cline 账号池(含 refreshToken, 敏感)
+	".clinepass-keys.json", // clinepass key 池(敏感)
+	"node-regions.json",    // 出口地区探测缓存
+}
+
+// configBackupAllowed 文件名是否在备份白名单内(导入侧防路径穿越)。
+func configBackupAllowed(name string) bool {
+	for _, f := range configBackupFiles {
+		if name == f {
+			return true
+		}
+	}
+	return false
+}
+
+// handleConfigExport GET /admin/api/config/export
+// 把全部配置文件打包成一个 JSON(信封带 kind/version/exportedAt), 供换机/备份。
+func handleConfigExport(w http.ResponseWriter, r *http.Request) {
+	if r.Method != "GET" {
+		writeAPI(w, http.StatusMethodNotAllowed, apiResponse{Error: "method not allowed"})
+		return
+	}
+	files := map[string]string{}
+	for _, name := range configBackupFiles {
+		if b, err := os.ReadFile(kit.ResolveDataPath(name)); err == nil && len(b) > 0 {
+			files[name] = string(b)
+		}
+	}
+	writeAPI(w, http.StatusOK, apiResponse{Success: true, Data: map[string]any{
+		"kind":       "cline-proxy-config-backup",
+		"version":    1,
+		"exportedAt": time.Now().Format(time.RFC3339),
+		"files":      files,
+	}})
+}
+
+// handleConfigImport POST /admin/api/config/import
+// body: {"files": {".zen-config.json": "<内容>", ...}}
+//
+// 安全与可靠性: 文件名必须命中白名单(防路径穿越); 内容必须是合法 JSON;
+// 覆盖前把现有文件备份为 <name>.bak-import(一次性, 可人工回滚)。
+// 写入后提示重启 —— 各配置在启动时加载, 热加载不在本功能范围内。
+func handleConfigImport(w http.ResponseWriter, r *http.Request) {
+	if r.Method != "POST" {
+		writeAPI(w, http.StatusMethodNotAllowed, apiResponse{Error: "method not allowed"})
+		return
+	}
+	var body struct {
+		Files map[string]string `json:"files"`
+	}
+	if err := json.NewDecoder(io.LimitReader(r.Body, 16<<20)).Decode(&body); err != nil {
+		writeAPI(w, http.StatusBadRequest, apiResponse{Error: "body 必须是 {\"files\": {\"<文件名>\": \"<内容>\"}}"})
+		return
+	}
+	if len(body.Files) == 0 {
+		writeAPI(w, http.StatusBadRequest, apiResponse{Error: "files 为空"})
+		return
+	}
+	imported := make([]string, 0, len(body.Files))
+	for name, content := range body.Files {
+		if !configBackupAllowed(name) {
+			writeAPI(w, http.StatusBadRequest, apiResponse{Error: "文件名不在备份白名单内: " + name})
+			return
+		}
+		if strings.TrimSpace(content) == "" {
+			writeAPI(w, http.StatusBadRequest, apiResponse{Error: name + " 内容为空"})
+			return
+		}
+		var check any
+		if err := json.Unmarshal([]byte(content), &check); err != nil {
+			writeAPI(w, http.StatusBadRequest, apiResponse{Error: name + " 不是合法 JSON: " + err.Error()})
+			return
+		}
+	}
+	// 全部校验通过才落盘(避免半套配置); 覆盖前备份现有文件。
+	for name, content := range body.Files {
+		path := kit.ResolveDataPath(name)
+		if old, err := os.ReadFile(path); err == nil && len(old) > 0 {
+			_ = os.WriteFile(path+".bak-import", old, 0600)
+		}
+		if err := kit.WriteFileAtomicDefault(path, []byte(content)); err != nil {
+			writeAPI(w, http.StatusInternalServerError, apiResponse{Error: "写入 " + name + " 失败: " + err.Error()})
+			return
+		}
+		imported = append(imported, name)
+	}
+	log.Printf("  admin: 配置导入完成 (%d 个文件), 重启后生效", len(imported))
+	writeAPI(w, http.StatusOK, apiResponse{Success: true, Data: map[string]any{
+		"imported": imported,
+		"note":     "导入完成, 重启网关后生效; 原文件已备份为 <文件名>.bak-import",
+	}})
 }

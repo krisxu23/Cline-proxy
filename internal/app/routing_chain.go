@@ -288,6 +288,82 @@ func describeRouteChain(alias string) map[string]any {
 	return out
 }
 
+// validateRouteTargets 校验配置里全部路由链的目标是否可解析(P1-15 一致性门禁)。
+//
+// 参照 OmniRoute 的 check-provider-consistency: 配置里的引用必须是"真实存在的
+// 上游+模型", 否则会变成静默错误(跳过/回落到错误上游)。返回问题列表(空=通过)。
+// 同时被两处消费: 管理端保存时的告警(非阻塞)与一致性门禁测试。
+func validateRouteTargets(cfg *zenConfigData) []string {
+	if cfg == nil {
+		return nil
+	}
+	var problems []string
+	providerNames := map[string]bool{}
+	for name := range cfg.Providers {
+		providerNames[name] = true
+	}
+	for alias, list := range cfg.Routes {
+		if len(list) == 0 {
+			continue
+		}
+		for _, raw := range list {
+			entry := strings.TrimSpace(raw)
+			if entry == "" {
+				continue
+			}
+			up, model, hasPrefix := strings.Cut(entry, ":")
+			if !hasPrefix {
+				// 无前缀按归属判定; 不可路由的条目在 expandRouteList 里本就会被跳过,
+				// 这里提前给出人话告警。
+				if routeModel(entry) != "zen" && routeModel(entry) != "cline" {
+					problems = append(problems, "别名 "+alias+" 的条目 "+entry+" 无法判断归属(用 upstream:model 形式)")
+				}
+				continue
+			}
+			up = strings.TrimSpace(up)
+			model = strings.TrimSpace(model)
+			key := routeCandidate{Upstream: up, Model: model}
+			switch up {
+			case upstreamZen:
+				if model == clinePoolPlaceholder {
+					problems = append(problems, "别名 "+alias+": zen 不支持占位符 "+clinePoolPlaceholder)
+					continue
+				}
+				if _, ok := resolveZenModel(model); !ok {
+					problems = append(problems, "别名 "+alias+": zen 目录里没有模型 "+model)
+				}
+			case upstreamCline:
+				if model != clinePoolPlaceholder {
+					problems = append(problems, "别名 "+alias+": cline 池只支持占位符 "+clinePoolPlaceholder+"(写的是 "+model+")")
+				}
+			case upstreamClinePass:
+				if _, ok := clinePassModelByID(model); !ok {
+					problems = append(problems, "别名 "+alias+": ClinePass 目录里没有模型 "+model)
+				}
+			default:
+				if !providerNames[up] {
+					problems = append(problems, "别名 "+alias+": 供应商 "+up+" 未配置")
+					continue
+				}
+				if p := providerByName(up); p != nil {
+					found := false
+					for _, fm := range freeModelsFor(up, p) {
+						if fm.ID == model {
+							found = true
+							break
+						}
+					}
+					if !found {
+						problems = append(problems, "别名 "+alias+": 供应商 "+up+" 的目录里没有模型 "+model)
+					}
+				}
+			}
+			_ = key
+		}
+	}
+	return problems
+}
+
 // routeAliasContext 别名的上下文长度: 取候选池里最大的那一个。
 // 客户端(尤其 agent)会按 /v1/models 报的 context 决定何时压缩历史, 报小了会
 // 提前截断; 别名是"哪个站能用就用哪个", 所以按池内上限报才不误导。
