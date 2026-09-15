@@ -48,20 +48,28 @@ func newIdleAbortReader(rc io.ReadCloser, timeout time.Duration) *idleAbortReade
 }
 
 func (r *idleAbortReader) Read(p []byte) (int, error) {
+	// 关键: 在途读必须写进**私有 scratch**而不是调用方的 p —— 超时路径返回后
+	// goroutine 可能仍在读, 若它直接写 p 会与调用方对 p 的后续使用构成数据竞态
+	// (CI 的 -race 在 Linux 上实测抓到; Windows 本地时序不同未触发)。
+	// 私有缓冲 + 缓冲 channel 收口: 超时后 goroutine 正常完成并把结果丢弃,
+	// 不泄漏 goroutine, 也不污染 p。
 	type result struct {
-		n   int
-		err error
+		n    int
+		err  error
+		data []byte
 	}
+	scratch := make([]byte, len(p))
 	ch := make(chan result, 1) // 缓冲 1: 即使超时后读才返回也不会泄漏
 	go func() {
-		n, err := r.reader.Read(p)
-		ch <- result{n, err}
+		n, err := r.reader.Read(scratch)
+		ch <- result{n, err, scratch[:n]}
 	}()
 
 	timer := time.NewTimer(r.timeout)
 	defer timer.Stop()
 	select {
 	case res := <-ch:
+		copy(p, res.data)
 		return res.n, res.err
 	case <-timer.C:
 		// 空闲超时: 关闭上游让在途的 Read 立即返回, 并向上报告超时
