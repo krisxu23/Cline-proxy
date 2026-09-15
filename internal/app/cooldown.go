@@ -326,6 +326,18 @@ type keyHealthState struct {
 	demotedAt int64
 }
 
+// recordKeySuccess key 请求成功: 清零失败计数并解除降级。
+func recordKeySuccess(provider, key string) {
+	keyHealthMu.Lock()
+	defer keyHealthMu.Unlock()
+	if m := keyHealth[provider]; m != nil {
+		if st := m[key]; st != nil {
+			st.failures = 0
+			st.demotedAt = 0
+		}
+	}
+}
+
 func recordKeyResult(provider, key string, status int, netErr bool) {
 	if status == 429 {
 		return

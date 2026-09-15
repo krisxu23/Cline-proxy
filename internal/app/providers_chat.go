@@ -158,10 +158,35 @@ func (p *modelProvider) Chat(ctx context.Context, params map[string]any, stream 
 		defer cancel()
 	}
 
-	var lastErr error
+	// key 级健康(P2): 与 pickHealthyKeys 完全同一判定(同一常量, 零语义分叉),
+	// 被降级的 key(5 分钟窗口内)排到队尾; 全部降级时仍按原序尝试(总好于
+	// 不发请求)。成功一次即清零(recordKeySuccess), 窗口过期自动恢复。
+	isDemoted := func(key string) bool {
+		keyHealthMu.Lock()
+		defer keyHealthMu.Unlock()
+		if st, ok := keyHealth[p.name][key]; ok && st != nil &&
+			st.failures >= keyFailThreshold && time.Now().UnixMilli()-st.demotedAt < keyCooldownMs {
+			return true
+		}
+		return false
+	}
+	order := make([]int, 0, len(keys))
+	demoted := make([]int, 0)
 	for i, key := range keys {
+		if isDemoted(key) {
+			demoted = append(demoted, i)
+			continue
+		}
+		order = append(order, i)
+	}
+	order = append(order, demoted...)
+
+	var lastErr error
+	for _, i := range order {
+		key := keys[i]
 		resp, err := p.chatWithKey(ctx, cfg, params, key, stream, needsSig, client)
 		if err == nil {
+			recordKeySuccess(p.name, key)
 			return resp, nil
 		}
 		if pe, ok := err.(*providerError); ok {
