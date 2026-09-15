@@ -15,6 +15,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"math/rand"
 	"net"
 	"os"
 	"sort"
@@ -67,7 +68,7 @@ func assignStablePort(key string) (int, bool, error) {
 	if old, ok := nodeStablePorts[key]; ok && old > 0 && tcpPortFree(old) {
 		return old, true, nil
 	}
-	p, err := freeLocalPort()
+	p, err := freeNodePortInRange()
 	if err != nil {
 		return 0, false, err
 	}
@@ -97,6 +98,14 @@ func purgeStablePorts(ports map[string]int) {
 	persistNodeStablePorts()
 }
 
+// 节点入站端口的自定义区间: 避开 Windows 默认临时源端口区(49152-65535)。
+// 入站端口若落在临时区, 网关自己的出站连接会随机抢占同一端口作为源端口,
+// 造成 sing-box bind 偶发 "Only one usage" 失败(实测 17:28 重建失败)。
+const (
+	nodePortMin = 20000
+	nodePortMax = 49000
+)
+
 // tcpPortFree 探测本地端口是否可用(尝试监听后立即释放)。
 func tcpPortFree(port int) bool {
 	l, err := net.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", port))
@@ -105,6 +114,17 @@ func tcpPortFree(port int) bool {
 	}
 	l.Close()
 	return true
+}
+
+// freeNodePortInRange 在 [min,max] 里找一个当前空闲的端口。
+func freeNodePortInRange() (int, error) {
+	for attempt := 0; attempt < 64; attempt++ {
+		p := nodePortMin + rand.Intn(nodePortMax-nodePortMin+1)
+		if tcpPortFree(p) {
+			return p, nil
+		}
+	}
+	return 0, fmt.Errorf("no free port in [%d,%d]", nodePortMin, nodePortMax)
 }
 
 // ============ 每节点流量统计 ============
