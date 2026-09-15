@@ -13,6 +13,11 @@
        （上游 open-sse/utils/jsonToSse.ts、src/lib/sseTextTransform.ts）
        本仓库对应：internal/app/json_to_sse.go、internal/app/proxy.go 的
        controlSanitizingReader 与合成/NDJSON 分支
+     - 协议翻译注册表与 anthropic/gemini 双向转换
+       （上游 open-sse/translator/registry.ts、formats.ts、
+        request/openai-to-claude|gemini.ts、response/claude|gemini-to-openai.ts）
+       本仓库对应：internal/translate/（逐步移植中，参照源码快照见
+       工作区 omniroute-translator-ref/，随仓库保留本声明与 MIT 许可文本）
 
 2) easy_proxies / Resin / mihomo / glider / Sub-Store —— 仅借鉴公开文档描述的
    设计思路（前两者仓库无 LICENSE，未复制任何代码），对应 internal/app/exit_select.go、
