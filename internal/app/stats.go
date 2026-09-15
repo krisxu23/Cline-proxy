@@ -30,8 +30,12 @@ type zenStatsRecord struct {
 	LatencyMs        int64  `json:"latencyMs"`
 	PromptTokens     int    `json:"promptTokens"`     // 入站估算
 	CompletionTokens int    `json:"completionTokens"` // 上游 usage 或估算
-	CompactionTokens int    `json:"compactionTokens"` // 摘要生成消耗
-	RateLimited      int    `json:"rateLimited"`      // 本次请求触发限流的次数
+	// ReasoningTokens / CacheTokens 推理与缓存 token 单列(P2-18):
+	// 推理不占用可见正文、缓存不重复计费, 混在 completion/prompt 里会误导。
+	ReasoningTokens  int `json:"reasoningTokens,omitempty"`
+	CacheTokens      int `json:"cacheTokens,omitempty"`
+	CompactionTokens int `json:"compactionTokens"` // 摘要生成消耗
+	RateLimited      int `json:"rateLimited"`      // 本次请求触发限流的次数
 }
 
 // 上游标识常量。四类上游都要记账: 只统计 opencode 会让面板上的总量失真。
@@ -52,20 +56,24 @@ func providerUpstream(name string) string {
 }
 
 type zenStatsAgg struct {
-	Date        string                    `json:"date"`
-	Requests    int64                     `json:"requests"`
-	PromptTok   int64                     `json:"promptTokens"`
-	CompleteTok int64                     `json:"completionTokens"`
-	Compaction  int64                     `json:"compactionTokens"`
-	RateLimited int64                     `json:"rateLimited"` // 限流命中次数
-	ByModel     map[string]*zenStatsModel `json:"byModel"`
-	ByUpstream  map[string]*zenStatsModel `json:"byUpstream"`
+	Date         string                    `json:"date"`
+	Requests     int64                     `json:"requests"`
+	PromptTok    int64                     `json:"promptTokens"`
+	CompleteTok  int64                     `json:"completionTokens"`
+	ReasoningTok int64                     `json:"reasoningTokens"`
+	CacheTok     int64                     `json:"cacheTokens"`
+	Compaction   int64                     `json:"compactionTokens"`
+	RateLimited  int64                     `json:"rateLimited"` // 限流命中次数
+	ByModel      map[string]*zenStatsModel `json:"byModel"`
+	ByUpstream   map[string]*zenStatsModel `json:"byUpstream"`
 }
 
 type zenStatsModel struct {
-	Requests    int64 `json:"requests"`
-	PromptTok   int64 `json:"promptTokens"`
-	CompleteTok int64 `json:"completionTokens"`
+	Requests     int64 `json:"requests"`
+	PromptTok    int64 `json:"promptTokens"`
+	CompleteTok  int64 `json:"completionTokens"`
+	ReasoningTok int64 `json:"reasoningTokens"`
+	CacheTok     int64 `json:"cacheTokens"`
 }
 
 var (
@@ -129,6 +137,18 @@ func (t *zenStatsTracker) observeUsage(u map[string]any) {
 	}
 	// 镜像进请求轨迹(多协议字段名归一在 req_trace.go 里)。
 	t.trace.ObserveUsage(u)
+	// 记账同样走统一归一(P2-18): 三协议字段名兼容, 推理/缓存单列,
+	// cache 读写不重复计入 prompt。
+	if p, c, r, cache, ok := parseUsageFields(u); ok {
+		if p > 0 {
+			t.rec.PromptTokens = p
+		}
+		t.rec.CompletionTokens = c
+		t.rec.ReasoningTokens = r
+		t.rec.CacheTokens = cache
+		return
+	}
+	// 兜底: 未识别字段名时沿用旧逻辑
 	if v, ok := u["prompt_tokens"].(float64); ok && v > 0 {
 		t.rec.PromptTokens = int(v)
 	}
@@ -210,14 +230,16 @@ func (a *zenStatsAgg) clone() *zenStatsAgg {
 		return nil
 	}
 	out := &zenStatsAgg{
-		Date:        a.Date,
-		Requests:    a.Requests,
-		PromptTok:   a.PromptTok,
-		CompleteTok: a.CompleteTok,
-		Compaction:  a.Compaction,
-		RateLimited: a.RateLimited,
-		ByModel:     make(map[string]*zenStatsModel, len(a.ByModel)),
-		ByUpstream:  make(map[string]*zenStatsModel, len(a.ByUpstream)),
+		Date:         a.Date,
+		Requests:     a.Requests,
+		PromptTok:    a.PromptTok,
+		CompleteTok:  a.CompleteTok,
+		ReasoningTok: a.ReasoningTok,
+		CacheTok:     a.CacheTok,
+		Compaction:   a.Compaction,
+		RateLimited:  a.RateLimited,
+		ByModel:      make(map[string]*zenStatsModel, len(a.ByModel)),
+		ByUpstream:   make(map[string]*zenStatsModel, len(a.ByUpstream)),
 	}
 	for k, v := range a.ByModel {
 		out.ByModel[k] = cloneStatsModel(v)
@@ -233,9 +255,11 @@ func cloneStatsModel(m *zenStatsModel) *zenStatsModel {
 		return nil
 	}
 	return &zenStatsModel{
-		Requests:    m.Requests,
-		PromptTok:   m.PromptTok,
-		CompleteTok: m.CompleteTok,
+		Requests:     m.Requests,
+		PromptTok:    m.PromptTok,
+		CompleteTok:  m.CompleteTok,
+		ReasoningTok: m.ReasoningTok,
+		CacheTok:     m.CacheTok,
 	}
 }
 
@@ -321,6 +345,8 @@ func aggregateRecord(agg *zenStatsAgg, rec *zenStatsRecord) {
 	agg.Requests++
 	agg.PromptTok += int64(rec.PromptTokens)
 	agg.CompleteTok += int64(rec.CompletionTokens)
+	agg.ReasoningTok += int64(rec.ReasoningTokens)
+	agg.CacheTok += int64(rec.CacheTokens)
 	agg.Compaction += int64(rec.CompactionTokens)
 	agg.RateLimited += int64(rec.RateLimited)
 	// 旧记录可能没有 upstream 字段(早期只写了 zen), 归到 zen 而不是空键,
@@ -341,6 +367,8 @@ func aggregateRecord(agg *zenStatsAgg, rec *zenStatsRecord) {
 		e.Requests++
 		e.PromptTok += int64(rec.PromptTokens)
 		e.CompleteTok += int64(rec.CompletionTokens)
+		e.ReasoningTok += int64(rec.ReasoningTokens)
+		e.CacheTok += int64(rec.CacheTokens)
 	}
 	bump(agg.ByModel, rec.Model)
 	bump(agg.ByUpstream, upstream)

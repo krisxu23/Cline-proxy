@@ -27,16 +27,33 @@
 const fs = require('fs');
 const path = require('path');
 
-const ADMIN_GO = path.join(__dirname, '..', 'internal', 'app', 'admin_html.go');
-const src = fs.readFileSync(ADMIN_GO, 'utf8');
+const APP_DIR = path.join(__dirname, '..', 'internal', 'app');
 
-// ---- 抽出 const adminHTML = `...` (Go 原始字符串, 无反义, 直接取) ----
-const m = src.match(/const adminHTML\s*=\s*`([\s\S]*?)`/);
-if (!m) {
+// ---- 抽出 adminHTML 原始字符串(Go 原始字符串, 无反义, 直接取) ----
+// P2-21 拆分后, adminHTML = part1+part2+part3+part4 分布在五个文件里:
+// 逐个读取原始字符串内容并按声明顺序拼接回整页。
+function readAdminHTML() {
+  const files = ['admin_html.go', 'admin_html_part1.go', 'admin_html_part2.go', 'admin_html_part3.go', 'admin_html_part4.go'];
+  let combined = '';
+  for (const f of files) {
+    try {
+      combined += fs.readFileSync(path.join(APP_DIR, f), 'utf8') + '\n';
+    } catch (e) { /* part 文件缺失时跳过(兼容拆分前的单文件形态) */ }
+  }
+  const pieces = [];
+  const re = /`([^`]*)`/g;
+  let m;
+  while ((m = re.exec(combined)) !== null) pieces.push(m[1]);
+  if (!pieces.length) return null;
+  return pieces.join('');
+}
+
+const src = readAdminHTML();
+if (!src) {
   console.error('FATAL: 没找到 adminHTML 原始字符串');
   process.exit(2);
 }
-const script = (m[1].match(/<script>([\s\S]*?)<\/script>/) || [])[1];
+const script = (src.match(/<script>([\s\S]*?)<\/script>/) || [])[1];
 if (!script) {
   console.error('FATAL: adminHTML 里没有 <script>');
   process.exit(2);
