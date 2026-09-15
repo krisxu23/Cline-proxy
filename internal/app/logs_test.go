@@ -75,7 +75,13 @@ func TestAppendReqLogConcurrent(t *testing.T) {
 
 // TestAppendReqLogNonBlocking 验证 AppendReqLog 永不阻塞调用方:
 // (1) 预先尽量塞满 channel 后再调用一次, 断言立即返回;
-// (2) 连续 10 万次调用总耗时必须是毫秒级(走 default 而非阻塞)。
+// (2) 连续 10 万次调用必须在有限时间内完成。
+//
+// 计时口径说明: -race 会让每次锁/原子/channel 操作慢约一个数量级
+// (Linux CI 实测 100k 次耗时 333ms), 硬编码的"毫秒级"墙钟阈值在 race
+// 构建下必然误报。测试真正要抓的是"阻塞等待空位"—— 那会让总耗时爆到
+// 分钟级, 用宽松兜底断言即可覆盖; "立即返回"的严格断言保留在单次调用
+// 级别(channel 满 => 必走 default), 该路径在 race 下依然是确定性的。
 func TestAppendReqLogNonBlocking(t *testing.T) {
 	tmp := filepath.Join(t.TempDir(), "req-nb.jsonl")
 	reqLogsFile = tmp
@@ -101,17 +107,22 @@ func TestAppendReqLogNonBlocking(t *testing.T) {
 
 	start := time.Now()
 	AppendReqLog(RequestLog{Method: "GET", Path: "/x"})
-	if elapsed := time.Since(start); elapsed > time.Millisecond {
+	if elapsed := time.Since(start); elapsed > 20*time.Millisecond {
 		t.Fatalf("AppendReqLog blocked for %v (channel full path should be non-blocking)", elapsed)
 	}
 
-	// 大规模调用也必须毫秒级返回
+	// 大规模调用: 断言"全部返回、没有卡成阻塞", 而不是卡毫秒墙钟。
+	// 丢弃计数增量仅记录(与 line/dropped 一致性由 Concurrent 用例负责断言)。
+	droppedBefore := atomic.LoadInt64(&reqLogDropped)
 	start = time.Now()
 	for i := 0; i < 100000; i++ {
 		AppendReqLog(RequestLog{Method: "GET", Path: "/x"})
 	}
-	if took := time.Since(start); took > 200*time.Millisecond {
-		t.Fatalf("100k AppendReqLog calls took %v, expected milliseconds", took)
+	took := time.Since(start)
+	if took > 10*time.Second {
+		t.Fatalf("100k AppendReqLog calls took %v — AppendReqLog appears to block", took)
 	}
+	t.Logf("100k AppendReqLog calls took %v (dropped +%d)",
+		took, atomic.LoadInt64(&reqLogDropped)-droppedBefore)
 	flushReqLogs()
 }
