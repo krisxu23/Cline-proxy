@@ -30,6 +30,11 @@ func stringEntries(entries []any) []any {
 // buildNodeParts 为每个节点条目分配本地端口并生成 sing-box 配置部件
 func buildNodeParts(entries []any) (ports map[string]int, inbounds, outbounds, rules []map[string]any, hasMap bool) {
 	ports = map[string]int{}
+	// 按 key 去重(P2 修复): 同一节点(链接去名后相同, 或订阅 tag 相同)可能在
+	// 多个订阅源里重复出现。稳定端口下"同 key → 同端口", 重复条目会造成
+	// 两个 inbound 监听同一端口 → 实例 Start 必败 → 全池瘫痪(实测事故)。
+	// 旧随机端口时代只是冗余, 稳定端口时代是致命的, 必须在这里收敛。
+	seenBuild := map[string]bool{}
 	for i, e := range entries {
 		var ob map[string]any
 		var key string
@@ -37,6 +42,11 @@ func buildNodeParts(entries []any) (ports map[string]int, inbounds, outbounds, r
 		var err error
 		switch v := e.(type) {
 		case string:
+			key = nodeLocalKey(v)
+			if seenBuild[key] {
+				continue
+			}
+			seenBuild[key] = true
 			if nodeExcludedByFilter(nodeDisplayName(v)) {
 				log.Printf("  node %d(%s): 命中排除关键词已跳过", i+1, nodeDisplayName(v))
 				continue
@@ -63,8 +73,13 @@ func buildNodeParts(entries []any) (ports map[string]int, inbounds, outbounds, r
 				continue
 			}
 		case map[string]any:
-			if nodeExcludedByFilter(subNodeDisplayName(subEntryKey(v))) {
-				log.Printf("  node %d(%s): 命中排除关键词已跳过", i+1, subNodeDisplayName(subEntryKey(v)))
+			key = subEntryKey(v)
+			if seenBuild[key] {
+				continue
+			}
+			seenBuild[key] = true
+			if nodeExcludedByFilter(subNodeDisplayName(key)) {
+				log.Printf("  node %d(%s): 命中排除关键词已跳过", i+1, subNodeDisplayName(key))
 				continue
 			}
 			hasMap = true
@@ -79,7 +94,6 @@ func buildNodeParts(entries []any) (ports map[string]int, inbounds, outbounds, r
 				}
 			}
 			ob = cp
-			key = subEntryKey(v)
 			// 稳定端口(P2): 订阅出站同样复用历史端口, 跨更新不漂移
 			port, _, err = assignStablePort(key)
 			if err != nil {

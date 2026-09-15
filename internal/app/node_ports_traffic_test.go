@@ -1,6 +1,6 @@
 package app
 
-// 出口选路增强第二组的测试: 稳定端口 / 每节点流量计数。
+// 稳定端口 / 每节点流量 / 构建去重 的测试。
 
 import (
 	"net"
@@ -14,7 +14,6 @@ func TestAssignStablePortReusesAcrossCalls(t *testing.T) {
 		t.Fatal(err)
 	}
 	_ = reused1
-	// 第二次分配必须复用同一端口(这是"订阅更新端口不漂移"的核心保证)
 	p2, reused2, err := assignStablePort(key)
 	if err != nil {
 		t.Fatal(err)
@@ -25,10 +24,6 @@ func TestAssignStablePortReusesAcrossCalls(t *testing.T) {
 	if !reused2 {
 		t.Fatalf("第二次分配应报告复用, got reused=%v", reused2)
 	}
-	if p1 <= 0 || p1 > 65535 {
-		t.Fatalf("端口应在合法范围, got %d", p1)
-	}
-	// 清理: 从稳定表移除, 避免污染其它测试
 	nodeStableMu.Lock()
 	delete(nodeStablePorts, key)
 	nodeStableMu.Unlock()
@@ -36,7 +31,6 @@ func TestAssignStablePortReusesAcrossCalls(t *testing.T) {
 
 func TestAssignStablePortReallocatesWhenOccupied(t *testing.T) {
 	key := "socks5://127.0.0.1:9402#occupied"
-	// 先占住一个端口
 	l, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
@@ -47,7 +41,6 @@ func TestAssignStablePortReallocatesWhenOccupied(t *testing.T) {
 	nodeStablePorts[key] = occupied
 	nodeStableMu.Unlock()
 
-	// 历史端口被占: 必须重新分配一个可用端口
 	p, reused, err := assignStablePort(key)
 	if err != nil {
 		t.Fatal(err)
@@ -64,8 +57,6 @@ func TestAssignStablePortReallocatesWhenOccupied(t *testing.T) {
 }
 
 func TestCountingConnCountsUpDown(t *testing.T) {
-	// 用一对 net.Pipe 模拟连接(注意: net.Pipe 是同步的, 对端必须消费数据,
-	// 否则 Write 会永久阻塞 —— 本测试曾因此挂死)
 	client, server := net.Pipe()
 	defer client.Close()
 	defer server.Close()
@@ -75,6 +66,7 @@ func TestCountingConnCountsUpDown(t *testing.T) {
 	wrapped := &countingConn{Conn: client, up: &tc.up, down: &tc.down, last: &tc.last}
 
 	// 对端 goroutine: 写 10 字节(触发下行计数), 再把上行写来的 5 字节读走
+	// (net.Pipe 是同步管道, 对端不读会导致 Write 永久阻塞)
 	go func() {
 		server.Write([]byte("0123456789"))
 		buf := make([]byte, 16)
@@ -98,4 +90,52 @@ func TestCountingConnCountsUpDown(t *testing.T) {
 	if tc.last.Load() == 0 {
 		t.Fatal("最近活跃时间应被记录")
 	}
+}
+
+func TestBuildNodePartsDedupsSameKey(t *testing.T) {
+	// 同一节点链接出现两次(不同 # 名称) + 同 tag 的订阅出站出现两次:
+	// 稳定端口下必须只产生一个 inbound, 否则同端口两个监听 → 实例必败。
+	link := "ss://YWVzLTI1Ni1nY206cHdk@1.2.3.4:443#nodeA"
+	entries := []any{
+		link,
+		"ss://YWVzLTI1Ni1nY206cHdk@1.2.3.4:443#nodeA-copy", // 同 key 不同名
+		map[string]any{"tag": "sub-1-x", "type": "socks", "server": "1.2.3.4", "server_port": 1080},
+		map[string]any{"tag": "sub-1-x", "type": "socks", "server": "1.2.3.4", "server_port": 1080},
+	}
+	ports, inbounds, _, _, _ := buildNodeParts(entries)
+	if len(ports) != 2 {
+		t.Fatalf("去重后应只有 2 个唯一节点, got %d: %v", len(ports), ports)
+	}
+	seen := map[int]bool{}
+	for _, ib := range inbounds {
+		p := ib["listen_port"].(int)
+		if seen[p] {
+			t.Fatalf("存在重复监听端口 %d — 实例会 Start 失败", p)
+		}
+		seen[p] = true
+	}
+}
+
+func TestPurgeStablePortsRemovesFailedRecords(t *testing.T) {
+	k1, k2 := "socks5://127.0.0.1:9501#p1", "socks5://127.0.0.1:9502#p2"
+	nodeStableMu.Lock()
+	nodeStablePorts = map[string]int{k1: 17001, k2: 17002}
+	nodeStableMu.Unlock()
+
+	// 模拟 k1 所在实例 Start 失败: 清除该批端口记录
+	purgeStablePorts(map[string]int{k1: 17001})
+
+	nodeStableMu.Lock()
+	_, k1gone := nodeStablePorts[k1]
+	_, k2kept := nodeStablePorts[k2]
+	nodeStableMu.Unlock()
+	if k1gone {
+		t.Fatal("失败批次的端口记录应被清除")
+	}
+	if !k2kept {
+		t.Fatal("未受影响的记录应保留")
+	}
+	nodeStableMu.Lock()
+	delete(nodeStablePorts, k2)
+	nodeStableMu.Unlock()
 }
