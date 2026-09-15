@@ -527,21 +527,17 @@ func buildNodeParts(entries []any) (ports map[string]int, inbounds, outbounds, r
 				log.Printf("  node %d(%s): 出站无效已剔除: %v", i+1, nodeDisplayName(subEntryKey(v)), verr)
 				continue
 			}
-			port, err = freeLocalPort()
+			key = nodeLocalKey(v)
+			// 稳定端口(P2): 优先复用历史分配, 订阅更新不再漂移端口
+			port, _, err = assignStablePort(key)
 			if err != nil {
 				log.Printf("  node %d: 分配本地端口失败: %v", i+1, err)
 				continue
 			}
-			key = nodeLocalKey(v)
 		case map[string]any:
 			hasMap = true
 			if verr := validateOutboundEntry(v); verr != nil {
 				log.Printf("  node %d(%s): 出站无效已剔除: %v", i+1, nodeDisplayName(subEntryKey(v)), verr)
-				continue
-			}
-			port, err = freeLocalPort()
-			if err != nil {
-				log.Printf("  node %d: 分配本地端口失败: %v", i+1, err)
 				continue
 			}
 			cp := map[string]any{"tag": fmt.Sprintf("out-%d", i)}
@@ -552,6 +548,12 @@ func buildNodeParts(entries []any) (ports map[string]int, inbounds, outbounds, r
 			}
 			ob = cp
 			key = subEntryKey(v)
+			// 稳定端口(P2): 订阅出站同样复用历史端口, 跨更新不漂移
+			port, _, err = assignStablePort(key)
+			if err != nil {
+				log.Printf("  node %d: 分配本地端口失败: %v", i+1, err)
+				continue
+			}
 		default:
 			continue
 		}
@@ -664,6 +666,13 @@ type nodeView struct {
 	MITMRisk    bool   `json:"mitmRisk"`
 	IsWarp      bool   `json:"isWarp"`
 	NetworkType string `json:"networkType,omitempty"` // datacenter/residential/mobile/cdn/unknown
+
+	// 稳定端口与流量(P2): localPort 是该节点在本机的固定 mixed 入站端口
+	// (订阅更新不漂移, 可当调试/固定入口); up/downBytes 是经此节点的累计流量。
+	LocalPort   int   `json:"localPort,omitempty"`
+	UpBytes     int64 `json:"upBytes,omitempty"`
+	DownBytes   int64 `json:"downBytes,omitempty"`
+	Blacklisted bool  `json:"blacklisted,omitempty"` // 人工拉黑中
 }
 
 // healthOf 节点最近一次连通检测结果
@@ -742,6 +751,14 @@ func withHealthResult(v nodeView, key string) nodeView {
 		v.IsWarp = r.IsWarp
 		v.NetworkType = r.NetworkType
 	}
+	if p, ok := nodePorts[key]; ok {
+		v.LocalPort = p
+	}
+	if tc, ok := nodeTrafficCounterOf(key); ok {
+		v.UpBytes = tc.up.Load()
+		v.DownBytes = tc.down.Load()
+	}
+	v.Blacklisted = nodeManuallyBlacklisted(key)
 	v.Region = nodeExitRegion(key)
 	return v
 }
@@ -806,7 +823,12 @@ func dialNodeProxy(ctx context.Context, link, network, addr string) (net.Conn, e
 	if err != nil {
 		return nil, err
 	}
-	return dialSOCKS5(ctx, u, network, addr)
+	conn, err := dialSOCKS5(ctx, u, network, addr)
+	if err != nil {
+		return nil, err
+	}
+	// 每节点流量统计(P2): 拨号成功即包计数器, 上行=写出/下行=读入
+	return countNodeConn(nodeLocalKey(link), conn), nil
 }
 
 // ============ 分享链接 → sing-box 出站配置 ============
