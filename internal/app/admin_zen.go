@@ -32,6 +32,7 @@ func handleZenConfig(w http.ResponseWriter, r *http.Request) {
 		"rescueDirect":    rescueDirectEnabled(),
 		"subsRefreshMins": cfg.SubsRefreshMins,
 		"proxyStrategy":   cfg.ProxyStrategy,
+		"stickySessions":  cfg.StickySessions,
 		"maxConcurrency":  cfg.MaxConcurrency,
 		"retries":         cfg.Retries,
 		"failover":        cfg.Failover,
@@ -76,6 +77,7 @@ func handleZenConfigUpdate(w http.ResponseWriter, r *http.Request) {
 		Proxies         []string `json:"proxies"`
 		Subs            []string `json:"subs"`
 		ExitMode        *string  `json:"exitMode"`
+		StickySessions  *bool    `json:"stickySessions"`
 		EnabledRegions  []string `json:"enabledRegions"`
 		DNSMode         *string  `json:"dnsMode"`
 		DNSCustom       *string  `json:"dnsCustom"`
@@ -159,6 +161,9 @@ func handleZenConfigUpdate(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		next.ExitMode = *patch.ExitMode
+	}
+	if patch.StickySessions != nil {
+		next.StickySessions = *patch.StickySessions
 	}
 	if patch.EnabledRegions != nil {
 		// 只允许 7 个已知地区; 空数组 = 清除限制(全部地区可用)。

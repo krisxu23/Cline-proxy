@@ -179,12 +179,18 @@ const adminHTMLPart2 = `<div id="tab-router" class="tab-panel" style="display:no
     <p class="hint" style="margin:0 0 14px">出口模式作用于整个网关：<strong style="color:var(--text)">所有上游、所有模型</strong>（Cline 账号池 / opencode / 通用 Provider / 订阅抓取）共用同一套出口决策。</p>
     <div class="form-row">
       <div class="field"><label>代理策略</label>
-        <select id="ocStrategy"><option value="round_robin">轮询 round_robin</option><option value="random">随机 random</option><option value="fill">固定 fill</option></select>
+        <select id="ocStrategy"><option value="round_robin">轮询 round_robin</option><option value="random">随机 random</option><option value="fill">固定 fill</option><option value="latency">延迟优先 latency</option></select>
       </div>
       <div class="field"><label>出口模式</label>
         <select id="ocExitMode">
           <option value="proxy">节点出口（全部走下面节点列表）</option>
           <option value="direct">直连（不走任何节点）</option>
+        </select>
+      </div>
+      <div class="field"><label>粘性会话</label>
+        <select id="ocSticky">
+          <option value="false">关闭（每次请求按策略选出口）</option>
+          <option value="true">开启（同一客户端 30 分钟内固定同一出口）</option>
         </select>
       </div>
       <div class="field"><label>节点全挂时</label>

@@ -69,6 +69,9 @@ func registerAdminRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("/admin/api/logs/trace", adminAuth(handleLogTrace))
 	mux.HandleFunc("/admin/api/config/export", adminAuth(handleConfigExport))
 	mux.HandleFunc("/admin/api/health", adminAuth(handleHealth))
+	mux.HandleFunc("/admin/api/nodes/blacklist", adminAuth(handleNodeBlacklist))
+	mux.HandleFunc("/admin/api/nodes/blacklist/clear", adminAuth(handleNodeBlacklistClear))
+	mux.HandleFunc("/admin/api/nodes/blacklist/list", adminAuth(handleNodeBlacklistList))
 	mux.HandleFunc("/admin/api/config/import", adminAuth(handleConfigImport))
 	mux.HandleFunc("/admin/api/keys", adminAuth(handleAdminGetKeys))
 	mux.HandleFunc("/admin/api/keys/generate", adminAuth(handleAdminGenerateKey))
@@ -1409,6 +1412,58 @@ func handleLogTrace(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeAPI(w, http.StatusOK, apiResponse{Success: true, Data: map[string]any{"trace": d}})
+}
+
+// ============ 节点手动拉黑 (P2, 参照 easy_proxies 的手动黑名单) ============
+
+// handleNodeBlacklist POST /admin/api/nodes/blacklist
+// body: {"key": "<nodeLocalKey>", "hours": 24}  hours<=0 或缺省 = 长期
+func handleNodeBlacklist(w http.ResponseWriter, r *http.Request) {
+	if r.Method != "POST" {
+		writeAPI(w, http.StatusMethodNotAllowed, apiResponse{Error: "method not allowed"})
+		return
+	}
+	var body struct {
+		Key   string  `json:"key"`
+		Hours float64 `json:"hours"`
+	}
+	if err := json.NewDecoder(io.LimitReader(r.Body, 16<<10)).Decode(&body); err != nil || strings.TrimSpace(body.Key) == "" {
+		writeAPI(w, http.StatusBadRequest, apiResponse{Error: "body 必须是 {\"key\": \"...\", \"hours\": 24}"})
+		return
+	}
+	blacklistNode(strings.TrimSpace(body.Key), time.Duration(body.Hours*float64(time.Hour)))
+	writeAPI(w, http.StatusOK, apiResponse{Success: true, Data: map[string]any{"blacklisted": body.Key, "list": blacklistList()}})
+}
+
+// handleNodeBlacklistClear POST /admin/api/nodes/blacklist/clear
+// body: {"key": "..."} 或 {"all": true}
+func handleNodeBlacklistClear(w http.ResponseWriter, r *http.Request) {
+	if r.Method != "POST" {
+		writeAPI(w, http.StatusMethodNotAllowed, apiResponse{Error: "method not allowed"})
+		return
+	}
+	var body struct {
+		Key string `json:"key"`
+		All bool   `json:"all"`
+	}
+	_ = json.NewDecoder(io.LimitReader(r.Body, 16<<10)).Decode(&body)
+	manualBlackMu.Lock()
+	if body.All {
+		manualBlack = map[string]time.Time{}
+	} else if strings.TrimSpace(body.Key) != "" {
+		delete(manualBlack, strings.TrimSpace(body.Key))
+	}
+	manualBlackMu.Unlock()
+	writeAPI(w, http.StatusOK, apiResponse{Success: true, Data: map[string]any{"list": blacklistList()}})
+}
+
+// handleNodeBlacklistList GET /admin/api/nodes/blacklist
+func handleNodeBlacklistList(w http.ResponseWriter, r *http.Request) {
+	if r.Method != "GET" {
+		writeAPI(w, http.StatusMethodNotAllowed, apiResponse{Error: "method not allowed"})
+		return
+	}
+	writeAPI(w, http.StatusOK, apiResponse{Success: true, Data: map[string]any{"list": blacklistList()}})
 }
 
 // handleHealth 网关健康总览 (P2-20, 参照 OmniRoute 的 ProviderHealthAutopilotCard):

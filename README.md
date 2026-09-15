@@ -1,11 +1,14 @@
-# Cline Go Proxy — 综合网关
 
-[![构建](https://github.com/krisxu23/Cline-proxy/actions/workflows/build.yml/badge.svg)](https://github.com/krisxu23/Cline-proxy/actions/workflows/build.yml)
-[![Release](https://img.shields.io/github/v/release/krisxu23/Cline-proxy)](https://github.com/krisxu23/Cline-proxy/releases)
-[![Go 版本](https://img.shields.io/github/go-mod/go-version/krisxu23/Cline-proxy)](https://go.dev/)
-[![Stars](https://img.shields.io/github/stars/krisxu23/Cline-proxy)](https://github.com/krisxu23/Cline-proxy/stargazers)
+## 致谢
 
-四合一上游网关：**Cline 账号池 + opencode zen 免费模型 + ClinePass 订阅池 + 任意 OpenAI 兼容 Provider**。一个二进制，按 model 自动分流到四类上游，对外同时提供 OpenAI、Anthropic、OpenAI Responses 三种协议接口，内置中文管理后台。
+出口选路、节点池与订阅处理的设计参考了以下优秀项目（思路借鉴，代码均为原创实现）：
+
+- [jasonwong1991/easy_proxies](https://github.com/jasonwong1991/easy_proxies) —— sing-box 节点池管理（健康检查/黑名单/GeoIP 路由/订阅热重载）
+- [Resinat/Resin](https://github.com/Resinat/Resin) —— 代理池网关的粘性会话（Sticky Session）
+- [MetaCubeX/mihomo](https://github.com/MetaCubeX/mihomo) —— url-test 选路 + tolerance 防抖
+- [nadoo/glider](https://github.com/nadoo/glider) —— 多策略转发与健康检查
+- [sub-store-org/Sub-Store](https://github.com/sub-store-org/Sub-Store) —— 订阅处理管线
+自动分流到四类上游，对外同时提供 OpenAI、Anthropic、OpenAI Responses 三种协议接口，内置中文管理后台。
 
 ## 目录
 

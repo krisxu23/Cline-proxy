@@ -402,7 +402,14 @@ func requestLogMiddleware(next http.Handler) http.Handler {
 
 		// 请求轨迹: 上游名/实际模型/尝试与跳过轨迹/错误类别/token 用量由链路上各层
 		// 回填(见 req_trace.go), 这里只负责注入与最终落盘。
-		tr := &reqTrace{RequestID: newRequestID(r.Header.Get("X-Request-Id"))}
+		clientIP := func() string {
+			host, _, err := net.SplitHostPort(r.RemoteAddr)
+			if err != nil {
+				return r.RemoteAddr
+			}
+			return host
+		}()
+		tr := &reqTrace{RequestID: newRequestID(r.Header.Get("X-Request-Id")), ClientIP: clientIP}
 		r = r.WithContext(withReqTrace(r.Context(), tr))
 		// 回写请求 id: 客户端可据此在自己的日志里对齐网关日志与面板详情。
 		w.Header().Set("X-Request-Id", tr.RequestID)

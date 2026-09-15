@@ -150,6 +150,12 @@ func pickZenProxy() (string, int) {
 
 // pickZenProxyWhere 在 pickZenProxy 的基础上追加一个候选过滤条件。
 // extra 为 nil 时等价于原行为; 上游可达性过滤(上游对出口地区有要求时)走这里。
+//
+// 策略(P2 出口选路增强, 参照 easy_proxies/mihomo url-test/glider lha):
+//
+//	round_robin(默认) / random / fill / **latency**(实测延迟最低优先 + 1.2 倍
+//	容差防抖)。所有策略都会跳过: 冷却中 / 未就绪 / 检测不可达 / 人工拉黑 /
+//	extra 过滤的出口。
 func pickZenProxyWhere(extra func(p string) bool) (string, int) {
 	if exitModeDirectNow() {
 		return "", -1
@@ -159,44 +165,66 @@ func pickZenProxyWhere(extra func(p string) bool) (string, int) {
 	if n == 0 {
 		return "", -1
 	}
-	idx := int(zenProxyCount.Add(1)-1) % n
+	// 先收集全部可用候选, 再按策略挑选(替代旧的"起点+线性探测"写法,
+	// 语义相同但 latency 策略需要完整的候选集合)。
+	avail := make([]int, 0, n)
+	for i := 0; i < n; i++ {
+		if zenProxyAvailable(i) && nodeDialable(list[i]) && nodeUsable(list[i]) &&
+			!nodeManuallyBlacklisted(nodeLocalKey(list[i])) &&
+			(extra == nil || extra(list[i])) {
+			avail = append(avail, i)
+		}
+	}
+	if len(avail) == 0 {
+		// 整池都不满足条件时返回直连决策(交给上层), 不退而求其次。
+		return "", -1
+	}
+	idx := int(zenProxyCount.Add(1)-1) % len(avail)
 	switch getZenConfig().ProxyStrategy {
 	case "random":
-		idx = int(time.Now().UnixNano() % int64(n))
+		idx = avail[int(time.Now().UnixNano()%int64(len(avail)))]
 	case "fill":
-		idx = 0
-	}
-	// 冷却/未就绪/已检测不可达/该上游不可达的出口跳过: 线性探测下一个可用代理
-	found := false
-	for i := 0; i < n; i++ {
-		if zenProxyAvailable(idx) && nodeDialable(list[idx]) && nodeUsable(list[idx]) &&
-			(extra == nil || extra(list[idx])) {
-			found = true
-			break
-		}
-		idx = (idx + 1) % n
-	}
-	if !found {
-		// 整池都不满足条件时返回直连决策(交给上层), 不退而求其次。
-		//
-		// 这里曾经是: 循环跑满 n 次后又落回起始下标, 然后只检查一次
-		// nodeDialable 就把它返回 —— 于是冷却中 / 健康度为 fail /
-		// 该上游不可达的节点照样会被选中, 与函数注释声明的
-		// "全部不可用时返回直连" 完全相反。extra 那条分支下面本来
-		// 就有正确写法(返回 "", -1), 冷却与健康度这两条漏了。
-		return "", -1
+		idx = avail[0]
+	case "latency":
+		idx = latencyPick(list, avail)
+	default: // round_robin: 按可用候选顺序轮转(保持与日志索引一致)
+		idx = avail[idx]
 	}
 	return list[idx], idx
 }
 
 // pickUnifiedExit 统一出口选择: 地区不再做全局特例, 按常规轮询选出口。
 // 空池/直连模式返回 ("", -1), 由 zenDialContext 按 rescueDirect 决定 fail-closed。
-func pickUnifiedExit(modelID string) (string, int) {
+// 开启粘性会话(P2, Resin 思路)时: 同一客户端来源 IP 在 TTL 内复用同一出口
+// (出口仍须通过健康复核), 服务于"同 IP 连续请求"的上游场景。
+func pickUnifiedExit(ctx context.Context, modelID string) (string, int) {
 	if exitModeDirectNow() {
 		return "", -1
 	}
+	clientIP := ""
+	if tr := traceFrom(ctx); tr != nil {
+		clientIP = tr.ClientIP
+	}
+	list := effectiveProxyList()
+	if stickySessionEnabled() && clientIP != "" && len(list) > 0 {
+		if pin, ok := stickyPinFor(clientIP); ok {
+			// 健康复核: 钉住的出口必须仍在池里且可用, 否则按正常选路走
+			for i, p := range list {
+				if p == pin.Proxy && zenProxyAvailable(i) && nodeDialable(p) && nodeUsable(p) {
+					stickyPinSave(clientIP, p, nodeLocalKey(p)) // 续期
+					return p, i
+				}
+			}
+			stickyMu.Lock()
+			delete(stickyPinMap, clientIP)
+			stickyMu.Unlock()
+		}
+	}
 	p, idx := pickZenProxyWhere(func(q string) bool { return true })
 	if p != "" {
+		if stickySessionEnabled() && clientIP != "" {
+			stickyPinSave(clientIP, p, nodeLocalKey(p))
+		}
 		return p, idx
 	}
 	return "", -1
@@ -370,7 +398,7 @@ func describeEffectiveExit() string {
 //     避免"sing-box 起不来 = 整个网关断网"。
 func zenDialContext(ctx context.Context, network, addr string) (net.Conn, error) {
 	modelID, _ := ctx.Value(ctxKeyZenModel).(string)
-	p, _ := pickUnifiedExit(modelID)
+	p, _ := pickUnifiedExit(ctx, modelID)
 	setReqExit(ctx, p)
 	if p != "" {
 		return dialViaProxy(ctx, p, network, addr)

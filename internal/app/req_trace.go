@@ -29,6 +29,7 @@ type reqTrace struct {
 	mu sync.Mutex
 
 	RequestID string
+	ClientIP  string // 客户端来源 IP(粘性会话用)
 	Upstream  string // zen / cline / clinepass / provider/<name>
 	Resolved  string // 实际发往上游的模型名
 	Protocol  string // openai | anthropic | responses

@@ -780,6 +780,7 @@ async function loadOcConfig() {
     ocSubsArr = (c.subs || []).slice();
     renderOcSubs();
     _('ocExitMode').value = c.exitMode === 'direct' ? 'direct' : 'proxy';
+    _('ocSticky').value = c.stickySessions ? 'true' : 'false';
     if (_('ocDnsMode')) _('ocDnsMode').value = c.dnsMode || 'doh-ali';
     if (_('ocDnsCustom')) _('ocDnsCustom').value = c.dnsCustom || '';
     if (_('ocRescue')) _('ocRescue').value = (c.rescueDirect === false) ? 'false' : 'true';
@@ -1001,6 +1002,7 @@ async function saveOcConfig() {
     proxies: proxies,
     subs: ocSubsArr,
     exitMode: _('ocExitMode').value,
+    stickySessions: _('ocSticky').value === 'true',
     enabledRegions: ocRegions,
     dnsMode: _('ocDnsMode') ? _('ocDnsMode').value : 'doh-ali',
     dnsCustom: _('ocDnsCustom') ? _('ocDnsCustom').value.trim() : '',

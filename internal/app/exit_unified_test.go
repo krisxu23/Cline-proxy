@@ -132,7 +132,7 @@ func TestProxyModeNoNodeWithoutRescueFails(t *testing.T) {
 func TestProxyModePoolEmptyFailsClosed(t *testing.T) {
 	no := false
 	withTestConfig(t, &zenConfigData{ExitMode: "proxy", RescueDirect: &no})
-	if p, _ := pickUnifiedExit("opencode/mimo-v2.5-free"); p != "" {
+	if p, _ := pickUnifiedExit(context.Background(), "opencode/mimo-v2.5-free"); p != "" {
 		t.Fatalf("must not direct, got %q", p)
 	}
 }
