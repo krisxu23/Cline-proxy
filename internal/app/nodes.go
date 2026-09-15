@@ -177,15 +177,14 @@ func syncNodeBox() {
 	entries = append(entries, subNodes...)
 	subMu.Unlock()
 
-	// 空入口守卫(P2 修复): 手动节点与订阅节点都解析为空、但配置里来源仍在
-	// 时, 多半是订阅刷新的中间态(缓存清空/抓取中)。此时若照常重建, 会用
-	// 0 出口实例顶掉正在服务的实例 —— 探测循环因"没有可检测的出口"跳过,
-	// 面板全部 0 可用(实测事故)。仅当来源配置本身为空(用户真的清空了)
-	// 才允许 0 出口实例。
-	if len(entries) == 0 && len(cfg.Proxies) == 0 && len(cfg.Subs) == 0 {
-		// 来源确实为空: 允许 0 出口(用户主动清空)
-	} else if len(entries) == 0 {
-		log.Printf("  nodes: 节点来源仍在但解析结果为空(疑似订阅刷新中间态), 保留当前实例不重建")
+	// 空入口守卫(P2 修复): 正在服务的实例(有出口)遇到"解析结果为空"时,
+	// 多半是订阅刷新的中间态(抓取中 subNodes 被清空)—— 若照常重建, 会用
+	// 0 出口实例顶掉服务中的实例, 探测循环因"没有可检测的出口"跳过,
+	// 面板全部 0 可用(实测事故)。此时保留实例不重建。
+	// 注意只在**已有可用实例**时拦: 启动期(nodeBox 为 nil)必须放行, 否则
+	// 首次订阅抓取完成前连 catch-all 实例都没有(实测冒烟发现的反例)。
+	if len(entries) == 0 && (len(cfg.Proxies) > 0 || len(cfg.Subs) > 0) && nodeBox != nil && len(nodePorts) > 0 {
+		log.Printf("  nodes: 节点解析结果为空(疑似订阅刷新中间态), 保留当前 %d 出口实例不重建", len(nodePorts))
 		nodeMu.Unlock()
 		return
 	}
@@ -274,7 +273,7 @@ func syncNodeBox() {
 		// 进程), 把本次使用的稳定端口记录全部清除 —— 下次重建重新分配,
 		// 避免反复撞同一批坏端口(实测事故: 同一端口连续失败数小时)。
 		purgeStablePorts(ports)
-		failKeepOld(fmt.Errorf("启动失败: %v", err))
+		failKeepOld(fmt.Errorf("启动失败(已清除本次稳定端口记录, 下次重建换端口): %v", err))
 		// 当前没有可用实例时, 30 秒后自动重试一次(给订阅刷新/端口释放留时间)
 		if len(prevPorts) == 0 && len(entries) > 0 {
 			go func() {
