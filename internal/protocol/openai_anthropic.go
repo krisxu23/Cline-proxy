@@ -15,18 +15,18 @@ type AnthropicMessage struct {
 
 // AnthropicRequest is the wire shape of POST /v1/messages.
 type AnthropicRequest struct {
-	Model       string           `json:"model"`
-	MaxTokens   int              `json:"max_tokens"`
+	Model       string             `json:"model"`
+	MaxTokens   int                `json:"max_tokens"`
 	Messages    []AnthropicMessage `json:"messages"`
-	System      json.RawMessage  `json:"system,omitempty"`
-	Stream      bool             `json:"stream,omitempty"`
-	Temperature float64          `json:"temperature,omitempty"`
-	TopP        float64          `json:"top_p,omitempty"`
-	TopK        int              `json:"top_k,omitempty"`
-	Stop        json.RawMessage  `json:"stop_sequences,omitempty"`
-	Tools       json.RawMessage  `json:"tools,omitempty"`
-	ToolChoice  json.RawMessage  `json:"tool_choice,omitempty"`
-	Metadata    json.RawMessage  `json:"metadata,omitempty"`
+	System      json.RawMessage    `json:"system,omitempty"`
+	Stream      bool               `json:"stream,omitempty"`
+	Temperature float64            `json:"temperature,omitempty"`
+	TopP        float64            `json:"top_p,omitempty"`
+	TopK        int                `json:"top_k,omitempty"`
+	Stop        json.RawMessage    `json:"stop_sequences,omitempty"`
+	Tools       json.RawMessage    `json:"tools,omitempty"`
+	ToolChoice  json.RawMessage    `json:"tool_choice,omitempty"`
+	Metadata    json.RawMessage    `json:"metadata,omitempty"`
 }
 
 // AnthropicToOpenAIRequest converts an Anthropic Messages request to a

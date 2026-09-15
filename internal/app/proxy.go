@@ -1598,7 +1598,7 @@ func handleStreamResponseWithUsage(w http.ResponseWriter, upstream *http.Respons
 					lastModel = m
 				}
 				normalized := normalizeOpenAIResponse(obj)
-				if !sawFinish && protocol.HasFinishReason(normalized) {
+				if !sawFinish && protocol.HasStopSignal(normalized) { // 跨协议终止判定(OmniRoute checkIfStopSignal 等价)
 					sawFinish = true
 				}
 				if normBytes, err := json.Marshal(normalized); err == nil {

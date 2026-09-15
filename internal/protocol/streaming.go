@@ -104,8 +104,8 @@ func EmptyOpenAIChunk(model string) SSEEvent {
 			"model":   model,
 			"choices": []any{
 				map[string]any{
-					"index":        0,
-					"delta":        map[string]any{"content": ""},
+					"index":         0,
+					"delta":         map[string]any{"content": ""},
 					"finish_reason": "stop",
 				},
 			},

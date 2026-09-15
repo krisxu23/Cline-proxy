@@ -82,6 +82,47 @@ func HasChoices(obj map[string]any) bool {
 	return ok && len(choices) > 0
 }
 
+// HasStopSignal 跨协议终止判定(参照 OmniRoute 的 checkIfStopSignal, MIT;
+// Go 侧实现)。中继用它决定"上游是不是已经结束了" —— 只认 OpenAI 的
+// finish_reason 时, 混入其它协议终止形态的上游会让网关一直等到超时:
+//
+//	OpenAI    choices[].finish_reason
+//	Gemini    candidates[].finishReason / finish_reason
+//	Anthropic content_block_stop / message_stop / message_delta.stop_reason
+//	Responses response.done / .completed / .cancelled / .failed
+func HasStopSignal(obj map[string]any) bool {
+	if HasFinishReason(obj) {
+		return true
+	}
+	if cds, ok := obj["candidates"].([]any); ok {
+		for _, cd := range cds {
+			m, ok := cd.(map[string]any)
+			if !ok {
+				continue
+			}
+			for _, k := range []string{"finishReason", "finish_reason"} {
+				if v, present := m[k]; present && v != nil && v != "" {
+					return true
+				}
+			}
+		}
+	}
+	if t, ok := obj["type"].(string); ok {
+		switch t {
+		case "content_block_stop", "message_stop",
+			"response.done", "response.completed", "response.cancelled", "response.failed":
+			return true
+		case "message_delta":
+			if d, ok := obj["delta"].(map[string]any); ok {
+				if v, present := d["stop_reason"]; present && v != nil && v != "" {
+					return true
+				}
+			}
+		}
+	}
+	return false
+}
+
 // HasFinishReason reports whether any choice in a parsed OpenAI chunk
 // carries a non-null finish_reason. Used to detect streams that end
 // without a terminal chunk so a synthetic stop chunk can be appended.
