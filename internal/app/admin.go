@@ -72,6 +72,13 @@ func registerAdminRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("/admin/api/nodes/blacklist", adminAuth(handleNodeBlacklist))
 	mux.HandleFunc("/admin/api/nodes/blacklist/clear", adminAuth(handleNodeBlacklistClear))
 	mux.HandleFunc("/admin/api/nodes/blacklist/list", adminAuth(handleNodeBlacklistList))
+	mux.HandleFunc("/admin/api/nodes/traffic/history", adminAuth(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != "GET" {
+			writeAPI(w, http.StatusMethodNotAllowed, apiResponse{Error: "method not allowed"})
+			return
+		}
+		writeAPI(w, http.StatusOK, apiResponse{Success: true, Data: map[string]any{"history": nodeTrafficHistory()}})
+	}))
 	mux.HandleFunc("/admin/api/nodes/traffic/reset", adminAuth(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != "POST" {
 			writeAPI(w, http.StatusMethodNotAllowed, apiResponse{Error: "method not allowed"})

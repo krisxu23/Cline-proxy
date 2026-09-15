@@ -178,3 +178,70 @@ func countNodeConn(key string, c net.Conn) net.Conn {
 	tc := trafficCounterFor(key)
 	return &countingConn{Conn: c, up: &tc.up, down: &tc.down, last: &tc.last}
 }
+
+// ============ 流量历史采样(P2, 面板速率/曲线数据源) ============
+
+const (
+	trafficSampleInterval = time.Minute
+	trafficHistoryMax     = 120 // 最近 2 小时
+)
+
+type trafficSample struct {
+	TS        int64 `json:"ts"`
+	TotalUp   int64 `json:"totalUp"`
+	TotalDown int64 `json:"totalDown"`
+}
+
+var (
+	trafficHistMu  sync.Mutex
+	trafficHistory []trafficSample
+	trafficOnce    sync.Once
+)
+
+// startTrafficSampler 惰性启动每分钟采样协程(记录总量序列, 面板算速率)。
+func startTrafficSampler() {
+	trafficOnce.Do(func() {
+		go func() {
+			t := time.NewTicker(trafficSampleInterval)
+			defer t.Stop()
+			for range t.C {
+				var up, down int64
+				nodeTrafficMu.Lock()
+				for _, c := range nodeTraffic {
+					up += c.up.Load()
+					down += c.down.Load()
+				}
+				nodeTrafficMu.Unlock()
+				trafficHistMu.Lock()
+				trafficHistory = append(trafficHistory, trafficSample{
+					TS: time.Now().UnixMilli(), TotalUp: up, TotalDown: down,
+				})
+				if len(trafficHistory) > trafficHistoryMax {
+					trafficHistory = trafficHistory[len(trafficHistory)-trafficHistoryMax:]
+				}
+				trafficHistMu.Unlock()
+			}
+		}()
+	})
+}
+
+// nodeTrafficHistory 返回速率序列(字节/秒), 由相邻采样差分得到; 最近一条在前。
+func nodeTrafficHistory() []map[string]any {
+	startTrafficSampler()
+	trafficHistMu.Lock()
+	h := append([]trafficSample(nil), trafficHistory...)
+	trafficHistMu.Unlock()
+	out := make([]map[string]any, 0, len(h))
+	for i := len(h) - 1; i > 0; i-- {
+		dt := h[i].TS - h[i-1].TS
+		rate := int64(0)
+		if dt > 0 {
+			rate = (h[i].TotalDown - h[i-1].TotalDown + h[i].TotalUp - h[i-1].TotalUp) * 1000 / dt
+		}
+		if rate < 0 {
+			rate = 0 // 计数重置后差分为负, 钳零
+		}
+		out = append(out, map[string]any{"ts": h[i].TS, "bps": rate})
+	}
+	return out
+}

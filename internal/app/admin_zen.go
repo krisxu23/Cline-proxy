@@ -18,27 +18,28 @@ func handleZenConfig(w http.ResponseWriter, r *http.Request) {
 	}
 	cfg := getZenConfig()
 	data := map[string]any{
-		"enabled":         cfg.Enabled,
-		"key":             cfg.Key,
-		"baseURL":         cfg.BaseURL,
-		"baseURLs":        zenBaseURLList(cfg),
-		"proxies":         cfg.Proxies,
-		"subs":            cfg.Subs,
-		"exitMode":        cfg.ExitMode,
-		"enabledRegions":  cfg.EnabledRegions,
-		"regionSummary":   exitRegionSummary(),
-		"dnsMode":         cfg.DNSMode,
-		"dnsCustom":       cfg.DNSCustomDNS,
-		"rescueDirect":    rescueDirectEnabled(),
-		"subsRefreshMins": cfg.SubsRefreshMins,
-		"proxyStrategy":   cfg.ProxyStrategy,
-		"stickySessions":  cfg.StickySessions,
-		"maxConcurrency":  cfg.MaxConcurrency,
-		"retries":         cfg.Retries,
-		"failover":        cfg.Failover,
-		"failoverCount":   cfg.FailoverCount,
-		"failoverMinutes": cfg.FailoverMinutes,
-		"compaction":      cfg.Compaction,
+		"enabled":             cfg.Enabled,
+		"key":                 cfg.Key,
+		"baseURL":             cfg.BaseURL,
+		"baseURLs":            zenBaseURLList(cfg),
+		"proxies":             cfg.Proxies,
+		"subs":                cfg.Subs,
+		"exitMode":            cfg.ExitMode,
+		"enabledRegions":      cfg.EnabledRegions,
+		"regionSummary":       exitRegionSummary(),
+		"dnsMode":             cfg.DNSMode,
+		"dnsCustom":           cfg.DNSCustomDNS,
+		"rescueDirect":        rescueDirectEnabled(),
+		"subsRefreshMins":     cfg.SubsRefreshMins,
+		"proxyStrategy":       cfg.ProxyStrategy,
+		"stickySessions":      cfg.StickySessions,
+		"nodeExcludeKeywords": cfg.NodeExcludeKeywords,
+		"maxConcurrency":      cfg.MaxConcurrency,
+		"retries":             cfg.Retries,
+		"failover":            cfg.Failover,
+		"failoverCount":       cfg.FailoverCount,
+		"failoverMinutes":     cfg.FailoverMinutes,
+		"compaction":          cfg.Compaction,
 		"runtime": map[string]any{
 			"failoverActive": zenFailedNow(),
 			"proxyCooldowns": zenProxyCooldownStatus(),
@@ -70,26 +71,27 @@ func handleZenConfigUpdate(w http.ResponseWriter, r *http.Request) {
 		cur = defaultZenConfig()
 	}
 	var patch struct {
-		Enabled         *bool    `json:"enabled"`
-		Key             *string  `json:"key"`
-		BaseURL         *string  `json:"baseURL"`
-		BaseURLs        []string `json:"baseURLs"`
-		Proxies         []string `json:"proxies"`
-		Subs            []string `json:"subs"`
-		ExitMode        *string  `json:"exitMode"`
-		StickySessions  *bool    `json:"stickySessions"`
-		EnabledRegions  []string `json:"enabledRegions"`
-		DNSMode         *string  `json:"dnsMode"`
-		DNSCustom       *string  `json:"dnsCustom"`
-		RescueDirect    *bool    `json:"rescueDirect"`
-		SubsRefreshMins *int     `json:"subsRefreshMins"`
-		ProxyStrategy   *string  `json:"proxyStrategy"`
-		MaxConcurrency  *int     `json:"maxConcurrency"`
-		Retries         *int     `json:"retries"`
-		Failover        *bool    `json:"failover"`
-		FailoverCount   *int     `json:"failoverCount"`
-		FailoverMinutes *int     `json:"failoverMinutes"`
-		Compaction      *struct {
+		Enabled             *bool     `json:"enabled"`
+		Key                 *string   `json:"key"`
+		BaseURL             *string   `json:"baseURL"`
+		BaseURLs            []string  `json:"baseURLs"`
+		Proxies             []string  `json:"proxies"`
+		Subs                []string  `json:"subs"`
+		ExitMode            *string   `json:"exitMode"`
+		StickySessions      *bool     `json:"stickySessions"`
+		NodeExcludeKeywords *[]string `json:"nodeExcludeKeywords"`
+		EnabledRegions      []string  `json:"enabledRegions"`
+		DNSMode             *string   `json:"dnsMode"`
+		DNSCustom           *string   `json:"dnsCustom"`
+		RescueDirect        *bool     `json:"rescueDirect"`
+		SubsRefreshMins     *int      `json:"subsRefreshMins"`
+		ProxyStrategy       *string   `json:"proxyStrategy"`
+		MaxConcurrency      *int      `json:"maxConcurrency"`
+		Retries             *int      `json:"retries"`
+		Failover            *bool     `json:"failover"`
+		FailoverCount       *int      `json:"failoverCount"`
+		FailoverMinutes     *int      `json:"failoverMinutes"`
+		Compaction          *struct {
 			Auto         *bool   `json:"auto"`
 			Buffer       *int    `json:"buffer"`
 			KeepTokens   *int    `json:"keepTokens"`
@@ -164,6 +166,15 @@ func handleZenConfigUpdate(w http.ResponseWriter, r *http.Request) {
 	}
 	if patch.StickySessions != nil {
 		next.StickySessions = *patch.StickySessions
+	}
+	if patch.NodeExcludeKeywords != nil {
+		cleaned := make([]string, 0, len(*patch.NodeExcludeKeywords))
+		for _, k := range *patch.NodeExcludeKeywords {
+			if k = strings.TrimSpace(k); k != "" {
+				cleaned = append(cleaned, k)
+			}
+		}
+		next.NodeExcludeKeywords = cleaned
 	}
 	if patch.EnabledRegions != nil {
 		// 只允许 7 个已知地区; 空数组 = 清除限制(全部地区可用)。

@@ -193,6 +193,9 @@ const adminHTMLPart2 = `<div id="tab-router" class="tab-panel" style="display:no
           <option value="true">开启（同一客户端 30 分钟内固定同一出口）</option>
         </select>
       </div>
+      <div class="field" style="flex:1;min-width:220px"><label>节点排除关键词（每行一个，命中节点名的订阅节点不入池）</label>
+        <textarea id="ocNodeExclude" rows="2" placeholder="官网&#10;过期&#10;剩余流量"></textarea>
+      </div>
       <div class="field"><label>节点全挂时</label>
         <select id="ocRescue">
           <option value="true">允许直连兜底（推荐，经 sing-box 的 direct 出站）</option>

@@ -264,9 +264,12 @@ type zenConfigData struct {
 	StreamHeartbeatSecs int `json:"streamHeartbeatSecs,omitempty"`
 	// StickySessions 粘性会话(P2, Resin 思路): 开启后同一客户端来源 IP 在
 	// TTL(30 分钟)内复用同一出口节点, 服务于"同 IP 连续请求"的上游场景。
-	StickySessions bool            `json:"stickySessions,omitempty"`
-	Usage          zenUsageConfig  `json:"usage"`  // 每日配额账本
-	Router         zenRouterConfig `json:"router"` // 自动路由模型名与参与范围
+	StickySessions bool `json:"stickySessions,omitempty"`
+	// NodeExcludeKeywords 节点名排除关键词(不区分大小写): 订阅节点显示名命中
+	// 任一关键词即不进入出口池(典型: 官网/过期/剩余流量 等信息位节点)。
+	NodeExcludeKeywords []string        `json:"nodeExcludeKeywords,omitempty"`
+	Usage               zenUsageConfig  `json:"usage"`  // 每日配额账本
+	Router              zenRouterConfig `json:"router"` // 自动路由模型名与参与范围
 }
 
 // zenEndpointMirrors 官方源之外的 CDN 镜像端点(实测镜像透传官方完整路径,须带 /v1)。
