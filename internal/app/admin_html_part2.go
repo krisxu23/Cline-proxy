@@ -112,17 +112,17 @@ const adminHTMLPart2 = `<div id="tab-router" class="tab-panel" style="display:no
         <div id="arPermBox" style="border:1px solid var(--border);border-radius:var(--radius-sm);background:var(--inset);min-height:42px;max-height:220px;overflow-y:auto"></div>
       </div>
     </div>
-    <div style="margin-yle="margin-top:12px;border-top:1px solid var(--border);padding-top:10px">
-      <div class="hint" style="margin-bottom:4px">🔎 路由预演（不发请求，试算这个名字会走哪些站、哪些被跳过）</div>
+    <div style="margin-top:12px;border-top:1px solid var(--border);padding-top:10px">
+      <div class="hint" style="margin-bottom:4px">🔎 路由预演（不发请求，试算某个模型名会走哪些站、哪些被跳过）</div>
       <div style="display:flex;gap:var(--sp-2)">
-        <input id="previewModel" placeholder="组合名 / 别名 / zen:xxx 等任意模型名" style="flex:1" onkeydown="if(event.key==='Enter'){previewRoute();}" />
+        <input id="previewModel" placeholder="别名 / zen:xxx / cline:* 等任意模型名" style="flex:1" onkeydown="if(event.key==='Enter'){previewRoute();}" />
         <button class="btn" onclick="previewRoute()">预演</button>
       </div>
       <div id="previewResult" style="margin-top:8px;font-size:var(--fs-xs)"></div>
     </div>
   </div>
 </div>
-
+</div>
 <div id="tab-settings" class="tab-panel" style="display:none">
 <h2>⚙️ 设置</h2>
 

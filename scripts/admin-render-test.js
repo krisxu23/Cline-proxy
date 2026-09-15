@@ -54,6 +54,31 @@ if (!src) {
   process.exit(2);
 }
 const script = (src.match(/<script>([\s\S]*?)<\/script>/) || [])[1];
+
+// ---- div 嵌套平衡断言(P2 回归): 曾因区块插入破坏 tab 面板嵌套, 导致
+// 设置/日志页整页空白(面板被吞进其它 tab 的容器, 切换时父级被隐藏)。
+// 规则: 整页 <div>/</div> 必须平衡; 所有 id="tab-*" 面板必须处于同一嵌套深度。
+{
+  let depth = 0;
+  const panelDepths = [];
+  const tagRe = /<div id="tab-[a-z]+"|<div\b|<\/div>/g;
+  let mm;
+  while ((mm = tagRe.exec(src)) !== null) {
+    const t = mm[0];
+    if (t.startsWith('<div id="tab-')) { panelDepths.push(depth); depth++; }
+    else if (t === '</div>') depth--;
+    else depth++;
+  }
+  if (depth !== 0) {
+    console.error('FATAL: 页面 div 未平衡, 最终嵌套深度=' + depth);
+    process.exit(2);
+  }
+  if (panelDepths.length === 0 || Math.max(...panelDepths) !== Math.min(...panelDepths)) {
+    console.error('FATAL: tab 面板嵌套深度不一致: ' + panelDepths.join(','));
+    process.exit(2);
+  }
+  console.log('[div-balance] 页面 div 平衡, ' + panelDepths.length + ' 个 tab 面板嵌套深度一致 = ' + panelDepths[0]);
+}
 if (!script) {
   console.error('FATAL: adminHTML 里没有 <script>');
   process.exit(2);
