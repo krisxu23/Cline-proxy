@@ -372,6 +372,9 @@ func handleProviderChat(w http.ResponseWriter, r *http.Request, params map[strin
 
 	isStream, _ := params["stream"].(bool)
 	params["model"] = pm
+	// 路由头(P2 修复): 不设置时请求日志会把本路径判为 "other" 噪音过滤掉,
+	// 面板日志里完全看不到 provider 请求。upstream=provider/<名> 供日志回填。
+	w.Header().Set("X-Proxy-Route", "upstream="+providerUpstream(name))
 	// 通用 Provider 也计入统计: 上游按 provider/<名> 归组, 模型记为 <名>:<模型>,
 	// 这样「按上游」能看出是哪个 Provider 在消耗 token。
 	tracker := newZenStatsTrackerCtx(r.Context(), zenStatsRecord{
