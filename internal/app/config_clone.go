@@ -114,14 +114,6 @@ func (c *zenConfigData) clone() *zenConfigData {
 			out.Routes[k] = cloneStrings(v)
 		}
 	}
-	if c.Combos != nil {
-		out.Combos = make(map[string]*comboDef, len(c.Combos))
-		for k, v := range c.Combos {
-			cp := *v
-			cp.Targets = append([]comboTarget(nil), v.Targets...)
-			out.Combos[k] = &cp
-		}
-	}
 	if c.CooldownMs != nil {
 		out.CooldownMs = make(map[string]int64, len(c.CooldownMs))
 		for k, v := range c.CooldownMs {

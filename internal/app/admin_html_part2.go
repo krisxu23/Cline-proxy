@@ -1,6 +1,6 @@
 package app
 
-// adminHTML 分段 2/4: 自动路由页(含组合模型与路由预演) + 设置页。
+// adminHTML 分段 2/4: 自动路由页(含路由预演) + 设置页。
 // 由 admin_html.go 拆分而来(P2-21): 单文件近 2900 行的原始字符串难以评审,
 // 按面板边界切成多段常量, 拼接结果与拆分前逐字节一致; 原始字符串内
 // 仍然禁止出现反引号(会终止字符串)。
@@ -112,32 +112,7 @@ const adminHTMLPart2 = `<div id="tab-router" class="tab-panel" style="display:no
         <div id="arPermBox" style="border:1px solid var(--border);border-radius:var(--radius-sm);background:var(--inset);min-height:42px;max-height:220px;overflow-y:auto"></div>
       </div>
     </div>
-  </div>
-</div>
-</div>
-
-<div class="section">
-  <div class="section-title">🧩 组合模型（虚拟模型，自动路由）</div>
-  <div class="section-body">
-    <p class="hint">把多家供应商的模型合成一个对外模型名：客户端只填组合名，网关按策略自动在目标间路由/回退。
-    策略：priority=按声明顺序（谁靠前先用谁）｜round_robin=轮流打头均摊用量｜weighted=按权重加权打头。
-    组合名会出现在 /v1/models 里，客户端可直接使用；失败自动换下一站（继承冷却与健康规则）。</p>
-    <div style="display:flex;gap:var(--sp-2);flex-wrap:wrap;align-items:flex-end;margin-bottom:10px">
-      <div><div class="hint" style="margin-bottom:2px">组合名（不能含空格）</div>
-        <input id="comboName" placeholder="例如 free-mix" style="width:180px" /></div>
-      <div><div class="hint" style="margin-bottom:2px">策略</div>
-        <select id="comboStrategy" style="width:140px">
-          <option value="priority">priority 顺序</option>
-          <option value="round_robin">round_robin 轮转</option>
-          <option value="weighted">weighted 加权</option>
-        </select></div>
-      <div style="flex:1;min-width:260px"><div class="hint" style="margin-bottom:2px">目标（每行一个：upstream:model[:权重]，如 zen/mimo-v2.5-free 或 cline:*）</div>
-        <input id="comboTargets" placeholder="zen/mimo-v2.5-free&#10;cline:*&#10;clinepass/glm-5.3-flash:20" style="width:100%" /></div>
-      <button class="btn btn-success" onclick="saveCombo()">💾 保存组合</button>
-    </div>
-    <div id="comboProblems" style="color:var(--amber);font-size:var(--fs-xs);margin-bottom:8px;white-space:pre-wrap"></div>
-    <div id="combosList"></div>
-    <div style="margin-top:12px;border-top:1px solid var(--border);padding-top:10px">
+    <div style="margin-yle="margin-top:12px;border-top:1px solid var(--border);padding-top:10px">
       <div class="hint" style="margin-bottom:4px">🔎 路由预演（不发请求，试算这个名字会走哪些站、哪些被跳过）</div>
       <div style="display:flex;gap:var(--sp-2)">
         <input id="previewModel" placeholder="组合名 / 别名 / zen:xxx 等任意模型名" style="flex:1" onkeydown="if(event.key==='Enter'){previewRoute();}" />

@@ -555,64 +555,6 @@ async function loadHealth() {
   }
 }
 
-// ========== 组合模型 (P1-13) ==========
-
-const COMBO_STRATEGY_LABEL = { priority: '顺序', round_robin: '轮转', weighted: '加权', '': '顺序' };
-
-async function loadCombos() {
-  const box = _('combosList');
-  try {
-    const d = await api('GET', '/combos');
-    const combos = d.data.combos || [];
-    if (!combos.length) { box.innerHTML = '<div class="hint">还没有组合。按上面的表单创建第一个组合模型。</div>'; return; }
-    box.innerHTML = combos.map(c => {
-      const targets = (c.targets || []).map(t => {
-        const w = t.weight ? ':' + t.weight : '';
-        return esc((t.upstream || '') + ':' + (t.model || '') + w);
-      }).join('<span style="color:var(--text3)"> → </span>');
-      return '<div style="display:flex;align-items:center;gap:10px;padding:var(--sp-2) var(--sp-3);background:rgba(148,163,184,.06);border:1px solid var(--border);border-radius:var(--radius-sm);margin-bottom:6px">' +
-        '<span class="model-tag" style="flex:none">' + esc(c.name) + '</span>' +
-        '<span style="flex:none;font-size:var(--fs-xs);color:var(--text3)">[' + esc(COMBO_STRATEGY_LABEL[c.strategy] || c.strategy) + ']</span>' +
-        '<span class="mono" style="flex:1;font-size:var(--fs-xs);overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="' + esc(targets) + '">' + targets + '</span>' +
-        '<button class="btn" style="flex:none;padding:4px 10px;font-size:var(--fs-xs)" onclick="previewRoute(\'' + esc(c.name) + '\')">预演</button>' +
-        '<button class="btn" style="flex:none;padding:4px 10px;font-size:var(--fs-xs);color:var(--danger)" onclick="deleteCombo(\'' + esc(c.name) + '\')">删除</button>' +
-      '</div>';
-    }).join('');
-  } catch (e) { box.innerHTML = '<div class="hint">' + fail(e, 'loadCombos()') + '</div>'; }
-}
-
-async function saveCombo() {
-  const name = _('comboName').value.trim();
-  const strategy = _('comboStrategy').value;
-  const raw = _('comboTargets').value.trim();
-  _('comboProblems').textContent = '';
-  if (!name || !raw) { _('comboProblems').textContent = '组合名与目标都不能为空'; return; }
-  const targets = raw.split('\n').map(line => {
-    const parts = line.trim().split(':').map(s => s.trim());
-    const t = { upstream: parts[0] || '', model: parts[1] || '' };
-    if (parts[2]) t.weight = parseInt(parts[2], 10) || 0;
-    return t;
-  }).filter(t => t.upstream && t.model);
-  try {
-    await api('POST', '/combos/save', { name: name, strategy: strategy, targets: targets });
-    toast('组合已保存: ' + name, 'success');
-    _('comboName').value = ''; _('comboTargets').value = '';
-    loadCombos(); loadRouterSelection && loadRouterSelection();
-  } catch (e) {
-    // 后端把具体问题(目录缺模型等)放在错误消息里, 原样展示
-    _('comboProblems').textContent = (e && e.message) || String(e);
-  }
-}
-
-async function deleteCombo(name) {
-  if (!confirm('删除组合 ' + name + ' ?')) return;
-  try {
-    await api('POST', '/combos/delete', { name: name });
-    toast('已删除: ' + name, 'success');
-    loadCombos();
-  } catch (e) { toast((e && e.message) || String(e), 'error'); }
-}
-
 async function previewRoute(name) {
   const box = _('previewResult');
   const model = name || _('previewModel').value.trim();

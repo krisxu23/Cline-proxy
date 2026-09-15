@@ -243,82 +243,10 @@ func cleanSelection(providers, models []string) ([]string, []string) {
 	return cl(providers), cl(models)
 }
 
-// ============ 组合模型管理 (P1-13) ============
-
-// handleCombosList GET /admin/api/combos — 列出全部组合模型。
-func handleCombosList(w http.ResponseWriter, r *http.Request) {
-	cfg := getZenConfig()
-	out := make([]*comboDef, 0, len(cfg.Combos))
-	for _, name := range comboNames() {
-		if c := cfg.Combos[name]; c != nil {
-			cp := *c
-			out = append(out, &cp)
-		}
-	}
-	writeAPI(w, http.StatusOK, apiResponse{Success: true, Data: map[string]any{"combos": out}})
-}
-
-// handleCombosSave POST /admin/api/combos/save
-// body: {"name": "...", "strategy": "priority|round_robin|weighted",
-//
-//	"targets": [{"upstream":"zen","model":"...","weight":10}]}
-//
-// 校验(目标可解析)通过才落盘 —— 拒绝把"静默失效"的配置写进网关。
-func handleCombosSave(w http.ResponseWriter, r *http.Request) {
-	if r.Method != "POST" {
-		writeAPI(w, http.StatusMethodNotAllowed, apiResponse{Error: "method not allowed"})
-		return
-	}
-	var body comboDef
-	if err := json.NewDecoder(io.LimitReader(r.Body, 64<<10)).Decode(&body); err != nil {
-		writeAPI(w, http.StatusBadRequest, apiResponse{Error: "body 解析失败: " + err.Error()})
-		return
-	}
-	body.Name = strings.TrimSpace(body.Name)
-	if problems := validateComboDef(&body); len(problems) > 0 {
-		writeAPI(w, http.StatusBadRequest, apiResponse{Error: "组合定义有问题: " + strings.Join(problems, "; ")})
-		return
-	}
-	cfg := getZenConfig()
-	if cfg.Combos == nil {
-		cfg.Combos = map[string]*comboDef{}
-	}
-	cp := body
-	cfg.Combos[body.Name] = &cp
-	setZenConfig(cfg)
-	writeAPI(w, http.StatusOK, apiResponse{Success: true, Data: map[string]any{"saved": body.Name}})
-}
-
-// handleCombosDelete POST /admin/api/combos/delete {"name": "..."}
-func handleCombosDelete(w http.ResponseWriter, r *http.Request) {
-	if r.Method != "POST" {
-		writeAPI(w, http.StatusMethodNotAllowed, apiResponse{Error: "method not allowed"})
-		return
-	}
-	var body struct {
-		Name string `json:"name"`
-	}
-	if err := json.NewDecoder(io.LimitReader(r.Body, 4<<10)).Decode(&body); err != nil || strings.TrimSpace(body.Name) == "" {
-		writeAPI(w, http.StatusBadRequest, apiResponse{Error: "body 必须是 {\"name\": \"...\"}"})
-		return
-	}
-	cfg := getZenConfig()
-	_, existed := cfg.Combos[body.Name]
-	delete(cfg.Combos, body.Name)
-	if existed {
-		setZenConfig(cfg)
-	}
-	if !existed {
-		writeAPI(w, http.StatusNotFound, apiResponse{Error: "组合不存在: " + body.Name})
-		return
-	}
-	writeAPI(w, http.StatusOK, apiResponse{Success: true, Data: map[string]any{"deleted": body.Name}})
-}
-
 // handleRoutePreview GET /admin/api/router/preview?model=<名>
 // 路由预演(P2-24, 参照 OmniRoute 的 route/preview): 不发上游请求, 返回
-// "这个名字会按什么顺序尝试哪些站、哪些会被跳过及原因" —— 排查选路问题
-// 的零消耗入口。组合/别名/直连模型名都可预演。
+// "这个名字会按什么顺序尝试哪些站、哪些会被跳过及原因" —— 排查自动路由
+// 选路问题的零消耗入口。别名与直连模型名都可预演。
 func handleRoutePreview(w http.ResponseWriter, r *http.Request) {
 	if r.Method != "GET" {
 		writeAPI(w, http.StatusMethodNotAllowed, apiResponse{Error: "method not allowed"})
