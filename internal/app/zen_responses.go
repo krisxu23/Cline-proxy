@@ -31,6 +31,7 @@ import (
 	"sync"
 	"time"
 
+	"cline-go-proxy/internal/app/translate"
 	"cline-go-proxy/internal/kit"
 )
 
@@ -187,6 +188,13 @@ func contentText(content any) string {
 	default:
 		return ""
 	}
+}
+
+// init 把请求体转换实现注册进 translate 注册表(P1-9): 调用方一律经
+// translate.TranslateRequest 取转换结果, 实现集中在本文件, 未来整体搬迁到
+// translate 包时调用方无需再改。
+func init() {
+	translate.RegisterRequest(translate.Chat, translate.Responses, chatBodyToResponsesBody)
 }
 
 // chatBodyToResponsesBody 把 OpenAI chat completions 请求体翻译成 Responses 请求体。

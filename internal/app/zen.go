@@ -2,6 +2,7 @@ package app
 
 import (
 	"bytes"
+	"cline-go-proxy/internal/app/translate"
 	"cline-go-proxy/internal/kit"
 	"context"
 	"encoding/json"
@@ -638,8 +639,13 @@ func callZenAPI(ctx context.Context, params map[string]any, stream bool) (*http.
 	// 客户端请求的输出预算: muse-spark 的 finish_reason 假截断判定需要它。
 	zenBudget := zenRequestedBudget(params)
 	if useRespAPI {
-		body = chatBodyToResponsesBody(body)
+		body = translate.TranslateRequest(translate.Chat, translate.Responses, body)
 		applyResponsesReasoning(body, reasoningEffort)
+		// 出站体形态不变量(P1-9): 违例说明转换层有 bug(如重复转换把 input
+		// 转空), 宁可网关 500 也不把畸形请求发给上游换回难以理解的 400。
+		if problems := translate.ValidateOutbound(translate.Responses, body); len(problems) > 0 {
+			return nil, 0, fmt.Errorf("responses outbound shape invalid: %s", strings.Join(problems, "; "))
+		}
 	}
 
 	bodyJSON, err := json.Marshal(body)
@@ -807,12 +813,14 @@ func callZenAPI(ctx context.Context, params map[string]any, stream bool) (*http.
 		if resp.StatusCode >= http.StatusInternalServerError {
 			if !useRespAPI && !respTried {
 				respTried = true
-				altBody := chatBodyToResponsesBody(body)
+				altBody := translate.TranslateRequest(translate.Chat, translate.Responses, body)
 				applyResponsesReasoning(altBody, reasoningEffort)
-				if alt := tryZenResponsesFallback(ctx, base, altBody, stream, client, zenBudget); alt != nil {
-					markZenSuccess()
-					recordZenModelResult(zenModelIDOf(params), false)
-					return alt, rateLimited, nil
+				if problems := translate.ValidateOutbound(translate.Responses, altBody); len(problems) == 0 {
+					if alt := tryZenResponsesFallback(ctx, base, altBody, stream, client, zenBudget); alt != nil {
+						markZenSuccess()
+						recordZenModelResult(zenModelIDOf(params), false)
+						return alt, rateLimited, nil
+					}
 				}
 			}
 			if attempt < retries {
