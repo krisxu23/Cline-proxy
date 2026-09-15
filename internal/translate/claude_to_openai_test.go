@@ -40,7 +40,8 @@ func TestClaudeResponseToOpenAIChat(t *testing.T) {
 		t.Fatalf("tool_use 的 stop_reason 应映射为 tool_calls, got %v", ch["finish_reason"])
 	}
 	u := out["usage"].(map[string]any)
-	if u["prompt_tokens"] != 10 || u["completion_tokens"] != 5 {
+	// JSON 解码后数值为 float64, 按数值比较
+	if int(u["prompt_tokens"].(float64)) != 10 || int(u["completion_tokens"].(float64)) != 5 {
 		t.Fatalf("usage 映射不符: %v", u)
 	}
 }
