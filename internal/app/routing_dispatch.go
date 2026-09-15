@@ -51,6 +51,13 @@ func handleChainedChatAs(w http.ResponseWriter, r *http.Request, params map[stri
 	isStream, _ := params["stream"].(bool)
 	applyOverride(params)
 
+	// 请求轨迹与决策轨迹: 一次链式调度同时回填"请求日志用的元数据"和
+	// "面板详情用的逐候选决策"(参照 OmniRoute 的 call_logs + decisionTrace)。
+	tr := traceFrom(r.Context())
+	tr.SetProtocol(chainProtocolName(tgt.Shape), isStream)
+	dec := decisionTraceStart(reqIDFrom(r.Context()), requested)
+	defer dec.finish()
+
 	var (
 		lastErr    error
 		lastStatus = http.StatusBadGateway
@@ -60,10 +67,13 @@ func handleChainedChatAs(w http.ResponseWriter, r *http.Request, params map[stri
 	for _, cand := range chain {
 		if why := candidateSkip(cand); why != "" {
 			skipped++
+			tr.AddSkip(cand.String(), why)
+			dec.addCandidate(cand.String(), "skipped", why, 0, "")
 			log.Printf("  chain: 跳过 %s (%s)", cand.String(), why)
 			continue
 		}
 		tried++
+		tr.AddAttempt()
 		hopParams := cloneParamsForCandidate(params, cand)
 		model, _ := hopParams["model"].(string)
 
@@ -76,6 +86,7 @@ func handleChainedChatAs(w http.ResponseWriter, r *http.Request, params map[stri
 			lastErr, lastStatus = err, upstreamErrorStatus(err)
 			applyCandidateFailure(cand, class, reason, body)
 			recordUsageForCandidate(cand, false)
+			dec.addCandidate(cand.String(), "tried", reason, status, class)
 			log.Printf("  chain: %s 失败(%s), 换下一站: %v", cand.String(), class, err)
 			continue
 		}
@@ -91,6 +102,7 @@ func handleChainedChatAs(w http.ResponseWriter, r *http.Request, params map[stri
 					lastStatus = http.StatusBadGateway
 					markCandidateCooldown(cand.Upstream, cand.Model, classTimeout, "读取响应失败")
 					recordUsageForCandidate(cand, false)
+					dec.addCandidate(cand.String(), "tried", "读取响应失败", 0, classTimeout)
 					continue
 				}
 				if !chatBodyHasContent(body) || chainBodyOnlyBrokenToolCalls(body) {
@@ -104,10 +116,11 @@ func handleChainedChatAs(w http.ResponseWriter, r *http.Request, params map[stri
 					}
 					markCandidateCooldown(cand.Upstream, cand.Model, classEmpty, reason)
 					recordUsageForCandidate(cand, false)
+					dec.addCandidate(cand.String(), "tried", reason, http.StatusOK, classEmpty)
 					log.Printf("  chain: %s %s, 换下一站", cand.String(), reason)
 					continue
 				}
-				tracker := newZenStatsTracker(zenStatsRecord{
+				tracker := newZenStatsTrackerCtx(r.Context(), zenStatsRecord{
 					TS:           time.Now().UnixMilli(),
 					Upstream:     chainUpstreamLabel(cand),
 					Model:        model,
@@ -115,14 +128,22 @@ func handleChainedChatAs(w http.ResponseWriter, r *http.Request, params map[stri
 					PromptTokens: estimateJSON(hopParams),
 				})
 				setRouteHeader(w, chainUpstreamLabel(cand), model, chainFailoverHeader)
-				writeChainNonStream(w, body, tgt, tracker)
+				tr.SetUpstream(chainUpstreamLabel(cand), model)
+				// 非流式: 上游 usage 由 writeChainNonStream 内部回填 tracker, 这里
+				// 顺带把同一份 usage 记进请求轨迹(trim 面板要的 token 明细)。
+				writeChainNonStream(w, body, tgt, func(u map[string]any) {
+					tracker.observeUsage(u)
+					tr.ObserveUsage(u)
+				})
 				tracker.finish(true, http.StatusOK)
 				recordUsageForCandidate(cand, true)
+				dec.addCandidate(cand.String(), "tried", "", http.StatusOK, "")
+				dec.setWinner(cand.String())
 				logChainResult(cand, tried, skipped)
 				return
 			}
 
-			tracker := newZenStatsTracker(zenStatsRecord{
+			tracker := newZenStatsTrackerCtx(r.Context(), zenStatsRecord{
 				TS:           time.Now().UnixMilli(),
 				Upstream:     chainUpstreamLabel(cand),
 				Model:        model,
@@ -130,9 +151,14 @@ func handleChainedChatAs(w http.ResponseWriter, r *http.Request, params map[stri
 				PromptTokens: estimateJSON(hopParams),
 			})
 			setRouteHeader(w, chainUpstreamLabel(cand), model, chainFailoverHeader)
+			tr.SetUpstream(chainUpstreamLabel(cand), model)
+			observe := func(u map[string]any) {
+				tracker.observeUsage(u)
+				tr.ObserveUsage(u)
+			}
 			switch tgt.Shape {
 			case shapeAnthropic:
-				handleAnthropicStreamWithUsage(w, resp, model, tgt.ToolSchemas, tracker.observeUsage)
+				handleAnthropicStreamWithUsage(w, resp, model, tgt.ToolSchemas, observe)
 			case shapeResponses:
 				w.Header().Set("Content-Type", "text/event-stream")
 				w.Header().Set("Cache-Control", "no-cache")
@@ -141,7 +167,7 @@ func handleChainedChatAs(w http.ResponseWriter, r *http.Request, params map[stri
 				w.WriteHeader(http.StatusOK)
 				chatStreamToResponses(w, resp, nil)
 			default:
-				handleStreamResponseWithUsage(w, resp, tracker.observeUsage)
+				handleStreamResponseWithUsage(w, resp, observe)
 			}
 			// 这里以前从不关闭上游响应体。对比上面两条失败路径(87/154 行)都显式
 			// Close 了, 唯独流式成功这条漏掉, 而三个流式 handler 内部也都只读到
@@ -149,6 +175,8 @@ func handleChainedChatAs(w http.ResponseWriter, r *http.Request, params map[stri
 			resp.Body.Close()
 			tracker.finish(resp.StatusCode < 400, resp.StatusCode)
 			recordUsageForCandidate(cand, true)
+			dec.addCandidate(cand.String(), "tried", "", resp.StatusCode, "")
+			dec.setWinner(cand.String())
 			logChainResult(cand, tried, skipped)
 			return
 		}
@@ -162,6 +190,7 @@ func handleChainedChatAs(w http.ResponseWriter, r *http.Request, params map[stri
 		class, reason := classifyCandidateFailure(resp.StatusCode, body)
 		applyCandidateFailure(cand, class, reason, body)
 		recordUsageForCandidate(cand, false)
+		dec.addCandidate(cand.String(), "tried", reason, resp.StatusCode, class)
 		log.Printf("  chain: %s HTTP %d(%s), 换下一站", cand.String(), resp.StatusCode, class)
 	}
 
@@ -174,12 +203,41 @@ func handleChainedChatAs(w http.ResponseWriter, r *http.Request, params map[stri
 	if status < 400 || status > 599 {
 		status = http.StatusBadGateway
 	}
+	tr.SetError(errClassForStatus(status), lastErr.Error())
 	writeJSON(w, status, map[string]any{
 		"error": map[string]string{
 			"message": fmt.Sprintf("route %q: all candidates failed; last error: %v", requested, lastErr),
 			"type":    "upstream_unavailable",
 		},
 	})
+}
+
+// chainProtocolName 把响应形状映射成客户端入口协议名(请求日志用)。
+func chainProtocolName(s chainShape) string {
+	switch s {
+	case shapeAnthropic:
+		return "anthropic"
+	case shapeResponses:
+		return "responses"
+	default:
+		return "openai"
+	}
+}
+
+// errClassForStatus 请求日志用的粗粒度错误类别(链式调度全站失败时)。
+func errClassForStatus(status int) string {
+	switch {
+	case status == http.StatusTooManyRequests:
+		return classRateLimit
+	case status >= 500:
+		return classServerError
+	case status == http.StatusUnauthorized || status == http.StatusForbidden:
+		return "auth"
+	case status >= 400:
+		return "client_error"
+	default:
+		return classEmpty
+	}
 }
 
 func logChainResult(cand routeCandidate, tried, skipped int) {
@@ -244,7 +302,7 @@ func applyCandidateFailure(cand routeCandidate, class, reason string, body []byt
 	if class == classServerError || class == classTimeout || class == classEmpty {
 		recordZenModelResult(cand.Model, true)
 	}
-	key := candidateKey(cand.Upstream, cand.Model)	// Gemini 的回包里带了"每日限额"就回填账本: 之后到量即跳过,
+	key := candidateKey(cand.Upstream, cand.Model) // Gemini 的回包里带了"每日限额"就回填账本: 之后到量即跳过,
 	// 不必等到真的撞一次 429 才知道用完。
 	if qf := parseQuotaFailure(jsonObject(body)); qf != nil && qf.DailyRequestLimit != nil {
 		autoFillDailyLimit(key, *qf.DailyRequestLimit)
@@ -288,14 +346,14 @@ func jsonObject(body []byte) map[string]any {
 //
 // body 已完整读过(非流式路径), 所以既可以直接透传 OpenAI 形状,
 // 也可以转成 Anthropic 形状 —— 上游永远只会返回 OpenAI 形状。
-func writeChainNonStream(w http.ResponseWriter, body []byte, tgt chainTarget, tracker *zenStatsTracker) {
+func writeChainNonStream(w http.ResponseWriter, body []byte, tgt chainTarget, observeUsage func(map[string]any)) {
 	if tgt.Shape == shapeOpenAI {
 		resp := &http.Response{
 			StatusCode: http.StatusOK,
 			Header:     http.Header{"Content-Type": []string{"application/json"}},
 			Body:       io.NopCloser(bytes.NewReader(body)),
 		}
-		handleNonStreamResponseWithUsage(w, resp, tracker.observeUsage)
+		handleNonStreamResponseWithUsage(w, resp, observeUsage)
 		return
 	}
 	var raw map[string]any
@@ -310,8 +368,8 @@ func writeChainNonStream(w http.ResponseWriter, body []byte, tgt chainTarget, tr
 		chatOut = d
 	}
 	chatOut = normalizeOpenAIResponse(chatOut)
-	if u, ok := chatOut["usage"].(map[string]any); ok && len(u) > 0 {
-		tracker.observeUsage(u)
+	if u, ok := chatOut["usage"].(map[string]any); ok && len(u) > 0 && observeUsage != nil {
+		observeUsage(u)
 	}
 	if tgt.Shape == shapeResponses {
 		writeJSON(w, http.StatusOK, chatToResponses(chatOut))

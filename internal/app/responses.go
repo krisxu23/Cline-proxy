@@ -498,7 +498,7 @@ func handleResponses(w http.ResponseWriter, r *http.Request) {
 		}
 		// 与其它 zen 路径一样接上统计: 此前流式分支传的是 nil, zen 的
 		// 流式调用用量完全不进账本, 面板上的 token 统计因此偏低。
-		tracker := newZenStatsTracker(zenStatsRecord{
+		tracker := newZenStatsTrackerCtx(r.Context(), zenStatsRecord{
 			TS:           time.Now().UnixMilli(),
 			Upstream:     upstreamZen,
 			Model:        zm.ID,

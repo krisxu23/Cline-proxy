@@ -3,6 +3,7 @@ package app
 import (
 	"bytes"
 	"cline-go-proxy/internal/kit"
+	"context"
 	"encoding/json"
 	"io"
 	"log"
@@ -19,8 +20,9 @@ import (
 
 type zenStatsRecord struct {
 	TS               int64  `json:"ts"`
-	Upstream         string `json:"upstream"` // zen / cline / clinepass / provider/<name>
-	Model            string `json:"model"`    // 上游实际模型 ID
+	ReqID            string `json:"reqId,omitempty"` // 请求 id: 与 requests.jsonl / 决策轨迹关联
+	Upstream         string `json:"upstream"`        // zen / cline / clinepass / provider/<name>
+	Model            string `json:"model"`           // 上游实际模型 ID
 	Stream           bool   `json:"stream"`
 	Compacted        bool   `json:"compacted"`
 	OK               bool   `json:"ok"`
@@ -83,10 +85,28 @@ type zenStatsTracker struct {
 	rec      zenStatsRecord
 	started  time.Time
 	finished bool
+	// trace 可选: 有请求轨迹时, usage 会同时镜像进轨迹 —— 这样面板上
+	// "这条请求花了多少 token" 不必再去 zen-stats.jsonl 里做二次关联。
+	// nil 安全(方法本身容忍 nil)。
+	trace *reqTrace
 }
 
 func newZenStatsTracker(rec zenStatsRecord) *zenStatsTracker {
 	return &zenStatsTracker{rec: rec, started: time.Now()}
+}
+
+// newZenStatsTrackerCtx 带请求上下文的构造: 自动回填请求 id、上游名/实际模型与
+// token 镜像。所有上游调用点都应优先用它, 保证请求日志与用量记录能互相关联。
+func newZenStatsTrackerCtx(ctx context.Context, rec zenStatsRecord) *zenStatsTracker {
+	rec.ReqID = reqIDFrom(ctx)
+	tr := traceFrom(ctx)
+	if tr != nil {
+		tr.SetUpstream(rec.Upstream, rec.Model)
+		if rec.Stream {
+			tr.SetProtocol("", true)
+		}
+	}
+	return &zenStatsTracker{rec: rec, started: time.Now(), trace: tr}
 }
 
 func (t *zenStatsTracker) finish(ok bool, status int) {
@@ -107,6 +127,8 @@ func (t *zenStatsTracker) observeUsage(u map[string]any) {
 	if t == nil || u == nil {
 		return
 	}
+	// 镜像进请求轨迹(多协议字段名归一在 req_trace.go 里)。
+	t.trace.ObserveUsage(u)
 	if v, ok := u["prompt_tokens"].(float64); ok && v > 0 {
 		t.rec.PromptTokens = int(v)
 	}

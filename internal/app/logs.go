@@ -18,17 +18,42 @@ import (
 )
 
 // RequestLog 单条代理请求记录（对话/API 调用历史）
+//
+// 字段口径参照 OmniRoute 的 call_logs 摘要设计: 一行就能回答
+// "谁、走哪个上游、什么模型、多快、多少 token、为什么失败"。
+// 注意这里只记元数据 —— 不含 prompt、响应正文与请求头, 避免日志变成泄露面。
 type RequestLog struct {
-	Time     time.Time `json:"time"`
-	Client   string    `json:"client"`
-	Method   string    `json:"method"`
-	Path     string    `json:"path"`
-	Model    string    `json:"model,omitempty"`
-	Route    string    `json:"route"` // zen | cline | admin | other
-	Exit     string    `json:"exit,omitempty"`
-	Status   int       `json:"status"`
-	Duration int64     `json:"duration_ms"`
-	Note     string    `json:"note,omitempty"`
+	Time   time.Time `json:"time"`
+	ID     string    `json:"id,omitempty"` // 请求 id(X-Request-Id), 与 zen-stats/决策轨迹关联
+	Client string    `json:"client"`
+	Method string    `json:"method"`
+	Path   string    `json:"path"`
+	Model  string    `json:"model,omitempty"` // 客户端请求的模型(可能是别名/组合名)
+	// ResolvedModel 实际发往上游的模型: 与 Model 不同即说明发生了别名/组合/兜底改写,
+	// 面板上两者的差异就是"这次到底打了谁"的直接证据。
+	ResolvedModel string `json:"resolvedModel,omitempty"`
+	Route         string `json:"route"`              // zen | cline | admin | other
+	Upstream      string `json:"upstream,omitempty"` // zen | cline | clinepass | provider/<name> | chain
+	Exit          string `json:"exit,omitempty"`
+	Status        int    `json:"status"`
+	DurationMs    int64  `json:"durationMs"`
+	// DurationLegacy 兼容旧落盘记录(历史字段名 duration_ms), 载入时回填到 DurationMs。
+	DurationLegacy int64  `json:"duration_ms,omitempty"`
+	TTFTMs         int64  `json:"ttftMs,omitempty"` // 首字节耗时(流式体验的关键指标)
+	Stream         bool   `json:"stream,omitempty"`
+	Protocol       string `json:"protocol,omitempty"` // openai | anthropic | responses
+	Attempts       int    `json:"attempts,omitempty"` // 候选链真实尝试次数
+	// Skipped 被跳过的候选及原因("zen/mimo=冷却中(rateLimit)"), 是"为什么没用那站"的答案。
+	Skipped          []string `json:"skipped,omitempty"`
+	ErrClass         string   `json:"errClass,omitempty"`
+	ErrMsg           string   `json:"errMsg,omitempty"`
+	PromptTokens     int      `json:"promptTokens,omitempty"`
+	CompletionTokens int      `json:"completionTokens,omitempty"`
+	ReasoningTokens  int      `json:"reasoningTokens,omitempty"`
+	CacheTokens      int      `json:"cacheTokens,omitempty"`
+	Note             string   `json:"note,omitempty"`
+	// UsageReported 上游是否真的上报了 usage(区分"报了 0"与"没报")。
+	UsageReported bool `json:"usageReported,omitempty"`
 }
 
 const (
@@ -248,6 +273,10 @@ func parseRequestLogsFromLines(s string) []RequestLog {
 			if isRequestNoise(l) {
 				continue
 			}
+			// 兼容旧记录: 历史字段是 duration_ms, 新字段是 durationMs。
+			if l.DurationMs == 0 && l.DurationLegacy > 0 {
+				l.DurationMs = l.DurationLegacy
+			}
 			out = append(out, l)
 		}
 	}
@@ -267,6 +296,21 @@ func upstreamFromRouteHeader(v string) string {
 		}
 	}
 	return ""
+}
+
+// protocolFromPath 按入口路径判定客户端协议, 供请求日志标注。
+// 上游一律 OpenAI 形状, 所以"协议"指的是客户端那一侧。
+func protocolFromPath(path string) string {
+	switch {
+	case strings.HasSuffix(path, "/messages") || strings.Contains(path, "/v1/messages"):
+		return "anthropic"
+	case strings.Contains(path, "/responses"):
+		return "responses"
+	case strings.HasSuffix(path, "/chat/completions"):
+		return "openai"
+	default:
+		return "openai"
+	}
 }
 
 // isRequestNoise 该条记录是否为管理轮询等噪音(与中间件过滤同一判定)
@@ -300,6 +344,8 @@ func splitLinesSafe(s string) []string {
 type statusWriter struct {
 	http.ResponseWriter
 	status int
+	// firstWriteAt 首次向客户端写出正文的时间, 用于计算 TTFT(首字节耗时)。
+	firstWriteAt time.Time
 }
 
 func (w *statusWriter) WriteHeader(code int) {
@@ -310,6 +356,9 @@ func (w *statusWriter) WriteHeader(code int) {
 func (w *statusWriter) Write(b []byte) (int, error) {
 	if w.status == 0 {
 		w.status = http.StatusOK
+	}
+	if w.firstWriteAt.IsZero() {
+		w.firstWriteAt = time.Now()
 	}
 	return w.ResponseWriter.Write(b)
 }
@@ -358,6 +407,13 @@ func requestLogMiddleware(next http.Handler) http.Handler {
 		exit := &reqExit{}
 		r = r.WithContext(context.WithValue(r.Context(), ctxKeyReqExit, exit))
 
+		// 请求轨迹: 上游名/实际模型/尝试与跳过轨迹/错误类别/token 用量由链路上各层
+		// 回填(见 req_trace.go), 这里只负责注入与最终落盘。
+		tr := &reqTrace{RequestID: newRequestID(r.Header.Get("X-Request-Id"))}
+		r = r.WithContext(withReqTrace(r.Context(), tr))
+		// 回写请求 id: 客户端可据此在自己的日志里对齐网关日志与面板详情。
+		w.Header().Set("X-Request-Id", tr.RequestID)
+
 		next.ServeHTTP(sw, r)
 
 		if sw.status == 0 {
@@ -377,7 +433,8 @@ func requestLogMiddleware(next http.Handler) http.Handler {
 
 		// 路由判定优先采用 handler 实际选择的出口(X-Proxy-Route):
 		// zen 熔断降级到 cline 池时, 仅凭 model 前缀会把请求误标为 zen。
-		if up := upstreamFromRouteHeader(sw.Header().Get("X-Proxy-Route")); up == "zen" || up == "cline" {
+		routeHdr := sw.Header().Get("X-Proxy-Route")
+		if up := upstreamFromRouteHeader(routeHdr); up == "zen" || up == "cline" {
 			route = up
 		}
 
@@ -399,16 +456,50 @@ func requestLogMiddleware(next http.Handler) http.Handler {
 		if host, _, err := net.SplitHostPort(client); err == nil {
 			client = host
 		}
+		snap := tr.snapshot()
+		upstream := snap.Upstream
+		if upstream == "" {
+			upstream = upstreamFromRouteHeader(routeHdr)
+		}
+		protocol := snap.Protocol
+		if protocol == "" {
+			protocol = protocolFromPath(r.URL.Path)
+		}
+		ttft := int64(0)
+		if !sw.firstWriteAt.IsZero() {
+			ttft = sw.firstWriteAt.Sub(start).Milliseconds()
+		}
+		// Note 是给人看的一句话摘要: 优先错误, 其次"跳过了哪些站"。
+		note := snap.ErrMsg
+		if note == "" && len(snap.Skipped) > 0 {
+			note = "跳过 " + strings.Join(snap.Skipped, ", ")
+		}
 		AppendReqLog(RequestLog{
-			Time:     time.Now(),
-			Client:   client,
-			Method:   r.Method,
-			Path:     r.URL.Path,
-			Model:    model,
-			Route:    route,
-			Exit:     exit.name,
-			Status:   sw.status,
-			Duration: time.Since(start).Milliseconds(),
+			Time:             time.Now(),
+			ID:               snap.RequestID,
+			Client:           client,
+			Method:           r.Method,
+			Path:             r.URL.Path,
+			Model:            model,
+			ResolvedModel:    snap.Resolved,
+			Route:            route,
+			Upstream:         upstream,
+			Exit:             exit.name,
+			Status:           sw.status,
+			DurationMs:       time.Since(start).Milliseconds(),
+			TTFTMs:           ttft,
+			Stream:           snap.Stream,
+			Protocol:         protocol,
+			Attempts:         snap.Attempts,
+			Skipped:          snap.Skipped,
+			ErrClass:         snap.ErrClass,
+			ErrMsg:           snap.ErrMsg,
+			PromptTokens:     snap.PromptTokens,
+			CompletionTokens: snap.CompletionTokens,
+			ReasoningTokens:  snap.ReasoningTokens,
+			CacheTokens:      snap.CacheTokens,
+			Note:             note,
+			UsageReported:    snap.UsageReported,
 		})
 	})
 }

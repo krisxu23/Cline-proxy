@@ -336,7 +336,7 @@ func StartProxy(host string, port int) error {
 
 		// cline 池路由也要记账: 面板的「全部 token」包含这一路,
 		// 否则只看得到 opencode 的消耗。
-		tracker := newZenStatsTracker(zenStatsRecord{
+		tracker := newZenStatsTrackerCtx(r.Context(), zenStatsRecord{
 			TS:           time.Now().UnixMilli(),
 			Upstream:     upstreamCline,
 			Model:        model,
@@ -906,7 +906,7 @@ func handleZenChat(w http.ResponseWriter, r *http.Request, params map[string]any
 		return
 	}
 	isStream, _ := params["stream"].(bool)
-	tracker := newZenStatsTracker(zenStatsRecord{
+	tracker := newZenStatsTrackerCtx(r.Context(), zenStatsRecord{
 		TS:           time.Now().UnixMilli(),
 		Upstream:     upstreamZen,
 		Model:        zm.ID,
@@ -2219,7 +2219,7 @@ func handleZenAnthropic(w http.ResponseWriter, r *http.Request, req anthropicReq
 		return
 	}
 	isStream := req.Stream
-	tracker := newZenStatsTracker(zenStatsRecord{
+	tracker := newZenStatsTrackerCtx(r.Context(), zenStatsRecord{
 		TS:           time.Now().UnixMilli(),
 		Upstream:     upstreamZen,
 		Model:        zm.ID,

@@ -374,7 +374,7 @@ func handleProviderChat(w http.ResponseWriter, r *http.Request, params map[strin
 	params["model"] = pm
 	// 通用 Provider 也计入统计: 上游按 provider/<名> 归组, 模型记为 <名>:<模型>,
 	// 这样「按上游」能看出是哪个 Provider 在消耗 token。
-	tracker := newZenStatsTracker(zenStatsRecord{
+	tracker := newZenStatsTrackerCtx(r.Context(), zenStatsRecord{
 		TS:           time.Now().UnixMilli(),
 		Upstream:     providerUpstream(name),
 		Model:        model,
