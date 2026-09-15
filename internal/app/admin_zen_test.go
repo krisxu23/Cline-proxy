@@ -13,8 +13,10 @@ import (
 // `next := &zenConfigData{...}` 只列举了自己想得到的 16 个字段,
 // 而结构体有 23 个。于是用户在 zen 设置页改任意一项(例如重试次数),
 // 下面这些字段就全部被零值覆盖并落盘:
-//   Routes(候选链) / Router(自动路由) / Usage(每日配额账本) /
-//   CooldownMs / DNSMode / DNSCustomDNS / RescueDirect
+//
+//	Routes(候选链) / Router(自动路由) / Usage(每日配额账本) /
+//	CooldownMs / DNSMode / DNSCustomDNS / RescueDirect
+//
 // 其中 RescueDirect 归 nil 会被"缺省视为 true"解释成重新打开
 // "节点全挂时直连兜底", 悄悄绕开统一出口。
 func TestZenConfigUpdatePreservesUntouchedFields(t *testing.T) {

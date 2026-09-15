@@ -45,7 +45,7 @@ func TestAppendReqLogConcurrent(t *testing.T) {
 	wg.Wait()
 	flushReqLogs()
 
-	data, err := os.ReadFile(tmp)
+	data, err := os.ReadFile(dailyLogPath(tmp, time.Now()))
 	if err != nil {
 		t.Fatalf("read log file: %v", err)
 	}

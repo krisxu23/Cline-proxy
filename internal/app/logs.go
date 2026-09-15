@@ -57,8 +57,9 @@ type RequestLog struct {
 }
 
 const (
-	maxReqLogs     = 500
-	maxReqLogsFile = 10 << 20 // 10MB 上限，超出后清空落盘文件（内存仍保留最近 500 条）
+	maxReqLogs = 500
+	// 请求日志按天分段(P2-17): requests-YYYYMMDD.jsonl, 保留 7 天(logRetentionDays),
+	// 取代旧的"10MB truncate 清零"。内存仍只保留最近 500 条。
 
 	// reqLogBodyProbeBytes 中间件读取请求体的上限, 只用于提取 model 字段。
 	// 多模态请求 body 可达数 MB, 全量读入会把整份内容存内存两次, 拖慢请求。
@@ -77,7 +78,7 @@ var (
 	reqLogCloseCh chan chan struct{}
 	reqLogDropped int64
 	reqLogOnce    sync.Once
-	reqLogFile    *os.File // 仅由写协程持有
+	reqLogWriter  *dailyLogFileWriter // 仅由写协程持有(按天分段)
 )
 
 // 写协程的缓冲容量: 远大于常规突发, 正常流量下几乎不丢; 异常突发时丢弃而非阻塞。
@@ -115,7 +116,7 @@ func startReqLogWriter() {
 	})
 }
 
-// reqLogWriterLoop 常驻写协程: 串行消费 channel, 写入文件, 并在超限时轮转。
+// reqLogWriterLoop 常驻写协程: 串行消费 channel, 按天分段写入(P2-17)。
 func reqLogWriterLoop() {
 	for {
 		select {
@@ -135,47 +136,26 @@ func reqLogWriterLoop() {
 			ack <- struct{}{}
 		case ack := <-reqLogCloseCh:
 			// 关闭句柄并回 ack(优雅退出/测试清理)。下次写入会惰性重开。
-			if reqLogFile != nil {
-				reqLogFile.Close()
-				reqLogFile = nil
+			if reqLogWriter != nil {
+				reqLogWriter.close()
 			}
 			ack <- struct{}{}
 		}
 	}
 }
 
-// writeReqLog 仅在写协程内执行: 惰性打开文件, 追加一行, 超限则串行轮转。
-// 句柄打开失败只打日志并允许后续重试, 不永久放弃。
+// writeReqLog 仅在写协程内执行: 追加一行到当天的分段文件。
+// 打开/写入失败只打日志并允许后续重试, 不永久放弃。
 func writeReqLog(l RequestLog) {
-	if reqLogFile == nil {
-		f, err := os.OpenFile(reqLogsFile, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0600)
-		if err != nil {
-			log.Printf("reqlog: open file failed (will retry): %v", err)
-			return
-		}
-		reqLogFile = f
-	}
 	data, err := json.Marshal(l)
 	if err != nil {
 		return
 	}
-	if _, err := reqLogFile.Write(append(data, '\n')); err != nil {
-		log.Printf("reqlog: write failed (will retry): %v", err)
-		reqLogFile.Close()
-		reqLogFile = nil
-		return
+	if reqLogWriter == nil {
+		reqLogWriter = &dailyLogFileWriter{base: reqLogsFile}
 	}
-	// 轮转与追加串行, 消除旧实现"截断竞态丢行/半行"的问题。
-	// 必须用 os.Truncate 而不是句柄级 Truncate: reqLogFile 是 O_APPEND 打开的,
-	// Windows 下该句柄没有 GENERIC_WRITE, 句柄级截断会 "Access is denied",
-	// 旧代码因此把轮转失败误判成"文件句柄坏了"并反复 close+重开。
-	if st, err := reqLogFile.Stat(); err == nil && st.Size() > maxReqLogsFile {
-		if err := os.Truncate(reqLogsFile, 0); err != nil {
-			log.Printf("reqlog: truncate failed: %v", err)
-			reqLogFile.Close()
-			reqLogFile = nil
-			return
-		}
+	if _, err := reqLogWriter.write(data); err != nil {
+		log.Printf("reqlog: write failed (will retry): %v", err)
 	}
 }
 
@@ -218,46 +198,59 @@ func LoadRequestLogs() []RequestLog {
 // 部一小段(64KB 已经覆盖数万条日志)完全够, 且启动峰值内存稳定。
 const reqLogTailBytes = 64 << 10
 
-// LoadRequestLogsFromFile 启动时从落盘文件读取尾部记录
-// 与请求日志中间件同规则: 管理面板只读轮询等噪音不载入, 只保留对话/写操作/错误。
+// LoadRequestLogsFromFile 启动时从落盘文件读取尾部记录(按天分段后的今天文件,
+// 不足 500 条时再回读昨天文件补齐)。与请求日志中间件同规则: 管理面板只读
+// 轮询等噪音不载入, 只保留对话/写操作/错误。
 func LoadRequestLogsFromFile() {
-	f, err := os.Open(reqLogsFile)
+	now := time.Now()
+	loaded := loadDailyRequestLogs(dailyLogPath(reqLogsFile, now))
+	if len(loaded) < maxReqLogs {
+		// 今天刚开张: 回读昨天的分段文件补齐, 保证面板冷启动也有历史
+		prev := append(loadDailyRequestLogs(dailyLogPath(reqLogsFile, now.AddDate(0, 0, -1))), loaded...)
+		if len(prev) > maxReqLogs {
+			prev = prev[len(prev)-maxReqLogs:]
+		}
+		loaded = prev
+	}
+	reqLogs = loaded
+}
+
+// loadDailyRequestLogs 读单个分段文件的尾部记录。
+func loadDailyRequestLogs(path string) []RequestLog {
+	f, err := os.Open(path)
 	if err != nil {
-		return
+		return nil
 	}
 	defer f.Close()
 	st, err := f.Stat()
 	if err != nil {
-		return
+		return nil
 	}
 	// 文件比尾读窗口还小时直接全量读, 避免不必要的 seek。
 	size := st.Size()
 	if size <= reqLogTailBytes {
 		raw, err := io.ReadAll(f)
 		if err != nil {
-			return
+			return nil
 		}
-		reqLogs = parseRequestLogsFromLines(string(raw))
-		return
+		return parseRequestLogsFromLines(string(raw))
 	}
 	// 大文件: 只 seek 到尾部窗口起点读取, 首行可能不完整 —— 解析时会自动跳过
 	// 那些解不出来的坏行。
-	offset := int64(reqLogTailBytes)
-	if _, err := f.Seek(offset, io.SeekStart); err != nil {
-		return
+	if _, err := f.Seek(int64(reqLogTailBytes), io.SeekStart); err != nil {
+		return nil
 	}
 	buf := make([]byte, reqLogTailBytes)
 	n, err := f.Read(buf)
 	if n == 0 {
-		return
+		return nil
 	}
 	raw := buf[:n]
 	// 从第一个 '\n' 之后开始解析, 丢掉那条被截断的半行。
 	if i := bytes.IndexByte(raw, '\n'); i >= 0 {
 		raw = raw[i+1:]
 	}
-	_ = err
-	reqLogs = parseRequestLogsFromLines(string(raw))
+	return parseRequestLogsFromLines(string(raw))
 }
 
 // parseRequestLogsFromLines 逐行解析并过滤噪音, 与旧的 LoadRequestLogsFromFile

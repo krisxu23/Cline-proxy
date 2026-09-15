@@ -2,6 +2,7 @@ package app
 
 import (
 	"encoding/json"
+	"fmt"
 	"sort"
 	"strings"
 	"sync"
@@ -51,6 +52,11 @@ type candidateCool struct {
 	until  int64 // unix ms
 	class  string
 	reason string
+	// 半开探测(P2-23, 参照 OmniRoute autoCombo/selfHealing): 冷却到期后
+	// 不直接视为痊愈 —— 第一次尝试是"探针", 成功才彻底恢复; 探针失败则
+	// 冷却时长翻倍重进冷却, 连续失败最多翻到 24h 上限。
+	probing    bool
+	probeFails int
 }
 
 var (
@@ -93,11 +99,37 @@ func markCandidateCooldown(upstream, model, class, reason string) {
 	}
 	k := candidateKey(upstream, model)
 	candidateCoolMu.Lock()
-	candidateCools[k] = candidateCool{
-		until:  time.Now().UnixMilli() + d,
-		class:  class,
-		reason: kit.Truncate(reason, 200),
+	// 半开探测失败(P2-23): 冷却时长按连续探测失败次数翻倍, 上限 24h。
+	// 这样"一直坏"的候选不会被每轮都白白探一次, 而"偶尔坏"的候选在
+	// 一次成功后即彻底恢复。
+	fails := 0
+	if prev, ok := candidateCools[k]; ok && prev.probing {
+		fails = prev.probeFails + 1
 	}
+	escalate := int64(1) << min(fails, 4) // 1,2,4,8,16 倍
+	if escalate*d > int64(24*60*60)*1000 {
+		escalate = int64(24*60*60) * 1000 / d
+	}
+	d *= escalate
+	candidateCools[k] = candidateCool{
+		until:      time.Now().UnixMilli() + d,
+		class:      class,
+		reason:     kit.Truncate(reason, 200) + fmt.Sprintf("(探测失败%d次)", fails),
+		probing:    false,
+		probeFails: fails,
+	}
+	candidateCoolMu.Unlock()
+}
+
+// markCandidateSuccess 候选成功: 若它此前在冷却/探测态, 彻底清除恢复健康。
+// 半开探测语义的另一半(见 candidateCool.probing)。
+func markCandidateSuccess(upstream, model string) {
+	if upstream == "" || model == "" {
+		return
+	}
+	k := candidateKey(upstream, model)
+	candidateCoolMu.Lock()
+	delete(candidateCools, k)
 	candidateCoolMu.Unlock()
 }
 
@@ -151,6 +183,13 @@ func candidateSkipReason(upstream, model string) string {
 	if c, ok := candidateCools[k]; ok {
 		if c.until > time.Now().UnixMilli() {
 			return "冷却中(" + c.class + "): " + c.reason
+		}
+		// 冷却已到期: 转入半开探测态并放行这一次尝试。
+		// 成功 → markCandidateSuccess 彻底恢复; 失败 → markCandidateCooldown
+		// 按探测失败次数加倍冷却。
+		if !c.probing {
+			c.probing = true
+			candidateCools[k] = c
 		}
 	}
 	return ""
