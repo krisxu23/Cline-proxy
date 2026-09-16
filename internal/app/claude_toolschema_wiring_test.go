@@ -86,7 +86,7 @@ func TestToolSchema接线_reasoningEffort写入位置(t *testing.T) {
 	}
 
 	// 顺序约束：reasoning_effort 在 tool_choice 之后（参考实现 :243-249 → :251-270）。
-	tcIdx := strings.Index(src, `openAI["tool_choice"] = req.ToolChoice`)
+	tcIdx := strings.Index(src, `openAI["tool_choice"] = convertToolChoice(tc)`)
 	effIdx := strings.Index(src, call)
 	if tcIdx < 0 || effIdx < 0 {
 		t.Fatalf("找不到调用点: tool_choice=%d effort=%d", tcIdx, effIdx)
@@ -95,12 +95,13 @@ func TestToolSchema接线_reasoningEffort写入位置(t *testing.T) {
 		t.Fatalf("reasoning_effort 写入(%d) 必须在 tool_choice(%d) 之后，与参考实现 :243→:251 顺序一致", effIdx, tcIdx)
 	}
 
-	// 实现文件本身要三个函数都在。
+	// 实现文件本身要四个函数都在。
 	impl := readSourceFile(t, "claude_toolschema.go")
 	for _, tok := range []string{
 		"func normalizeToolSchema(schema any) any",
 		"func normalizeOpenAIReasoningEffort(effort any) string",
 		"func openAIReasoningEffort(body map[string]any) string",
+		"func convertToolChoice(choice any) any",
 	} {
 		if !strings.Contains(impl, tok) {
 			t.Fatalf("claude_toolschema.go 缺 %s", tok)
@@ -120,6 +121,35 @@ func TestToolSchema接线_reasoningEffort写入位置(t *testing.T) {
 	} {
 		if !strings.Contains(impl, tok) {
 			t.Fatalf("claude_toolschema.go 缺分档分支 %q", tok)
+		}
+	}
+}
+
+func TestToolSchema接线_convertToolChoice接入位置(t *testing.T) {
+	src := readSourceFile(t, "anthropic.go")
+
+	// 照抄 claude-to-openai.ts:244-248。断言完整调用形态。
+	call := `openAI["tool_choice"] = convertToolChoice(tc)`
+	if n := strings.Count(src, call); n != 1 {
+		t.Fatalf("%q 出现 %d 次，期望恰好 1 次\n来源: claude-to-openai.ts:244-248", call, n)
+	}
+
+	// 旧形态（直接透传 json.RawMessage）必须残留 0 次。
+	stale := `openAI["tool_choice"] = req.ToolChoice`
+	if n := strings.Count(src, stale); n != 0 {
+		t.Fatalf("anthropic.go 仍有 %d 处直接透传 req.ToolChoice 的旧形态，必须改走 convertToolChoice", n)
+	}
+
+	// 实现文件要有 switch 的四个分支。
+	impl := readSourceFile(t, "claude_toolschema.go")
+	for _, tok := range []string{
+		`case "auto":`,
+		`case "any":`,
+		`case "tool":`,
+		`"function": map[string]any{"name": m["name"]}`,
+	} {
+		if !strings.Contains(impl, tok) {
+			t.Fatalf("claude_toolschema.go 缺 convertToolChoice 分支 %q", tok)
 		}
 	}
 }

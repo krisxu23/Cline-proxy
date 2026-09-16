@@ -204,3 +204,46 @@ func TestOpenAIReasoningEffort(t *testing.T) {
 		})
 	}
 }
+
+func TestConvertToolChoice(t *testing.T) {
+	cases := []struct {
+		name string
+		in   any
+		want any
+	}{
+		// 1) falsy → "auto"
+		{"nil", nil, "auto"},
+		{"false", false, "auto"},
+		{"empty string", "", "auto"},
+		{"zero number", float64(0), "auto"},
+
+		// 2) string 形态原样透传（参考实现 :539 `typeof choice === "string"`）
+		//
+		// ★ 反直觉：字符串 "any" 不会被转成 "required" —— 只有**对象**
+		//   {type:"any"} 才会。字符串形态直接透传给上游。
+		{"string auto", "auto", "auto"},
+		{"string required", "required", "required"},
+		{"string any passthrough", "any", "any"},
+		{"string none", "none", "none"},
+
+		// 3) 对象形态翻译
+		{"object auto", map[string]any{"type": "auto"}, "auto"},
+		{"object any → required", map[string]any{"type": "any"}, "required"},
+		{"object tool → function", map[string]any{"type": "tool", "name": "my_tool"}, map[string]any{"type": "function", "function": map[string]any{"name": "my_tool"}}},
+		{"object unknown type → auto", map[string]any{"type": "unknown"}, "auto"},
+		{"object empty → auto", map[string]any{}, "auto"},
+
+		// 4) 非字符串非对象 → "auto"（走了 jsTruthy=true 但断言失败的路径）
+		{"number", float64(42), "auto"},
+		{"array", []any{"a"}, "auto"},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := convertToolChoice(tc.in)
+			if !reflect.DeepEqual(got, tc.want) {
+				t.Fatalf("convertToolChoice(%#v) = %#v, want %#v", tc.in, got, tc.want)
+			}
+		})
+	}
+}

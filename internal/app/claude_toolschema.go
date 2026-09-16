@@ -169,3 +169,65 @@ func openAIReasoningEffort(body map[string]any) string {
 		return "xhigh"
 	}
 }
+
+// convertToolChoice 照抄 claude-to-openai.ts:537-554。
+//
+// 参考实现原文（逐字）：
+//
+//	const TOOL_CHOICE_ANY = ["a", "n", "y"].join("");
+//	function convertToolChoice(choice, hasServerWebSearch = false) {
+//	  if (!choice) return "auto";
+//	  if (typeof choice === "string") return choice;
+//	  switch (choice.type) {
+//	    case "auto":      return "auto";
+//	    case TOOL_CHOICE_ANY:  return "required";
+//	    case "tool":
+//	      if (hasServerWebSearch && choice.name === "web_search")
+//	        return { type: "web_search" };
+//	      return { type: "function", function: { name: choice.name } };
+//	    default: return "auto";
+//	  }
+//	}
+//
+// ★ 有意去掉第二参数 hasServerWebSearch（不留死代码纪律）：
+//
+//	参考实现里该参数的真值来自
+//	`useNativeResponsesWebSearch && hasClaudeServerWebSearchTool(body.tools)`，
+//	而 `useNativeResponsesWebSearch` 要求上游走 OpenAI Responses API
+//	（见本文件头部对 convertClaudeServerWebSearchTool 的说明）。本网关上行端点
+//	恒为 /chat/completions → 恒 false → web_search 分支不可达。去掉参数后，
+//	后续若真的接入 Responses 上游，再按需补回该分支即可。
+//
+// ★ 我方入参是 json.RawMessage（req.ToolChoice），调用方先 Unmarshal 成 any 再喂进来。
+//
+//	JS 的 `typeof choice === "string"` 对位 Go 的 `choice.(string)`；
+//	`choice.type` 对位 `m["type"]`（choice 为 map[string]any 时）。
+//
+// ★ 返回值保持 any：字符串形态（"auto"/"required"）与对象形态
+//
+//	（{type:"function", function:{name:...}}）共用同一返回类型。
+func convertToolChoice(choice any) any {
+	if !jsTruthy(choice) {
+		return "auto"
+	}
+	if s, ok := choice.(string); ok {
+		return s
+	}
+	m, ok := choice.(map[string]any)
+	if !ok {
+		return "auto"
+	}
+	switch m["type"] {
+	case "auto":
+		return "auto"
+	case "any": // TOOL_CHOICE_ANY
+		return "required"
+	case "tool":
+		return map[string]any{
+			"type":     "function",
+			"function": map[string]any{"name": m["name"]},
+		}
+	default:
+		return "auto"
+	}
+}

@@ -167,7 +167,18 @@ func anthropicToOpenAI(req anthropicReq) map[string]any {
 		}
 	}
 	if req.ToolChoice != nil {
-		openAI["tool_choice"] = req.ToolChoice
+		// 照抄 claude-to-openai.ts:244-248 —— Claude 的 tool_choice 是对象
+		// 形态（{type:"auto"} / {type:"any"} / {type:"tool",name:...}），
+		// OpenAI 是字符串形态（"auto" / "required"）或对象形态
+		// （{type:"function",function:{name:...}}）。必须翻译，直接透传
+		// 会让上游收到一个它不认识的字段结构。
+		var tc any
+		if json.Unmarshal(req.ToolChoice, &tc) == nil {
+			openAI["tool_choice"] = convertToolChoice(tc)
+		} else {
+			// 解析失败对位参考实现的 `if (!choice) return "auto"`。
+			openAI["tool_choice"] = "auto"
+		}
 	}
 
 	// 照抄 claude-to-openai.ts:251-270 —— 把 Claude 侧的 thinking 控制翻译成
