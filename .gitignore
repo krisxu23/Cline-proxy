@@ -1,28 +1,33 @@
 # Build output
-dist/
+# 注意: 这些"产物名"必须锚定到仓库根(前导斜杠)。
+# 曾经写成不带斜杠的 `cline-proxy`, 它同时匹配了**目录** cmd/cline-proxy/ ——
+# 于是 `git add -A` 静默吞掉整个入口包, CI 构建报"找不到目录"才发现
+# (2026-09-16 实撞)。目录名与产物名重合时一律用 /name 锚定。
+/dist/
 
 # Compiled binary
-cline-proxy
-cline-proxy.exe
-cline-proxy-*
+/cline-proxy
+/cline-proxy.exe
+/cline-proxy-*
+/cline-proxy-test.exe*
 
 # Go workspace
 *.test
 *.out
 
-# Local data
-.cline-accounts.json
-.cline-credentials.json
-.zen-config.json
-zen-stats.jsonl
-cline-proxy.log
-cline-proxy-stream.log
-data/
-override.md
-# Local debug tool (kept locally, not uploaded)
-capture.go
-capture-logs/
+# Local data (根目录下的数据文件; data/ 整目录忽略)
+/data/
+/.cline-accounts.json
+/.cline-credentials.json
+/.zen-config.json
+/zen-stats.jsonl
+/cline-proxy.log
+/cline-proxy-stream.log
+/override.md
 
-# 本地构建备份
+# Local debug tool (kept locally, not uploaded)
+/capture.go
+/capture-logs/
+
+# 本地构建备份 / 配置导入备份
 *.bak-*
-cline-proxy-test.exe*
