@@ -230,7 +230,7 @@ func TestUpstreamDiagnostic_只捕获第一个(t *testing.T) {
 //   - {"error":"字符串"} → usefulValueKeys 命中 error 且为非空字符串 → true
 //   - {"error":{"message":"x"}} → error 是 record, 递归后 message 不在键表里 → false
 //     (它与就绪判定一致: error-only 帧不算内容; 客户端侧的错误可见性由
-//      frameHasStructuredStreamError / SawError 承担, 不由这里管)
+//     frameHasStructuredStreamError / SawError 承担, 不由这里管)
 func TestHasUsefulStreamContent_error帧(t *testing.T) {
 	if !hasUsefulStreamContent("data: {\"error\":\"rate limit\"}\n\n") {
 		t.Fatal("error 为非空字符串时应算有用内容")
@@ -288,7 +288,7 @@ func TestHasUsefulStreamContent_基础(t *testing.T) {
 
 func TestFrameHasStructuredStreamError(t *testing.T) {
 	trueCases := []struct {
-		name string
+		name  string
 		frame string
 	}{
 		{"event error行", "event: error\ndata: {\"type\":\"error\"}\n\n"},
@@ -308,7 +308,7 @@ func TestFrameHasStructuredStreamError(t *testing.T) {
 		})
 	}
 	falseCases := []struct {
-		name string
+		name  string
 		frame string
 	}{
 		{"空", ""},

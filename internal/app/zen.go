@@ -325,9 +325,9 @@ type zenConfigData struct {
 	// (如 union-alpha): 它们能被目录同步拉下来, 但过不了 isZenFreeModel 的
 	// "-free 后缀 / seed 白名单" 判定, 永远不会出现在列表里。用户在面板上
 	// 勾选的模型写到这里, isZenFreeModel 即放行。
-	EnabledModels []string `json:"enabledModels,omitempty"`
-	Usage               zenUsageConfig  `json:"usage"`  // 每日配额账本
-	Router              zenRouterConfig `json:"router"` // 自动路由模型名与参与范围
+	EnabledModels []string        `json:"enabledModels,omitempty"`
+	Usage         zenUsageConfig  `json:"usage"`  // 每日配额账本
+	Router        zenRouterConfig `json:"router"` // 自动路由模型名与参与范围
 }
 
 // zenEndpointMirrors 官方源之外的 CDN 镜像端点(实测镜像透传官方完整路径,须带 /v1)。
