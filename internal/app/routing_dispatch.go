@@ -148,16 +148,25 @@ func handleChainedChatAs(w http.ResponseWriter, r *http.Request, params map[stri
 
 			// 流式早断守卫(P2, 参照 OmniRoute 的 STREAM_EARLY_EOF 语义):
 			// 上游回 200 + event-stream 却立即空流时, 一旦提交就只能把空答案
-			// 交给客户端。提交前先探首个非空事件 —— 空流则按非流式路径同样的
+			// 交给客户端。提交前先探首个有效事件 —— 空流则按非流式路径同样的
 			// 方式冷却本站并换下一站; 首 token 慢的上游不误杀(超时即放行)。
-			if empty, nb := probeStreamFirstEvent(resp.Body); empty {
+			//
+			// ★ 判定强度已升级为 stream_readiness.go 的状态机（照抄
+			//   streamReadiness.ts）：error-only 帧、ping 事件、空对象都
+			//   不算就绪，避免空答案被当成功提交。
+			empty, nb, upstreamDiag := probeStreamFirstEvent(resp.Body)
+			if empty {
 				resp.Body.Close()
 				lastErr = fmt.Errorf("%s: HTTP 200 stream with no first event", cand.String())
 				lastStatus = http.StatusBadGateway
 				markCandidateCooldown(cand.Upstream, cand.Model, classEmpty, "200 但空流")
 				recordUsageForCandidate(cand, false)
 				dec.addCandidate(cand.String(), "tried", "200 但空流", http.StatusOK, classEmpty)
-				log.Printf("  chain: %s 200 但空流(early EOF), 换下一站", cand.String())
+				if upstreamDiag != "" {
+					log.Printf("  chain: %s 200 但空流(early EOF), 上游诊断: %s, 换下一站", cand.String(), upstreamDiag)
+				} else {
+					log.Printf("  chain: %s 200 但空流(early EOF), 换下一站", cand.String())
+				}
 				continue
 			} else {
 				resp.Body = nb

@@ -20,7 +20,6 @@ import (
 	"bufio"
 	"bytes"
 	"io"
-	"strings"
 )
 
 // prefixedBody 把探测阶段已消费的前缀与续读句柄合回一个响应体;
@@ -45,31 +44,49 @@ func (b *prefixedBody) Close() error {
 	return nil
 }
 
-// probeStreamFirstEvent 探测首个非空 SSE data 事件。
-// 返回 (是否空流, 可继续读取的响应体)。空流时返回的 body 已无需使用。
-func probeStreamFirstEvent(body io.ReadCloser) (bool, io.ReadCloser) {
+// probeStreamFirstEvent 探测首个**有效** SSE 事件（照抄升级）。
+//
+// ★ 旧实现只看 `data:` 行非空，会把 error-only 帧
+// （`data: {"error":{"message":"rate limit"}}`）误判为"流已就绪"。
+// 现在改用 stream_readiness.go 的 hasStreamReadinessSignal 状态机：
+//   - 跳过 ping/keepalive/heartbeat 事件
+//   - 跳过空 data 与 [DONE]
+//   - JSON 解析后判 hasNonPingStructuredPayload（error-only 帧不算就绪）
+//   - 顺带捕获 upstreamDiagnostic 供换站日志
+//
+// 返回 (是否空流, 可继续读取的响应体, 上游诊断信息)。空流时 body 已无需使用。
+func probeStreamFirstEvent(body io.ReadCloser) (bool, io.ReadCloser, string) {
 	// 内层空闲上限: 上游彻底静默时探测不会永久挂起(中继稍后还会包一层,
 	// 双层无害 —— 内层先到就断)。
 	idle := newIdleAbortReader(body, streamIdleTimeout())
 	br := bufio.NewReader(idle)
 
+	st := &streamReadinessState{}
 	var buf bytes.Buffer
 	for {
 		line, err := br.ReadString('\n')
 		buf.WriteString(line)
-		if t := strings.TrimSpace(line); strings.HasPrefix(t, "data:") {
-			payload := strings.TrimSpace(strings.TrimPrefix(t, "data:"))
-			if payload != "" && payload != "[DONE]" {
+		// 喂给状态机（按行），同时处理 \r\n
+		if line != "" {
+			if appendStreamReadinessSignal(st, line) {
 				return false, &prefixedBody{
 					prefix: bytes.NewReader(buf.Bytes()),
 					rest:   br,
 					closer: idle,
-				}
+				}, st.upstreamDiagnostic
 			}
 		}
 		if err != nil {
 			// EOF(或空闲超时)前都没读到有效事件: 视作空流, 换下一站
-			return true, nil
+			// 先冲刷残留的 pendingLine，处理最后一个不完整帧
+			if finishStreamReadinessSignal(st) {
+				return false, &prefixedBody{
+					prefix: bytes.NewReader(buf.Bytes()),
+					rest:   br,
+					closer: idle,
+				}, st.upstreamDiagnostic
+			}
+			return true, nil, st.upstreamDiagnostic
 		}
 	}
 }

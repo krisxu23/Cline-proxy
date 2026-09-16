@@ -12,6 +12,12 @@ var (
 	zenConfigMu sync.Mutex
 )
 
+func init() {
+	// zenConfig 在包级变量初始化时已加载, 这里重建手动启用集合。
+	// 之后每次 setZenConfig 都会再刷一次。
+	refreshZenEnabledModels()
+}
+
 // ============ 限流防御状态机 ============
 
 var (

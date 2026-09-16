@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"sort"
 	"strings"
 )
 
@@ -314,7 +315,12 @@ func handleZenNodesCheck(w http.ResponseWriter, r *http.Request) {
 	writeAPI(w, http.StatusOK, apiResponse{Success: true, Message: "连通检测已启动"})
 }
 
-// GET /admin/api/zen/models — 只返回免费模型
+// GET /admin/api/zen/models — 返回**全部**已同步的 zen 模型, 并逐个标注:
+//   - free:    自动判定为免费(seed 白名单 / -free 后缀), 面板上锁定勾选
+//   - enabled: 当前对网关可用(free 或用户手动启用), 未启用的可在面板勾选启用
+//
+// 之前只返回免费模型, opencode 不定期放进的免费测试模型(如 union-alpha,
+// 不带 -free 后缀)在目录里拉得到、却永远不显示, 用户无从启用。
 func handleZenModels(w http.ResponseWriter, r *http.Request) {
 	if r.Method != "GET" {
 		writeAPI(w, http.StatusMethodNotAllowed, apiResponse{Error: "method not allowed"})
@@ -324,19 +330,89 @@ func handleZenModels(w http.ResponseWriter, r *http.Request) {
 	zenModelsMu.RLock()
 	models := make([]map[string]any, 0, len(zenModels))
 	for _, m := range zenModels {
-		if !isZenFreeModel(m) || zenModelUnavailable(m.ID) {
-			continue
-		}
+		free := isZenFreeModel(m)
 		models = append(models, map[string]any{
-			"id":      m.ID,
-			"aliases": m.Aliases,
-			"context": m.Context,
-			"output":  m.Output,
-			"source":  m.Source,
+			"id":       m.ID,
+			"aliases":  m.Aliases,
+			"context":  m.Context,
+			"output":   m.Output,
+			"source":   m.Source,
+			"free":     free,
+			"enabled":  free && !zenModelUnavailable(m.ID),
+			"manually": !free && zenModelEnabled(m.ID), // 用户手动启用的非免费模型
 		})
 	}
 	zenModelsMu.RUnlock()
+	// 按 ID 排序, 保证面板上新增的测试模型位置稳定、不乱跳
+	sort.Slice(models, func(i, j int) bool {
+		return models[i]["id"].(string) < models[j]["id"].(string)
+	})
 	writeAPI(w, http.StatusOK, apiResponse{Success: true, Data: map[string]any{"models": models, "count": len(models)}})
+}
+
+// POST /admin/api/zen/models/toggle — 启用/禁用一个非自动免费的 zen 模型。
+//
+// body: {"model": "union-alpha", "enabled": true}
+// 自动免费的模型(seed / -free 后缀)不需要也不能从这里关闭 —— 它们本来就免费,
+// 开关对它们无效; 能操作的是目录里拉到、但没过免费判定的测试模型。
+// 写入 cfg.EnabledModels 并立即刷缓存(isZenFreeModel 热路径读缓存集合)。
+func handleZenModelsToggle(w http.ResponseWriter, r *http.Request) {
+	if r.Method != "POST" {
+		writeAPI(w, http.StatusMethodNotAllowed, apiResponse{Error: "method not allowed"})
+		return
+	}
+	var req struct {
+		Model   string `json:"model"`
+		Enabled *bool  `json:"enabled"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeAPI(w, http.StatusBadRequest, apiResponse{Error: "invalid JSON: " + err.Error()})
+		return
+	}
+	id := strings.TrimSpace(req.Model)
+	if id == "" || req.Enabled == nil {
+		writeAPI(w, http.StatusBadRequest, apiResponse{Error: "需要 model 与 enabled 字段"})
+		return
+	}
+	initZenModels()
+	// 必须是目录里真实存在的模型: 防止拼错或随手填一个不存在的 ID 进启用表
+	zenModelsMu.RLock()
+	m, exists := zenModels[id]
+	zenModelsMu.RUnlock()
+	if !exists {
+		writeAPI(w, http.StatusBadRequest, apiResponse{Error: fmt.Sprintf("模型 %q 不在 zen 目录中(等待目录同步或名称有误)", id)})
+		return
+	}
+	// 自动免费的模型不能从这里关: 它们本来就免费, 关掉只会让用户误以为"关了还能用"
+	if isZenFreeModel(m) && m.Source != "synced" {
+		writeAPI(w, http.StatusOK, apiResponse{Success: true, Message: fmt.Sprintf("模型 %q 本就是免费模型, 无需手动启用", id)})
+		return
+	}
+	cur := getZenConfig()
+	next := cur.clone()
+	set := make(map[string]bool, len(next.EnabledModels))
+	for _, e := range next.EnabledModels {
+		if e = strings.TrimSpace(e); e != "" {
+			set[e] = true
+		}
+	}
+	if *req.Enabled {
+		set[id] = true
+	} else {
+		delete(set, id)
+	}
+	list := make([]string, 0, len(set))
+	for e := range set {
+		list = append(list, e)
+	}
+	sort.Strings(list)
+	next.EnabledModels = list
+	setZenConfig(next)
+	writeAPI(w, http.StatusOK, apiResponse{
+		Success: true,
+		Message: fmt.Sprintf("模型 %q 已%s", id, map[bool]string{true: "启用", false: "禁用"}[*req.Enabled]),
+		Data:    map[string]any{"enabled": *req.Enabled},
+	})
 }
 
 // POST /admin/api/zen/models/refresh

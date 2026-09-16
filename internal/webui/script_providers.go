@@ -206,7 +206,17 @@ function providerCardBody(n, p, stat) {
     }
     if (n === 'opencode') {
       const disp = 'zen/' + m.id;
-      return '<tr data-mrow data-row-search="' + escAttr(disp) + '"><td class="mrow-label" style="text-align:left;font-family:var(--font-mono)">' + esc(disp) + '</td>' +
+      // 自动免费的模型(seed / -free 后缀)锁定勾选: 它们本来就免费, 关掉只会误导。
+      // 其余的是 opencode 不定期放进、未标注 -free 的(免费)测试模型 —— 开关写入
+      // cfg.EnabledModels, 后端 isZenFreeModel 放行后才对网关可用。
+      const free = m.free !== false;
+      const on = free || !!m.on;
+      const box = free
+        ? '<input type="checkbox" checked disabled title="自动免费模型, 无需手动启用">'
+        : '<input type="checkbox" data-ocmodel="' + escAttr(m.id) + '"' + (on ? ' checked' : '') + ' onchange="toggleOcModel(this)">';
+      const tag = free ? '' : '<span class="model-tag" title="opencode 免费但未标注 -free 的测试模型, 手动启用后才会对网关发布">测试</span>';
+      return '<tr data-mrow data-row-search="' + escAttr(disp) + '"><td>' + box + '</td>' +
+        '<td class="mrow-label" style="text-align:left;font-family:var(--font-mono)">' + esc(disp) + ' ' + tag + '</td>' +
         '<td style="font-size:var(--fs-sm)">' + fmtNum(m.context || 0) + '</td>' +
         '<td style="font-size:var(--fs-sm)">' + fmtNum(m.output || 0) + '</td>' +
         '<td><button type="button" class="copy-icon" aria-label="复制 ' + escAttr(disp) + '" onclick="copyText(\'' + escJs(disp) + '\')">📋</button></td></tr>';
@@ -223,8 +233,8 @@ function providerCardBody(n, p, stat) {
     const ls = p.lastSync ? new Date(p.lastSync).toLocaleString('zh-CN') : '-';
     note = '池内自动选账号与模型, 无需逐个启用。状态来自官方推荐清单(上次同步 ' + ls + ')。';
   } else if (n === 'opencode') {
-    head = '<tr><th style="text-align:left">模型 ID</th><th>上下文</th><th>最大输出</th><th style="width:44px"></th></tr>';
-    note = 'zen 免费目录, 每 10 分钟自动同步; 用 zen/ 前缀调用。';
+    head = '<tr><th style="width:44px">启用</th><th style="text-align:left">模型 ID</th><th>上下文</th><th>最大输出</th><th style="width:44px"></th></tr>';
+    note = 'zen 目录全量(每 10 分钟自动同步); 自动免费的模型锁定勾选, 标「测试」的是上游放进但未标注 -free 的模型, 手动勾选即启用。';
   } else {
     head = '<tr><th style="width:44px">启用</th><th style="text-align:left">模型 ID' +
       '<button type="button" class="btn btn-sm" style="margin-left:10px;padding:2px 10px;font-size:var(--fs-xs)" onclick="toggleAllProviderModels(\'' + escJs(n) + '\',true)">全选</button>' +

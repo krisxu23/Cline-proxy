@@ -93,12 +93,53 @@ func resolveZenModel(id string) (*ZenModel, bool) {
 	return nil, false
 }
 
-// isZenFreeModel 免费判定: seed 白名单 或 ID 带 -free 后缀
+// isZenFreeModel 免费判定: seed 白名单 / ID 带 -free 后缀 / 用户手动启用。
+//
+// 第三条是为 opencode 的**免费但未标注**测试模型加的: 上游会不定期放进
+// 新模型(如 union-alpha), 它们是免费的但 ID 不带 -free 后缀, 也不会出现在
+// seed 白名单里 —— 目录同步能拉到它们(进 zenModels), 但纯靠后缀判定永远
+// 不会放行, 用户侧表现就是"这个模型永远拉取不到"。面板上勾选的模型写入
+// cfg.EnabledModels, 这里放行。
 func isZenFreeModel(m *ZenModel) bool {
 	if m == nil {
 		return false
 	}
-	return m.Source == "seed" || strings.HasSuffix(m.ID, "-free")
+	if m.Source == "seed" || strings.HasSuffix(m.ID, "-free") {
+		return true
+	}
+	return zenModelEnabled(m.ID)
+}
+
+// zenModelEnabled 该模型 ID 是否被用户在面板上手动启用。
+// 热路径(routeModel 每次请求都调)读克隆配置太重, 用一个读多写少的集合缓存,
+// 配置变更时由 refreshZenEnabledModels 重建。
+var (
+	zenEnabledMu       sync.RWMutex
+	zenEnabledModelSet = map[string]bool{}
+)
+
+// refreshZenEnabledModels 依当前 zen 配置重建手动启用集合。
+// 在配置加载后、以及每次 setZenConfig 之后调用。
+func refreshZenEnabledModels() {
+	cfg := getZenConfig()
+	set := make(map[string]bool, len(cfg.EnabledModels))
+	for _, id := range cfg.EnabledModels {
+		if id = strings.TrimSpace(id); id != "" {
+			set[id] = true
+		}
+	}
+	zenEnabledMu.Lock()
+	zenEnabledModelSet = set
+	zenEnabledMu.Unlock()
+}
+
+func zenModelEnabled(id string) bool {
+	if id == "" {
+		return false
+	}
+	zenEnabledMu.RLock()
+	defer zenEnabledMu.RUnlock()
+	return zenEnabledModelSet[id]
 }
 
 // resolveZenFreeModel 只解析免费 zen 模型(连续硬失败被暂停的除外)。
@@ -122,6 +163,23 @@ func zenFreeCatalog() []ZenModel {
 		if isZenFreeModel(m) && !zenModelUnavailable(m.ID) {
 			out = append(out, *m)
 		}
+	}
+	zenModelsMu.RUnlock()
+	sort.Slice(out, func(i, j int) bool { return out[i].ID < out[j].ID })
+	return out
+}
+
+// zenAllCatalog 目录里的**全部** zen 模型, 不做免费/健康过滤, 按 ID 排序。
+//
+// 面板要展示"拉到了哪些模型、哪些还没启用": opencode 会不定期放进免费但
+// 未标注 -free 的测试模型(如 union-alpha), zenFreeCatalog 把它们滤掉,
+// 用户在面板上就看不到、也无从启用。这里给全量, 由前端按 on/free 渲染开关。
+func zenAllCatalog() []ZenModel {
+	initZenModels()
+	zenModelsMu.RLock()
+	out := make([]ZenModel, 0, len(zenModels))
+	for _, m := range zenModels {
+		out = append(out, *m)
 	}
 	zenModelsMu.RUnlock()
 	sort.Slice(out, func(i, j int) bool { return out[i].ID < out[j].ID })
@@ -261,7 +319,13 @@ type zenConfigData struct {
 	StreamIdleSecs int `json:"streamIdleSecs,omitempty"`
 	// NodeExcludeKeywords 节点名排除关键词(不区分大小写): 订阅节点显示名命中
 	// 任一关键词即不进入出口池(典型: 官网/过期/剩余流量 等信息位节点)。
-	NodeExcludeKeywords []string        `json:"nodeExcludeKeywords,omitempty"`
+	NodeExcludeKeywords []string `json:"nodeExcludeKeywords,omitempty"`
+	// EnabledModels 手动启用的 zen 模型 ID(不带 zen/ 前缀)。
+	// opencode 会不定期放进**免费但没标 -free 后缀**的测试模型
+	// (如 union-alpha): 它们能被目录同步拉下来, 但过不了 isZenFreeModel 的
+	// "-free 后缀 / seed 白名单" 判定, 永远不会出现在列表里。用户在面板上
+	// 勾选的模型写到这里, isZenFreeModel 即放行。
+	EnabledModels []string `json:"enabledModels,omitempty"`
 	Usage               zenUsageConfig  `json:"usage"`  // 每日配额账本
 	Router              zenRouterConfig `json:"router"` // 自动路由模型名与参与范围
 }

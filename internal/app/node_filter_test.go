@@ -189,16 +189,16 @@ func TestIdleAbortReaderPassesThroughActiveStream(t *testing.T) {
 
 func TestProbeStreamFirstEvent(t *testing.T) {
 	// 空流(200 后立即 EOF) → 判失败换站
-	if empty, _ := probeStreamFirstEvent(io.NopCloser(strings.NewReader(""))); !empty {
+	if empty, _, _ := probeStreamFirstEvent(io.NopCloser(strings.NewReader(""))); !empty {
 		t.Fatal("空流应判为 early EOF")
 	}
 	// 只有 [DONE] 无内容 → 同样判空流
-	if empty, _ := probeStreamFirstEvent(io.NopCloser(strings.NewReader("data: [DONE]\n\n"))); !empty {
+	if empty, _, _ := probeStreamFirstEvent(io.NopCloser(strings.NewReader("data: [DONE]\n\n"))); !empty {
 		t.Fatal("仅 [DONE] 应判为空流")
 	}
 	// 正常首事件 → 放行, 且已消费字节必须能原样读回(不丢数据)
 	raw := "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\ndata: [DONE]\n\n"
-	empty, nb := probeStreamFirstEvent(io.NopCloser(strings.NewReader(raw)))
+	empty, nb, _ := probeStreamFirstEvent(io.NopCloser(strings.NewReader(raw)))
 	if empty {
 		t.Fatal("正常首事件不应判空流")
 	}

@@ -73,6 +73,11 @@ func handleProvidersConfig(w http.ResponseWriter, r *http.Request) {
 // 不进 zenConfig.Providers、不落盘: 它们没有 baseUrl, 进了配置会被当成
 // 通用 Provider 做目录刷新/连通测试。与 routerSnapshot 同源
 // (opencode = zenFreeCatalog 含健康门, cline = 官方推荐清单全量)。
+//
+// opencode 行**带出目录里的全部模型**(不只是免费的那部分): opencode 会不定期
+// 放进免费但未标注 -free 的测试模型(如 union-alpha), 只列免费模型时它们在
+// 面板上根本看不到, 用户无从启用。每项带 on(当前是否对网关可用) 与
+// free(是否自动免费 —— 自动免费的锁定勾选, 其余的可手动开关)。
 func builtinProviderEntries() map[string]map[string]any {
 	zenKey := ""
 	if cfg := getZenConfig(); cfg != nil {
@@ -80,11 +85,14 @@ func builtinProviderEntries() map[string]map[string]any {
 	}
 	zenModels := []map[string]any{}
 	zenCatalog := []map[string]any{}
-	for _, m := range zenFreeCatalog() {
+	for _, m := range zenAllCatalog() {
+		free := isZenFreeModel(&m)
+		on := free && !zenModelUnavailable(m.ID)
 		zenModels = append(zenModels, map[string]any{
 			"id": "opencode:" + m.ID, "model": m.ID, "context": m.Context, "output": m.Output,
+			"free": free, "on": on,
 		})
-		zenCatalog = append(zenCatalog, map[string]any{"id": m.ID, "disabled": false})
+		zenCatalog = append(zenCatalog, map[string]any{"id": m.ID, "disabled": !on, "free": free})
 	}
 	zenKeys := 0
 	if zenKey != "" {

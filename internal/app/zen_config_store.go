@@ -113,6 +113,8 @@ func setZenConfig(c *zenConfigData) {
 	zenConfigMu.Unlock()
 	// 勾选地区/代理/订阅都可能变, 出口列表缓存立即失效(否则最长 2 秒内还在用旧池)
 	invalidateExitListCache()
+	// 手动启用的模型集合也要同步: isZenFreeModel 热路径读的是缓存集合
+	refreshZenEnabledModels()
 	saveZenConfig()
 	rebuildZenTransport()
 	rebuildZenSem()

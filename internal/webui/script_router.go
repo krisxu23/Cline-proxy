@@ -362,6 +362,28 @@ async function refreshOcModels() {
   } catch (e) { toast('同步失败: ' + e.message, 'error'); }
 }
 
+// toggleOcModel 启用/禁用一个 opencode 测试模型。
+// 自动免费的模型在卡片上锁定勾选(不会走到这里), 能切换的是目录里拉到、
+// 但未标注 -free 的模型: 勾选写入 cfg.EnabledModels, 后端 isZenFreeModel
+// 放行后才对网关发布、可用 zen/ 前缀调用。
+async function toggleOcModel(el) {
+  const id = el.getAttribute('data-ocmodel');
+  if (!id) return;
+  const enabled = el.checked;
+  el.disabled = true;
+  try {
+    const d = await api('POST', '/opencode/models/toggle', { model: id, enabled });
+    toast(d.message || (enabled ? '已启用' : '已禁用'), 'success');
+    // 延迟刷新: 后端落盘 + 刷启用集合后重列, 确保新状态与目录一致
+    setTimeout(loadModelIndex, 600);
+  } catch (e) {
+    toast('切换失败: ' + e.message, 'error');
+    el.checked = !enabled;   // 失败要把勾选态拨回去, 不能留着错误状态
+  } finally {
+    el.disabled = false;
+  }
+}
+
 // 统计表渲染: 三个框分别展示 总量 / 按上游 / 按模型, 口径都是全部上游。
 const STAT_HEAD = '<table><thead><tr><th style="text-align:left">口径</th><th>请求数</th><th>输入 tokens</th><th>输出 tokens</th><th>合计 tokens</th><th>压缩消耗</th><th>限流命中</th></tr></thead><tbody>';
 function statRow(label, e) {
