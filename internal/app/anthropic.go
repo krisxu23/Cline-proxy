@@ -889,6 +889,28 @@ func handleAnthropicStreamWithUsage(w http.ResponseWriter, upstream *http.Respon
 			argsObj = filterToolInput(acc.name, inputMap, toolSchemas)
 		}
 		parsed, _ := json.Marshal(argsObj)
+		// 照抄 OmniRoute open-sse/translator/helpers/toolCallShim.ts:112 `applyToolCallShimToBuffer`。
+		//
+		// 参考实现原注释（逐字）:
+		//
+		//	// Applied on the assembled OpenAI tool-call arguments after streaming, just
+		//	// before they are re-emitted as a single Claude input_json_delta.
+		//
+		// 本处正是那个消费点: acc.args 已由流式分片拼装完毕(OpenAI 形态的
+		// tool_calls[].function.arguments), 此刻把它作为**单条** Claude
+		// input_json_delta 发给客户端。
+		//
+		// 为什么必须在"发出去之前"清洗（而非上游侧）: Claude Code 的 Read 工具
+		// 对 limit>2000 / 负数 offset / 非 PDF 带 pages 会**直接拒收并重试**,
+		// 每轮重发整个上下文 —— token 成倍烧掉且表现为任务无声中断。
+		// 无 shim 时 applyToolCallShimToBuffer 原样返回 raw(不做 JSON 往返),
+		// 故对不认识的工具零影响。
+		if hasToolCallShim(acc.name) {
+			cleaned := applyToolCallShimToBuffer(acc.name, string(parsed))
+			log.Printf("  tool_call_shim applied: name=%s before=%s after=%s",
+				acc.name, kit.Truncate(string(parsed), 300), kit.Truncate(cleaned, 300))
+			parsed = []byte(cleaned)
+		}
 		log.Printf("  tool_use emit: name=%s id=%s input=%s", acc.name, id, string(parsed))
 		emit("content_block_start", map[string]any{
 			"type":  "content_block_start",

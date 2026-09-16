@@ -309,6 +309,8 @@ hasValidUsage`），缺第三个 `legitEmpty`。后果是**纯工具调用回合
 | 空 reasoning_content 回放（含接线 gate） | `translator/index.ts:610-619` + `provider.ts:471-473` + `services/reasoningCache.ts:83-121` + `schemaCoercion.ts:455-487` | `reasoning_replay.go`（**已接入** `providers_chat.go:chatWithKey` 的非 anthropic 分支） | ✅ 双负向验证通过（NEG-Q 2 红 / NEG-R 4 红）+ 源码层接线断言，md5 `73d532b9`。★ 接线 gate 与 inject 内部判定**故意不对称**（`allowLegacyFallback=false` + 真实 `hasThinkingConfig`），480 组枚举里 256 组不同 |
 | Claude 工具顺序归一（Pass 1.5） | `translator/helpers/claudeHelper.ts:160-284`（`fixToolUseOrdering` 三步） | `claude_tool_ordering.go`（**已接入** `providers_chat.go:chatWithKey` 的 anthropic 分支，`splitMisplacedToolResults` 之后） | ✅ 负向验证通过（NEG-TOJ 3 红：形态守卫 + 两条既有接入测试），md5 `aa749c15`。★ 含**形态守卫**（见下） |
 | Claude prompt-cache 断点重锚 + `output_config` 剥离 | `translator/helpers/claudeHelper.ts:286-293`/`:295-302`/`:307-328`/`:342-347`/`:387-396`/`:408-413`/`:499-513`/`:527-544`/`:727-740` | `claude_cache_control.go`（**已接入** `providers_chat.go:chatWithKey` 的 anthropic 分支） | ✅ 双负向验证通过（NEG-CACHE-A 1 红 / NEG-CACHE-B 1 红）+ 23 用例，md5 `bdffa2c8` |
+| 工具调用参数清洗 shim（Read / submit_pr_review） | `translator/helpers/toolCallShim.ts`（129 行，含 `coerceToArray` / `isValidPdfPagesArg` / `sanitizeReadArgs` / `TOOL_SHIMS` / `resolveToolCallShim` / `applyToolCallShimToBuffer`） | `tool_call_shim.go`（**已接入** `anthropic.go:emitToolBlock`，即组装完成后、发 `input_json_delta` 之前） | ✅ 双负向验证通过（NEG-SHIM-A 实现级 1 红 / NEG-SHIM-B 作用域级 2 红），md5 `63c37be2` |
+| Claude thinking 块归一（Pass 2） | `translator/helpers/claudeHelper.ts:546-719` + `config/defaultThinkingSignature.ts:2-3` + `utils/reasoningPlaceholder.ts:6` | `claude_thinking_blocks.go`（**已接入** `providers_chat.go:chatWithKey` 的 anthropic 分支，`reanchorClaudePromptCache` 之后） | ✅ 双负向验证通过（NEG-THINK-A 接线 1 红 / NEG-THINK-B 实现 6 红）+ 15 用例 + 接线锁，md5 `063a59ee` |
 
 ### `fixToolUseOrdering` 的形态守卫（★ 本轮最重要的作用域修正）
 
@@ -343,6 +345,57 @@ Claude 形态**（`openaiToClaudeRequest` 已把 `tool_calls` 转成 `content[].
 > 消失（模型再也看不到工具输出）。新链把它**归一成合法形状** —— 合并相邻同 role 回合、
 > tool_result 提前，工具输出得以保留。这一差异由 `.negbak/probe_chain6.mjs` 的
 > C1（六步链）vs C3（旧五步链）两栏对照实测锁定。
+
+### ★ `modelTargetsClaude` 必须作为参数传入，不能写死（本轮第二次「作用域」教训）
+
+`claudeHelper.ts:383-385`：
+
+```ts
+const modelTargetsClaude =
+  !!provider && !!model && getModelTargetFormat(provider, model) === "claude";
+const supportsRedactedThinking = !isKimiCoding && (supportsPromptCaching || modelTargetsClaude);
+```
+
+`supportsRedactedThinking` 决定 thinking 块走 **`redacted_thinking{data:<签名 blob>}`** 还是
+**`thinking{thinking:<文本>}`**。我第一版实现把 `modelTargetsClaude` 写死为 `true`，理由是
+"进入本函数的路径本身就是 anthropic 形态出站，语义上等价于 `targetFormat === "claude"`"。
+
+**这个推理是错的**，而且错得很隐蔽：
+
+- `targetFormat === "claude"` 说的是**出站协议形态**（用 Messages API 的 body 结构）；
+- `modelTargetsClaude` 说的是**上游是不是真 Anthropic 端点**（能不能校验签名 blob）。
+
+二者只在 `claude` / `anthropic-compatible-*` 上重合。对 `glmt` / `zai` 这类
+"说 Claude 协议但不是 Anthropic"的中转，出站形态确实是 `claude`，但它们**无法校验签名
+blob** —— 参考实现的注释点名了这种情形会 400
+`Invalid signature in thinking block`，而这正是它引入 `supportsRedactedThinking` 的原因。
+
+**抓出方式**：探针首版同样写死 `true`，于是 T11–T13 全部产出 `redacted_thinking`；
+把 `modelTargetsClaude` 改为入参、对 `glmt` 传 `false` 后，这三栏立刻变成
+`thinking{thinking:"(prior reasoning summary unavailable)"}` —— 差异肉眼可见。
+据此把 Go 实现的签名改成接收 `modelTargetsClaude bool`，调用方传
+`supportsPromptCachingForProvider(upstreamProvider)`（保守：只认 claude /
+anthropic-compatible-*），并在接线锁里加了一条"**不得写死 true**"的断言
+（NEG-THINK-A 实测抓出 1 红）。
+
+> **教训**：照抄一个从别处 import 的判定值时，先问清它**语义上在判什么**。
+> "当前上下文里恒为真"常常只是巧合 —— 参考实现写 `getModelTargetFormat(...)` 而不是
+> 写 `true`，恰恰因为它需要区分"说 Claude 协议"和"是 Anthropic"。
+
+### ★ 源码层接线锁必须断言「次数 == 1」（本轮第一次「弱断言」教训）
+
+`toolCallShim` 的接线锁初版只断言两条：
+
+1. `hasToolCallShim` / `applyToolCallShimToBuffer` 出现在 `emitToolBlock` 区间内；
+2. `applyToolCallShimToBuffer` 全文件出现 1 次。
+
+把调用**同时**放进 `emitToolBlock` 和 `processSSELine` 的分片累加路径后，第 2 条立刻变红
+（`应恰好出现 1 次, 实际 2 次`），而如果只写"第一次出现的位置落在区间内"就会漏掉 ——
+第一次出现的位置**没变**，错误在于**多了一处**。
+
+第 1 条还额外锁了"shim 不得出现在分片累加路径上"：参考实现要求清洗发生在**拼装完成之后**，
+若在分片路径上跑，会把还没拼完的半截 JSON 当完整 JSON 解析 → 全部退化成 `{}`。
+这是一条**只有靠作用域断言才能守住**的语义（函数级测试永远看不到）。NEG-SHIM-B 实测 2 红。
 
 ### `fixToolUseOrdering` 的有意偏离（探针实测，非猜测）
 

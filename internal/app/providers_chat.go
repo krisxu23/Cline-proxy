@@ -398,6 +398,49 @@ func (p *modelProvider) chatWithKey(ctx context.Context, cfg providerConfig, par
 		// 时, 每一轮都把整个前缀按**未缓存**计费。长会话(agent 客户端动辄几十轮)
 		// 下这是数倍成本差。Codex / Cline 默认都不带 marker。
 		reanchorClaudePromptCache(params, normalizeProviderID(p.name))
+
+		// thinking 块处理（照抄 claudeHelper.ts:546-719，prepareClaudeRequest Pass 2）。
+		//
+		// ★ 位置: 参考实现里这一段与"给最后一条 assistant 打 cache_control"
+		//   **在同一个反向循环内**（claudeHelper.ts:530-721），而该循环排在
+		//   "给倒数第二条 user 打 cache_control"（:503-513）之后。
+		//   故此处必须排在 reanchorClaudePromptCache 之后 —— 后者正是把
+		//   system/倒数第二 user/最后 assistant/tools 四处断点都锚完的那一步。
+		//
+		// ★ 作用域: `prepareClaudeRequest` 只在 `targetFormat === FORMATS.CLAUDE`
+		//   时被调用（translator/index.ts:567），即本 anthropic 分支内部。
+		//
+		// 业务意义: 上游（claude 原生 / anthropic-compatible 中转 / kimi-coding）
+		// 在 `thinking.type === "enabled"` 时执行严格形态契约 —— assistant 回合
+		// 只要含 tool_use，同一 content[] 就必须有一个 thinking / redacted_thinking
+		// 块排在它之前。客户端重放历史时常丢掉它，上游随即 400：
+		//   "thinking is enabled but reasoning_content is missing in assistant
+		//    tool call message at index N" 或 "Invalid signature in thinking block"。
+		// 400 在 agent 客户端里常常只表现为**任务无声中断** —— 与用户报的现象一致。
+		//
+		// 注: 本网关没有照抄 reasoningCache 的内存+DB 双级缓存服务，故此处
+		// lookupReasoning 传 nil —— 语义上等价于参考实现的 cache miss，
+		// 落到 NON_ANTHROPIC_THINKING_PLACEHOLDER 兜底（:674/:716）。
+		//
+		// ★ modelTargetsClaude 不能写死 true：它决定 supportsRedactedThinking
+		//   （claudeHelper.ts:385），进而决定块形状是 redacted_thinking 还是
+		//   plain thinking。参考实现取自 per-model 的 getModelTargetFormat 注册表
+		//   （providerModels.ts:172）；本网关无该表，故保守地复用
+		//   supportsPromptCachingForProvider —— 即只把 claude / anthropic-compatible-*
+		//   视为"真 Anthropic Messages 端点"（能校验签名 blob）。其余上游走
+		//   plain thinking + 占位符，这正是它们能接受的形态。
+		//   探针 T11–T13 实测了 targetsClaude=false 分支的权威值。
+		if msgs, ok := params["messages"].([]any); ok {
+			upstreamProvider := normalizeProviderID(p.name)
+			thinkingChanged := applyClaudeThinkingBlocks(
+				msgs, params, upstreamProvider,
+				supportsPromptCachingForProvider(upstreamProvider),
+				nil, nil,
+			)
+			if thinkingChanged {
+				log.Printf("  providers: %s applied claude thinking-block normalization", p.name)
+			}
+		}
 	} else if msgs, ok := params["messages"]; ok {
 		// 空 reasoning_content 回放（照抄 translator/index.ts:610-619 +
 		// schemaCoercion.ts:455-487 + services/reasoningCache.ts:83-121）。
