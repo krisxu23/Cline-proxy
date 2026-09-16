@@ -532,6 +532,25 @@ func (p *modelProvider) chatWithKey(ctx context.Context, cfg providerConfig, par
 		attempts = 2
 	}
 
+	// 照抄 OmniRoute modelStrip.ts:19-55 —— 剥掉该模型不支持的
+	// 内容类型（image / audio）。不剥的话上游直接 400 拒绝
+	// （"model does not support images"），agent 客户端表现为任务无声中断。
+	//
+	// 位置：所有消息处理（工具顺序归一、prompt-cache 重锚、thinking 块归一、
+	// 工具名伪装）之后、marshal 之前。此时 p.name（真实 provider）与
+	// params["model"]（未被改写的原始模型 id）都已就位。
+	modelStr, _ := params["model"].(string)
+	if stripTypes := stripTypesForModel(p.name, modelStr); len(stripTypes) > 0 {
+		if msgs, ok := params["messages"].([]any); ok {
+			stripped, removed := stripIncompatibleMessageContent(msgs, stripTypes)
+			if removed > 0 {
+				params["messages"] = stripped
+				log.Printf("  [model-strip] provider=%s model=%s removed %d incompatible content parts",
+					p.name, modelStr, removed)
+			}
+		}
+	}
+
 	// `_toolNameMap` 绝不能上行（照抄 OmniRoute chatCore.ts:2610
 	// `delete translatedBody._toolNameMap;` + cliproxyapi.ts:417 的 replacer）。
 	//

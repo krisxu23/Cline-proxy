@@ -117,9 +117,10 @@ func TestAnthropicToOpenAI(t *testing.T) {
 		t.Fatalf("function.parameters.properties.a missing: %#v", params)
 	}
 
-	// tool_choice 透传
-	if !equalAny(out["tool_choice"], map[string]any{"type": "auto"}) {
-		t.Fatalf("tool_choice wrong: %#v", out["tool_choice"])
+	// tool_choice 经 convertToolChoice 翻译（照抄 claude-to-openai.ts:537-554）：
+	// Claude 的 {type:"auto"} → OpenAI 的 "auto" 字符串形态。
+	if out["tool_choice"] != "auto" {
+		t.Fatalf("tool_choice wrong: %#v, want \"auto\"", out["tool_choice"])
 	}
 }
 
