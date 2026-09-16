@@ -40,7 +40,13 @@ type anthropicReq struct {
 	Tools       json.RawMessage `json:"tools,omitempty"`
 	ToolChoice  json.RawMessage `json:"tool_choice,omitempty"`
 	Metadata    json.RawMessage `json:"metadata,omitempty"`
-	Extra       map[string]any  `json:"-"`
+	// 照抄 claude-to-openai.ts:252-271 —— Claude 侧两种推理强度方言：
+	//   - `thinking.budget_tokens`（Claude 原生客户端）
+	//   - `output_config.effort`（Claude Code 客户端，严格优先）
+	// 两者都需解出来才能映射成 OpenAI 的 `reasoning_effort`。
+	Thinking     json.RawMessage `json:"thinking,omitempty"`
+	OutputConfig json.RawMessage `json:"output_config,omitempty"`
+	Extra        map[string]any  `json:"-"`
 }
 
 func loadOverrideContent() string {
@@ -117,7 +123,14 @@ func anthropicToolsToOpenAI(tools []any) []any {
 			// 这里是与参考实现逐字对位的位置: input_schema 被原样搬进 OpenAI 的
 			// parameters。若不先净化, Claude Code 之类客户端发来的截断占位符
 			// (`enum: "[MaxDepth]"`) 或含 lookaround 的正则会原样上行并触发 400。
-			schema := sanitizeClaudeToolSchema(tMap["input_schema"])
+			//
+			// ★ 第二层照抄 claude-to-openai.ts:232 `parameters: normalizeToolSchema(record.input_schema)`:
+			// 参考实现是**两步** —— executor 先 sanitize（剥非法构造），translator
+			// 再 normalize（给 `{"type":"object"}` 补 `properties: {}`）。OpenAI 的
+			// strict 校验要求 object schema 必带 `properties`，Anthropic/MCP 工具常省略
+			// （#1898），只 sanitize 不 normalize 仍会 400。顺序不可反：先剥再补，
+			// 否则剥空 schema 后 normalize 会得到无意义的空 properties。
+			schema := normalizeToolSchema(sanitizeClaudeToolSchema(tMap["input_schema"]))
 			// Convert Anthropic format to OpenAI
 			oai := map[string]any{
 				"type": "function",
@@ -155,6 +168,39 @@ func anthropicToOpenAI(req anthropicReq) map[string]any {
 	}
 	if req.ToolChoice != nil {
 		openAI["tool_choice"] = req.ToolChoice
+	}
+
+	// 照抄 claude-to-openai.ts:251-270 —— 把 Claude 侧的 thinking 控制翻译成
+	// OpenAI 的 `reasoning_effort`。
+	//
+	// 参考实现原注释（逐字）:
+	//
+	//	// Reasoning effort: map Claude-side thinking controls to OpenAI reasoning_effort.
+	//	// Priority: output_config.effort (Claude Code) > thinking.budget_tokens (Claude native).
+	//	// Budget buckets match the reverse mapping in thinkingBudget.ts::setCustomBudget.
+	//
+	// Claude Code 客户端用 `output_config.effort` 表达推理强度，Claude 原生客户端用
+	// `thinking.budget_tokens`。不翻译则上游收到一个它不认识的字段（被静默忽略或
+	// 直接 400），模型实际跑在默认强度上 —— 用户以为自己调过档，实际没有。
+	//
+	// 顺序照抄参考实现：tools → tool_choice → reasoning_effort。
+	if req.Thinking != nil || req.OutputConfig != nil {
+		body := map[string]any{}
+		if req.Thinking != nil {
+			var th map[string]any
+			if json.Unmarshal(req.Thinking, &th) == nil {
+				body["thinking"] = th
+			}
+		}
+		if req.OutputConfig != nil {
+			var oc map[string]any
+			if json.Unmarshal(req.OutputConfig, &oc) == nil {
+				body["output_config"] = oc
+			}
+		}
+		if e := openAIReasoningEffort(body); e != "" {
+			openAI["reasoning_effort"] = e
+		}
 	}
 
 	msgs := []any{}

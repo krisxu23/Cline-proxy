@@ -312,6 +312,7 @@ hasValidUsage`），缺第三个 `legitEmpty`。后果是**纯工具调用回合
 | 工具调用参数清洗 shim（Read / submit_pr_review） | `translator/helpers/toolCallShim.ts`（129 行，含 `coerceToArray` / `isValidPdfPagesArg` / `sanitizeReadArgs` / `TOOL_SHIMS` / `resolveToolCallShim` / `applyToolCallShimToBuffer`） | `tool_call_shim.go`（**已接入** `anthropic.go:emitToolBlock`，即组装完成后、发 `input_json_delta` 之前） | ✅ 双负向验证通过（NEG-SHIM-A 实现级 1 红 / NEG-SHIM-B 作用域级 2 红），md5 `63c37be2` |
 | Claude thinking 块归一（Pass 2） | `translator/helpers/claudeHelper.ts:546-719` + `config/defaultThinkingSignature.ts:2-3` + `utils/reasoningPlaceholder.ts:6` | `claude_thinking_blocks.go`（**已接入** `providers_chat.go:chatWithKey` 的 anthropic 分支，`reanchorClaudePromptCache` 之后） | ✅ 双负向验证通过（NEG-THINK-A 接线 1 红 / NEG-THINK-B 实现 6 红）+ 15 用例 + 接线锁，md5 `063a59ee` |
 | 第三方工具名伪装 + 双向还原 | `services/claudeCodeToolRemapper.ts`（483 行）+ `services/claudeCodeExtraRemap.ts`（18 行）+ `translator/helpers/toolCallHelper.ts:100-157`（`caseInsensitiveToolNameLookup` / `restoreOpenAIToolNames`） | `claude_tool_remap.go`（**已接入 5 处**：请求侧 `providers_chat.go:chatWithKey` anthropic 分支；响应侧 `anthropic.go:emitToolBlock` 流式 + `openAIToAnthropicWithMap` 非流式 + `proxy_stream.go` 两个 OpenAI 形态还原点；映射经 `routing_dispatch.go` 的 `hopParams` 透传） | ✅ 双负向验证通过（NEG-REMAP-A 实现 1 红 `R6l` / NEG-REMAP-B 接线 1 红「出现 2 次」）+ R1–R6 共 30 用例 + 接线锁 5 例，md5 `2f90c3ef` |
+| Claude→OpenAI 请求转换咽喉三小项 | `translator/request/claude-to-openai.ts:26-34`（`normalizeToolSchema`）+ `:36-40`（`normalizeOpenAIReasoningEffort`）+ `:251-270`（reasoning_effort 分档，与 `services/thinkingBudget.ts:316-324` 反向映射逐值一致） | `claude_toolschema.go`（**已接入 2 处**：`anthropic.go:anthropicToolsToOpenAI` 的 `schema := normalizeToolSchema(sanitizeClaudeToolSchema(...))`；`anthropic.go:anthropicToOpenAI` 的 `openAI["reasoning_effort"] = e`） | ✅ 双负向验证通过（NEG-SCHEMA-A 实现级 P3d 边界 1 红 / NEG-SCHEMA-B 接线级「出现 0 次」1 红）+ P1–P3 共 35 用例 + 接线锁 3 例，md5 `d7f7dedd` |
 
 ### ★ 工具名伪装的任务价值（`claudeCodeToolRemapper`）
 
@@ -372,6 +373,49 @@ Go 侧的等价做法是**双键**：
 `filterToolInput(acc.name, ...)` 与 `hasToolCallShim(acc.name)` 都以**上游回显的别名**
 （如 `Read`）为键 —— 那两张表按 Claude 权威名建索引，用别名查才对。只有**发给客户端**
 的那个名字要还原。
+
+### ★ `normalizeToolSchema` 是两步管道的第二步，顺序不可反
+
+参考实现在**两个不同文件**里各做一步，我方把它们合到一个表达式里：
+
+| 步 | 参考位置 | 作用 |
+|---|---|---|
+| ① sanitize | `executors/base.ts:970` / `cliproxyapi.ts:347` → `schemaCoercion.ts:625` | 剥非法构造（截断占位符 `enum:"[MaxDepth]"`、index-keyed 对象、lookaround 正则） |
+| ② normalize | `translator/request/claude-to-openai.ts:232` | 给 `{"type":"object"}` 补 `properties:{}`（OpenAI strict 模式必需，#1898） |
+
+我方接入点：`anthropicToolsToOpenAI` 里
+`schema := normalizeToolSchema(sanitizeClaudeToolSchema(tMap["input_schema"]))`。
+
+**顺序不可反**：先剥再补。反了的话，剥空 schema 后 normalize 会往一个已经被判非法的
+对象上补一个无意义的空 properties，上游照样 400，而我们白改。
+
+### ★ `reasoning_effort` 的优先级与 `output_config.effort==""` 的 fall through
+
+照抄 `claude-to-openai.ts:251-270`。两个反直觉点已用探针 P3p 锁定：
+
+- **优先级**：`output_config.effort`（Claude Code 方言）**严格优先**于
+  `thinking.budget_tokens`（Claude 原生方言）。两者同时存在只看前者。
+- **fall through**：`output_config.effort` 存在但为空串时，经
+  `normalizeOpenAIReasoningEffort` 归 `undefined`、再 `|| ""` 得 `""`，于是
+  **fall through 到 thinking 分支**。不是"output_config 存在就屏蔽 thinking"，
+  而是"有**有效** effort 才屏蔽"。
+
+分档阈值与 `services/thinkingBudget.ts:316-324` 的**反向映射**逐值核对一致：
+`low ≤ 1024` / `medium ≤ 10240` / `high < 131072` / `xhigh` 其余。
+
+### ★ 有意**不抄**的 server web_search 工具转换（死代码，不接）
+
+`claude-to-openai.ts:42-83` 的 `convertClaudeServerWebSearchTool` /
+`isClaudeServerWebSearchTool` / `hasClaudeServerWebSearchTool`（调用点 `:217-219`）
+在参考实现里被 `shouldUseNativeResponsesWebSearch(credentials)` 门控，条件是
+`credentials._targetFormat === FORMATS.OPENAI_RESPONSES`，即**上游**走 OpenAI
+Responses API。
+
+本网关的上行端点恒为 `/chat/completions`（`providers_config.go:152`
+`return base + "/chat/completions"`），`shapeResponses` 只用于**下行**
+（`responses.go:461` / `:474`，即回复客户端的形状）。因此该分支在本网关**恒为 false**
+—— 抄过来就是永远不触发的死代码，按本仓库纪律不接，并在
+`claude_toolschema.go` 文件头注释里显式登记原因，禁止后人"为了看起来完整"而补上。
 
 ### `fixToolUseOrdering` 的形态守卫（★ 本轮最重要的作用域修正）
 
