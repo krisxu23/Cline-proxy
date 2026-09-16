@@ -131,10 +131,12 @@ func handleChainedChatAs(w http.ResponseWriter, r *http.Request, params map[stri
 				tr.SetUpstream(chainUpstreamLabel(cand), model)
 				// 非流式: 上游 usage 由 writeChainNonStream 内部回填 tracker, 这里
 				// 顺带把同一份 usage 记进请求轨迹(trim 面板要的 token 明细)。
-				writeChainNonStream(w, body, tgt, func(u map[string]any) {
+				// 非流式同样需要工具名还原（对位 responseTranslator.ts:740 —— 那条
+				// 路径同时覆盖"纯非流式请求"与"stream:true 但上游以 application/json 回"）。
+				writeChainNonStreamWithMap(w, body, tgt, func(u map[string]any) {
 					tracker.observeUsage(u)
 					tr.ObserveUsage(u)
-				})
+				}, takeToolNameMap(hopParams))
 				tracker.finish(true, http.StatusOK)
 				recordUsageForCandidate(cand, true)
 				markCandidateSuccess(cand.Upstream, cand.Model)
@@ -170,13 +172,22 @@ func handleChainedChatAs(w http.ResponseWriter, r *http.Request, params map[stri
 			})
 			setRouteHeader(w, chainUpstreamLabel(cand), model, chainFailoverHeader)
 			tr.SetUpstream(chainUpstreamLabel(cand), model)
+			// 工具名还原映射（照抄 OmniRoute chatCore.ts:2592-2610 的
+			// `const toolNameMap = translatedBody._toolNameMap; delete ...`）。
+			//
+			// hopParams 就是被 chatWithKey 改写过的那个对象（同一引用）—— 请求侧
+			// cloak 把 `_toolNameMap` 摘到旁路键后，这里读出并移除，交给响应侧的
+			// Claude-shape 回写器把上游回显的别名换回客户端声明的原名。
+			// 无伪装（纯 PascalCase 真 Claude Code 流量）时为 nil，行为不变。
+			responseToolNameMap := takeToolNameMap(hopParams)
+
 			observe := func(u map[string]any) {
 				tracker.observeUsage(u)
 				tr.ObserveUsage(u)
 			}
 			switch tgt.Shape {
 			case shapeAnthropic:
-				handleAnthropicStreamWithUsage(w, resp, model, tgt.ToolSchemas, observe)
+				handleAnthropicStreamWithToolNameMap(w, resp, model, tgt.ToolSchemas, observe, responseToolNameMap)
 			case shapeResponses:
 				w.Header().Set("Content-Type", "text/event-stream")
 				w.Header().Set("Cache-Control", "no-cache")
@@ -185,7 +196,7 @@ func handleChainedChatAs(w http.ResponseWriter, r *http.Request, params map[stri
 				w.WriteHeader(http.StatusOK)
 				chatStreamToResponses(w, resp, nil)
 			default:
-				handleStreamResponseWithUsage(w, resp, observe)
+				handleStreamResponseWithToolNameMap(w, resp, observe, responseToolNameMap)
 			}
 			// 这里以前从不关闭上游响应体。对比上面两条失败路径(87/154 行)都显式
 			// Close 了, 唯独流式成功这条漏掉, 而三个流式 handler 内部也都只读到
@@ -374,13 +385,20 @@ func jsonObject(body []byte) map[string]any {
 // body 已完整读过(非流式路径), 所以既可以直接透传 OpenAI 形状,
 // 也可以转成 Anthropic 形状 —— 上游永远只会返回 OpenAI 形状。
 func writeChainNonStream(w http.ResponseWriter, body []byte, tgt chainTarget, observeUsage func(map[string]any)) {
+	writeChainNonStreamWithMap(w, body, tgt, observeUsage, nil)
+}
+
+// writeChainNonStreamWithMap 带上工具名还原映射（对位参考实现
+// `convertOpenAINonStreamingToClaude(openaiResponse, toolNameMap?)` 的可选尾参）。
+func writeChainNonStreamWithMap(w http.ResponseWriter, body []byte, tgt chainTarget, observeUsage func(map[string]any), toolNameMap *toolNameMap) {
 	if tgt.Shape == shapeOpenAI {
 		resp := &http.Response{
 			StatusCode: http.StatusOK,
 			Header:     http.Header{"Content-Type": []string{"application/json"}},
 			Body:       io.NopCloser(bytes.NewReader(body)),
 		}
-		handleNonStreamResponseWithUsage(w, resp, observeUsage)
+		// OpenAI 形态出站同样要还原别名（responseTranslator.ts:173）。
+		handleNonStreamResponseWithToolNameMap(w, resp, observeUsage, toolNameMap)
 		return
 	}
 	var raw map[string]any
@@ -402,7 +420,7 @@ func writeChainNonStream(w http.ResponseWriter, body []byte, tgt chainTarget, ob
 		writeJSON(w, http.StatusOK, chatToResponses(chatOut))
 		return
 	}
-	anthropicResp := openAIToAnthropic(chatOut)
+	anthropicResp := openAIToAnthropicWithMap(chatOut, toolNameMap)
 	if tc, ok := getNested(chatOut, "choices", 0, "message", "tool_calls").([]any); ok && len(tc) > 0 {
 		anthropicResp["stop_reason"] = "tool_use"
 	}

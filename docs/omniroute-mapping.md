@@ -311,6 +311,67 @@ hasValidUsage`），缺第三个 `legitEmpty`。后果是**纯工具调用回合
 | Claude prompt-cache 断点重锚 + `output_config` 剥离 | `translator/helpers/claudeHelper.ts:286-293`/`:295-302`/`:307-328`/`:342-347`/`:387-396`/`:408-413`/`:499-513`/`:527-544`/`:727-740` | `claude_cache_control.go`（**已接入** `providers_chat.go:chatWithKey` 的 anthropic 分支） | ✅ 双负向验证通过（NEG-CACHE-A 1 红 / NEG-CACHE-B 1 红）+ 23 用例，md5 `bdffa2c8` |
 | 工具调用参数清洗 shim（Read / submit_pr_review） | `translator/helpers/toolCallShim.ts`（129 行，含 `coerceToArray` / `isValidPdfPagesArg` / `sanitizeReadArgs` / `TOOL_SHIMS` / `resolveToolCallShim` / `applyToolCallShimToBuffer`） | `tool_call_shim.go`（**已接入** `anthropic.go:emitToolBlock`，即组装完成后、发 `input_json_delta` 之前） | ✅ 双负向验证通过（NEG-SHIM-A 实现级 1 红 / NEG-SHIM-B 作用域级 2 红），md5 `63c37be2` |
 | Claude thinking 块归一（Pass 2） | `translator/helpers/claudeHelper.ts:546-719` + `config/defaultThinkingSignature.ts:2-3` + `utils/reasoningPlaceholder.ts:6` | `claude_thinking_blocks.go`（**已接入** `providers_chat.go:chatWithKey` 的 anthropic 分支，`reanchorClaudePromptCache` 之后） | ✅ 双负向验证通过（NEG-THINK-A 接线 1 红 / NEG-THINK-B 实现 6 红）+ 15 用例 + 接线锁，md5 `063a59ee` |
+| 第三方工具名伪装 + 双向还原 | `services/claudeCodeToolRemapper.ts`（483 行）+ `services/claudeCodeExtraRemap.ts`（18 行）+ `translator/helpers/toolCallHelper.ts:100-157`（`caseInsensitiveToolNameLookup` / `restoreOpenAIToolNames`） | `claude_tool_remap.go`（**已接入 5 处**：请求侧 `providers_chat.go:chatWithKey` anthropic 分支；响应侧 `anthropic.go:emitToolBlock` 流式 + `openAIToAnthropicWithMap` 非流式 + `proxy_stream.go` 两个 OpenAI 形态还原点；映射经 `routing_dispatch.go` 的 `hopParams` 透传） | ✅ 双负向验证通过（NEG-REMAP-A 实现 1 红 `R6l` / NEG-REMAP-B 接线 1 红「出现 2 次」）+ R1–R6 共 30 用例 + 接线锁 5 例，md5 `2f90c3ef` |
+
+### ★ 工具名伪装的任务价值（`claudeCodeToolRemapper`）
+
+Anthropic 在**第一方 Messages API**（原生 Claude OAuth）上用**工具名指纹**识别第三方
+agent harness：真 Claude Code 用 `Bash` / `Read` 大驼峰，而 Codex / OpenCode / Cline
+发来的历史普遍是 snake_case（`read_file` / `run_command` / `list_directory`）。被识别后
+上游**拒绝服务，且错误伪装成 `400 out of extra usage`** —— 看着像计费问题，实为 SSE
+流被拒。在 agent 客户端里就表现为**任务无声中断**，与本轮用户报的现象同源。
+
+两种失败模式（参考实现原注释逐字）：
+
+> 1. Specific blacklisted names (e.g. `mixture_of_agents`) are refused even in isolation.
+> 2. A large enough SET of recognizable snake_case agent tool names is refused
+>    collectively, even though each name passes on its own.
+
+因此分两步、**不可合并**：`remapToolNamesInRequest` 只归一**固定清单**，`cloakThirdPartyToolNames`
+把**任何**看起来不像真 Claude Code 工具的名字确定性改名（有 canonical 用 canonical，
+否则 PascalCase），并记入 per-request 的 `_toolNameMap` 供回程还原。
+
+### ★ `_toolNameMap` 的"不该上行"必须用**显式 delete** 表达（Go 侧无法照搬 `enumerable: false`）
+
+参考实现把映射用
+
+```ts
+Object.defineProperty(transformed, "_toolNameMap", {
+  value: toolNameMap, enumerable: false, configurable: true, writable: true,
+});
+```
+
+挂在**同一个** body 对象上：`JSON.stringify` 自然忽略它，而 `chatCore` 仍能从同一对象读到。
+Go 的 `json.Marshal` 没有 "non-enumerable" 概念 —— 要么删掉（读不到）、要么留着（会发上线，
+哪怕值是 `{}`，**键名本身非法**，Anthropic 回 400 `Extra inputs are not permitted`）。
+
+Go 侧的等价做法是**双键**：
+
+| 键 | 作用 | 线序化可见性 |
+|---|---|---|
+| `_toolNameMap`（`toolNameMapKey`） | 对位参考实现的同名键，仅在函数内部短暂存在 | 出站前被 `detachToolNameMap` 摘除 |
+| `__goToolNameMap`（`toolNameMapSideChannelKey`） | Go 专有的进程内旁路键 | 每次 `json.Marshal(params)` **之前** delete、之后回填，**永远不出现在 payload 里** |
+
+这样既满足"同对象读写"的语义，又保证映射不上行。摘下来的映射由调用方
+（`routing_dispatch.go` 的 `hopParams` / `providers_chat.go` 的 `params`）用
+`takeToolNameMap` 读走，交给响应侧还原。
+
+### ★ 响应侧还原必须**按客户端形态**各接一处（漏一处就漏一种客户端）
+
+请求侧 cloak 只由**上游形状**决定（`claude` / `anthropic-compatible-*`），与客户端形态无关。
+因此回程必须在**每种客户端形态**上都还原，否则该形态的客户端会收到自己从未声明过的工具名：
+
+| 客户端形态 | 还原点 | 参考实现出处 |
+|---|---|---|
+| Claude 流式 | `anthropic.go:emitToolBlock`（`restoreClaudeToolName(acc.name, toolNameMap)`） | `utils/stream.ts:restoreClaudePassthroughToolUseName` |
+| Claude 非流式 | `anthropic.go:openAIToAnthropicWithMap`（`restoreClaudeToolName(name, nameMap)`） | `responseTranslator.ts:740` |
+| OpenAI 流式 | `proxy_stream.go`（`restoreOpenAIToolNames(normalized, toolNameMap)`） | `responseTranslator.ts:165` + `toolCallHelper.ts:131-157` |
+| OpenAI 非流式 | `proxy_stream.go`（`restoreOpenAIToolNames(out, toolNameMap)`） | `responseTranslator.ts:173` + `toolCallHelper.ts:131-157` |
+
+**只在 `emitToolBlock` 里改 `content_block.name`，绝不能改 `acc.name` 本身**：上方的
+`filterToolInput(acc.name, ...)` 与 `hasToolCallShim(acc.name)` 都以**上游回显的别名**
+（如 `Read`）为键 —— 那两张表按 Claude 权威名建索引，用别名查才对。只有**发给客户端**
+的那个名字要还原。
 
 ### `fixToolUseOrdering` 的形态守卫（★ 本轮最重要的作用域修正）
 

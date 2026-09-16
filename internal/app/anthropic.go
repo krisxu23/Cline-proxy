@@ -387,6 +387,34 @@ func anthropicContentToString(v any) string {
 }
 
 func openAIToAnthropic(openAI map[string]any) map[string]any {
+	return openAIToAnthropicWithMap(openAI, nil)
+}
+
+// openAIToAnthropicWithMap 是 openAIToAnthropic 的带映射版本。
+//
+// ★ 对应参考实现 `convertOpenAINonStreamingToClaude(openaiResponse, toolNameMap?)`
+//
+//	  的**可选尾参**（handlers/responseTranslator.ts:684-690）。参考实现在
+//
+//		name: restoreClaudeToolName(toString(fn.name), toolNameMap ?? null)
+//
+//	  （:740）处还原工具名，注释（逐字）:
+//
+//		`toolNameMap` carries request-side aliases; when it does not resolve a name,
+//		`restoreClaudeToolName` upgrades known Claude Code tools to their canonical
+//		PascalCase ("bash" → "Bash", "croncreate" → "CronCreate"). Without this, a
+//		non-streaming upstream JSON body (or a stream:true request the upstream
+//		answered with application/json) reaches Claude Code with lowercase tool_use
+//		names the CLI rejects as "No such tool available".
+//
+// 为什么必须有这一步: 请求侧把 `read_file` 伪装成 `Read` 发出（见
+// providers_chat.go 的 cloak 接入点），上游就会**回显 `Read`**。若不在回程还原，
+// 客户端收到的是它从未声明过的工具名 → Claude Code 报
+// "No such tool available: Read"（它声明的叫 read_file）。
+//
+// nameMap 为 nil 时行为与 openAIToAnthropic 完全一致（纯 PascalCase 真 Claude Code
+// 流量不走伪装，故恒为 nil）—— 保证对既有路径零影响。
+func openAIToAnthropicWithMap(openAI map[string]any, nameMap *toolNameMap) map[string]any {
 	out := map[string]any{
 		"id":    "msg_" + fmt.Sprintf("%x", time.Now().UnixMilli()),
 		"type":  "message",
@@ -461,6 +489,15 @@ func openAIToAnthropic(openAI map[string]any) map[string]any {
 					if name == "" {
 						continue
 					}
+					// 工具名还原（照抄 responseTranslator.ts:740
+					// `restoreClaudeToolName(toString(fn.name), toolNameMap ?? null)`）。
+					//
+					// nameMap 为空时 restoreClaudeToolName 仍会走它的
+					// "canonical casing upgrade" 分支（`bash` → `Bash`），
+					// 这正是参考实现想要的：非流式上游 JSON（或 stream:true 但上游
+					// 以 application/json 回）送到 Claude Code 时，小写工具名会被
+					// CLI 拒为 "No such tool available"。
+					name = restoreClaudeToolName(name, nameMap)
 					block := map[string]any{
 						"type":  "tool_use",
 						"id":    id,
@@ -815,7 +852,23 @@ func handleZenAnthropic(w http.ResponseWriter, r *http.Request, req anthropicReq
 	tracker.finish(true, resp.StatusCode)
 }
 
+// handleAnthropicStreamWithUsage 是带可选工具名映射的流式 Claude-shape 回写入口。
+//
+// toolNameMap 对位参考实现 `utils/stream.ts:restoreClaudePassthroughToolUseName`
+// 的映射来源（chatCore.ts:2592-2610 从 translatedBody._toolNameMap 取出后
+// 一路透传到流式转换器）。为 nil 时行为与无映射版本完全一致。
 func handleAnthropicStreamWithUsage(w http.ResponseWriter, upstream *http.Response, modelName string, toolSchemas map[string]map[string]bool, onUsage func(map[string]any)) {
+	handleAnthropicStreamWithToolNameMap(w, upstream, modelName, toolSchemas, onUsage, nil)
+}
+
+// handleAnthropicStreamWithToolNameMap 是实际实现。
+//
+// ★ 还原位置的出处: emitToolBlock 内 `content_block.name` 是**上游回显**的工具名。
+//
+//	请求侧 cloak 后上游回的是别名（如 `Read`），必须在写给 Claude Code 之前
+//	还原成客户端声明的原名（如 `read_file`），否则 CLI 报
+//	"No such tool available: Read"。
+func handleAnthropicStreamWithToolNameMap(w http.ResponseWriter, upstream *http.Response, modelName string, toolSchemas map[string]map[string]bool, onUsage func(map[string]any), toolNameMap *toolNameMap) {
 	log.Printf("  anthropic stream: starting real-time forward")
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
@@ -911,14 +964,23 @@ func handleAnthropicStreamWithUsage(w http.ResponseWriter, upstream *http.Respon
 				acc.name, kit.Truncate(string(parsed), 300), kit.Truncate(cleaned, 300))
 			parsed = []byte(cleaned)
 		}
-		log.Printf("  tool_use emit: name=%s id=%s input=%s", acc.name, id, string(parsed))
+		// 工具名还原（照抄 OmniRoute utils/stream.ts:restoreClaudePassthroughToolUseName，
+		// 映射来源 chatCore.ts:2592-2610；非流式对位 responseTranslator.ts:740）。
+		//
+		// ★ 还原的是**写给客户端的那个名字**，不碰 acc.name 本身:
+		//   上面的 filterToolInput / hasToolCallShim 都以 acc.name（上游回显的
+		//   别名，如 `Read`）为键 —— 那两张表按 Claude 权威名建索引，用别名查才对。
+		//   只有**发给客户端**的 content_block.name 必须还原成客户端声明的原名
+		//   （如 `read_file`），否则 Claude Code 报 "No such tool available: Read"。
+		emitName := restoreClaudeToolName(acc.name, toolNameMap)
+		log.Printf("  tool_use emit: name=%s id=%s input=%s", emitName, id, string(parsed))
 		emit("content_block_start", map[string]any{
 			"type":  "content_block_start",
 			"index": idx,
 			"content_block": map[string]any{
 				"type":  "tool_use",
 				"id":    id,
-				"name":  acc.name,
+				"name":  emitName,
 				"input": map[string]any{},
 			},
 		})

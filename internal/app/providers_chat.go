@@ -309,6 +309,55 @@ func (p *modelProvider) chatWithKey(ctx context.Context, cfg providerConfig, par
 	// 我方用 providerConfig.APIType == "anthropic" 表达同一件事
 	// (见 providers_config.go:174-181 的鉴权分派)。
 	if cfg.APIType == "anthropic" {
+		// 工具名伪装（照抄 OmniRoute services/claudeCodeToolRemapper.ts:113-185
+		// `remapToolNamesInRequest` + :373-483 `cloakThirdPartyToolNames`）。
+		//
+		// ★ 作用域是照抄的: 参考实现把这两步包在
+		//
+		//	((this.provider === "claude" && (isClaudeCodeClient || hasClaudeOAuthToken)) ||
+		//	 usesClaudeCodeProtocol) && typeof transformedBody === "object"
+		//
+		//   （executors/base.ts:955-960）—— **仅 Claude 原生 OAuth / Claude Code 协议路径**。
+		//   我方用 providerConfig.APIType == "anthropic" 表达同一件事（与本文件上方
+		//   工具配对链共用同一个 gate）。
+		//
+		// ★ 顺序是照抄的（executors/base.ts:962-970）:
+		//	stripProxyToolPrefix(tb)      —— 本网关无 proxy_ 前缀通道，跳过（另见说明）;
+		//	remapToolNamesInRequest(tb)   —— 固定 Claude Code 工具名大小写归一;
+		//	cloakThirdPartyToolNames(tb)  —— 通用伪装 + 记 _toolNameMap;
+		//	sanitizeClaudeToolSchemas     —— 已在入站 anthropicToolsToOpenAI 处做（schema 层面）。
+		//
+		// 业务意义（本步是本网关"任务无声中断"的一条真实根因）:
+		//   Anthropic 在**第一方 Messages API**（原生 Claude OAuth）上用**工具名指纹**
+		//   识别第三方 agent harness。真 Claude Code 用 `Bash`/`Read` 大驼峰，而
+		//   Codex / OpenCode / Cline 发来的历史普遍是 snake_case（`read_file` /
+		//   `run_command` / `list_directory`）。被识别 → 上游拒绝服务，且错误**伪装成
+		//   `400 out of extra usage`**（看着像计费问题，实为 SSE 流被拒）。
+		//
+		// 两步的分工（不可合并）:
+		//   remapToolNamesInRequest 只归一**固定清单**里的名字，返回"是否需要小写化回写";
+		//   cloakThirdPartyToolNames 把**任何**看起来不像真 Claude Code 工具的名字
+		//   确定性改名（有 canonical 用 canonical，否则 PascalCase），并记入
+		//   per-request 的 `_toolNameMap`，供响应路径还原。
+		//
+		// ★ Go 侧必须显式摘掉 `_toolNameMap`（参考实现靠 `enumerable: false`）:
+		//   下方 json.Marshal(params) 会把它序列化进上行 body，Anthropic 400
+		//   `Extra inputs are not permitted`。摘下来的映射存回 params 的旁路，
+		//   由 handleProviderChat 读走交给响应侧的 restoreClaudeToolName。
+		{
+			nameMapChanged := remapToolNamesInRequest(params)
+			cloakMap := cloakThirdPartyToolNames(params, nil)
+			// 合并两张反向映射（remap 写的是 params["_toolNameMap"] 里的同一张表，
+			// cloak 返回的是它，故此处只需取一次 —— 与参考实现
+			// cliproxyapi.ts:363-368 的 "new Map(cloakMap) 再并 mcpMap" 同构，
+			// 我方无 mcp 改写通道，故并集即 cloakMap）。
+			_ = nameMapChanged
+			if cloakMap != nil && cloakMap.len() > 0 {
+				params[toolNameMapSideChannelKey] = cloakMap
+				log.Printf("  providers: %s cloaked third-party tool names (%d aliases)", p.name, cloakMap.len())
+			}
+		}
+
 		if msgs, ok := params["messages"].([]any); ok {
 			// tool id 双侧对称净化（照抄 claudeHelper.ts:432-450 的 Pass 1.4）。
 			//
@@ -482,8 +531,27 @@ func (p *modelProvider) chatWithKey(ctx context.Context, cfg providerConfig, par
 	if needsSig {
 		attempts = 2
 	}
+
+	// `_toolNameMap` 绝不能上行（照抄 OmniRoute chatCore.ts:2610
+	// `delete translatedBody._toolNameMap;` + cliproxyapi.ts:417 的 replacer）。
+	//
+	// 参考实现靠 `Object.defineProperty(..., { enumerable: false })` 让
+	// `JSON.stringify` 忽略它；Go 的 `json.Marshal` 没有这个概念，**必须显式 delete**。
+	// 否则 Anthropic 会回 400 `Extra inputs are not permitted`
+	// （哪怕值是 `{}` —— 键名本身非法）。
+	//
+	// 摘下来的映射不丢：转存到独立的旁路键 `toolNameMapSideChannelKey`，
+	// 该键在每次 marshal 前被移除、marshal 后回填，因此**永远不出现在 payload 里**。
+	// 调用方（handleProviderChat / callChainUpstream）在 Chat 返回后读它交给响应侧还原。
+	wireToolNameMap := detachToolNameMap(params)
+
 	for attempt := 1; attempt <= attempts; attempt++ {
+		// 旁路键在 marshal 前移除 —— 它只是 Go 侧的进程内通道，绝不参与线序化。
+		delete(params, toolNameMapSideChannelKey)
 		payload, err := json.Marshal(params)
+		if wireToolNameMap != nil && wireToolNameMap.len() > 0 {
+			params[toolNameMapSideChannelKey] = wireToolNameMap
+		}
 		if err != nil {
 			return nil, fmt.Errorf("marshal provider body: %w", err)
 		}
@@ -686,9 +754,14 @@ func handleProviderChat(w http.ResponseWriter, r *http.Request, params map[strin
 	defer resp.Body.Close()
 	status = resp.StatusCode
 	usageFn := func(u map[string]any) { tracker.observeUsage(u) }
+	// 工具名还原映射: 从同一 params 对象的旁路键读出并移除。
+	// 出处 responseTranslator.ts:165/173 `restoreOpenAIToolNames(responseBody, toolNameMap)` ——
+	// 客户端是 OpenAI 形态（/v1/chat/completions）而上游是 anthropic 形状时必须还原，
+	// 否则客户端收到自己从未声明过的工具名。无伪装时为 nil, 行为不变。
+	responseToolNameMap := takeToolNameMap(params)
 	if isStream {
-		handleStreamResponseWithUsage(w, resp, usageFn)
+		handleStreamResponseWithToolNameMap(w, resp, usageFn, responseToolNameMap)
 		return
 	}
-	handleNonStreamResponseWithUsage(w, resp, usageFn)
+	handleNonStreamResponseWithToolNameMap(w, resp, usageFn, responseToolNameMap)
 }

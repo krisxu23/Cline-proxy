@@ -14,6 +14,23 @@ import (
 )
 
 func handleStreamResponseWithUsage(w http.ResponseWriter, upstream *http.Response, onUsage func(map[string]any)) {
+	handleStreamResponseWithToolNameMap(w, upstream, onUsage, nil)
+}
+
+// handleStreamResponseWithToolNameMap 是 OpenAI 形态流式回写的实际实现，
+// 多一个可选的工具名还原映射。
+//
+// 出处: OmniRoute handlers/responseTranslator.ts:165/173
+// `restoreOpenAIToolNames(responseBody, toolNameMap)` 的**流式对位** —— 参考实现
+// 在 OpenAI 形态出站时把 `choices[].delta.tool_calls[].function.name` 上的别名
+// 换回客户端声明的原名（toolCallHelper.ts:131-157）。
+//
+// ★ 为什么 OpenAI 形态也需要还原: 请求侧的形状是**上游**决定的（claude /
+//
+//	anthropic-compatible-* 都要 cloak），而与客户端形态无关。若客户端是 OpenAI
+//	形态而只做了 cloak 不做还原，它会收到自己从未声明过的工具名 → 调用静默失败。
+//	toolNameMap 为 nil 时逐字节等价于旧行为。
+func handleStreamResponseWithToolNameMap(w http.ResponseWriter, upstream *http.Response, onUsage func(map[string]any), toolNameMap *toolNameMap) {
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
@@ -148,6 +165,14 @@ func handleStreamResponseWithUsage(w http.ResponseWriter, upstream *http.Respons
 				lastModel = m
 			}
 			normalized := normalizeOpenAIResponse(obj)
+			// 工具名还原（照抄 toolCallHelper.ts:131-157 `restoreOpenAIToolNames`）。
+			//
+			// 位置: 必须在 normalize 之后、marshal 之前 —— 此时 `choices[].delta`
+			// 已是标准形态，别名也仍在上游回显的位置上。还原是**幂等**的
+			// （原样再跑一次不会改动），故对未 cloak 的请求零代价。
+			if toolNameMap != nil && toolNameMap.len() > 0 {
+				restoreOpenAIToolNames(normalized, toolNameMap)
+			}
 			if !sawFinish && protocol.HasStopSignal(normalized) { // 跨协议终止判定(OmniRoute checkIfStopSignal 等价)
 				sawFinish = true
 			}
@@ -654,6 +679,13 @@ func writeStreamEmptyContentError(w http.ResponseWriter, hb *sseHeartbeat, model
 }
 
 func handleNonStreamResponseWithUsage(w http.ResponseWriter, upstream *http.Response, onUsage func(map[string]any)) {
+	handleNonStreamResponseWithToolNameMap(w, upstream, onUsage, nil)
+}
+
+// handleNonStreamResponseWithToolNameMap 是 OpenAI 形态非流式回写的实际实现，
+// 多一个可选的工具名还原映射（出处与流式版同: responseTranslator.ts:165/173
+// `restoreOpenAIToolNames`）。
+func handleNonStreamResponseWithToolNameMap(w http.ResponseWriter, upstream *http.Response, onUsage func(map[string]any), toolNameMap *toolNameMap) {
 	// 非流式响应同样要过控制字符清洗 —— 此前只有流式路径有清洗器, 于是上游
 	// (实测 B.AI 图片响应的 C2PA _manifest)忽略 stream:true 直接回完整 JSON,
 	// 或流式被掏空退化成裸 body 时, 字符串里的裸控制字符会原样直达客户端,
@@ -707,6 +739,12 @@ func handleNonStreamResponseWithUsage(w http.ResponseWriter, upstream *http.Resp
 	}
 
 	out = normalizeOpenAIResponse(out)
+
+	// 工具名还原（照抄 toolCallHelper.ts:131-157 `restoreOpenAIToolNames`）。
+	// 位置与参考实现一致: 在 `choices[].message.tool_calls` 已就位、即将写出之前。
+	if toolNameMap != nil && toolNameMap.len() > 0 {
+		restoreOpenAIToolNames(out, toolNameMap)
+	}
 
 	if msg, ok := getNested(out, "choices", 0, "message").(map[string]any); ok {
 		tc, _ := msg["tool_calls"].([]any)
