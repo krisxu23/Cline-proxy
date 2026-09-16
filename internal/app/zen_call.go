@@ -59,6 +59,13 @@ func callZenAPI(ctx context.Context, params map[string]any, stream bool) (*http.
 	reasoningEffort := zenReasoningEffortOf(params)
 	// 客户端请求的输出预算: muse-spark 的 finish_reason 假截断判定需要它。
 	zenBudget := zenRequestedBudget(params)
+	// muse-spark 家族: 客户端没给预算时, 转换阶段会补 museSparkDefaultOutputTokens,
+	// 因此这里的"假截断"修正必须按**实际发给上游的预算**比较 —— 否则预算恒为 0,
+	// normalizeMuseSparkFinish 永远不生效, 客户端会把一个正常答完的回合当成
+	// "超出输出上限"而中止(该家族 finish_reason 恒报 length 的已知怪癖)。
+	if zenBudget == 0 && isMuseSparkModel(zenResolvedModel) {
+		zenBudget = museSparkDefaultOutputTokens
+	}
 	if useRespAPI {
 		body = translate_registry.TranslateRequest(translate_registry.Chat, translate_registry.Responses, body)
 		applyResponsesReasoning(body, reasoningEffort)

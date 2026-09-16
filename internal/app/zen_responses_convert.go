@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"strings"
 	"time"
@@ -47,6 +48,12 @@ func chatBodyToResponsesBody(chat map[string]any) map[string]any {
 				out["max_output_tokens"] = n
 			}
 			break
+		}
+		// muse-spark 家族: 调用方**没给**预算时也必须补一个兜底 —— 否则上游默认预算
+		// 会被隐藏推理吃光, 收到"完成"但可见正文为空, 客户端视为静默中断
+		// (见 museSparkDefaultOutputTokens 的实测说明)。
+		if mid, _ := chat["model"].(string); mid != "" {
+			applyMuseSparkBudget(out, mid)
 		}
 	}
 
@@ -269,6 +276,9 @@ func translateResponsesStreamToChat(src io.Reader, dst io.Writer, model string, 
 	toolIdx := map[string]int{} // item_id -> chat tool_calls 下标
 	nextToolIdx := 0
 	finishReason := ""
+	delivered := 0      // 已交付的可见内容量(正文字符 + 工具调用), 用于识别空回合
+	reasoningChars := 0 // 只推理未出正文时的诊断线索
+	sawCompletion := false
 
 	writeChunk := func(obj map[string]any) error {
 		obj["id"] = chunkID
@@ -282,6 +292,29 @@ func translateResponsesStreamToChat(src io.Reader, dst io.Writer, model string, 
 			return err
 		}
 		return nil
+	}
+
+	// writeTerminalError 向客户端交付"可见的失败": 同一个帧里既带 error(客户端
+	// 能弹出原因), 又带 finish_reason(不依赖 error 的客户端也能正常收尾),
+	// 再补 [DONE]。这样中继的收尾合成不会再追加第二份终止帧。
+	//
+	// 为什么不直接伪装成功(旧行为): 上游失败/空回合时写 finish_reason=stop,
+	// 客户端会当成"模型这一轮没话说了", agent 于是静默结束任务 —— 用户看到的是
+	// "无缘无故中断, 没有任何提示"(2026-09-16 定位)。
+	writeTerminalError := func(kind, msg string) error {
+		frame := map[string]any{
+			"choices": []any{map[string]any{
+				"index": 0, "delta": map[string]any{}, "finish_reason": "stop",
+			}},
+			"error": map[string]any{"type": kind, "message": msg},
+		}
+		if err := writeChunk(frame); err != nil {
+			return err
+		}
+		if _, err := writer.WriteString("data: [DONE]\n\n"); err != nil {
+			return err
+		}
+		return writer.Flush()
 	}
 
 	for {
@@ -316,6 +349,7 @@ func translateResponsesStreamToChat(src io.Reader, dst io.Writer, model string, 
 		case "response.output_text.delta":
 			delta, _ := ev["delta"].(string)
 			if delta != "" {
+				delivered += len(delta)
 				if err := writeChunk(map[string]any{
 					"choices": []any{map[string]any{
 						"index": 0, "delta": map[string]any{"content": delta},
@@ -324,9 +358,16 @@ func translateResponsesStreamToChat(src io.Reader, dst io.Writer, model string, 
 					return err
 				}
 			}
+		case "response.reasoning_summary_text.delta", "response.reasoning_text.delta":
+			// 服务端推理/推理摘要: 不算"交付内容"(客户端要的是正文或工具调用),
+			// 但记一笔 —— 出现"只有推理、没有正文"的空回合时这是关键诊断线索。
+			if d, _ := ev["delta"].(string); d != "" {
+				reasoningChars += len(d)
+			}
 		case "response.output_item.added":
 			item, _ := ev["item"].(map[string]any)
 			if item != nil && item["type"] == "function_call" {
+				delivered++ // 工具调用本身就是一次有效交付(agent 靠它继续干活)
 				itemID, _ := item["id"].(string)
 				callID, _ := item["call_id"].(string)
 				if callID == "" {
@@ -390,6 +431,18 @@ func translateResponsesStreamToChat(src io.Reader, dst io.Writer, model string, 
 				}
 				finishReason = normalizeMuseSparkFinish(finishReason, model, completion, budget)
 			}
+			sawCompletion = true
+			// 空回合必须是"可见的失败", 不能伪装成正常收尾 —— 否则 agent 拿到
+			// 一个没有正文、没有工具调用的回合就直接结束任务, 用户侧表现为
+			// "无缘无故中断, 没有任何提示"(2026-09-16 实证: 当天 394 次成功里 12 次)。
+			if delivered == 0 {
+				log.Printf("  zen: /responses 空回合(model=%s completion_tokens=%d reasoning_chars=%d 可见输出 0) — 已向客户端报错而非静默结束",
+					model, completion, reasoningChars)
+				return writeTerminalError("upstream_empty_response",
+					fmt.Sprintf("上游模型 %s 本轮没有产出任何可见内容(completion_tokens=%d, 推理字符=%d)。"+
+						"该家族会把预算烧在隐藏推理上, 通常是输出预算不足或上游配额/地区问题; 请重试, 若持续出现请检查 zen 配额与出口地区。",
+						model, completion, reasoningChars))
+			}
 			final := map[string]any{
 				"choices": []any{map[string]any{
 					"index": 0, "delta": map[string]any{}, "finish_reason": finishReason,
@@ -408,25 +461,36 @@ func translateResponsesStreamToChat(src io.Reader, dst io.Writer, model string, 
 			_ = writer.Flush()
 			return nil
 		case "response.failed", "error":
-			// 上游在流中途失败: 补一个 finish 让客户端正常收尾, 不再续传。
-			if err := writeChunk(map[string]any{
-				"choices": []any{map[string]any{
-					"index": 0, "delta": map[string]any{}, "finish_reason": "stop",
-				}},
-			}); err != nil {
-				return err
+			// 上游在流中途失败: 不再伪装成"正常收尾"(旧实现写 finish_reason=stop,
+			// 客户端以为模型答完了 → 任务静默中断)。改为交付一个带原因的错误帧,
+			// 已经流出去的正文保持不变, 客户端能弹出真实原因。
+			msg := "上游流中途失败"
+			if e, ok := ev["error"].(map[string]any); ok {
+				if m, _ := e["message"].(string); m != "" {
+					msg = m
+				}
+			} else if r, ok := ev["response"].(map[string]any); ok {
+				if m, _ := r["error"].(map[string]any); ok {
+					if s, _ := m["message"].(string); s != "" {
+						msg = s
+					}
+				}
 			}
-			_, werr := writer.WriteString("data: [DONE]\n\n")
-			if werr != nil {
-				return werr
-			}
-			_ = writer.Flush()
-			return nil
+			log.Printf("  zen: /responses 流中途失败(model=%s, 已交付=%d): %s", model, delivered, kit.Truncate(msg, 200))
+			return writeTerminalError("upstream_stream_failed",
+				fmt.Sprintf("上游流在交付过程中失败(model=%s): %s", model, msg))
 		}
 
 		if err != nil {
 			break
 		}
+	}
+	// 循环正常结束但从未收到 response.completed/incomplete: 上游把连接掐了。
+	// 同样不能静默收尾 —— 已交付内容保留, 补一个可见的错误帧。
+	if !sawCompletion {
+		log.Printf("  zen: /responses 流被上游截断(model=%s, 已交付=%d, 推理字符=%d)", model, delivered, reasoningChars)
+		return writeTerminalError("upstream_stream_truncated",
+			fmt.Sprintf("上游流被意外截断(model=%s, 已交付=%d 字节内容); 通常是出口节点或上游 worker 掉线, 请重试。", model, delivered))
 	}
 	_ = writer.Flush()
 	return nil
@@ -473,11 +537,43 @@ func convertResponsesResponseToChat(resp *http.Response, fallbackModel string, r
 	if len(requestedBudget) > 0 {
 		budget = requestedBudget[0]
 	}
-	out, err := json.Marshal(responsesToChatBody(parsed, budget))
+	chat := responsesToChatBody(parsed, budget)
+	// 非流式同样要拦住"空回合": 转出来既没有正文也没有工具调用时, 直接报错让
+	// 调用方换出口/换候选, 而不是把一个空消息交付给客户端(那会让 agent 静默结束)。
+	if responsesChatEmpty(chat) {
+		return nil, fmt.Errorf("上游 %s 返回空回合(无正文且无工具调用): 通常是输出预算不足或上游配额/地区问题", fallbackModel)
+	}
+	out, err := json.Marshal(chat)
 	if err != nil {
 		return nil, fmt.Errorf("marshal converted chat body: %w", err)
 	}
 	return synthesizeChatJSONResponse(out), nil
+}
+
+// responsesChatEmpty 转换后的 chat 响应是否"什么都没产出"。
+func responsesChatEmpty(chat map[string]any) bool {
+	choices, _ := chat["choices"].([]any)
+	if len(choices) == 0 {
+		return true
+	}
+	c0, _ := choices[0].(map[string]any)
+	if c0 == nil {
+		return true
+	}
+	msg, _ := c0["message"].(map[string]any)
+	if msg == nil {
+		return true
+	}
+	if s, _ := msg["content"].(string); strings.TrimSpace(s) != "" {
+		return false
+	}
+	if tcs, _ := msg["tool_calls"].([]any); len(tcs) > 0 {
+		return false
+	}
+	if fr, _ := msg["function_call"].(map[string]any); fr != nil {
+		return false
+	}
+	return true
 }
 
 // wrapResponsesStreamToChat 流式: 把 Responses SSE 体翻译成 chat SSE 体。

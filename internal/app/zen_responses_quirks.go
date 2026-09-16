@@ -10,13 +10,57 @@ import (
 	"strings"
 )
 
-// responsesToChatBody 把非流式 Responses 响应体翻译成 chat completions 响应体。
 // museSparkMinOutputTokens muse-spark 家族的最小输出预算。
 //
 // 参照 OmniRoute 的 MUSE_SPARK_MIN_OUTPUT_TOKENS=512: 该家族会先把预算烧在
 // 不可见的服务端推理上, 预算太小则可见正文恒为空(我们实测 300 与 800 都是空正文),
 // 客户端会误判成"模型坏了"。只在调用方给了预算且小于该值时抬高。
 const museSparkMinOutputTokens = 512
+
+// museSparkDefaultOutputTokens 调用方**没有**给输出预算时的兜底预算。
+//
+// 为什么必须兜底(2026-09-16 实锤): Codex / cc-switch 这类客户端根本不发
+// max_tokens, 于是我们此前按"与上游默认一致"**完全不发** max_output_tokens,
+// 上游默认预算被隐藏推理吃光 → 收到 `response.completed` 但 output_tokens=0、
+// 可见正文为空。实测当天 394 次成功请求里有 12 次是这种空回合, 客户端表现为
+// "任务无缘无故中断, 没有提示也没有报错"(agent 收到一个空回合就结束了这一轮)。
+//
+// 8192 的取法: 远大于 512 下限, 足以覆盖一次 agent 回合的可见输出(工具调用 +
+// 说明文字), 又远小于该模型 output=32768 的上限, 不至于让单次请求无限拉长。
+const museSparkDefaultOutputTokens = 8192
+
+// applyMuseSparkBudget 为 muse-spark 家族补足输出预算。
+//
+// 规则: 调用方给了就按其值(小于下限抬到下限); 没给则补 museSparkDefaultOutputTokens。
+// 该家族的"假截断"(finish_reason=length 但其实答完了)修正依赖 requestedBudget,
+// 兜底之后这个值也始终存在, 修正才有依据。
+func applyMuseSparkBudget(out map[string]any, modelID string) {
+	if !isMuseSparkModel(modelID) {
+		return
+	}
+	if n, ok := anyToIntOK(out["max_output_tokens"]); ok && n > 0 {
+		if n < museSparkMinOutputTokens {
+			out["max_output_tokens"] = museSparkMinOutputTokens
+		}
+		return
+	}
+	out["max_output_tokens"] = museSparkDefaultOutputTokens
+}
+
+// anyToIntOK anyToInt 的存在性版本(anyToInt 把 0 与非法都归成 0, 这里要区分)。
+func anyToIntOK(v any) (int, bool) {
+	switch n := v.(type) {
+	case float64:
+		return int(n), true
+	case int:
+		return n, true
+	case json.Number:
+		if i, err := n.Int64(); err == nil {
+			return int(i), true
+		}
+	}
+	return 0, false
+}
 
 // isMuseSparkModel 是否 muse-spark 家族(该家族有若干上游特有的行为需要单独处理)。
 func isMuseSparkModel(modelID string) bool {
