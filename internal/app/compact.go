@@ -469,98 +469,201 @@ func maybeCompact(ctx context.Context, params map[string]any, m *ZenModel, sessi
 // 按 split 切片重组很容易把配对砍断(assistant 留下了、tool 回复被切掉, 或反之),
 // 上游会直接 400 —— 这不是理论风险, 是压缩功能最常见的线上错误。
 //
-// 修复策略(两步, 均为确定性处理, 参照 OmniRoute contextManager 的 fixToolPairs):
-//  1. 丢弃"孤儿 tool 结果": tool_call_id 没有任何 assistant 声明过的 tool 消息;
-//  2. 修剪 assistant 的 tool_calls: 只保留收到了回复的那些; 若修完后该 assistant
-//     既没有 tool_calls 也没有非空 content(它唯一的价值就是那次调用), 整条丢弃。
+// 照抄 OmniRoute services/contextManager.ts:717-819（四遍扫描）。
+//
+// 逐字对照时必须保留的四处语义（每条都实证过, 不要"简化"回去）:
+//
+//  1. Pass 1 同时收集 `role=="tool"` 的 tool_call_id **和** Anthropic 形态
+//     `user.content[].tool_result.tool_use_id`（:721-730）。只认前者的话,
+//     Anthropic 形态的 tool_result 既不进"已声明"集合也不进"存活"集合 ——
+//     既删不掉也留不对, 孤儿的会原样发给上游。
+//  2. Pass 2 的 `!isLastMessage(idx)` 例外（:735-737）: **最后一条 assistant 的
+//     tool_calls 永不修剪**。agent 循环里"刚发起调用、还没拿到结果"是正常瞬时
+//     状态; 删掉它等于让 agent 的关键调用凭空蒸发 —— 客户端表现为
+//     「没有任何错误、没有任何提示、任务直接中断」。
+//  3. Pass 2 同时修剪 content 数组里的 `tool_use` 块（:751-760）。
+//  4. 保留条件是 `!tc.id || toolResultIds.has(tc.id)` —— **没有 id 的 tool_call
+//     一律保留**（:743）; 按空串查表会把它误删。
+//
+// Pass 4（:786-819）才做"修完后既无内容也无调用的 assistant 整条剔除",
+// 必须放在最后 —— 否则会把上面那个"最后一条"例外又删回去。
 func fixToolPairs(msgs []any) []any {
 	if len(msgs) == 0 {
 		return msgs
 	}
-	// 第一遍: 收集所有 assistant 声明的 tool_call_id。
-	declared := map[string]bool{}
-	for _, mi := range msgs {
-		m, ok := mi.(map[string]any)
-		if !ok || strField(m, "role") != "assistant" {
-			continue
-		}
-		for _, id := range assistantToolCallIDs(m) {
-			declared[id] = true
-		}
-	}
 
-	// 第二遍: 丢孤儿 tool 结果, 记下存活的回复 id。
-	answered := map[string]bool{}
-	kept := make([]any, 0, len(msgs))
+	// --- Pass 1 (:718-731): 收集所有 tool 结果 id（两种形态）---
+	toolResultIDs := map[string]bool{}
 	for _, mi := range msgs {
 		m, ok := mi.(map[string]any)
 		if !ok {
-			kept = append(kept, mi)
 			continue
 		}
 		if strField(m, "role") == "tool" {
-			id, _ := m["tool_call_id"].(string)
-			if !declared[id] {
-				continue // 孤儿: 对应的 assistant 已被切掉
+			if id, _ := m["tool_call_id"].(string); id != "" {
+				toolResultIDs[id] = true
 			}
-			answered[id] = true
 		}
-		kept = append(kept, m)
+		if strField(m, "role") == "user" {
+			if blocks, ok := m["content"].([]any); ok {
+				for _, bi := range blocks {
+					b, ok := bi.(map[string]any)
+					if !ok || strField(b, "type") != "tool_result" {
+						continue
+					}
+					if id, _ := b["tool_use_id"].(string); id != "" {
+						toolResultIDs[id] = true
+					}
+				}
+			}
+		}
 	}
 
-	// 第三遍: 修剪 assistant 的未回复 tool_calls; 空壳 assistant 整条丢弃。
-	out := make([]any, 0, len(kept))
-	for _, mi := range kept {
+	// --- Pass 2 (:733-765): 修剪 assistant 里"未收到回复"的调用, 末条除外 ---
+	filtered := make([]any, 0, len(msgs))
+	for idx, mi := range msgs {
+		m, ok := mi.(map[string]any)
+		if !ok || strField(m, "role") != "assistant" || idx == len(msgs)-1 {
+			filtered = append(filtered, mi)
+			continue
+		}
+		// :739 原版是 `const newMsg = { ...msg }` 浅拷贝, 仅在真有改动时替换;
+		// 无改动时返回原对象(保持引用稳定)。
+		modified := false
+		newMsg := shallowCopyRecord(m)
+
+		if tcs, ok := newMsg["tool_calls"].([]any); ok {
+			live := make([]any, 0, len(tcs))
+			for _, tc := range tcs {
+				// :743 `!tc.id || toolResultIds.has(tc.id)` —— 无 id 保留
+				tcm, _ := tc.(map[string]any)
+				id, _ := tcm["id"].(string)
+				if id == "" || toolResultIDs[id] {
+					live = append(live, tc)
+				}
+			}
+			if len(live) != len(tcs) {
+				newMsg["tool_calls"] = live
+				modified = true
+			}
+		}
+
+		if blocks, ok := newMsg["content"].([]any); ok {
+			live := make([]any, 0, len(blocks))
+			for _, bi := range blocks {
+				// :753-755 `block.type !== "tool_use" || !block.id || toolResultIds.has(block.id)`
+				b, _ := bi.(map[string]any)
+				if b == nil || strField(b, "type") != "tool_use" {
+					live = append(live, bi)
+					continue
+				}
+				id, _ := b["id"].(string)
+				if id == "" || toolResultIDs[id] {
+					live = append(live, bi)
+				}
+			}
+			if len(live) != len(blocks) {
+				newMsg["content"] = live
+				modified = true
+			}
+		}
+
+		if modified {
+			filtered = append(filtered, newMsg)
+		} else {
+			filtered = append(filtered, mi)
+		}
+	}
+
+	// --- Pass 3 (:767-784): 收集修剪后仍存活的 tool_call id（两种形态）---
+	toolCallIDs := map[string]bool{}
+	for _, mi := range filtered {
 		m, ok := mi.(map[string]any)
 		if !ok || strField(m, "role") != "assistant" {
+			continue
+		}
+		if tcs, ok := m["tool_calls"].([]any); ok {
+			for _, tc := range tcs {
+				if tcm, ok := tc.(map[string]any); ok {
+					if id, _ := tcm["id"].(string); id != "" {
+						toolCallIDs[id] = true
+					}
+				}
+			}
+		}
+		if blocks, ok := m["content"].([]any); ok {
+			for _, bi := range blocks {
+				if b, ok := bi.(map[string]any); ok &&
+					strField(b, "type") == "tool_use" {
+					if id, _ := b["id"].(string); id != "" {
+						toolCallIDs[id] = true
+					}
+				}
+			}
+		}
+	}
+
+	// --- Pass 4 (:786-819): 丢掉孤儿结果, 丢掉修空的 assistant ---
+	out := make([]any, 0, len(filtered))
+	for _, mi := range filtered {
+		m, ok := mi.(map[string]any)
+		if !ok {
 			out = append(out, mi)
 			continue
 		}
-		tcs, _ := m["tool_calls"].([]any)
-		if len(tcs) == 0 {
-			out = append(out, m)
-			continue
+		role := strField(m, "role")
+
+		if role == "tool" {
+			if id, _ := m["tool_call_id"].(string); id != "" && !toolCallIDs[id] {
+				continue // :790 孤儿 tool 结果整条丢弃
+			}
 		}
-		live := make([]any, 0, len(tcs))
-		for _, tc := range tcs {
-			tcm, ok := tc.(map[string]any)
-			if !ok {
+
+		if role == "user" {
+			if blocks, ok := m["content"].([]any); ok {
+				live := make([]any, 0, len(blocks))
+				for _, bi := range blocks {
+					// :796 `block.type !== "tool_result" || !block.tool_use_id || toolCallIds.has(...)`
+					b, _ := bi.(map[string]any)
+					if b == nil || strField(b, "type") != "tool_result" {
+						live = append(live, bi)
+						continue
+					}
+					id, _ := b["tool_use_id"].(string)
+					if id == "" || toolCallIDs[id] {
+						live = append(live, bi)
+					}
+				}
+				if len(live) != len(blocks) {
+					if len(live) == 0 {
+						continue // :799 整个 user 消息只剩孤儿结果 -> 丢弃
+					}
+					m = shallowCopyRecord(m)
+					m["content"] = live
+				}
+			}
+		}
+
+		if role == "assistant" {
+			// :805-813 修完后既无内容也无调用 -> 整条丢弃
+			if !contentEmpty(m) {
+				out = append(out, m)
 				continue
 			}
-			id, _ := tcm["id"].(string)
-			if answered[id] {
-				live = append(live, tc)
+			if tcs, ok := m["tool_calls"].([]any); ok && len(tcs) > 0 {
+				out = append(out, m)
+				continue
 			}
-		}
-		if len(live) == len(tcs) {
-			out = append(out, m) // 配对完整, 原样保留
+			if blocks, ok := m["content"].([]any); ok && len(blocks) > 0 {
+				out = append(out, m)
+				continue
+			}
 			continue
 		}
-		if len(live) == 0 && contentEmpty(m) {
-			continue // 纯调用壳, 调用全没回复 → 整条没有意义
-		}
-		if len(live) > 0 {
-			m["tool_calls"] = live
-		} else {
-			delete(m, "tool_calls")
-		}
+
 		out = append(out, m)
 	}
 	return out
-}
-
-// assistantToolCallIDs 取 assistant 消息里全部 tool_call 的 id。
-func assistantToolCallIDs(m map[string]any) []string {
-	tcs, _ := m["tool_calls"].([]any)
-	ids := make([]string, 0, len(tcs))
-	for _, tc := range tcs {
-		if tcm, ok := tc.(map[string]any); ok {
-			if id, _ := tcm["id"].(string); id != "" {
-				ids = append(ids, id)
-			}
-		}
-	}
-	return ids
 }
 
 // contentEmpty assistant 是否没有可见内容(只有空串/数组)。

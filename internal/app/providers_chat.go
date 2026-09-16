@@ -214,6 +214,225 @@ func (p *modelProvider) Chat(ctx context.Context, params map[string]any, stream 
 func (p *modelProvider) chatWithKey(ctx context.Context, cfg providerConfig, params map[string]any, key string, stream, needsSig bool, client *http.Client) (*http.Response, error) {
 	model, _ := params["model"].(string)
 
+	// 上游不支持参数剥离（照抄 OmniRoute open-sse/translator/paramSupport.ts）。
+	//
+	// 这里是 generic provider 出站的**真正咽喉**, 与参考实现
+	// handlers/chatCore/upstreamBody.ts:227 → services/targetRequestSanitizer.ts:80
+	// 的位置同构: translated body 已在手、target 已解析、即将 fetch。
+	//
+	// 为什么必须在此处而不是别处: 规则表 11 条里 6 条带 provider 限定
+	// (github / nvidia / volcengine / zai / glm / azure-*), 而另外 5 条按 model
+	// 正则匹配。只有在"真实 provider + 原始 model id"都可用时才判定得准 ——
+	// p.name 是真实 provider, params["model"] 是客户端要的原始 id
+	// (未被 normalizeRequestModel 改写)。
+	//
+	// 语义: 客户端为它选中的模型带上控制参数, 但路由/回退可能把模型换成另一系列。
+	// 属于源模型、对目标模型非法的参数会招致上游 400 (例如 claude-opus-4 系列的
+	// temperature 已被弃用、GitHub Copilot 的 Claude 拒绝 thinking +
+	// reasoning_effort), 在发出前剔除可避免整次请求报废。
+	stripUnsupportedParams(normalizeProviderID(p.name), model, params)
+
+	// 严格 provider 的 system 消息提升（照抄 OmniRoute
+	// open-sse/translator/helpers/strictSystemHoist.ts +
+	// src/lib/memory/injection.ts）。
+	//
+	// 参考实现在 translateRequest() 的**每个**出站路径上调用它
+	// (translator/index.ts:413 / :787), 包括 OpenAI→OpenAI 同格式透传 ——
+	// 透传时格式专用译码器根本不执行, 客户端插在数组中间的 system 消息会原样
+	// 到达上游。Codex / OpenCode / Kilo Code 风格 agent 客户端都会这么发。
+	//
+	// 严格清单 (injection.ts:84): xiaomi-mimo / mimo / tokenrouter ——
+	// 其中 **tokenrouter 是本网关用户实际在用的 provider**, 故这条会真实触发。
+	//
+	// 语义要点: 目标 provider 不在严格清单时**原样返回同一切片**(no-op),
+	// 这是 prompt-cache 前缀稳定性的硬要求(#3890), 故不能无条件重建切片。
+	// 本构造点有真实 provider(p.name), 判定得准。
+	//
+	// 只在键存在且是数组时处理: 参考实现由 `result.messages && Array.isArray(...)`
+	// 守卫(translator/index.ts:412)。
+	if msgs, ok := params["messages"].([]any); ok {
+		params["messages"] = hoistLeadingSystemMessage(msgs, p.name, strictSystemProviderIDs())
+	}
+
+	// 工具 description 归一（照抄 OmniRoute translator/helpers/schemaCoercion.ts
+	// :77-81/:226-254/:444-447）。
+	//
+	// ★ 作用域是**所有格式**, 不带 provider 限定 —— 这是照抄的:
+	//   参考实现在 translator/index.ts:606-607 与 :628-629 两处调用它, 两处都在
+	//   `if (result.tools !== undefined)` / `if (result.tools)` 之下, **没有**
+	//   targetFormat 或 provider 的前置条件。它属于"翻译收尾的统一归一"。
+	//   我方对位: 出站咽喉处对 tools 无条件跑一次(no-op 幂等)。
+	//
+	// 语义: agent harness 深截断工具定义时会把 description 写成 null 或数字,
+	// 严格上游(Anthropic / MiniMax)回 400。null -> ""、数字 -> String(数字),
+	// 键不存在则完全不动。
+	//
+	// 注意与 sanitizeOpenAITools 的分工: 后者管 `parameters`(JSON Schema 结构),
+	// 本函数只碰 `description` 字段 —— 两者不重叠, 都可跑。
+	if tools, ok := params["tools"]; ok && tools != nil {
+		params["tools"] = sanitizeToolDescriptions(tools)
+	}
+
+	// 工具配对/相邻性守卫（照抄 OmniRoute services/contextManager.ts:717-1000,
+	// 调用链逐字对位 executors/base.ts:1320-1339）。
+	//
+	// 参考实现原注释: "Clients can ship truncated histories mid-tool-call which
+	// Anthropic rejects with `messages.N: tool_use ids were found without
+	// tool_result blocks immediately after: toolu_...`. fixToolPairs strips
+	// orphans, then stripTrailingAssistantOrphanToolUse catches the case where
+	// the request body itself ends on an unmatched assistant(tool_use) —
+	// invalid for an upstream-send turn since the body must end on a user
+	// message. Both are idempotent on clean histories."
+	//
+	// ★ 作用域同样是照抄的: 整条链在参考实现里被包在
+	//   `if (((this.provider === "claude" && (isClaudeCodeClient ||
+	//   hasClaudeOAuthToken)) || usesClaudeCodeProtocol) && ...)`
+	//   (executors/base.ts:955-960) —— **仅 Claude 原生 / Claude Code 协议路径**。
+	//
+	//   曾有一版把它无条件挂到所有 provider 上, 结果把 gemini 路径里合法的
+	//   "以 assistant(tool_calls) 结尾"的历史也当成孤儿调用删掉了
+	//   (两条既有测试当场变红)。Anthropic 之外的协议对 tool_result 位置没有
+	//   这种强约束, 越界施加只会破坏正常请求 —— 照抄必须连作用域一起抄。
+	//
+	// 顺序是照抄的, 每一步都有理由, 不要重排:
+	//  1. fixToolPairs  —— 清"某处有 tool_use 但全无结果"的孤儿;
+	//  2. fixToolAdjacency —— Claude 严格要求 tool_result 在**紧邻**下一条
+	//     (OpenAI 允许分散在多条后续消息, 故仅 Claude 走这步);
+	//  3. fixToolPairs 再跑一遍 —— adjacency 可能剥出新的孤儿(讨论 #2410);
+	//  4. stripTrailingAssistantOrphanToolUse —— 请求体必须**以 user 回合结尾**,
+	//     结尾是 assistant(tool_use) 会触发同一个 400;
+	//  5. stripTrailingAssistantForProvider —— Mistral 连"纯文本 assistant 结尾"
+	//     都拒绝 (#3396)。
+	// 干净历史上这五步全是 no-op(幂等), 所以放在咽喉处对正常请求零代价。
+	//
+	// isClaude 对位参考实现的 `this.provider === "claude" || usesClaudeCodeProtocol`。
+	// 我方用 providerConfig.APIType == "anthropic" 表达同一件事
+	// (见 providers_config.go:174-181 的鉴权分派)。
+	if cfg.APIType == "anthropic" {
+		if msgs, ok := params["messages"].([]any); ok {
+			// tool id 双侧对称净化（照抄 claudeHelper.ts:432-450 的 Pass 1.4）。
+			//
+			// ★ 必须排在整条链**最前**, 且必须在 splitMisplacedToolResults 之前。
+			// 理由有两层:
+			//
+			//  1. 参考实现的顺序是「先净化 id, 后搬块」。它把 Pass 1.4 放在
+			//     prepareClaudeRequest 的消息遍历里, 而 splitMisplacedToolResults
+			//     是更后面的 Pass 1.45（claudeHelper.ts:484-486）。顺序颠倒时,
+			//     "某个 tool_result 的 id 是否被更早的 assistant 发出过"这个判定
+			//     会拿**未净化**的 id 去比对**未净化**的集合 —— 两边都没净化其实
+			//     仍然配对, 但净化后集合与块上的值就不同步了, 于是搬完再净化会
+			//     让 splitMisplacedToolResults 的"孤儿丢弃"判定基于过期的 id 表。
+			//     先净化保证后续每一步看到的是同一份 id。
+			//
+			//  2. 本函数同时剔除「空名 tool_use」与「缺 id 的 tool_result」——
+			//     这两类块在后续的 fixToolPairs / fixToolAdjacency 里会被当成
+			//     孤儿处理, 不如在最早的位置删掉, 让后续判定面对干净输入。
+			//
+			// Anthropic 对 tool id 强制 `^[a-zA-Z0-9_-]+$`; 客户端重放的历史
+			// (尤其 Codex 经 cc-switch 从别的 provider 带过来的) 可能含 `.`/`:`/`#`,
+			// 上游回 400 TOOL_SCHEMA_INVALID —— 在 agent 客户端里只表现为
+			// 任务无声中断。两侧同函数改写才能保住 tool_use/tool_result 配对。
+			fixed, idChanged := sanitizeClaudeToolIDs(msgs)
+			if idChanged {
+				params["messages"] = fixed
+				log.Printf("  providers: %s sanitized tool ids in messages[] (%d msgs)", p.name, len(fixed))
+				msgs = fixed
+			}
+
+			// splitMisplacedToolResults（照抄 claudeHelper.ts:103-156, #2815）
+			// 排在整条链**最前**: 它处理的是"tool_result 出现在 assistant 回合"
+			// 这一结构性问题, 必须先把块搬到正确的 user 回合, 后面的
+			// 配对/相邻性判定才有意义 —— 否则 fixToolPairs 看到的是一份
+			// 块位置本身就错的历史。
+			//
+			// 参考实现在 normalizeClaudeUpstreamMessages 的**最后**一步调用它
+			// (claudeUpstreamMessages.ts:169-172), 那是"先清理内容再搬块";
+			// 我方链路上没有前置的内容清理步骤(空块过滤在别处), 故等价于
+			// 把这一步提到链首 —— 两者对最终块位置的结果一致, 但链首要更安全:
+			// 后续每一步都建立"块已在正确回合"的前提上。
+			//
+			// Anthropic 对 assistant 里的 tool_result 直接 400, 而 400 在
+			// agent 客户端里常常只显示成任务无声中断。
+			fixed = splitMisplacedToolResults(fixed)
+			// fixToolUseOrdering（照抄 claudeHelper.ts:160-284）—— 三步:
+			//  ① 删 assistant 里 tool_use **之后**的 text 块（Claude 位置约束）;
+			//  ② 合并相邻同 role 回合（tool_result 提前）;
+			//  ③ 把失去配对的 tool_result 降级成 user 文本, 并给缺 tool_result 的
+			//     tool_use 补空占位。
+			//
+			// 位置是照抄的: 参考实现在 prepareClaudeRequest 里按
+			//   Pass 1(过滤空消息) → Pass 1.4(净化 id + 剔空名) →
+			//   Pass 1.45(splitMisplacedToolResults) → Pass 1.5(本函数)
+			// 的顺序执行（claudeHelper.ts:403/422/484/488）。
+			//
+			// ★ 必须在 splitMisplacedToolResults **之后**: 后者的动机是"把块搬到
+			//   正确的 user 回合", 本函数的 Pass 3 则要基于"块已归位"来判断配对,
+			//   顺序颠倒会让 Pass 3 看到一份块位置本身就错的历史。
+			// ★ 必须在 fixToolPairs/fixToolAdjacency **之前**: 本函数已把孤儿
+			//   tool_result 全部转成文本、并给缺失结果补了占位, 因此后续两步在
+			//   正常输入上变成 no-op, 不会与它争着改同一批块。
+			fixed = fixToolUseOrdering(fixed)
+			fixed = fixToolPairs(fixed)
+			fixed = fixToolPairs(fixToolAdjacency(fixed))
+			fixed = stripTrailingAssistantOrphanToolUse(fixed)
+			params["messages"] = stripTrailingAssistantForProvider(fixed, normalizeProviderID(p.name))
+		}
+
+		// prompt-cache 断点重锚（照抄 claudeHelper.ts:364-396 / :499-513 / :527-544 / :724-740）。
+		//
+		// ★ 作用域是照抄的: 参考实现整段在 prepareClaudeRequest 里, 而后者**只**
+		//   在 `targetFormat === FORMATS.CLAUDE` 时被调用(translator/index.ts:567)。
+		//   我方对位即 anthropic 分支内部 —— 不能外溢到 OpenAI 形态出站, 那里
+		//   的 `cache_control` 字段名根本不在协议里。
+		//
+		// ★ 模式选择也是照抄: 参考实现的 `preserveCacheControl` 由调用方传
+		//   (relay 路径传 true 表示"客户端自己管 marker")。本网关的出站咽喉
+		//   没有该开关的上游来源 —— 客户端发来的 body 里若已有 marker, 说明它
+		//   自己管; 若一个都没有, 则按 Claude Code 约定补断点。
+		//
+		//   这正是参考实现 `opts.fallbackToHeuristicWhenNoMarkers` 的语义
+		//   (claudeHelper.ts:356-362): `preserveCacheControl && 无任何 marker`
+		//   -> 降级为不 preserve, 照常补断点。
+		//
+		// 业务意义: Anthropic 的 prompt cache 是显式断点制 —— 客户端不带 marker
+		// 时, 每一轮都把整个前缀按**未缓存**计费。长会话(agent 客户端动辄几十轮)
+		// 下这是数倍成本差。Codex / Cline 默认都不带 marker。
+		reanchorClaudePromptCache(params, normalizeProviderID(p.name))
+	} else if msgs, ok := params["messages"]; ok {
+		// 空 reasoning_content 回放（照抄 translator/index.ts:610-619 +
+		// schemaCoercion.ts:455-487 + services/reasoningCache.ts:83-121）。
+		//
+		// ★ 作用域的三重限定, 逐条对位参考实现, 缺一条就是越界施加:
+		//
+		//  1. **仅 OpenAI 形态出站**。参考实现是 `targetFormat === FORMATS.OPENAI`;
+		//     我方用 `cfg.APIType != "anthropic"`(即本 else 分支)表达同一件事。
+		//     Anthropic 形态的等价逻辑是"往 content[] 里插 thinking block", 那在
+		//     anthropic 分支里已由 claude_helper.go 的另一套流程处理, 不能在这里
+		//     补 `reasoning_content` 字段 —— 字段名都不在 Anthropic 协议里。
+		//
+		//  2. **`!requiresExplicitReasoningReplay`**, 由 applyEmptyReasoningReplay
+		//     内部照抄(注意实参是 `allowLegacyFallback=false` 且 thinkingEnabled 取
+		//     真实配置, 与 inject 内部的判定**故意不对称**)。
+		//
+		//  3. **messages 必须是数组**, 由 applyEmptyReasoningReplay 内部把关。
+		//
+		// 业务意义: DeepSeek V4 / Kimi thinking / Xiaomi MiMo 这类上游有反向契约 ——
+		// 多轮请求里 assistant 回合若带 `tool_calls`, 就必须同时带 `reasoning_content`
+		// (哪怕空串), 否则上游 400 "The reasoning_content in the thinking mode must
+		// be passed back to the API."。客户端(尤其 Codex 经 cc-switch 路由)会把该
+		// 字段丢掉, 而 400 在 agent 客户端里常常只表现为**任务无声中断** ——
+		// 与用户报的现象一致。
+		//
+		// provider/model 必须用**上游真实值**: p.name 是真实 provider 名,
+		// params["model"] 是客户端要的原始 id(未被 normalizeRequestModel 改写)。
+		// 判定表里既有 provider 白名单也有 model 正则, 两者都依赖这两个值。
+		replayed, replayChanged := applyEmptyReasoningReplay(msgs, normalizeProviderID(p.name), model, params)
+		if replayChanged {
+			params["messages"] = replayed
+			log.Printf("  providers: %s injected empty reasoning_content for tool-call turns", p.name)
+		}
+	}
+
 	// Gemini 会拒绝缓存里失效的签名(400)。此时用跳过哨兵重放一次,
 	// 否则同一段会话会一直失败到该缓存项被淘汰为止。
 	attempts := 1

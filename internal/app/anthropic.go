@@ -58,6 +58,20 @@ func loadOverrideContent() string {
 	return content
 }
 
+// extractStringContent 把 Anthropic 形态的 system 字段（字符串或 text 块数组）
+// 拍平成一段纯文本。
+//
+// ★ 每一段都过 stripAnthropicBillingHeader（照抄 claude-to-openai.ts:16-19）。
+//
+//	参考实现在组装 OpenAI 请求时**逐条** system 入口都调它
+//	（claude-to-openai.ts:145 / :147 / :155 / :158），不区分字符串形态还是块数组
+//	形态。本函数是那两个分支在 Go 侧的唯一汇合点，故在此统一剥。
+//
+//	业务意义: Anthropic 会在部分 system prompt 顶部注入一行动态的
+//	`x-anthropic-billing-header: <每请求都变的值>`。本网关的入站 Claude 路径正是
+//	"Claude → OpenAI 再转发给非 Anthropic 上游"，不剥掉的话这一行会漏进上游
+//	上下文；更糟的是它在 prompt 最开头且每请求轮换，会让整个前缀的 prompt-cache
+//	永远不命中 —— 请求正常、回答正常，只有账单和延迟悄悄变差。
 func extractStringContent(raw json.RawMessage) string {
 	if len(raw) == 0 {
 		return ""
@@ -65,7 +79,7 @@ func extractStringContent(raw json.RawMessage) string {
 	// Try string first
 	var s string
 	if err := json.Unmarshal(raw, &s); err == nil {
-		return s
+		return stripAnthropicBillingHeader(s)
 	}
 	// Try array of content blocks
 	var blocks []map[string]any
@@ -74,7 +88,7 @@ func extractStringContent(raw json.RawMessage) string {
 		for _, b := range blocks {
 			if b["type"] == "text" {
 				if t, ok := b["text"].(string); ok {
-					parts = append(parts, t)
+					parts = append(parts, stripAnthropicBillingHeader(t))
 				}
 			}
 		}
@@ -92,13 +106,25 @@ func anthropicToolsToOpenAI(tools []any) []any {
 				out = append(out, t)
 				continue
 			}
+			// 照抄 OmniRoute executors/base.ts:970 与 executors/cliproxyapi.ts:347:
+			// `if (Array.isArray(tb.tools)) tb.tools = sanitizeClaudeToolSchemas(tb.tools);`
+			//
+			// 参考实现原注释: "Sanitize invalid tool input_schemas (truncation
+			// placeholders such as `enum: "[MaxDepth]"`, or index-keyed objects
+			// where arrays are required) that Anthropic rejects with
+			// `tools.N.custom.input_schema: JSON schema is invalid`"。
+			//
+			// 这里是与参考实现逐字对位的位置: input_schema 被原样搬进 OpenAI 的
+			// parameters。若不先净化, Claude Code 之类客户端发来的截断占位符
+			// (`enum: "[MaxDepth]"`) 或含 lookaround 的正则会原样上行并触发 400。
+			schema := sanitizeClaudeToolSchema(tMap["input_schema"])
 			// Convert Anthropic format to OpenAI
 			oai := map[string]any{
 				"type": "function",
 				"function": map[string]any{
 					"name":        tMap["name"],
 					"description": tMap["description"],
-					"parameters":  tMap["input_schema"],
+					"parameters":  schema,
 				},
 			}
 			out = append(out, oai)
@@ -508,6 +534,53 @@ func handleAnthropicMessages(w http.ResponseWriter, r *http.Request) {
 	openAIReq := anthropicToOpenAI(req)
 	req.Model = stripDisplayPrefix(req.Model)
 	openAIReq["model"] = req.Model
+
+	// system/developer 角色消息提升（照抄 OmniRoute
+	// open-sse/handlers/chatCore/claudeSystemRole.ts）。
+	//
+	// 参考实现的调用点 (chatCore.ts:2305-2320) 在「Claude 语义透传」分支内:
+	//
+	//	if (isClaudeCodeSemanticPassthrough) {
+	//	  if (provider !== "claude" || !shouldUseMidConversationSystem(body, model)) {
+	//	    extractSystemRoleMessages(translatedBody);
+	//	  } else {
+	//	    relocateDirectiveOnlyMessages(translatedBody);
+	//	  }
+	//	}
+	//
+	// 对本网关而言入站**已经是** Anthropic Messages 形状（客户端直接发
+	// /v1/messages），所以语义上就处在 isClaudeCodeSemanticPassthrough 那条路径上。
+	//
+	// ★ 作用域同样照抄: 本网关的 Anthropic 入站端点只服务 Claude 协议,
+	//   不会把 Anthropic 形状的 body 交给任何非 Anthropic 上游 —— 即
+	//   `provider !== "claude"` 在这个入口上恒为真，故恒走
+	//   extractSystemRoleMessages 这一支（`mid-conversation-system` 是
+	//   Anthropic 1M beta 档的例外, 见 providerSupportsMidConversationSystem）。
+	//
+	// 为什么这条必须做: Anthropic Messages API **拒绝** `system` / `developer`
+	// 作为 messages[] 里的角色。Codex / OpenCode / Kilo Code 风格客户端会把
+	// system 消息插在数组中间(尤其续接历史时), 参考实现记为
+	// "Anthropic's Messages API rejects either as a chat role"。
+	// 不提升的表现就是上游 400 —— 而 400 在 agent 客户端里常常只显示成
+	// 任务无声中断, 没有任何可读提示。
+	//
+	// 客户端传来的 system 走的是 req.System(顶层字段), 与 messages[] 内的
+	// system 角色是两件事: 前者由 anthropicToOpenAI 放在 msgs[0], 后者此前
+	// **完全没人处理**, 会被当成 role:"system" 原样塞进中间位置。
+	if msgs, ok := openAIReq["messages"].([]any); ok {
+		hasSystemField := getNested(openAIReq, "messages", 0, "role") == "system"
+		hasTools := false
+		if tl, ok := openAIReq["tools"].([]any); ok && len(tl) > 0 {
+			hasTools = true
+		}
+		if !providerSupportsMidConversationSystem(hasSystemField, hasTools, req.Model) {
+			fixed, _, _, changed := extractSystemRoleMessages(msgs, nil, false, nil, false)
+			if changed {
+				openAIReq["messages"] = fixed
+				log.Printf("  anthropic req: lifted system/developer roles out of messages[] (%d -> %d)", len(msgs), len(fixed))
+			}
+		}
+	}
 
 	log.Printf("  anthropic: model=%s stream=%v msgs=%d", req.Model, req.Stream, len(req.Messages))
 

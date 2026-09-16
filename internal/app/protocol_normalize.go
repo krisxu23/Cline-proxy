@@ -2,11 +2,13 @@ package app
 
 import (
 	"cline-go-proxy/internal/kit"
+	"encoding/json"
 	"strings"
 )
 
 func normalizeOpenAIResponse(obj map[string]any) map[string]any {
 	out := make(map[string]any)
+	sawToolCalls := false
 	for k, v := range obj {
 		if k == "provider_metadata" || k == "proxy_metadata" {
 			continue
@@ -26,7 +28,11 @@ func normalizeOpenAIResponse(obj map[string]any) map[string]any {
 					nc[k] = v
 				}
 				if msg, ok := nc["message"].(map[string]any); ok {
-					nc["message"] = normalizeMessage(msg)
+					nm := normalizeMessage(msg)
+					nc["message"] = nm
+					if tc, ok := nm["tool_calls"].([]any); ok && len(tc) > 0 {
+						sawToolCalls = true
+					}
 				}
 				if delta, ok := nc["delta"].(map[string]any); ok {
 					nd := make(map[string]any)
@@ -41,11 +47,45 @@ func normalizeOpenAIResponse(obj map[string]any) map[string]any {
 						if nd["content"] == nil {
 							nd["content"] = ""
 						}
+						sawToolCalls = true
 					}
 					// 对齐 OmniRoute 流式 delta 处理: 与 normalizeMessage 同一份
 					// 归一逻辑, 保证流式/非流式两条路径不漂移。
 					copyOpenAICompatibleReasoningFields(delta, nd)
 					nc["delta"] = nd
+				}
+				// T18 归一(照抄 OmniRoute open-sse/utils/stream.ts:1953):
+				//
+				//	// T18: Normalize finish_reason to 'tool_calls' if tool calls were used
+				//	if (isFinishChunk && passthroughHasToolCalls &&
+				//	    parsed.choices[0].finish_reason !== "tool_calls") {
+				//	  parsed.choices[0].finish_reason = "tool_calls";
+				//
+				// 非流式形态的等价实现见:
+				//   open-sse/handlers/responseSanitizer.ts:302
+				//   open-sse/handlers/chatCore/passthroughToolNames.ts:93
+				//     normalizeOpenAIToolFinishReasons()
+				// 两者都做同一件事: `message.tool_calls?.length > 0 &&
+				// choice.finish_reason !== "tool_calls"` → 改成 "tool_calls"。
+				//
+				// 上游(尤其 OpenAI 兼容网关与部分 free 模型)在本回合用了工具调用时,
+				// 终止帧的 finish_reason 仍会送 "stop"。agent 工具(Codex / Cline 类)
+				// 依据 finish_reason 决定"这一回合是结束还是要去执行工具", 看到 "stop"
+				// 就当成回合正常结束 —— 于是工具调用被静默丢弃, 任务无故中断且无提示。
+				// 必须在本回合确实出现了 tool_calls 时把它归一为 "tool_calls"。
+				//
+				// 注意判定依据是本 choice **自身**是否带 tool_calls(非流式形态),
+				// 而非整个响应的 sawToolCalls —— 与 OmniRoute 逐 choice 的写法对齐。
+				if fr, ok := nc["finish_reason"].(string); ok && fr != "" && fr != "tool_calls" {
+					choiceHasToolCalls := sawToolCalls
+					if msg, ok := nc["message"].(map[string]any); ok {
+						if tc, ok := msg["tool_calls"].([]any); ok && len(tc) > 0 {
+							choiceHasToolCalls = true
+						}
+					}
+					if choiceHasToolCalls {
+						nc["finish_reason"] = "tool_calls"
+					}
 				}
 				normalized = append(normalized, nc)
 			} else {
@@ -87,6 +127,72 @@ func normalizeMessage(msg map[string]any) map[string]any {
 	// 客户端的内容里不含请求脚手架。
 	copyOpenAICompatibleReasoningFields(msg, out)
 	return out
+}
+
+// appendToolCallArgumentDelta 照抄 OmniRoute open-sse/utils/toolCallArguments.ts:41。
+//
+// 上游有两种 tool-call arguments 分片形态, 必须区别对待:
+//   - **增量分片**: 每帧只带**新**片段。必须**逐字拼接** —— 即便某片段的开头
+//     字节与已有内容的结尾重复(例如 `ls -ll` 里那个重复的 `l`)。
+//   - **完整快照**: 每帧重发**截至此刻的全部** arguments。拼接会复制 payload
+//     (OmniRoute issue #3701)。
+//
+// 只在**无歧义**时才按快照处理(取后者): 完全相同的重复, 或以已有内容为前缀的
+// 增长。其余一律按增量分片原样追加。
+//
+// 原注释明确警告(**这是最容易写错的地方**):
+//
+//	A fuzzy suffix/prefix-overlap heuristic must NOT be used here: it silently
+//	drops bytes from legitimate incremental deltas (turning `ll` into `l`,
+//	`xx` into `x`), which trades a visible duplication bug for a silent
+//	truncation bug.
+//
+// 即: **绝不能**用"后缀/前缀模糊重叠"去重 —— 那会把 `ll` 悄悄吞成 `l`。
+// 把可见的重复 bug 换成静默的截断 bug, 后者更危险(参数被截断 = 工具调用出错)。
+//
+// 第三种非规范形态 OmniRoute #6459 也处理了: 某些上游把**已解析的 JSON 对象/数组**
+// 当作 arguments 直接发来(违反 OpenAI 流式契约, 但 Anthropic 形态透传的后端会这么干)。
+// 若按"非字符串"静默丢弃, 上游的 tool_use.input 会变空; 若用普通字符串强转,
+// 客户端会看到字面量 `[object Object]`。正确做法是 JSON 序列化成合法分片。
+func appendToolCallArgumentDelta(current, incoming any) string {
+	existing, _ := current.(string)
+	next := normalizeIncomingFragment(incoming)
+
+	if existing == "" {
+		return next
+	}
+	if next == "" {
+		return existing
+	}
+	// 无歧义的"快照重复/增长" → 替换而非拼接
+	if next == existing {
+		return existing
+	}
+	if strings.HasPrefix(next, existing) {
+		return next
+	}
+	// 增量分片 → 逐字追加(保留重复字符)
+	return existing + next
+}
+
+// normalizeIncomingFragment 对应同文件 normalizeIncomingFragment:
+// 字符串直接用; nil → 空; 对象/数组 → JSON 序列化(照抄 #6459 的修法,
+// 避免丢参数或渲染出字面量 "[object Object]")。
+func normalizeIncomingFragment(incoming any) string {
+	switch v := incoming.(type) {
+	case nil:
+		return ""
+	case string:
+		return v
+	case map[string]any, []any:
+		b, err := json.Marshal(v)
+		if err != nil {
+			return ""
+		}
+		return string(b)
+	default:
+		return ""
+	}
 }
 
 // genToolCallID 生成 OpenAI 风格的 tool_call id。

@@ -65,6 +65,21 @@ func handleStreamResponseWithUsage(w http.ResponseWriter, upstream *http.Respons
 	// "usage-only streams are fine")。纯 usage 的收尾帧是正常协议行为,
 	// 不是静默中断, 不能误杀。
 	hasValidUsage := false
+	// sawLegitEmptyTerminal 对齐 OmniRoute createStreamContentWatcher 的
+	// sawLegitEmptyTerminal(): 一旦见到"合法空终止态"(finish_reason 为
+	// length / tool_calls / content_filter, 或 stop_reason 为 max_tokens /
+	// tool_use), 就说明这一回合**本就不该有正文** —— 纯工具调用回合、被
+	// token 上限截断的回合都是合法的成功完成。此时空内容不是故障, 不能报 502。
+	// 照抄 open-sse/utils/streamReadiness.ts:166 LEGIT_EMPTY_TERMINAL_REASONS。
+	sawLegitEmptyTerminal := false
+	// textualToolCalls 对齐 OmniRoute stream.ts:735 起的 passthroughToolCalls:
+	// 承载从正文里解析出来的文本形态工具调用(键为调用序号)。
+	textualToolCalls := map[string]textualToolCallRecord{}
+	// allowedToolNames 对齐 stream.ts:299 extractAllowedToolNames(body):
+	// 只接受客户端**确实声明过**的工具名, 防止正文里偶然出现的
+	// "[Tool call: xxx]" 被误当成真实调用。
+	// nil 语义与参考实现一致(:319-320) —— 没有工具声明时不做白名单过滤。
+	allowedToolNames := extractAllowedToolNames(streamRequestTools(upstream))
 	handleLine := func(line string, residual bool) bool {
 		line = strings.TrimRight(line, "\r\n")
 		if strings.HasPrefix(line, "data:") {
@@ -136,11 +151,26 @@ func handleStreamResponseWithUsage(w http.ResponseWriter, upstream *http.Respons
 			if !sawFinish && protocol.HasStopSignal(normalized) { // 跨协议终止判定(OmniRoute checkIfStopSignal 等价)
 				sawFinish = true
 			}
+			// 文本形态工具调用收集, 对齐 OmniRoute open-sse/utils/stream.ts:2506-2529。
+			//
+			// 部分上游(gemini 系/若干中转)不返回结构化 tool_calls, 而是把调用写进
+			// 正文: "[Tool call: read_file]\nArguments: {...}"。不识别的话这段文本会
+			// 原样透传给 agent —— 既不会执行工具也不报错, 表现就是**任务无声中断**。
+			//
+			// 三个分支逐条对齐参考实现:
+			//   :2521-2526 collect 成功 → 从正文摘除, 并置 hasToolCalls
+			//   :2527-2528 collect 失败但形态畸形 → 清空正文(避免把畸形标记喂给 agent)
+			if collectTextualToolCalls(normalized, textualToolCalls, allowedToolNames) {
+				forwardedValuableChunk = true
+			}
 			// 对齐 OmniRoute: 该帧是否值得转发由它是否带 content / tool_calls /
 			// finish_reason 决定。三者都没有(空 choices)的帧仍然照常透传, 但它
 			// 不计入"已交付有价值内容"。
 			if openAIChunkHasValuableContent(normalized) {
 				forwardedValuableChunk = true
+			}
+			if legitEmptyTerminalReason(normalized) {
+				sawLegitEmptyTerminal = true
 			}
 			if normBytes, err := json.Marshal(normalized); err == nil {
 				hb.writeFlush([]byte("data: " + string(normBytes) + "\n\n"))
@@ -201,6 +231,9 @@ func handleStreamResponseWithUsage(w http.ResponseWriter, upstream *http.Respons
 						if openAIChunkHasValuableContent(probe) {
 							forwardedValuableChunk = true
 						}
+						if legitEmptyTerminalReason(probe) {
+							sawLegitEmptyTerminal = true
+						}
 						if u, ok := probe["usage"].(map[string]any); ok && hasValidUsageTokens(u) {
 							hasValidUsage = true
 						}
@@ -224,7 +257,7 @@ func handleStreamResponseWithUsage(w http.ResponseWriter, upstream *http.Respons
 						break
 					}
 				}
-				if !streamDeliveredValue(forwardedValuableChunk, hasValidUsage) {
+				if !streamDeliveredValue(forwardedValuableChunk, hasValidUsage, sawLegitEmptyTerminal) {
 					log.Printf("  stream: NDJSON 流未交付任何有价值内容, 回 error 帧而非静默空 200")
 					writeStreamEmptyContentError(w, hb, lastModel)
 					return
@@ -264,7 +297,13 @@ func handleStreamResponseWithUsage(w http.ResponseWriter, upstream *http.Respons
 			if fullCompletionBodyHasContent(body) {
 				forwardedValuableChunk = true
 			}
-			if !streamDeliveredValue(forwardedValuableChunk, hasValidUsage) {
+			// 合法空终止态同样要按**原始 body** 判定(理由同上: 合成器补的终止帧
+			// 会把任意空壳 body 都带上 finish_reason="stop", 而 "stop" 不在白名单里,
+			// 所以只有原始 body 真实携带 length/tool_calls 等才算数)。
+			if b, ok := parseJSONMap(body); ok && legitEmptyTerminalReason(b) {
+				sawLegitEmptyTerminal = true
+			}
+			if !streamDeliveredValue(forwardedValuableChunk, hasValidUsage, sawLegitEmptyTerminal) {
 				log.Printf("  stream: 上游完整 JSON body 不含任何有价值内容, 补 error 帧")
 				writeStreamEmptyContentError(w, hb, lastModel)
 			}
@@ -302,7 +341,7 @@ func handleStreamResponseWithUsage(w http.ResponseWriter, upstream *http.Respons
 	//
 	// 与上游"空流"的区别: 那种在提交前就被 probeStreamFirstEvent 拦下并换站
 	// (见 routing_dispatch.go), 这里兜的是**已提交之后**每帧都空的情况。
-	if !streamDeliveredValue(forwardedValuableChunk, hasValidUsage) {
+	if !streamDeliveredValue(forwardedValuableChunk, hasValidUsage, sawLegitEmptyTerminal) {
 		log.Printf("  stream: 上游整条流未交付任何有价值内容(model=%s, 已发 finish=%v), 回 502 而非静默空 200",
 			lastModel, sawFinish)
 		writeStreamEmptyContentError(w, hb, lastModel)
@@ -385,8 +424,57 @@ func openAIChunkHasValuableContent(obj map[string]any) bool {
 // 返回 true 表示"这条流确实交付了东西, 不该判为空流"。
 // 两个条件任一成立即放行 —— 有价值 chunk, 或上游报告了真实 usage
 // (usage-only 流是合法协议行为, 原注释: "usage-only streams are fine")。
-func streamDeliveredValue(forwardedValuableChunk, hasValidUsage bool) bool {
-	return forwardedValuableChunk || hasValidUsage
+//
+// legitEmpty 是第三个放行条件, 对应 OmniRoute streamReadiness.ts:166 的
+// LEGIT_EMPTY_TERMINAL_REASONS 白名单(详见 legitEmptyTerminalReason 注释)。
+func streamDeliveredValue(forwardedValuableChunk, hasValidUsage, legitEmpty bool) bool {
+	return forwardedValuableChunk || hasValidUsage || legitEmpty
+}
+
+// legitEmptyTerminalReasons 照抄 OmniRoute open-sse/utils/streamReadiness.ts:166:
+//
+//	// Terminal states where a completion legitimately carries no content, kept in
+//	// step with errorClassifier.ts's LEGIT_EMPTY_OPENAI_FINISH / LEGIT_EMPTY_CLAUDE_STOP
+//	// so the streaming and non-streaming empty-content checks agree.
+//	const LEGIT_EMPTY_TERMINAL_REASONS = new Set([
+//	  "length", "tool_calls", "content_filter", "max_tokens", "tool_use",
+//	]);
+//
+// 对应的权威来源 open-sse/services/errorClassifier.ts:14-15:
+//
+//	const LEGIT_EMPTY_CLAUDE_STOP = new Set(["max_tokens", "tool_use"]);
+//	const LEGIT_EMPTY_OPENAI_FINISH = new Set(["length", "tool_calls", "content_filter"]);
+//
+// 原注释点明用途: 被 token 上限截断(finish_reason="length")、或纯工具调用回合
+// (finish_reason="tool_calls")的空内容, 是**合法的成功完成**, 不是静默假成功。
+// 不加这条白名单会把合法的 HTTP 200 改写成合成的 502 —— 例如 Claude Code 的
+// max_tokens:1 连通性探测, 以及 agent 工具调用回合(该回合本来就只有
+// tool_calls 而无正文文本)。
+var legitEmptyTerminalReasons = map[string]bool{
+	"length":         true,
+	"tool_calls":     true,
+	"content_filter": true,
+	"max_tokens":     true,
+	"tool_use":       true,
+}
+
+// legitEmptyTerminalReason 判一个 chunk 是否带"合法空终止态"的终止原因。
+// 照抄 OmniRoute TERMINAL_REASON_PATTERN / LEGIT_EMPTY_TERMINAL_REASONS 语义:
+// 只认 finish_reason(OpenAI)与 stop_reason(Claude)两个字段名。
+func legitEmptyTerminalReason(obj map[string]any) bool {
+	choices, ok := obj["choices"].([]any)
+	if ok && len(choices) > 0 {
+		if first, ok := choices[0].(map[string]any); ok {
+			if fr, ok := first["finish_reason"].(string); ok && legitEmptyTerminalReasons[fr] {
+				return true
+			}
+		}
+	}
+	// Anthropic 形态的顶层 stop_reason(经 normalizeOpenAIResponse 后仍可能保留)
+	if sr, ok := obj["stop_reason"].(string); ok && legitEmptyTerminalReasons[sr] {
+		return true
+	}
+	return false
 }
 
 // hasValidUsageTokens 对应 OmniRoute usageTracking.ts:639 的 hasValidUsage:
@@ -512,6 +600,15 @@ func splitSynthesizedSSEFrames(sse []byte) []map[string]any {
 		}
 	}
 	return frames
+}
+
+// parseJSONMap 把完整 JSON body 解析成 map, 供"合法空终止态"判定使用。
+func parseJSONMap(body []byte) (map[string]any, bool) {
+	var parsed map[string]any
+	if err := json.Unmarshal(body, &parsed); err != nil {
+		return nil, false
+	}
+	return parsed, true
 }
 
 // parsedUsageFromJSONBody 从完整 JSON body 里取 usage。

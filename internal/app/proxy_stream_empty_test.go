@@ -342,3 +342,210 @@ func Test空流_错误帧协议合法性(t *testing.T) {
 type nopCloser struct{ *strings.Reader }
 
 func (nopCloser) Close() error { return nil }
+
+// ─────────── 合法空终止态白名单 ───────────
+//
+// 照抄 OmniRoute open-sse/utils/streamReadiness.ts:166 LEGIT_EMPTY_TERMINAL_REASONS,
+// 权威来源 open-sse/services/errorClassifier.ts:14-15:
+//
+//	const LEGIT_EMPTY_CLAUDE_STOP = new Set(["max_tokens", "tool_use"]);
+//	const LEGIT_EMPTY_OPENAI_FINISH = new Set(["length", "tool_calls", "content_filter"]);
+//
+// 参考用例: tests/unit/empty-stream-no-content-8649.test.ts
+//   — "an all-empty-choices stream is rejected" 与
+//     "a response truncated at the token limit is NOT flagged as empty content"
+//
+// 为什么必须抄: agent 工具调用回合**本来就只有 tool_calls 而无正文文本**,
+// 被 token 上限截断的回合也**本来就没有正文**。误判成空流会把这些合法的成功
+// 完成改写成合成的 502 —— 表现为 agent 的每次工具调用都失败重试。
+
+func TestLegitEmptyTerminalReason(t *testing.T) {
+	cases := []struct {
+		name string
+		obj  map[string]any
+		want bool
+	}{
+		{
+			name: "finish_reason=length → 合法空终止(被 token 上限截断)",
+			obj: map[string]any{"choices": []any{
+				map[string]any{"index": 0, "delta": map[string]any{}, "finish_reason": "length"},
+			}},
+			want: true,
+		},
+		{
+			name: "finish_reason=tool_calls → 合法空终止(纯工具调用回合)",
+			obj: map[string]any{"choices": []any{
+				map[string]any{"index": 0, "delta": map[string]any{}, "finish_reason": "tool_calls"},
+			}},
+			want: true,
+		},
+		{
+			name: "finish_reason=content_filter → 合法空终止",
+			obj: map[string]any{"choices": []any{
+				map[string]any{"index": 0, "delta": map[string]any{}, "finish_reason": "content_filter"},
+			}},
+			want: true,
+		},
+		{
+			name: "顶层 stop_reason=max_tokens → 合法空终止(Claude 形态)",
+			obj:  map[string]any{"stop_reason": "max_tokens"},
+			want: true,
+		},
+		{
+			name: "顶层 stop_reason=tool_use → 合法空终止(Claude 形态)",
+			obj:  map[string]any{"stop_reason": "tool_use"},
+			want: true,
+		},
+		{
+			name: "finish_reason=stop → 不在白名单(普通终止, 空内容仍是故障)",
+			obj: map[string]any{"choices": []any{
+				map[string]any{"index": 0, "delta": map[string]any{}, "finish_reason": "stop"},
+			}},
+			want: false,
+		},
+		{
+			name: "无 finish_reason → 不在白名单",
+			obj: map[string]any{"choices": []any{
+				map[string]any{"index": 0, "delta": map[string]any{"content": "hi"}},
+			}},
+			want: false,
+		},
+		{
+			name: "空 choices → 不在白名单",
+			obj:  map[string]any{"choices": []any{}},
+			want: false,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := legitEmptyTerminalReason(tc.obj); got != tc.want {
+				t.Fatalf("legitEmptyTerminalReason() = %v, 期望 %v (obj=%#v)", got, tc.want, tc.obj)
+			}
+		})
+	}
+}
+
+// ── 白名单真正起作用的地方: 只有终止原因、别无其他价值信号的帧 ──
+//
+// 负向验证得出的关键区分(重要!):
+//   - 带 delta.tool_calls 的帧 → hasValuableContent 已判真, 白名单是**冗余**的;
+//   - 带 firstChoice.finish_reason 的帧 → hasValuableContent 已判真, 白名单也是**冗余**的;
+//   - **只有顶层 stop_reason 的 Claude 形态帧** → hasValuableContent 不认
+//     (它只看 choices[0].delta.* 与 firstChoice.finish_reason),
+//     此时**只有白名单能救它**。
+//
+// 实测证据: 把 legitEmptyTerminalReason(normalized) 改成 `&& false` 后,
+// 本用例由"通过"变为"被判空流"; 带 tool_calls / finish_reason 的用例则**不受影响**。
+// 这说明白名单并非装饰, 而是 Claude 形态空终止的唯一防线。
+func Test空流_仅顶层stop_reason必须通过(t *testing.T) {
+	cases := []struct {
+		name string
+		body string
+	}{
+		{
+			name: "max_tokens(被上限截断)",
+			body: "data: " + `{"type":"message_delta","stop_reason":"max_tokens"}` + "\n\n",
+		},
+		{
+			name: "tool_use(纯工具调用回合)",
+			body: "data: " + `{"type":"message_delta","stop_reason":"tool_use"}` + "\n\n",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			out := drainStream(t, tc.body)
+			if strings.Contains(out, "empty_content") {
+				t.Fatalf("顶层 stop_reason=%s 是合法空终止态, 不得报空流 "+
+					"(hasValuableContent 不认顶层 stop_reason, 此处唯一防线就是白名单), 实得:\n%s",
+					tc.name, out)
+			}
+		})
+	}
+}
+
+// 对照: 顶层 stop_reason 取值**不在**白名单里时, 仍必须判空流。
+// 防止"把整个 stop_reason 判真"这种过度放行。
+func Test空流_顶层stop_reason非白名单值仍失败(t *testing.T) {
+	body := "data: " + `{"type":"message_delta","stop_reason":"end_turn"}` + "\n\n"
+	out := drainStream(t, body)
+	if !strings.Contains(out, "empty_content") {
+		t.Fatalf("end_turn 不在 LEGIT_EMPTY 白名单内, 空内容应判失败, 实得:\n%s", out)
+	}
+}
+
+// 纯工具调用回合(无任何正文文本, finish_reason=tool_calls)必须正常通过,
+// 不得被判空流。这正是 agent 工具调用场景, 误杀会让 agent 每次调工具都失败。
+func Test空流_纯工具调用回合必须通过(t *testing.T) {
+	body := "data: " + `{"id":"c1","object":"chat.completion.chunk","model":"mimo-test","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_abc","type":"function","function":{"name":"read_file","arguments":"{}"}}]}}]}` + "\n\n" +
+		"data: " + `{"id":"c1","object":"chat.completion.chunk","model":"mimo-test","choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}` + "\n\n" +
+		"data: [DONE]\n\n"
+	out := drainStream(t, body)
+
+	if strings.Contains(out, "empty_content") {
+		t.Fatalf("纯工具调用回合是合法完成, 不得报空流, 实得:\n%s", out)
+	}
+	if !strings.Contains(out, "read_file") {
+		t.Fatalf("工具调用帧必须转发给客户端, 实得:\n%s", out)
+	}
+}
+
+// 被 token 上限截断的回合(finish_reason=length, 无正文)必须正常通过。
+// OmniRoute 参考用例明确要求: "a response truncated at the token limit is
+// NOT flagged as empty content"。
+func Test空流_被token上限截断必须通过(t *testing.T) {
+	body := "data: " + `{"id":"c1","object":"chat.completion.chunk","model":"mimo-test","choices":[{"index":0,"delta":{},"finish_reason":"length"}]}` + "\n\n" +
+		"data: [DONE]\n\n"
+	out := drainStream(t, body)
+
+	if strings.Contains(out, "empty_content") {
+		t.Fatalf("被 token 上限截断是合法终止, 不得报空流, 实得:\n%s", out)
+	}
+}
+
+// 完整 JSON body 形态的纯工具调用回合(非流式回包被当成流式处理)也必须通过。
+func Test空流_完整JSON纯工具调用必须通过(t *testing.T) {
+	body := `{"id":"c1","object":"chat.completion","model":"mimo-test","choices":[{"index":0,"message":{"role":"assistant","content":null,"tool_calls":[{"id":"call_1","type":"function","function":{"name":"list_dir","arguments":"{}"}}]},"finish_reason":"tool_calls"}]}`
+	out := drainStream(t, body)
+
+	if strings.Contains(out, "empty_content") {
+		t.Fatalf("完整 JSON 形态的纯工具调用回合不得报空流, 实得:\n%s", out)
+	}
+}
+
+// 对照用例: 说明 finish_reason=stop 的空 delta 帧在参考实现语义下**确实算有价值**。
+//
+// 这不是疏漏, 是照抄 hasValuableContent(streamHelpers.ts:379)的必然结果 ——
+// 它显式 `if (firstChoice.finish_reason) return true;`。OmniRoute 自己的参考
+// 用例(tests/unit/stream-empty-choices-interceptor.test.ts)也从未用
+// "finish_reason=stop + 空 delta" 来构造"空流"场景, 它构造空流只用一个东西:
+// **choices 为空数组**(emptyChoicesChunk: `choices: []`)。
+//
+// 因此本网关的"空流"定义与参考实现完全一致:
+//   - 空流 = 整条流没有任何 choices 非空的帧(或全零 usage)
+//   - 有 finish_reason 的终止帧 → 有价值, 不判空流
+//
+// 该用例锁定这一语义, 防止后人"顺手加强"判定而与参考实现漂移。
+func Test空流_finish_reason帧按参考实现算有价值(t *testing.T) {
+	body := "data: " + `{"id":"c1","object":"chat.completion.chunk","model":"mimo-test","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}` + "\n\n" +
+		"data: [DONE]\n\n"
+	out := drainStream(t, body)
+
+	// 照抄语义: 有 finish_reason → hasValuableContent 判真 → 不算空流。
+	if strings.Contains(out, "empty_content") {
+		t.Fatalf("参考实现显式接受 finish_reason 作为价值信号, 不应报空流, 实得:\n%s", out)
+	}
+	if !strings.Contains(out, `"finish_reason":"stop"`) {
+		t.Fatalf("终止帧必须转发给客户端, 实得:\n%s", out)
+	}
+}
+
+// 与上面对照: choices 为空数组才是参考实现定义的"空流", 必须失败。
+// (emptyChoicesChunk 的等价物, 见 stream-empty-choices-interceptor.test.ts)
+func Test空流_空choices数组才是真空流(t *testing.T) {
+	body := emptyChoicesFrame("1") + emptyChoicesFrame("2") + "data: [DONE]\n\n"
+	out := drainStream(t, body)
+
+	if !strings.Contains(out, "empty_content") {
+		t.Fatalf("choices 为空数组正是参考实现定义的空流, 必须失败, 实得:\n%s", out)
+	}
+}
