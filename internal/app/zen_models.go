@@ -36,36 +36,61 @@ func syncZenModels() (int, error) {
 	initZenModels()
 	cfg := getZenConfig()
 	var lastErr error
-	for _, base := range zenBaseURLList(cfg) {
-		endpoint := base + "/models"
-		req, err := http.NewRequest("GET", endpoint, nil)
-		if err != nil {
-			return 0, err
+
+	// tryAll 用给定客户端把全部端点试一遍。抽成闭包是为了让"经出口"与"直连兜底"
+	// 走同一段逻辑(否则两处的响应处理迟早会漂移)。
+	tryAll := func(client *http.Client) (int, error) {
+		var err error
+		for _, base := range zenBaseURLList(cfg) {
+			endpoint := base + "/models"
+			req, rerr := http.NewRequest("GET", endpoint, nil)
+			if rerr != nil {
+				return 0, rerr
+			}
+			req.Header.Set("Authorization", "Bearer "+cfg.Key)
+			ctx, cancel := context.WithTimeout(context.Background(), 25*time.Second)
+			resp, derr := client.Do(req.WithContext(ctx))
+			cancel()
+			if derr != nil {
+				err = derr
+				continue
+			}
+			if resp.StatusCode != 200 {
+				body := kit.ReadBody(resp)
+				resp.Body.Close()
+				err = fmt.Errorf("%s HTTP %d: %s", base, resp.StatusCode, kit.Truncate(body, 200))
+				continue
+			}
+			added, derr2 := decodeZenModels(resp)
+			if derr2 != nil {
+				err = derr2
+				continue
+			}
+			return added, nil
 		}
-		req.Header.Set("Authorization", "Bearer "+cfg.Key)
-		// 走网关统一出口(与 zen 对话同一链路), 出口模式跟随全局直连/节点选择
-		ctx, cancel := context.WithTimeout(context.Background(), 25*time.Second)
-		resp, err := getZenHTTPClient().Do(req.WithContext(ctx))
-		cancel()
-		if err != nil {
-			lastErr = err
-			continue
+		if err == nil {
+			err = fmt.Errorf("no zen endpoints configured")
 		}
-		if resp.StatusCode != 200 {
-			body := kit.ReadBody(resp)
-			resp.Body.Close()
-			lastErr = fmt.Errorf("%s HTTP %d: %s", base, resp.StatusCode, kit.Truncate(body, 200))
-			continue
-		}
-		added, err := decodeZenModels(resp)
-		if err != nil {
-			lastErr = err
-			continue
-		}
+		return 0, err
+	}
+
+	added, err := tryAll(getZenHTTPClient())
+	if err == nil {
 		return added, nil
 	}
-	if lastErr == nil {
-		lastErr = fmt.Errorf("no zen endpoints configured")
+	lastErr = err
+
+	// 直连兜底: 目录同步是**控制面**请求 —— 出口池整体失效时(实测 exitReachable
+	// 38/4482), 若这里直接放弃, 面板就一直吃历史缓存, 用户看到的是"永远拉取不了
+	// 上游免费模型"。目标站点直连通常可达(实测 1.3s 200), 所以值得再试一遍。
+	if rescueDirectEnabled() {
+		log.Printf("  zen: 目录经出口全部失败(%v), 走直连兜底再试一次", err)
+		added, derr := tryAll(directHTTPClient())
+		if derr == nil {
+			log.Printf("  zen: 目录直连兜底成功(同步到 %d 个模型)", added)
+			return added, nil
+		}
+		lastErr = fmt.Errorf("%v; 直连兜底也失败: %v", err, derr)
 	}
 	return 0, lastErr
 }

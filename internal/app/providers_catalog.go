@@ -284,8 +284,17 @@ func (p *modelProvider) fetchCatalogPage(ctx context.Context, cfg providerConfig
 // 走网关统一出口: 代理模式经节点(节点池全试一遍仍失败时, 由出口决策按
 // "节点全挂兜底"开关决定是否直连), 直连模式经 sing-box 的 direct 出站。
 // 原先这里是"强制直连"的旁路, 会绕过出口模式, 现已收回统一决策。
+// catalogFallbackClient 目录抓取的**直连**兜底客户端(不经出口池)。
+//
+// 此前它返回的是同一个出口客户端, 所谓"兜底"等于再撞一次同样的死节点 ——
+// 日志实证: `直连兜底也失败: socks5: general SOCKS server failure`。
+// 目录抓取是控制面请求: 目标站点通常直连就通(实测 opencode.ai 直连 1.3s 200),
+// 不该被数据面出口池的整体状况拖死。显式关闭 rescueDirect 时返回 nil, 调用方跳过兜底。
 func catalogFallbackClient() *http.Client {
-	return getZenHTTPClient()
+	if !rescueDirectEnabled() {
+		return nil
+	}
+	return directHTTPClient()
 }
 
 // fetchCatalogPages 逐页拉取一个目录地址直到取完。第一页带出口轮换与直连兜底
@@ -332,8 +341,12 @@ func (p *modelProvider) fetchFirstCatalogPage(ctx context.Context, cfg providerC
 	// 由出口决策按"节点全挂兜底"开关决定是否直连。
 	if !p.catalogDirectTried && len(effectiveProxyList()) > 0 {
 		p.catalogDirectTried = true
-		log.Printf("  providers: %s 目录经节点全部失败, 走出口兜底再试一次", p.name)
 		cl := catalogFallbackClient()
+		if cl == nil {
+			log.Printf("  providers: %s 目录经节点全部失败(直连兜底已关闭)", p.name)
+			return catalogPage{}, nil, err
+		}
+		log.Printf("  providers: %s 目录经节点全部失败, 走直连兜底再试一次", p.name)
 		pg, derr := p.fetchCatalogPage(ctx, cfg, rawURL, "", cl)
 		if derr == nil {
 			return pg, cl, nil

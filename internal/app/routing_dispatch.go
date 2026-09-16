@@ -318,7 +318,11 @@ func quotaDayExhausted(body []byte) bool {
 //   - 其余类别 : 按配置或默认时长冷却。
 func applyCandidateFailure(cand routeCandidate, class, reason string, body []byte) {
 	// 硬失败记入模型可用性门(429/4xx 不计): 连续挂掉的模型自动从列表与选路中摘除。
-	if class == classServerError || class == classTimeout || class == classEmpty {
+	//
+	// 只认两类**上游明确表达**的信号: 5xx(上游自己报错)与空响应(上游正常收尾但没
+	// 产出内容)。超时/网络属线路问题 —— 把它算成模型硬失败, 会让出口池抖动期间
+	// 健康模型被连续暂停 30 分钟并从列表消失(2026-09-16 实证)。
+	if class == classServerError || class == classEmpty {
 		recordZenModelResult(cand.Model, true)
 	}
 	key := candidateKey(cand.Upstream, cand.Model) // Gemini 的回包里带了"每日限额"就回填账本: 之后到量即跳过,

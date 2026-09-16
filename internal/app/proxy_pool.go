@@ -107,6 +107,42 @@ func getZenHTTPClient() *http.Client {
 	return zenHTTPClient
 }
 
+// directHTTPClient 真正的直连客户端: 拨号器里没有出口决策, 不经过节点、也不经过
+// catch-all 入站。专供"控制面"请求(目录/模型同步这类必须拿到结果、且对出口地区不
+// 敏感的调用)做兜底。
+//
+// 为什么需要它(2026-09-16 实证): 出口池近乎全挂时(exitReachable 38/4482), 所有经
+// 出口的请求都是 `socks5: general SOCKS server failure`, 而 opencode.ai 直连 1.3s
+// 就 200 —— 于是"拉取上游免费模型"整条链路瘫掉, 面板只能吃 65 个模型的历史缓存。
+// 此前 catalogFallbackClient() 返回的是同一个出口客户端, 所谓"直连兜底"等于再撞一次
+// 同样的死节点(日志里那句"直连兜底也失败: socks5: ..."就是这么来的)。
+func directHTTPClient() *http.Client {
+	directTransportOnce.Do(func() {
+		directTransport = &http.Transport{
+			DialContext:         (&net.Dialer{Timeout: 30 * time.Second, KeepAlive: 30 * time.Second}).DialContext,
+			MaxIdleConns:        16,
+			MaxIdleConnsPerHost: 4,
+			IdleConnTimeout:     90 * time.Second,
+			TLSHandshakeTimeout: 15 * time.Second,
+			ForceAttemptHTTP2:   true,
+		}
+	})
+	directClientOnce.Do(func() {
+		directClient = &http.Client{Transport: directTransport}
+	})
+	directClientOnceMu.Lock()
+	defer directClientOnceMu.Unlock()
+	return directClient
+}
+
+var (
+	directTransportOnce sync.Once
+	directTransport     *http.Transport
+	directClientOnce    sync.Once
+	directClient        *http.Client
+	directClientOnceMu  sync.Mutex
+)
+
 // effectiveProxyList 生效的出口列表: 手动代理/节点 + 订阅解析出的节点
 func effectiveProxyList() []string {
 	cfg := getZenConfig()
@@ -396,25 +432,54 @@ func describeEffectiveExit() string {
 	}
 }
 
+// maxDialExitCandidates 单次拨号内最多依次尝试几个候选出口。
+//
+// 为什么要"一次多试几个": 上层确实是"失败→换下一个出口重试"的循环(retries 默认 6,
+// 每次重新选路), 但出口池的质量可能极差 —— 实测 4482 个节点只有 38 个真的可达,
+// 而健康表仍把 3831 个标成可用。一次只拨一个节点时, 固定的重申次数会在死节点区里
+// 耗尽, 用户侧表现为"节点明明一堆, 就是连不上"。
+// 死节点的拨号失败很快(握手即拒), 所以多试几个的代价很小。
+const maxDialExitCandidates = 3
+
 // zenDialContext 网关全部出站的唯一拨号入口。
 //
 // 出口策略(B 方案: 模式跟随):
-//   - 代理模式且存在可用节点 -> 拨该节点的本地入站(候选链按错误类型换节点靠它);
-//   - 其余情况(直连模式 / 代理模式但节点全不可用) -> 拨常驻 catch-all 入站,
-//     由 sing-box 内部决定出网方式 —— 直连模式下走 direct 出站, 因此**即使
-//     直连, 流量依然经过 sing-box**, 而不是绕开它用 Go 原生拨号;
-//   - catch-all 也不可用(实例未就绪) -> 回退 Go 原生拨号保命, 并显式记日志,
-//     避免"sing-box 起不来 = 整个网关断网"。
+//  1. 依次尝试至多 maxDialExitCandidates 个候选出口(每次失败立即冷却该节点,
+//     后续请求自动跳过), 任一成功即返回;
+//  2. 候选耗尽(或池里没有可用节点)后按"节点全挂兜底"开关决定是否继续:
+//     catch-all 入站(直连模式下由 sing-box 走 direct 出站) → Go 原生直连;
+//  3. 直连兜底被显式关闭时, 直接返回最后一次错误。
+//
+// 关键点: **不再"选到一个节点就只试它"** —— 选路依据的是可能过期的健康数据,
+// 而拨号层是唯一能拿到真实结果的地方, 所以由它兜住"节点看着健康、实际已死"。
 func zenDialContext(ctx context.Context, network, addr string) (net.Conn, error) {
 	modelID, _ := ctx.Value(ctxKeyZenModel).(string)
-	p, _ := pickUnifiedExit(ctx, modelID)
-	setReqExit(ctx, p)
-	if p != "" {
-		return dialViaProxy(ctx, p, network, addr)
+
+	var lastErr error
+	for i := 0; i < maxDialExitCandidates; i++ {
+		p, _ := pickUnifiedExit(ctx, modelID)
+		if p == "" {
+			break // 池里没有可用节点: 交给下面的兜底链
+		}
+		setReqExit(ctx, p)
+		conn, err := dialViaProxy(ctx, p, network, addr)
+		if err == nil {
+			return conn, nil
+		}
+		lastErr = err
+		cooldownActualExit(ctx, 2*time.Minute)
+		log.Printf("  exit: 出口拨号失败(%v) — 已冷却并换下一个(第 %d/%d 个候选)",
+			err, i+1, maxDialExitCandidates)
+		if ctx.Err() != nil {
+			return nil, lastErr // 客户端已断开: 不再继续试
+		}
 	}
 
 	// 代理模式但一个可用节点都没有: 是否允许直连兜底由配置决定。
 	if !exitModeDirectNow() && !rescueDirectEnabled() {
+		if lastErr != nil {
+			return nil, lastErr
+		}
 		return nil, fmt.Errorf("没有可用节点，且已禁用直连兜底")
 	}
 	if local := catchAllLocalAddr(); local != "" {
@@ -423,11 +488,19 @@ func zenDialContext(ctx context.Context, network, addr string) (net.Conn, error)
 		if err == nil {
 			return conn, nil
 		}
+		lastErr = err
 		log.Printf("  exit: catch-all 拨号失败(%v), 回退 Go 原生直连", err)
 	}
 	// 保命路径: sing-box 实例不可用时不能让整个网关失去联网能力。
 	d := &net.Dialer{Timeout: 30 * time.Second, KeepAlive: 30 * time.Second}
-	return d.DialContext(ctx, network, addr)
+	conn, err := d.DialContext(ctx, network, addr)
+	if err == nil {
+		return conn, nil
+	}
+	if lastErr != nil {
+		return nil, lastErr
+	}
+	return nil, err
 }
 
 // rescueDirectEnabled 节点全部不可用时是否允许直连兜底(缺省 true)。

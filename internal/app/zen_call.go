@@ -170,7 +170,13 @@ func callZenAPI(ctx context.Context, params map[string]any, stream bool) (*http.
 					err, attempt+1, retries, baseURLs[(attempt+1)%len(baseURLs)])
 				continue
 			}
-			recordZenModelResult(zenModelIDOf(params), true)
+			// 传输层失败(拨号/socks5/握手/超时)说明的是**出口线路**, 不是模型本身。
+			// 此前这里记了一次模型硬失败 —— 出口池大面积失效时, 5 次连败就把一个
+			// 完全健康的免费模型"暂停使用 30 分钟", 它随即从免费模型列表里消失
+			// (2026-09-16 用户实证: opencode 官方客户端里 muse-spark 仍在免费列表,
+			//  我们这边没了)。出口的冷却已由 cooldownActualExit 处理, 这里不记。
+			log.Printf("  zen: 全部出口尝试失败(model=%s, 最后一次: %v) — 属线路故障, 不计入模型健康门",
+				zenModelIDOf(params), err)
 			return nil, rateLimited, fmt.Errorf("zen request: %w", err)
 		}
 		if resp.StatusCode == http.StatusOK {
