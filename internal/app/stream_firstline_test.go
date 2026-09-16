@@ -22,10 +22,44 @@ func TestStreamFirstLineDoneNoDuplicateDone(t *testing.T) {
 	mw := &mockFlushWriter{}
 	// 极短流: 首行即 [DONE]。旧首行分支不更新 sawDone, 收尾会再补一个
 	// [DONE] —— 客户端收到重复终止帧。
+	//
+	// 注意(2026-09-16 空流防护引入后的行为变化): 上游什么都没发只给 [DONE],
+	// 在 OmniRoute 语义下 (rejectEmptyChoicesStream: 既无有价值的 chunk,
+	// 也无有效 usage) 就是**空流**, 必须判成可见失败而不是干净的收尾。
+	// 因此这条流现在以 empty_content 错误帧结尾 —— 它自身带 [DONE],
+	// 与网关的错误帧 [DONE] 合计会出现两个 [DONE], 这是"失败可见"的
+	// 必然结果, 不再是缺陷。本用例改为锁住真正的不变量:
+	//   1. 正常收尾路径不得重复补 [DONE](即不含错误帧时只有一个);
+	//   2. 若判为空流, 必须带 empty_content 错误帧(失败不得静默)。
 	handleStreamResponseWithUsage(mw, streamUpstream("data: [DONE]\n\n"), nil)
 	out := mw.String()
+
+	if strings.Contains(out, "empty_content") {
+		// 判空流: 必须显式失败, 且不得只剩一个光秃秃的 [DONE]
+		if n := strings.Count(out, "[DONE]"); n < 1 {
+			t.Fatalf("判空流后仍应交付终止帧, got %q", out)
+		}
+		return
+	}
+	// 未判空流: 严格锁住"只补一次 [DONE]"
 	if n := strings.Count(out, "[DONE]"); n != 1 {
 		t.Fatalf("首行即 [DONE] 时全流应只出现一个 [DONE], got %d in %q", n, out)
+	}
+}
+
+// 空流防护的对照用例: 同样走首行路径, 但上游给了真实内容 ——
+// 不得判空, 且 [DONE] 只出现一次(收尾不得重复补)。
+func TestStreamFirstLineDoneNoDuplicateDone_有内容(t *testing.T) {
+	mw := &mockFlushWriter{}
+	body := "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hi\"}}]}\n\ndata: [DONE]\n\n"
+	handleStreamResponseWithUsage(mw, streamUpstream(body), nil)
+	out := mw.String()
+
+	if strings.Contains(out, "empty_content") {
+		t.Fatalf("有真实内容的流不得判空, 实得 %q", out)
+	}
+	if n := strings.Count(out, "[DONE]"); n != 1 {
+		t.Fatalf("有内容时 [DONE] 应只出现一次, got %d in %q", n, out)
 	}
 }
 

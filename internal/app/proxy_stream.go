@@ -52,6 +52,19 @@ func handleStreamResponseWithUsage(w http.ResponseWriter, upstream *http.Respons
 	sawFinish := false // 上游是否已发过 finish_reason
 	sawDone := false   // 上游是否已发过 [DONE]
 	lastModel := ""    // 用于兜底 chunk 的 model 字段
+	// forwardedValuableChunk 对齐 OmniRoute open-sse/utils/stream.ts 的同名状态:
+	// 只要有一帧带 content / tool_calls / finish_reason 被转发给客户端, 就置真。
+	// 收尾时若它仍为假, 说明整条流没有交付任何有价值内容 —— 上游可能每帧都是
+	// 空 choices。这种"干净的空 200"会被客户端当成一次合法的空回合, 于是静默
+	// 结束任务且不会重试(2026-09-16 实测: 用户表现为"任务无缘无故中断, 没有
+	// 任何提示也没有报错")。必须改判成可见的失败。
+	forwardedValuableChunk := false
+	// hasValidUsage 对齐 OmniRoute streamEmptyChoices.ts 的 ctx.hasValidUsage:
+	// 上游如果报告了真实 token 用量, 说明这一回合在上游侧**确实发生过**,
+	// 即便没有转发任何有价值 chunk 也不算空流(OmniRoute 原注释:
+	// "usage-only streams are fine")。纯 usage 的收尾帧是正常协议行为,
+	// 不是静默中断, 不能误杀。
+	hasValidUsage := false
 	handleLine := func(line string, residual bool) bool {
 		line = strings.TrimRight(line, "\r\n")
 		if strings.HasPrefix(line, "data:") {
@@ -62,6 +75,9 @@ func handleStreamResponseWithUsage(w http.ResponseWriter, upstream *http.Respons
 			}
 			if payload == "[DONE]" {
 				// 上游结束但从未给出 finish_reason: 补一个终止 chunk
+				// 注意: 这个终止 chunk 是**我们合成的**, 绝不能计入
+				// forwardedValuableChunk —— 否则上游"一帧内容都没发、只发了
+				// [DONE]"的空流会因为这一帧被判成"有交付价值", 防护当场失效。
 				if !sawFinish {
 					if b, mErr := json.Marshal(protocol.EmptyOpenAIChunk(lastModel).Payload); mErr == nil {
 						hb.write([]byte("data: " + string(b) + "\n\n"))
@@ -110,12 +126,21 @@ func handleStreamResponseWithUsage(w http.ResponseWriter, upstream *http.Respons
 					onUsage(u)
 				}
 			}
+			if u, ok := obj["usage"].(map[string]any); ok && hasValidUsageTokens(u) {
+				hasValidUsage = true
+			}
 			if m, ok := obj["model"].(string); ok && m != "" {
 				lastModel = m
 			}
 			normalized := normalizeOpenAIResponse(obj)
 			if !sawFinish && protocol.HasStopSignal(normalized) { // 跨协议终止判定(OmniRoute checkIfStopSignal 等价)
 				sawFinish = true
+			}
+			// 对齐 OmniRoute: 该帧是否值得转发由它是否带 content / tool_calls /
+			// finish_reason 决定。三者都没有(空 choices)的帧仍然照常透传, 但它
+			// 不计入"已交付有价值内容"。
+			if openAIChunkHasValuableContent(normalized) {
+				forwardedValuableChunk = true
 			}
 			if normBytes, err := json.Marshal(normalized); err == nil {
 				hb.writeFlush([]byte("data: " + string(normBytes) + "\n\n"))
@@ -149,45 +174,99 @@ func handleStreamResponseWithUsage(w http.ResponseWriter, upstream *http.Respons
 	// 上游可能忽略 stream:true 直接回完整 JSON, 或按 NDJSON 逐行回 JSON。
 	// 这两类都不是 SSE —— 原样透传会让客户端报 "JSON parsing failed"。
 	// 首行探测: 非 data:/event:/注释 且以 { [ 开头 → 走合成路径。
+	//
+	// 注意: 这两条合成路径同样要计入 forwardedValuableChunk —— 空流判定必须
+	// 覆盖所有转发路径, 否则"上游回一个空壳 JSON"会绕过防护, 退回成客户端
+	// 眼中的"干净空回合"(正是要根治的静默中断)。
 	if firstLine, ferr := reader.ReadString('\n'); looksLikeJSONBody(firstLine) {
-		if json.Valid([]byte(strings.TrimSpace(firstLine))) {
-			// NDJSON 模式: 逐行转 data: 帧
-			log.Printf("%s", sseSynthesisLog("NDJSON", len(firstLine)))
-			if frame, ok := ndjsonLineToSSE(firstLine); ok {
-				hb.writeFlush(frame)
-			}
-			for {
-				line, lerr := reader.ReadString('\n')
-				if t := strings.TrimSpace(line); t != "" {
-					if frame, ok := ndjsonLineToSSE(t); ok {
-						hb.writeFlush(frame)
-					} else if t == "[DONE]" {
-						hb.writeFlush([]byte("data: [DONE]\n\n"))
+		trimmedFirst := strings.TrimSpace(firstLine)
+		if json.Valid([]byte(trimmedFirst)) {
+			// 判别"完整 JSON body"与"NDJSON 首行": 两者首行都是合法 JSON。
+			// 区别在于**是不是一次完整回包** —— 非流式回包的 choices[].message
+			// 形态与逐行 chunk 的 choices[].delta 形态是不同的。
+			//   - 完整回包(choices 里有 message, 或带 object=chat.completion)
+			//     → 走下面的完整 JSON body 合成路径;
+			//   - 逐行 chunk(choices 里有 delta)
+			//     → 走 NDJSON 路径。
+			// 旧代码不做区分, 单行完整回包会被误当成 NDJSON 逐行透传: 它的
+			// message 形态经 ndjsonLineToSSE 原样包成 data 帧后, delta 缺失,
+			// hasValuableContent 判否 —— 一个**正常有内容的回包**会被空流防护
+			// 误杀成 502(Test空流_完整JSON有内容正常通过 抓出的缺陷)。
+			if !looksLikeFullCompletionBody(trimmedFirst) {
+				// NDJSON 模式: 逐行转 data: 帧
+				log.Printf("%s", sseSynthesisLog("NDJSON", len(firstLine)))
+				markValuable := func(line string) {
+					var probe map[string]any
+					if json.Unmarshal([]byte(line), &probe) == nil {
+						if openAIChunkHasValuableContent(probe) {
+							forwardedValuableChunk = true
+						}
+						if u, ok := probe["usage"].(map[string]any); ok && hasValidUsageTokens(u) {
+							hasValidUsage = true
+						}
 					}
 				}
-				if lerr != nil {
-					break
+				markValuable(trimmedFirst)
+				if frame, ok := ndjsonLineToSSE(firstLine); ok {
+					hb.writeFlush(frame)
 				}
+				for {
+					line, lerr := reader.ReadString('\n')
+					if t := strings.TrimSpace(line); t != "" {
+						markValuable(t)
+						if frame, ok := ndjsonLineToSSE(t); ok {
+							hb.writeFlush(frame)
+						} else if t == "[DONE]" {
+							hb.writeFlush([]byte("data: [DONE]\n\n"))
+						}
+					}
+					if lerr != nil {
+						break
+					}
+				}
+				if !streamDeliveredValue(forwardedValuableChunk, hasValidUsage) {
+					log.Printf("  stream: NDJSON 流未交付任何有价值内容, 回 error 帧而非静默空 200")
+					writeStreamEmptyContentError(w, hb, lastModel)
+					return
+				}
+				if b, mErr := json.Marshal(protocol.EmptyOpenAIChunk("").Payload); mErr == nil {
+					hb.writeFlush([]byte("data: " + string(b) + "\n\n"))
+				}
+				hb.writeFlush([]byte("data: [DONE]\n\n"))
+				return
 			}
-			if b, mErr := json.Marshal(protocol.EmptyOpenAIChunk("").Payload); mErr == nil {
-				hb.writeFlush([]byte("data: " + string(b) + "\n\n"))
-			}
-			hb.writeFlush([]byte("data: [DONE]\n\n"))
-			return
 		}
-		// 多行 JSON body: 缓冲全部后解析合成
+		// 多行 / 单行完整 JSON body: 缓冲全部后解析合成
 		rest, _ := io.ReadAll(io.LimitReader(reader, jsonBodyMaxBytes))
 		body := append([]byte(firstLine), rest...)
 		if sse, ok := synthesizeOpenAISSEFromJSON(body); ok {
 			log.Printf("%s", sseSynthesisLog("完整 JSON body", len(body)))
 			hb.writeFlush(sse)
+			// 合成的完整 JSON 同样是"是否交付了价值内容"的依据: 上游可能回一个
+			// choices 里只有空 message 的壳。
+			//
+			// 判定对象是**原始 body 的实际内容**, 不是合成后的 SSE 帧 ——
+			// synthesizeOpenAISSEFromJSON 会额外注入两种脚手架帧:
+			//   1. delta.role = "assistant"(idx==0 必补);
+			//   2. 带 finish_reason 的终止帧(每个 choice 都补)。
+			// 而 hasValuableContent 显式接受 role 与 finish_reason, 于是拿合成帧
+			// 去判会让"content 为空、只补了 role + finish"的空壳 body 被判成
+			// 有交付价值, 空流防护当场失效。必须按原始 body 里**真实存在的**
+			// 正文/工具调用判定(Test空流_完整JSON空壳body必须失败 抓出的缺陷)。
 			if onUsage != nil {
-				var parsed map[string]any
-				if json.Unmarshal(body, &parsed) == nil {
-					if u, ok := parsed["usage"].(map[string]any); ok && len(u) > 0 {
-						onUsage(u)
-					}
+				if u, ok := parsedUsageFromJSONBody(body); ok {
+					onUsage(u)
 				}
+			}
+			if u, ok := parsedUsageFromJSONBody(body); ok && hasValidUsageTokens(u) {
+				hasValidUsage = true
+			}
+			if fullCompletionBodyHasContent(body) {
+				forwardedValuableChunk = true
+			}
+			if !streamDeliveredValue(forwardedValuableChunk, hasValidUsage) {
+				log.Printf("  stream: 上游完整 JSON body 不含任何有价值内容, 补 error 帧")
+				writeStreamEmptyContentError(w, hb, lastModel)
 			}
 			return
 		}
@@ -216,6 +295,20 @@ func handleStreamResponseWithUsage(w http.ResponseWriter, upstream *http.Respons
 		}
 	}
 
+	// 空流拒绝(对齐 OmniRoute open-sse/utils/streamEmptyChoices.ts 的
+	// rejectEmptyChoicesStream): 整条流没交付任何有价值 chunk 时, 不能以
+	// "干净的 200" 收尾。客户端会把这种空回合当成合法结果 —— 不报错、不重试,
+	// 直接静默结束任务, 用户看到的就是"无缘无故中断"。
+	//
+	// 与上游"空流"的区别: 那种在提交前就被 probeStreamFirstEvent 拦下并换站
+	// (见 routing_dispatch.go), 这里兜的是**已提交之后**每帧都空的情况。
+	if !streamDeliveredValue(forwardedValuableChunk, hasValidUsage) {
+		log.Printf("  stream: 上游整条流未交付任何有价值内容(model=%s, 已发 finish=%v), 回 502 而非静默空 200",
+			lastModel, sawFinish)
+		writeStreamEmptyContentError(w, hb, lastModel)
+		return
+	}
+
 	// 上游断流未发 [DONE](或发 [DONE] 前无 finish_reason): 合成收尾,
 	// 避免客户端报 "Stream ended without finish_reason" 或挂起等待。
 	if !sawFinish {
@@ -226,6 +319,240 @@ func handleStreamResponseWithUsage(w http.ResponseWriter, upstream *http.Respons
 	if !sawDone {
 		hb.write([]byte("data: [DONE]\n\n"))
 	}
+	hb.flush()
+}
+
+// openAIChunkHasValuableContent 判断一个 OpenAI 形态的 chunk 是否"有价值",
+// 即 OmniRoute 的 hasValuableContent(chunk, FORMATS.OPENAI)。
+//
+// 严格对照 open-sse/utils/streamHelpers.ts:379 的实现, 逐条对应:
+//
+//	const choices = Array.isArray(chunk.choices) ? chunk.choices : [];
+//	const firstChoice = isRecord(choices[0]) ? choices[0] : null;
+//	const delta = isRecord(firstChoice?.delta) ? firstChoice.delta : null;
+//	if (!firstChoice || !delta) return false;
+//	if (typeof delta.content === "string" && delta.content.length > 0) return true;
+//	if (hasAnyReasoningSignal(delta)) return true;
+//	if (Array.isArray(delta.tool_calls) && delta.tool_calls.length > 0) return true;
+//	if (firstChoice.finish_reason) return true;
+//	if (typeof delta.role === "string" && delta.role.length > 0) return true;
+//	return false;
+//
+// 三条容易写错的要点(此前本函数都写错了, 由 Test空流_完整JSON空壳body必须失败 抓出):
+//  1. **只认 choices[0]**, 不是遍历所有 choice;
+//  2. **delta 缺失即 false** —— 非流式的 message 形态在这里一律"无价值",
+//     不能因为 message.content / finish_reason 好看就放行;
+//     否则上游回一个 "choices[0].message.content=”" 的空壳 body 会被当成
+//     有内容交付, 静默空回合的防护就此失效(正是要根治的中断场景);
+//  3. **reasoning 信号也算价值**, 且 role 骨架帧也算 —— 这一条比 streamEmptyChoices
+//     的注释描述更宽, 以 streamHelpers.ts 的实现为准。
+func openAIChunkHasValuableContent(obj map[string]any) bool {
+	choices, ok := obj["choices"].([]any)
+	if !ok || len(choices) == 0 {
+		return false
+	}
+	firstChoice, ok := choices[0].(map[string]any)
+	if !ok {
+		return false
+	}
+	delta, ok := firstChoice["delta"].(map[string]any)
+	if !ok {
+		return false
+	}
+	if c, ok := delta["content"].(string); ok && len(c) > 0 {
+		return true
+	}
+	// hasAnyReasoningSignal(delta)
+	if hasAnyReasoningSignal(delta) {
+		return true
+	}
+	if tc, ok := delta["tool_calls"].([]any); ok && len(tc) > 0 {
+		return true
+	}
+	if fr, ok := firstChoice["finish_reason"].(string); ok && fr != "" {
+		return true
+	}
+	if role, ok := delta["role"].(string); ok && len(role) > 0 {
+		return true
+	}
+	return false
+}
+
+// streamDeliveredValue 对应 OmniRoute rejectEmptyChoicesStream 的首行守卫:
+//
+//	if (ctx.forwardedValuableChunk || ctx.hasValidUsage) return false;
+//
+// 返回 true 表示"这条流确实交付了东西, 不该判为空流"。
+// 两个条件任一成立即放行 —— 有价值 chunk, 或上游报告了真实 usage
+// (usage-only 流是合法协议行为, 原注释: "usage-only streams are fine")。
+func streamDeliveredValue(forwardedValuableChunk, hasValidUsage bool) bool {
+	return forwardedValuableChunk || hasValidUsage
+}
+
+// hasValidUsageTokens 对应 OmniRoute usageTracking.ts:639 的 hasValidUsage:
+// 已知 token 字段任一 > 0 才算有效用量。全为 0 或缺失 → false
+// (上游常回 "usage":{"prompt_tokens":0,...} 这类全零壳, 不能算数)。
+func hasValidUsageTokens(usage map[string]any) bool {
+	if usage == nil {
+		return false
+	}
+	for _, field := range []string{
+		"prompt_tokens",
+		"completion_tokens",
+		"total_tokens", // OpenAI
+		"input_tokens",
+		"output_tokens", // Claude
+		"promptTokenCount",
+		"candidatesTokenCount", // Gemini
+	} {
+		if v, ok := usage[field].(float64); ok && v > 0 {
+			return true
+		}
+	}
+	return false
+}
+
+// looksLikeFullCompletionBody 判断一个合法 JSON 对象是不是"一次完整回包"
+// (非流式 chat.completion), 而不是 NDJSON 的一行流式 chunk。
+//
+// 判据(任一命中即认为是完整回包):
+//   - object 字段等于 "chat.completion"(非 ".chunk");
+//   - choices[] 里出现 message 形态(非流式回包用它承载正文)。
+func looksLikeFullCompletionBody(payload string) bool {
+	var obj map[string]any
+	if err := json.Unmarshal([]byte(payload), &obj); err != nil {
+		return false
+	}
+	if objType, ok := obj["object"].(string); ok {
+		if objType == "chat.completion" || strings.HasSuffix(objType, ".completion") {
+			return true
+		}
+	}
+	choices, ok := obj["choices"].([]any)
+	if !ok {
+		return false
+	}
+	for _, raw := range choices {
+		choice, ok := raw.(map[string]any)
+		if !ok {
+			continue
+		}
+		if _, hasMessage := choice["message"]; hasMessage {
+			return true
+		}
+	}
+	return false
+}
+
+// fullCompletionBodyHasContent 判断"一次完整回包"的 body 里是否真有内容。
+//
+// 不看脚手架(role / finish_reason —— 这两样合成器会补、且 hasValuableContent
+// 显式接受), 只看 body 里**真实承载输出**的字段:
+//   - choices[].message.content 非空;
+//   - choices[].message 带非空 reasoning 家族字段;
+//   - choices[].message.tool_calls 非空;
+//   - choices[].text(旧版 text_completion 形态)非空。
+//
+// 全都没有 → 上游交付的是一个空壳。
+func fullCompletionBodyHasContent(body []byte) bool {
+	var parsed map[string]any
+	if err := json.Unmarshal(body, &parsed); err != nil {
+		return false
+	}
+	choices, ok := parsed["choices"].([]any)
+	if !ok {
+		return false
+	}
+	for _, raw := range choices {
+		choice, ok := raw.(map[string]any)
+		if !ok {
+			continue
+		}
+		if text, ok := choice["text"].(string); ok && len(text) > 0 {
+			return true
+		}
+		msg, ok := choice["message"].(map[string]any)
+		if !ok {
+			// 已带 delta 的形态也接受(合成器兼容这种输入)
+			msg, _ = choice["delta"].(map[string]any)
+		}
+		if msg == nil {
+			continue
+		}
+		if c, ok := msg["content"].(string); ok && len(c) > 0 {
+			return true
+		}
+		if hasAnyReasoningSignal(msg) {
+			return true
+		}
+		if tc, ok := msg["tool_calls"].([]any); ok && len(tc) > 0 {
+			return true
+		}
+	}
+	return false
+}
+
+// splitSynthesizedSSEFrames 把合成出来的 SSE 文本切成 data 帧的对象列表,
+// 供空流判定逐帧使用。无法解析的帧直接跳过(合成器产出的帧一定是合法 JSON,
+// 跳过只是防御)。
+func splitSynthesizedSSEFrames(sse []byte) []map[string]any {
+	var frames []map[string]any
+	for _, line := range strings.Split(string(sse), "\n") {
+		line = strings.TrimSpace(line)
+		if !strings.HasPrefix(line, "data:") {
+			continue
+		}
+		payload := strings.TrimSpace(strings.TrimPrefix(line, "data:"))
+		if payload == "" || payload == "[DONE]" {
+			continue
+		}
+		var obj map[string]any
+		if err := json.Unmarshal([]byte(payload), &obj); err == nil {
+			frames = append(frames, obj)
+		}
+	}
+	return frames
+}
+
+// parsedUsageFromJSONBody 从完整 JSON body 里取 usage。
+func parsedUsageFromJSONBody(body []byte) (map[string]any, bool) {
+	var parsed map[string]any
+	if err := json.Unmarshal(body, &parsed); err != nil {
+		return nil, false
+	}
+	u, ok := parsed["usage"].(map[string]any)
+	if !ok || len(u) == 0 {
+		return nil, false
+	}
+	return u, true
+}
+
+// writeStreamEmptyContentError 交付"可见的空内容失败"。
+//
+// 帧里同时带 error(能弹提示的客户端看得到原因)与 finish_reason(只认协议
+// 终止信号的客户端也能正常收尾), 再补 [DONE]。HTTP 状态码在流式提交后无法
+// 再改, 因此失败信息只能走 SSE 帧 —— 这正是 OmniRoute 用 controller.error
+// 表达 502 的等价做法。
+func writeStreamEmptyContentError(w http.ResponseWriter, hb *sseHeartbeat, model string) {
+	payload := map[string]any{
+		"choices": []any{map[string]any{
+			"index":         0,
+			"delta":         map[string]any{},
+			"finish_reason": "stop",
+		}},
+		"error": map[string]any{
+			"type": "empty_content",
+			"message": "上游未返回任何内容(整条流无有效 chunk)。这通常是出口节点或上游 worker " +
+				"异常所致, 请重试; 若持续出现请更换出口节点。",
+		},
+	}
+	if model != "" {
+		payload["model"] = model
+	}
+	if b, err := json.Marshal(payload); err == nil {
+		hb.write([]byte("data: " + string(b) + "\n\n"))
+	}
+	hb.write([]byte("data: [DONE]\n\n"))
 	hb.flush()
 }
 

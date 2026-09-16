@@ -36,6 +36,27 @@ func buildZenBody(params map[string]any, stream bool) map[string]any {
 	}
 	delete(body, "reasoning_effort")
 	delete(body, "reasoningEffort")
+
+	// 对齐 OmniRoute 的 OpencodeExecutor.transformRequest 末尾两步:
+	//
+	//  1. opencode-go 系后端(含 opencode-zen)的 ChatCompletionRequest.reasoning
+	//     是结构化类型, 收下布尔值会 400 "cannot unmarshal bool into Go struct
+	//     field", 转发前剥掉布尔形态(对象/字符串形态合法, 保持原样);
+	//  2. thinking 家族(DeepSeek / Kimi / K2 / MiniMax / MiMo)要求历史里每条
+	//     assistant 消息回传非空 reasoning_content, 否则 400 "reasoning_content
+	//     must be passed back"; OpenAI 协议客户端跨回合不保留该字段, 这里补占位符。
+	//
+	// 模型 ID 用已解析的 zen ID(body["model"]), 未登记模型时退回请求里的原始值。
+	reasoningModelID, _ := body["model"].(string)
+	if reasoningModelID == "" {
+		reasoningModelID, _ = params["model"].(string)
+	}
+	body = stripBooleanReasoning(body)
+	if isThinkingMessageModel(reasoningModelID) {
+		if injected, ok := injectReasoningContentForThinkingModel(body).(map[string]any); ok {
+			body = injected
+		}
+	}
 	return body
 }
 

@@ -42,6 +42,9 @@ func normalizeOpenAIResponse(obj map[string]any) map[string]any {
 							nd["content"] = ""
 						}
 					}
+					// 对齐 OmniRoute 流式 delta 处理: 与 normalizeMessage 同一份
+					// 归一逻辑, 保证流式/非流式两条路径不漂移。
+					copyOpenAICompatibleReasoningFields(delta, nd)
 					nc["delta"] = nd
 				}
 				normalized = append(normalized, nc)
@@ -79,6 +82,10 @@ func normalizeMessage(msg map[string]any) map[string]any {
 	if c, ok := out["content"].(string); ok {
 		out["content"] = sanitizeContent(c)
 	}
+	// 对齐 OmniRoute sanitizeMessage: 推理字段归一 + 内部占位符净化。
+	// 必须在 content 处理之后、tool_calls 修补之后的出口侧执行, 保证转发给
+	// 客户端的内容里不含请求脚手架。
+	copyOpenAICompatibleReasoningFields(msg, out)
 	return out
 }
 
