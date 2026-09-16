@@ -1,10 +1,10 @@
-package app
+package webui
 
 // adminHTML 分段 3/4: 请求日志页(筛选/分页/详情抽屉)。
 // 由 admin_html.go 拆分而来(P2-21): 单文件近 2900 行的原始字符串难以评审,
 // 按面板边界切成多段常量, 拼接结果与拆分前逐字节一致; 原始字符串内
 // 仍然禁止出现反引号(会终止字符串)。
-const adminHTMLPart3 = `<div id="tab-logs" class="tab-panel" style="display:none">
+const htmlSettingsLogs = `<div id="tab-logs" class="tab-panel" style="display:none">
 <div class="flex justify-between" style="margin-bottom:var(--sp-4)">
   <h2>📜 请求日志 <span class="probe-pill" style="font-weight:normal">最近 500 条，落盘 data/requests.jsonl；点任意行看详情与路由决策</span></h2>
   <div style="display:flex;gap:var(--sp-2)">

@@ -55,7 +55,7 @@ jobs:
 
       - name: Frontend admin render test
         # scripts/admin-render-test.js 是纯 Node 零依赖的渲染冒烟测试(104+ 断言),
-        # 覆盖 admin_html.go 嵌入的 2300+ 行管理后台 HTML/JS。前端改坏必须让 CI 红。
+        # 覆盖 internal/webui 嵌入的 2800+ 行管理后台 HTML/JS。前端改坏必须让 CI 红。
         run: node scripts/admin-render-test.js
 
   build:
@@ -141,7 +141,7 @@ jobs:
             LDFLAGS="-s -w"
           fi
           LDFLAGS="$LDFLAGS -X cline-go-proxy/internal/app.buildVersion=${{ steps.ver.outputs.version }}"
-          go build -tags with_quic,with_grpc,with_utls -ldflags="$LDFLAGS" -o cline-proxy-${{ matrix.target }}${{ matrix.ext }} .
+          go build -tags with_quic,with_grpc,with_utls -ldflags="$LDFLAGS" -o cline-proxy-${{ matrix.target }}${{ matrix.ext }} ./cmd/cline-proxy
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4

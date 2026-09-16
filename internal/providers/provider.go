@@ -10,13 +10,13 @@ import (
 // providers accept. It is produced by internal/app/proxy.go after
 // converting OpenAI / Anthropic / Responses to this common form.
 type ChatRequest struct {
-	Model       string         `json:"model"`
+	Model       string          `json:"model"`
 	Messages    json.RawMessage `json:"messages"`
-	Stream      bool           `json:"stream"`
-	MaxTokens   int            `json:"max_tokens,omitempty"`
-	Temperature float64        `json:"temperature,omitempty"`
-	TopP        float64        `json:"top_p,omitempty"`
-	TopK        int            `json:"top_k,omitempty"`
+	Stream      bool            `json:"stream"`
+	MaxTokens   int             `json:"max_tokens,omitempty"`
+	Temperature float64         `json:"temperature,omitempty"`
+	TopP        float64         `json:"top_p,omitempty"`
+	TopK        int             `json:"top_k,omitempty"`
 	Tools       json.RawMessage `json:"tools,omitempty"`
 	ToolChoice  json.RawMessage `json:"tool_choice,omitempty"`
 	// Extra holds any fields not listed above (e.g. reasoning_effort,
@@ -44,6 +44,11 @@ type Provider interface {
 	// ChatStream performs a streaming completion. The provider writes
 	// SSE events directly to w; the caller does not need to parse them.
 	// onUsage is called when a usage chunk arrives (may be nil).
+	//
+	// w 的契约: **任意 io.Writer 都可** —— 需要写响应头/Flush 的实现必须自行
+	// 适配(见 app 包的 streamResponseWriter), 不得把 io.Writer 收窄成
+	// http.ResponseWriter 后再拒绝其他实现: clinepass 链式转发就是用
+	// io.Pipe 做首字节门的, 传进来的只是 *io.PipeWriter(2026-09-16 审计 P2-9)。
 	ChatStream(ctx context.Context, req ChatRequest, w io.Writer, onUsage func(map[string]any)) error
 
 	// ListModels returns available models for this provider.

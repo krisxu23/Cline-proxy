@@ -1,7 +1,7 @@
 // 管理后台渲染冒烟测试
 //
-// admin_html.go 里嵌着一个 2300+ 行的 HTML/JS 字符串, 没有构建步骤、没有打包器,
-// 浏览器里改坏一处很难定位。这个脚本把它抽出来在 Node 里真的跑一遍:
+// internal/webui/ 里嵌着一个 2800+ 行的 HTML/JS 字符串(纯资产常量), 没有构建步骤、
+// 没有打包器, 浏览器里改坏一处很难定位。这个脚本把它抽出来在 Node 里真的跑一遍:
 // 用样例 provider 数据调用 renderModelIndex(), 断言输出 HTML 的结构 / 前缀 / 权限边界。
 //
 // 用法:  node scripts/admin-render-test.js
@@ -27,18 +27,49 @@
 const fs = require('fs');
 const path = require('path');
 
-const APP_DIR = path.join(__dirname, '..', 'internal', 'app');
+const APP_DIR = path.join(__dirname, '..', 'internal', 'webui');
 
-// ---- 抽出 adminHTML 原始字符串(Go 原始字符串, 无反义, 直接取) ----
-// P2-21 拆分后, adminHTML = part1+part2+part3+part4 分布在五个文件里:
-// 逐个读取原始字符串内容并按声明顺序拼接回整页。
+// ---- 抽出面板整页的原始字符串(Go 原始字符串, 无反义, 直接取) ----
+// 拼接顺序**从 webui.go 的 HTML 常量解析**, 不再手写文件清单 —— 之前那份清单
+// 与生产拼接顺序各写一遍, 改分段时极易漂移(拼接顺序错 = 页面结构错乱)。
+function orderedFiles() {
+  let decl = '';
+  try {
+    decl = fs.readFileSync(path.join(APP_DIR, 'webui.go'), 'utf8');
+  } catch (e) { return []; }
+  // 解析 const HTML = A + B + ... —— 逐行吃到"不再是纯标识符"为止
+  // (不能用正则找空行结尾: 常量可能正好在文件末尾, 后面没有空行)
+  const idx = decl.indexOf('const HTML =');
+  if (idx < 0) return [];
+  const names = [];
+  for (const raw of decl.slice(idx + 'const HTML ='.length).split('\n')) {
+    const t = raw.trim().replace(/\+$/, '').trim();
+    if (!/^[A-Za-z_]\w*$/.test(t)) {
+      if (names.length) break;
+      continue;
+    }
+    names.push(t);
+  }
+  if (!names.length) return [];
+  const files = [];
+  for (const f of fs.readdirSync(APP_DIR)) {
+    if (!f.endsWith('.go') || f.endsWith('_test.go')) continue;
+    const body = fs.readFileSync(path.join(APP_DIR, f), 'utf8');
+    for (const n of names) {
+      if (body.includes('const ' + n + ' = `')) files.push({ name: n, file: f });
+    }
+  }
+  // 按 HTML 声明里的顺序排列
+  files.sort((a, b) => names.indexOf(a.name) - names.indexOf(b.name));
+  return files.map(x => x.file);
+}
+
 function readAdminHTML() {
-  const files = ['admin_html.go', 'admin_html_part1.go', 'admin_html_part2.go', 'admin_html_part3.go', 'admin_html_part4.go'];
+  const files = orderedFiles();
+  if (!files.length) return null;
   let combined = '';
   for (const f of files) {
-    try {
-      combined += fs.readFileSync(path.join(APP_DIR, f), 'utf8') + '\n';
-    } catch (e) { /* part 文件缺失时跳过(兼容拆分前的单文件形态) */ }
+    combined += fs.readFileSync(path.join(APP_DIR, f), 'utf8') + '\n';
   }
   const pieces = [];
   const re = /`([^`]*)`/g;

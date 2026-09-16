@@ -1,4 +1,9 @@
-// Package translate 网关协议翻译的统一注册表与出站体校验 (P1-9)。
+// Package translate_registry 网关请求体转换的**统一注册表 + 出站体形态不变量校验** (P1-9)。
+//
+// 命名说明(2026-09-16 去歧义): 本包原名 `internal/app/translate`, 与
+// `internal/translate`(OmniRoute 移植的协议互转实现, 批次⑤待接线)同名不同路径,
+// 极易改错包。现按职责改名为 translate_registry —— 本包只做"取转换函数 + 校验
+// 出站体", 具体协议互转实现归 internal/translate。
 //
 // 背景: 网关要在三种协议形状之间转换 —— chat(completions) / responses /
 // anthropic。历史上转换逻辑散落在 proxy.go / responses.go / zen_responses.go
@@ -24,13 +29,14 @@
 //	           不得残留 responses 形状字段 input。
 //
 // 与 internal/translate 的分工(R2 审计 F4): 本包是**注册表与出站校验**(已接
-// 生产, 由 zen.go / zen_responses.go 消费); internal/translate 是 OmniRoute
-// open-sse/translator 的**格式互转实现**(批次⑤预铺, 尚未接线)。两包同名
-// 不同路径、职责不同, 引用时以完整 import 路径为准。
-package translate
+// 生产, 由 zen_call.go / zen_responses.go 消费); internal/translate 是 OmniRoute
+// open-sse/translator 的**格式互转实现**(批次⑤预铺, 尚未接线)。两包职责不同,
+// 且已按职责命名区分, 引用时仍以完整 import 路径为准。
+package translate_registry
 
 import (
 	"fmt"
+	"log"
 	"sort"
 	"strings"
 	"sync"
@@ -66,6 +72,10 @@ func HasRequest(from, to Kind) bool {
 	return requestFn[key{from, to}] != nil
 }
 
+// 未注册方向告警去重: 每个方向只告警一次。热路径上不能每请求刷日志,
+// 但"完全静默"会让漏注册长期无人发现(审计 P1-6)。
+var warnedUnregistered sync.Map
+
 // TranslateRequest 按 from:to 转换请求体; 未注册该方向时原样返回(幂等转换语义:
 // 同形状 = 不需要转换)。body 为 nil 时返回 nil。
 func TranslateRequest(from, to Kind, body map[string]any) map[string]any {
@@ -83,6 +93,9 @@ func TranslateRequest(from, to Kind, body map[string]any) map[string]any {
 		return fn(body)
 	}
 	// 未注册方向: 原样返回并让出站校验兜底 —— 宁可上游报错, 也不在这里猜。
+	if _, loaded := warnedUnregistered.LoadOrStore(key{from, to}, true); !loaded {
+		log.Printf("translate_registry: 转换方向 %s→%s 未注册, 请求体原样透传(补注册或见 internal/translate)", from, to)
+	}
 	return body
 }
 

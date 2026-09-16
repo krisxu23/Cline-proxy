@@ -13,10 +13,16 @@ import (
 )
 
 const (
-	workosClientID       = "client_01K3A541FN8TA3EPPHTD2325AR"
-	workosDeviceAuthURL  = "https://api.workos.com/user_management/authorize/device"
-	workosAuthenticateURL = "https://api.workos.com/user_management/authenticate"
-	ClineAPIBase         = "https://api.cline.bot/api/v1"
+	workosClientID = "client_01K3A541FN8TA3EPPHTD2325AR"
+	ClineAPIBase   = "https://api.cline.bot/api/v1"
+)
+
+// 端点基址。声明为变量是为了给测试留注入点(把 base 指向 httptest.Server, 校验
+// 路径/方法/表单字段的组装), 生产路径不会改写它们。
+// ClineAPIBase 仍是导出常量: app / providers 两个包直接引用它拼线上地址。
+var (
+	workosBaseURL = "https://api.workos.com"
+	clineAPIBase  = ClineAPIBase
 )
 
 type credentials struct {
@@ -94,7 +100,6 @@ func FindCredentialsFile() string {
 	return filepath.Join(pwd, ".cline-credentials.json")
 }
 
-
 func LoadCredentials() *credentials {
 	data, err := os.ReadFile(credentialsPath)
 	if err != nil {
@@ -119,7 +124,7 @@ func SaveCredentials(rt string) {
 
 func WorkosDeviceAuth() (*deviceAuthResp, error) {
 	form := url.Values{"client_id": {workosClientID}}
-	resp, err := kit.HTTPPostForm(workosDeviceAuthURL, form)
+	resp, err := kit.HTTPPostForm(workosBaseURL+"/user_management/authorize/device", form)
 	if err != nil {
 		return nil, fmt.Errorf("workos device auth: %w", err)
 	}
@@ -150,7 +155,7 @@ func PollWorkosToken(deviceCode string, interval, expiresIn int) (*authenticateR
 			"device_code": {deviceCode},
 			"client_id":   {workosClientID},
 		}
-		resp, err := kit.HTTPPostForm(workosAuthenticateURL, form)
+		resp, err := kit.HTTPPostForm(workosBaseURL+"/user_management/authenticate", form)
 		if err != nil {
 			return nil, fmt.Errorf("workos poll: %w", err)
 		}
@@ -188,7 +193,7 @@ func RegisterWithCline(workosAccess, workosRefresh string) (*clineAuthResp, erro
 		"accessToken":  workosAccess,
 		"refreshToken": workosRefresh,
 	}
-	resp, err := kit.HTTPPostJSON(ClineAPIBase+"/auth/register", body)
+	resp, err := kit.HTTPPostJSON(clineAPIBase+"/auth/register", body)
 	if err != nil {
 		return nil, fmt.Errorf("cline register: %w", err)
 	}
@@ -211,7 +216,7 @@ func RefreshClineToken(refreshToken string) (*clineRefreshResp, error) {
 		"refreshToken": refreshToken,
 		"grantType":    "refresh_token",
 	}
-	resp, err := kit.HTTPPostJSON(ClineAPIBase+"/auth/refresh", body)
+	resp, err := kit.HTTPPostJSON(clineAPIBase+"/auth/refresh", body)
 	if err != nil {
 		return nil, fmt.Errorf("cline refresh: %w", err)
 	}

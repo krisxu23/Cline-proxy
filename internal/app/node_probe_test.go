@@ -2,6 +2,7 @@ package app
 
 import (
 	"encoding/base64"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -142,5 +143,129 @@ func TestProbeNodeSpeedReadsBodyBeforeCancel(t *testing.T) {
 	}
 	if speed <= 0 {
 		t.Fatalf("吞吐应为正数, got %d(stalled=%v)", speed, stalled)
+	}
+}
+
+// --- 活性三源并发 + 地区多数投票(2026-09-16 用户需求) ---
+//
+// 活性: 三权威源并发, 任一成功即活。本用例起三个本地源 —— 快源立即 204,
+// 慢源延迟后 200, 死源恒 500 —— 必须判活, 且延迟应接近快源而非等慢源。
+func TestProbeNodeLivenessConcurrent(t *testing.T) {
+	fast := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer fast.Close()
+	slow := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		time.Sleep(800 * time.Millisecond)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer slow.Close()
+	dead := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	defer dead.Close()
+
+	prev := nodeLivenessURLs
+	nodeLivenessURLs = []string{dead.URL, slow.URL, fast.URL}
+	t.Cleanup(func() { nodeLivenessURLs = prev })
+
+	client := &http.Client{Timeout: 30 * time.Second}
+	t0 := time.Now()
+	lat, alive := probeNodeLiveness(client)
+	if !alive {
+		t.Fatal("两源可用却判死 —— 并发活性失败")
+	}
+	if elapsed := time.Since(t0); elapsed > 700*time.Millisecond {
+		t.Fatalf("并发退化为串行等待: 耗时 %v, 快源本应立即成功", elapsed)
+	}
+	if lat < 0 {
+		t.Fatalf("延迟为负: %d", lat)
+	}
+}
+
+// 活性全死: 三源全 500 必须判死。用"立即拒连"的本地端口而非超时桩,
+// 判死应毫秒级返回, 不必等满超时。
+func TestProbeNodeLivenessAllDead(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	deadAddr := ln.Addr().String()
+	ln.Close() // 关闭即拒连: dial 立刻 ECONNREFUSED
+
+	prev := nodeLivenessURLs
+	nodeLivenessURLs = []string{
+		"http://" + deadAddr,
+		"http://" + deadAddr,
+		"http://" + deadAddr,
+	}
+	t.Cleanup(func() { nodeLivenessURLs = prev })
+
+	t0 := time.Now()
+	if _, alive := probeNodeLiveness(&http.Client{Timeout: 30 * time.Second}); alive {
+		t.Fatal("三源全死却判活")
+	}
+	if elapsed := time.Since(t0); elapsed > 5*time.Second {
+		t.Fatalf("全死源判死过慢: %v(应毫秒级拒连返回)", elapsed)
+	}
+}
+
+// 地区投票: 用本地三源分别返回 US/US/CA, 必须判 US(少数服从多数),
+// 附带信息(ASN/ISP)取多数票源。源格式复用三家真实 API 的字段形状。
+func TestProbeNodeExitInfoMajorityVote(t *testing.T) {
+	us1 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.Write([]byte(`{"ip":"1.1.1.1","country_code":"US","asn":13335,"asn_organization":"CLOUDFLARENET","isp":"Cloudflare"}`))
+	}))
+	defer us1.Close()
+	us2 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.Write([]byte(`{"ip":"1.1.1.1","country":"US","org":"AS13335 CLOUDFLARENET"}`))
+	}))
+	defer us2.Close()
+	ca := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.Write([]byte(`{"query":"1.1.1.1","countryCode":"CA","as":"AS1234 EXAMPLE-CA","isp":"ExampleCA","org":"ExampleCA","hosting":false,"mobile":false,"proxy":false}`))
+	}))
+	defer ca.Close()
+
+	prev := nodeIPEchoURLs
+	nodeIPEchoURLs = []string{us1.URL, us2.URL, ca.URL}
+	t.Cleanup(func() { nodeIPEchoURLs = prev })
+
+	var result nodeTestResult
+	probeNodeExitInfo(&http.Client{Timeout: 30 * time.Second}, &result)
+	if result.ExitCountry != "US" {
+		t.Fatalf("两票 US 一票 CA 应判 US, got %q", result.ExitCountry)
+	}
+	if result.ExitIP != "1.1.1.1" {
+		t.Fatalf("出口 IP 应为 1.1.1.1, got %q", result.ExitIP)
+	}
+}
+
+// 地区投票三票各异: US/JP/DE 必须留空(调用方归 other), 但出口 IP 仍保留。
+func TestProbeNodeExitInfoTieGoesOther(t *testing.T) {
+	mk := func(cc string) *httptest.Server {
+		return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			w.Write([]byte(`{"ip":"9.9.9.9","country_code":"` + cc + `"}`))
+		}))
+	}
+	s1, s2, s3 := mk("US"), mk("JP"), mk("DE")
+	defer s1.Close()
+	defer s2.Close()
+	defer s3.Close()
+
+	prev := nodeIPEchoURLs
+	nodeIPEchoURLs = []string{s1.URL, s2.URL, s3.URL}
+	t.Cleanup(func() { nodeIPEchoURLs = prev })
+
+	var result nodeTestResult
+	probeNodeExitInfo(&http.Client{Timeout: 30 * time.Second}, &result)
+	if result.ExitCountry != "" {
+		t.Fatalf("三票各异地区应留空归 other, got %q", result.ExitCountry)
+	}
+	if result.ExitIP != "9.9.9.9" {
+		t.Fatalf("地区无法判定时出口 IP 仍应保留, got %q", result.ExitIP)
 	}
 }

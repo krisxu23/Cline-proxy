@@ -1,10 +1,10 @@
-package app
+package webui
 
 // adminHTML 分段 1/4: 框架/样式/导航 + 仪表盘 + 供应商管理页。
 // 由 admin_html.go 拆分而来(P2-21): 单文件近 2900 行的原始字符串难以评审,
 // 按面板边界切成多段常量, 拼接结果与拆分前逐字节一致; 原始字符串内
 // 仍然禁止出现反引号(会终止字符串)。
-const adminHTMLPart1 = `<!DOCTYPE html>
+const htmlShell = `<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
 <meta charset="UTF-8">

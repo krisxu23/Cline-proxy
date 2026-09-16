@@ -16,10 +16,10 @@ type ClassifyFunc func(model string) string
 // Router dispatches requests to registered providers by kind. The kind is
 // decided by a ClassifyFunc injected at construction time.
 type Router struct {
-	mu        sync.RWMutex
-	registry  map[string]Provider
-	classify  ClassifyFunc
-	fallback  string // kind used when classify returns "" or unknown
+	mu       sync.RWMutex
+	registry map[string]Provider
+	classify ClassifyFunc
+	fallback string // kind used when classify returns "" or unknown
 }
 
 func NewRouter(classify ClassifyFunc, fallback string) *Router {

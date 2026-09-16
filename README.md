@@ -1,18 +1,3 @@
-
-## 致谢
-
-- [diegosouzapw/OmniRoute](https://github.com/diegosouzapw/OmniRoute)（MIT）—— 本项目的路由/日志/错误规则/协议翻译/SSE 数据处理多处机制以其为参照并做了 Go 侧移植；MIT 版权声明见仓库根目录 `NOTICE`
-
-
-出口选路、节点池与订阅处理的设计参考了以下优秀项目（思路借鉴，代码均为原创实现）：
-
-- [jasonwong1991/easy_proxies](https://github.com/jasonwong1991/easy_proxies) —— sing-box 节点池管理（健康检查/黑名单/GeoIP 路由/订阅热重载）
-- [Resinat/Resin](https://github.com/Resinat/Resin) —— 代理池网关的粘性会话（Sticky Session）
-- [MetaCubeX/mihomo](https://github.com/MetaCubeX/mihomo) —— url-test 选路 + tolerance 防抖
-- [nadoo/glider](https://github.com/nadoo/glider) —— 多策略转发与健康检查
-- [sub-store-org/Sub-Store](https://github.com/sub-store-org/Sub-Store) —— 订阅处理管线
-自动分流到四类上游，对外同时提供 OpenAI、Anthropic、OpenAI Responses 三种协议接口，内置中文管理后台。
-
 ## 目录
 
 - [特性](#特性)
@@ -71,13 +56,13 @@
 
 ```bash
 # Windows GUI 构建（无控制台窗口）
-go build -tags "with_quic,with_grpc,with_utls" -ldflags "-s -w -H=windowsgui" -o cline-proxy.exe .
+go build -tags "with_quic,with_grpc,with_utls" -ldflags "-s -w -H=windowsgui" -o cline-proxy.exe ./cmd/cline-proxy
 
 # 控制台构建（调试用，或 Linux/macOS）
-go build -tags "with_quic,with_grpc,with_utls" -o cline-proxy.exe .
+go build -tags "with_quic,with_grpc,with_utls" -o cline-proxy.exe ./cmd/cline-proxy
 
 # 构建 + 启动 + 打开浏览器
-go run -tags "with_quic,with_grpc,with_utls" . -start
+go run -tags "with_quic,with_grpc,with_utls" ./cmd/cline-proxy -start
 ```
 
 > 构建标签 `with_quic,with_grpc,with_utls` **不可省略**：缺少时 reality/uTLS 与 QUIC（hysteria2/tuic）类节点会被 sing-box 判为无效出站并从出口池剔除，可用节点数会大幅减少。
@@ -333,52 +318,97 @@ curl -s http://127.0.0.1:3457/health
 
 ## 项目结构
 
+标准 Go 布局：入口在 `cmd/`，业务代码全在 `internal/`。同目录内按**功能前缀**分文件，
+相关代码不必跨目录翻找（`proxy_*` 属中继层，`zen_*` 属 zen 上游，`node*` 属节点出口，以此类推）。
+
 ```
-├── main.go                    入口与 CLI 参数
+├── cmd/
+│   └── cline-proxy/            入口包：CLI 参数、桌面/托盘模式、平台差异
+│       ├── main.go             main()、runDesktop、buildAndStart
+│       ├── main_windows.go     Windows 专用：回挂父控制台、失败弹窗
+│       ├── main_other.go       其它平台占位实现
+│       └── rsrc_windows_amd64.syso  编译期嵌入的图标/清单资源
 ├── internal/
-│   ├── app/
-│   │   ├── proxy.go           HTTP 路由、协议转换、账号池调用与故障转移
-│   │   ├── adapters.go        cline/zen Provider 适配器 + 网关组装
-│   │   ├── clinepass.go       ClinePass 三协议 handler + admin API
-│   │   ├── zen.go             zen 上游、三态路由、限流状态机
-│   │   ├── proxy_pool.go      出口代理选择、冷却、按模型选路
-│   │   ├── nodes.go           vmess/vless/trojan/ss/hy2/tuic 节点出口（内嵌 sing-box）
-│   │   ├── model_region.go    地区受限模型的节点校验与标记
-│   │   ├── sub.go             订阅抓取、解析、缓存
+│   ├── app/                    网关主体（HTTP 面 + 上游编排）
+│   │   ├── proxy.go            监听启动、健康信息、入站体限制、进程级状态
+│   │   ├── proxy_cline.go      Cline 池上游调用、账号轮换与故障转移
+│   │   ├── proxy_stream.go     流式/非流式中继与 usage 采集
+│   │   ├── proxy_http.go       CORS、路由标记、JSON 响应工具
+│   │   ├── proxy_sanitize.go   控制字符清洗（流式/非流式共用的坏 JSON 门卫）
+│   │   ├── proxy_log.go        主日志与流式诊断日志、日志轮转
+│   │   ├── proxy_lifecycle.go  优雅退出与后台收口
+│   │   ├── proxy_util.go       端口占用、进程名、时延解析等工具
+│   │   ├── proxy_pool.go       出口代理选择、冷却、按模型选路
+│   │   ├── anthropic.go        Anthropic Messages ↔ OpenAI 双向转换与流式桥接
+│   │   ├── protocol_normalize.go  chunk 归一化、tool_call 修复、内容清洗
+│   │   ├── zen.go              zen 模型目录、三态路由与配置结构
+│   │   ├── zen_call.go         zen 上游调用与错误映射
+│   │   ├── zen_state.go        限流熔断状态机（并发信号量/半开探测）
+│   │   ├── zen_config_store.go zen 配置读写与校验
+│   │   ├── zen_models.go       免费模型目录同步
+│   │   ├── zen_responses.go    仅支持 Responses 的模型：自适应学习与名单
+│   │   ├── zen_responses_convert.go chat ↔ Responses 请求/响应/流转换
+│   │   ├── zen_responses_quirks.go muse-spark 配额、reasoning 预算、回退
 │   │   ├── providers_config.go  通用 Provider 配置与运行时注册表
 │   │   ├── providers_catalog.go 目录拉取与免费模型判定
-│   │   ├── providers_chat.go    通用 Provider 请求转发与聊天入口
-│   │   ├── thought_signature.go Gemini thought-signature 缓存与回填
-│   │   ├── gemini_quota.go      Gemini 配额语义与永久拒绝判定
-│   │   ├── compact.go         opencode 官方摘要压缩机制移植
-│   │   ├── responses.go       /v1/responses 转换
-│   │   ├── models.go          Cline 官方免费模型同步
-│   │   ├── pool.go            账号池管理与持久化
-│   │   ├── logs.go            请求日志与过滤
-│   │   ├── stats.go           token 统计与 JSONL 日志
-│   │   ├── admin.go           管理后台 REST API
-│   │   ├── admin_zen.go       zen 管理页面与 API
-│   │   ├── admin_providers.go 通用 Provider 管理 API
-│   │   ├── admin_html.go      管理后台页面
-│   │   ├── tray_windows.go    系统托盘（Windows）
-│   │   ├── tray_other.go      托盘占位（其他平台）
-│   │   └── types.go           数据结构
-│   ├── providers/
-│   │   ├── provider.go        Provider 接口与类型
-│   │   ├── router.go          按注入的分类函数路由分发
-│   │   └── clinepass.go       ClinePass key 池（轮询/冷却/恢复）
-│   ├── protocol/
-│   │   ├── streaming.go       SSE 扫描、空 choices 兜底
-│   │   ├── normalize.go       OpenAI chunk 归一化
-│   │   ├── openai_anthropic.go Anthropic ↔ OpenAI 转换
-│   │   └── responses_chat.go  Responses ↔ Chat 转换
-│   ├── cline/                 WorkOS OAuth、token 刷新
-│   └── kit/                   HTTP 客户端、路径解析、身份轮换
-├── Dockerfile
-├── docker-compose.yml
-├── go.mod
-└── override.md                可选的系统提示词覆盖
+│   │   ├── providers_chat.go    通用 Provider 请求转发
+│   │   ├── adapters.go         cline/zen Provider 适配器 + 网关组装
+│   │   ├── clinepass.go        ClinePass 三协议 handler
+│   │   ├── pool.go             账号池管理与持久化
+│   │   ├── nodes.go            节点出口（内嵌 sing-box）编排
+│   │   ├── node_*.go           节点解析/探测/健康/过滤/端口流量/视图
+│   │   ├── sub.go              订阅抓取、解析、缓存
+│   │   ├── routing_chain.go    候选链解析
+│   │   ├── routing_dispatch.go 选路与派发
+│   │   ├── exit_*.go           出口折叠、地区判定、出口选路
+│   │   ├── stream_*.go         SSE 保活心跳、空闲中断、早断守卫
+│   │   ├── json_to_sse.go      NDJSON / 完整 JSON → SSE 合成
+│   │   ├── admin.go            管理后台路由注册与页面出口
+│   │   ├── admin_accounts.go   账号/OAuth/导入导出 API
+│   │   ├── admin_config.go     网关配置与 key 管理 API
+│   │   ├── admin_logs.go       请求日志与统计 API
+│   │   ├── admin_nodes.go      节点黑名单与健康 API
+│   │   ├── admin_{zen,router,providers}.go  各页面专属 API
+│   │   ├── compact.go          opencode 官方摘要压缩机制移植
+│   │   ├── responses.go        /v1/responses 转换
+│   │   ├── models.go           Cline 官方免费模型同步
+│   │   ├── model_region.go     地区受限模型的节点校验与标记
+│   │   ├── thought_signature.go / gemini_quota.go  Gemini 适配
+│   │   ├── logs.go / log_rotate.go / stats.go / usage.go  日志、轮转、统计
+│   │   ├── tray_windows.go / tray_other.go  系统托盘
+│   │   └── types.go            数据结构
+│   ├── webui/                  管理后台整页资产（HTML/CSS/JS 原始字符串常量）
+│   │   ├── page_shell.go       框架/样式/导航 + 仪表盘 + 供应商管理页
+│   │   ├── page_router.go      自动路由页（含路由预演）
+│   │   ├── page_settings_logs.go 设置页 + 请求日志页
+│   │   └── script_*.go         面板脚本（core/accounts/logs/config/providers/router）
+│   ├── app/translate_registry/ 请求体转换注册表 + 出站体形态不变量校验（生产使用）
+│   ├── providers/              Provider 接口、按注入分类函数路由、ClinePass key 池
+│   ├── protocol/               SSE 扫描、chunk 归一化、跨协议转换
+│   ├── translate/              OmniRoute 协议互转实现（批次⑤预铺，尚未接线）
+│   ├── cline/                  WorkOS OAuth、token 刷新
+│   └── kit/                    HTTP 客户端、路径解析、身份轮换、原子写文件
+├── assets/                     图标源文件
+├── scripts/                    开发脚本（渲染冒烟测试、GitHub SSH 配置）
+├── docs/
+│   ├── reports/                历次审计/评审报告
+│   └── superpowers/            设计与实施计划（plans / specs）
+├── dist/                       构建产物（gitignore）
+├── Dockerfile / docker-compose.yml
+├── AGENTS.md / NOTICE / README.md
+└── go.mod / go.sum
 ```
+
+> `internal/app/translate_registry`（转换注册表 + 出站体校验，**生产使用**，由
+> `zen_call.go` / `zen_responses.go` 消费）与 `internal/translate`（协议互转实现，
+> **待接线**）职责不同且已按职责命名区分，改动前先确认导入的是哪一个。
+
+### 环境变量
+
+| 变量 | 作用 |
+|---|---|
+| `CLINE_PROXY_ALLOW_PRIVATE_UPSTREAM=1` | 允许把**私网/回环地址**配为上游（本机或内网跑 Ollama / LM Studio / vLLM 等）。默认拦截以防 SSRF；链路本地与云元数据地址（`169.254.169.254` 等）即使设了该变量也仍然拦截 |
+| `CLINE_PROXY_SKIP_NODEBOX=1` | 测试专用：不实例化真实 sing-box（避开其内部竞态） |
 
 运行时数据在 `data/`（首次使用时生成）：
 
@@ -391,6 +421,7 @@ curl -s http://127.0.0.1:3457/health
 | `requests.jsonl` | 请求日志 |
 | `zen-stats.jsonl` | token 统计 |
 | `cline-proxy.log` | 运行日志 |
+| `override.md` | 可选的系统提示词覆盖 |
 
 ## 开发与构建
 
@@ -453,6 +484,18 @@ git config --global url."ssh://git@ssh.github.com:443/".insteadOf "https://githu
   这类镜像（如 `github.boki.moe`）只代理只读流量的居多，推送以 SSH 为准。
 
 ## 致谢
+
+- [diegosouzapw/OmniRoute](https://github.com/diegosouzapw/OmniRoute)（MIT）—— 本项目的路由/日志/错误规则/协议翻译/SSE 数据处理多处机制以其为参照并做了 Go 侧移植；MIT 版权声明见仓库根目录 `NOTICE`
+
+
+出口选路、节点池与订阅处理的设计参考了以下优秀项目（思路借鉴，代码均为原创实现）：
+
+- [jasonwong1991/easy_proxies](https://github.com/jasonwong1991/easy_proxies) —— sing-box 节点池管理（健康检查/黑名单/GeoIP 路由/订阅热重载）
+- [Resinat/Resin](https://github.com/Resinat/Resin) —— 代理池网关的粘性会话（Sticky Session）
+- [MetaCubeX/mihomo](https://github.com/MetaCubeX/mihomo) —— url-test 选路 + tolerance 防抖
+- [nadoo/glider](https://github.com/nadoo/glider) —— 多策略转发与健康检查
+- [sub-store-org/Sub-Store](https://github.com/sub-store-org/Sub-Store) —— 订阅处理管线
+自动分流到四类上游，对外同时提供 OpenAI、Anthropic、OpenAI Responses 三种协议接口，内置中文管理后台。
 
 - [YuJunZhiXue/Cline-proxy](https://github.com/YuJunZhiXue/Cline-proxy) — 项目基座
 - [defyma/cline-proxy](https://github.com/defyma/cline-proxy) — SSE 空 choices 兜底思路

@@ -1,4 +1,4 @@
-package translate
+package translate_registry
 
 import "testing"
 
@@ -106,5 +106,23 @@ func TestRegisterAndTranslateRequestRoundtrip(t *testing.T) {
 	}
 	if !found {
 		t.Fatalf("RegisteredDirections 缺少注册项: %v", RegisteredDirections())
+	}
+}
+
+// 未注册方向必须原样透传(语义不变), 同时留下"告警一次"的痕迹 —— 审计 P1-6:
+// 静默透传会让漏注册长期无人发现, 但热路径不能每请求刷日志。
+func TestTranslateRequestUnregisteredWarnsOnce(t *testing.T) {
+	from, to := Kind("nope"), Chat // 该方向不会有任何注册, 且不依赖其它用例的注册顺序
+	body := map[string]any{"model": "m", "messages": []any{1}}
+	got := TranslateRequest(from, to, body)
+	if got["messages"] == nil {
+		t.Fatal("未注册方向必须原样返回, 不能清空内容")
+	}
+	if _, ok := warnedUnregistered.Load(key{from, to}); !ok {
+		t.Fatal("未注册方向应被记入告警去重表(只告警一次)")
+	}
+	// 二次调用仍不得改变语义
+	if again := TranslateRequest(from, to, body); again["messages"] == nil {
+		t.Fatal("二次调用同样原样返回")
 	}
 }

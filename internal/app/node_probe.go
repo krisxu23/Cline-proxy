@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"regexp"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -21,8 +22,9 @@ import (
 // 使用。链式前置(chain relay)是 CI 特有的(模拟用户 v2rayN 链式), 运行时不做。
 //
 // 四关对应 freesub 的 test_single_node:
-//   1. 活性探测: 分层超时(generate_204 首击 12s / 重试 4s), 任一成功即活
-//   2. 出口 IP: 多路 IP 情报 API(ip.sb / ipinfo.io / ip-api.com), 取第一成功
+//   1. 活性探测: 三权威源并发(gstatic 明文 204 / CF 204 / Apple  captive 200),
+//      任一成功即活, 延迟取最快成功者
+//   2. 出口 IP: 三路 IP 情报 API 并发, 国家码少数服从多数投票, 附带信息取多数票源
 //   3. 测速断流: Cloudflare 限时下载(5s 预算, 70KB/s 阈值, 3s 空闲=断流)
 //   4. MITM 检测: TLS 证书链验证 + Cloudflare trace warp=on 套壳识别
 // ============================================================================
@@ -31,8 +33,8 @@ import (
 
 const (
 	// 活性探测
-	nodeProbeTimeout      = 12 * time.Second // 首击宽超时, 容纳慢启动节点
-	nodeProbeRetryTimeout = 4 * time.Second  // 重试窄超时, 死节点快速放弃
+	nodeProbeTimeout      = 12 * time.Second // 单源宽超时, 容纳慢启动节点
+	nodeProbeRetryTimeout = 4 * time.Second  // MITM/WARP 复核窄超时, 死节点快速放弃
 
 	// 测速
 	nodeSpeedBudget      = 5.0   // 测速时间预算(秒)
@@ -44,15 +46,24 @@ const (
 	nodeIPEchoTimeout = 8 * time.Second
 
 	// 并发: checkAllNodeHealth 按节点规模放大, 基数 nodeTestWorkers, 上限 nodeTestMaxWorkers
-	nodeTestWorkers    = 10
-	nodeTestMaxWorkers = 48
+	nodeTestWorkers    = 32
+	nodeTestMaxWorkers = 128
 )
 
-// 活性探测 URL(freesub LIVENESS_URLS, 全部要求代理链路完整)
+// 活性探测 URL(三权威 captive-portal 探测源, 并发取最快成功):
+//   - gstatic 明文 generate_204: 经典探测, 回 204 即链路通(明文是故意的,
+//     探测体本身不含任何敏感信息, 且 captive 门户只劫持明文)
+//   - Cloudflare generate_204: 第二独立源, 回 204 即活
+//   - Apple captive: 回 200(体为 Success 文本, 只认状态码不校验体)即活
 var nodeLivenessURLs = []string{
-	"https://www.gstatic.com/generate_204",
-	"https://gstatic.com/generate_204",
+	"http://www.gstatic.com/generate_204",
+	"https://cp.cloudflare.com/generate_204",
+	"https://captive.apple.com",
 }
+
+// nodeMITMURL MITM 复核专用: 必须走 HTTPS 才能验证 TLS 证书链,
+// 不能复用上面的明文 gstatic 源。
+const nodeMITMURL = "https://www.gstatic.com/generate_204"
 
 // 出口 IP 情报 URL(freesub IP_ECHO_URLS, 多路冗余)
 var nodeIPEchoURLs = []string{
@@ -135,76 +146,16 @@ func testNodeComprehensive(key string) nodeTestResult {
 		Timeout:   nodeProbeTimeout + nodeProbeRetryTimeout + 10*time.Second,
 	}
 
-	// === 1) 活性探测: 分层超时 ===
-	t0 := time.Now()
-	for i, u := range nodeLivenessURLs {
-		timeout := nodeProbeTimeout
-		if i > 0 {
-			timeout = nodeProbeRetryTimeout
-		}
-		ctx, cancel := context.WithTimeout(context.Background(), timeout)
-		req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
-		if err != nil {
-			cancel()
-			continue
-		}
-		req.Header.Set("User-Agent", "Go-http-client/2.0")
-		resp, err := client.Do(req)
-		if err == nil {
-			resp.Body.Close()
-		}
-		cancel()
-		if err == nil {
-			if resp.StatusCode == http.StatusNoContent || resp.StatusCode == http.StatusOK {
-				result.Alive = true
-				result.LatencyMs = time.Since(t0).Milliseconds()
-				break
-			}
-		}
-	}
-	if !result.Alive {
+	// === 1) 活性探测: 三权威源并发, 任一成功即活 ===
+	if lat, ok := probeNodeLiveness(client); ok {
+		result.Alive = true
+		result.LatencyMs = lat
+	} else {
 		return result
 	}
 
-	// === 2) 出口 IP 检测(多路冗余) ===
-	for _, u := range nodeIPEchoURLs {
-		ctx, cancel := context.WithTimeout(context.Background(), nodeIPEchoTimeout)
-		req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
-		if err != nil {
-			cancel()
-			continue
-		}
-		resp, err := client.Do(req)
-		if err != nil {
-			cancel()
-			continue
-		}
-		body, readErr := io.ReadAll(io.LimitReader(resp.Body, 64<<10))
-		resp.Body.Close()
-		cancel()
-		if readErr != nil || resp.StatusCode != http.StatusOK {
-			continue
-		}
-		ip, country, asn, asnOrg, isp := parseIPEcho(u, body)
-		if ip == "" {
-			continue
-		}
-		result.ExitIP = ip
-		result.ExitCountry = country
-		result.ExitASN = asn
-		result.ExitASNorg = truncateStr(asnOrg, 120)
-		result.ExitISP = truncateStr(isp, 120)
-		// ip-api.com 额外提供 hosting/mobile/proxy 布尔标记, 供分类用
-		if strings.Contains(u, "ip-api.com") {
-			var raw map[string]any
-			if json.Unmarshal(body, &raw) == nil {
-				result.IPAPIHosting, _ = raw["hosting"].(bool)
-				result.IPAPIMobile, _ = raw["mobile"].(bool)
-				result.IPAPIProxy, _ = raw["proxy"].(bool)
-			}
-		}
-		break
-	}
+	// === 2) 出口 IP 检测(三源并发 + 国家码多数投票) ===
+	probeNodeExitInfo(client, &result)
 
 	// === 3) 测速 + 断流检测 ===
 	result.SpeedBPS, result.IsStalled = probeNodeSpeed(client)
@@ -219,12 +170,191 @@ func testNodeComprehensive(key string) nodeTestResult {
 	return result
 }
 
+// --- 活性探测(三权威源并发) ---
+
+// probeNodeLiveness 并发探测三权威 captive 源, 返回 (最快成功延迟ms, 是否存活)。
+// 任一源回 204/200 即活; 三源全失败才判死。各源独立超时互不阻塞, 整体耗时
+// 取决于最快成功者而非最慢源。cancel 发生在各自响应体读尽并 Close 之后,
+// 与 P0 修复(见 testNodeComprehensive 注释)同一规则。
+func probeNodeLiveness(client *http.Client) (int64, bool) {
+	t0 := time.Now()
+	type liveResult struct {
+		lat int64
+		ok  bool
+	}
+	// 每个探测 goroutine 必发一条回执(成功或失败), 主循环收齐即判 ——
+	// 旧写法只在成功时发送, 全死时主循环收不到任何回执, 只能等满兜底
+	// 超时才返回(2026-09-16 回归)。
+	ch := make(chan liveResult, len(nodeLivenessURLs))
+	for _, u := range nodeLivenessURLs {
+		go func(url string) {
+			send := func(lat int64, ok bool) {
+				ch <- liveResult{lat: lat, ok: ok}
+			}
+			ctx, cancel := context.WithTimeout(context.Background(), nodeProbeTimeout)
+			defer cancel()
+			req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+			if err != nil {
+				send(0, false)
+				return
+			}
+			req.Header.Set("User-Agent", "Go-http-client/2.0")
+			resp, err := client.Do(req)
+			if err != nil {
+				send(0, false)
+				return
+			}
+			// 只认状态码不读体: 204 空体 / Apple 200 Success 文本都只看码,
+			// 避免体格式漂移误杀。
+			ok := resp.StatusCode == http.StatusNoContent || resp.StatusCode == http.StatusOK
+			resp.Body.Close()
+			if !ok {
+				send(0, false)
+				return
+			}
+			send(time.Since(t0).Milliseconds(), true)
+		}(u)
+	}
+	// 首个成功即返回, 不等慢源; 全失败时收齐三条回执即判死, 不等超时。
+	// 慢源 goroutine 受各自 ctx 超时约束, 最多存活 nodeProbeTimeout 后自行
+	// 退出, 发送时 channel 带缓冲不会阻塞, 不泄漏。
+	for range nodeLivenessURLs {
+		if r := <-ch; r.ok {
+			return r.lat, true
+		}
+	}
+	return 0, false
+}
+
 // --- 出口 IP 解析 ---
+
+// exitVote 单源的解析结果(供投票用)。
+type exitVote struct {
+	ip, country     string
+	asn             int64
+	asnOrg, isp     string
+	hosting, mobile bool
+	proxy           bool
+	hasNetFlags     bool // 是否携带 hosting/mobile/proxy 标记(ip-api.com 专有)
+}
+
+// probeNodeExitInfo 并发查询三路 IP 情报, 国家码少数服从多数后写入 result:
+// 三票一致取该地区; 两票一致取多数票; 三票各异或有效票为零归空(调用方按
+// other 处理)。ASN/ISP/出口IP 取多数票源, 持平时取先返回者。
+func probeNodeExitInfo(client *http.Client, result *nodeTestResult) {
+	type indexed struct {
+		v exitVote
+	}
+	ch := make(chan indexed, len(nodeIPEchoURLs))
+	var wg sync.WaitGroup
+	for _, u := range nodeIPEchoURLs {
+		wg.Add(1)
+		go func(url string) {
+			defer wg.Done()
+			ctx, cancel := context.WithTimeout(context.Background(), nodeIPEchoTimeout)
+			req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+			if err != nil {
+				cancel()
+				return
+			}
+			resp, err := client.Do(req)
+			if err != nil {
+				cancel()
+				return
+			}
+			body, readErr := io.ReadAll(io.LimitReader(resp.Body, 64<<10))
+			resp.Body.Close()
+			cancel()
+			if readErr != nil || resp.StatusCode != http.StatusOK {
+				return
+			}
+			ip, country, asn, asnOrg, isp := parseIPEcho(url, body)
+			if ip == "" {
+				return
+			}
+			v := exitVote{
+				ip:      ip,
+				country: strings.ToUpper(strings.TrimSpace(country)),
+				asn:     asn,
+				asnOrg:  truncateStr(asnOrg, 120),
+				isp:     truncateStr(isp, 120),
+			}
+			// ip-api.com 额外提供 hosting/mobile/proxy 布尔标记, 供分类用
+			if strings.Contains(url, "ip-api.com") {
+				var raw map[string]any
+				if json.Unmarshal(body, &raw) == nil {
+					v.hosting, _ = raw["hosting"].(bool)
+					v.mobile, _ = raw["mobile"].(bool)
+					v.proxy, _ = raw["proxy"].(bool)
+					v.hasNetFlags = true
+				}
+			}
+			ch <- indexed{v: v}
+		}(u)
+	}
+	go func() {
+		wg.Wait()
+		close(ch)
+	}()
+	var votes []exitVote
+	for it := range ch {
+		votes = append(votes, it.v)
+	}
+	if len(votes) == 0 {
+		return
+	}
+	// 国家码计票(空国家码不计票, 但该票的 IP/ASN 仍可作为附带信息候选)。
+	counts := map[string]int{}
+	for _, v := range votes {
+		if v.country != "" {
+			counts[v.country]++
+		}
+	}
+	winner, best := "", 0
+	tie := false
+	for cc, n := range counts {
+		if n > best {
+			best, winner, tie = n, cc, false
+		} else if n == best {
+			tie = true
+		}
+	}
+	// 三票各异(best==1 且票数>1)或零有效票 → 无胜者, 地区留空归 other。
+	if winner == "" || (tie && best == 1 && len(counts) > 1) {
+		// 地区无法判定, 但出口 IP 仍有价值(去重折叠/面板展示用): 取首票。
+		result.ExitIP = votes[0].ip
+		result.ExitASN = votes[0].asn
+		result.ExitASNorg = votes[0].asnOrg
+		result.ExitISP = votes[0].isp
+		return
+	}
+	result.ExitCountry = winner
+	// 附带信息取"投给胜者且最先返回"的那票, 找不到则取首票。
+	chosen := votes[0]
+	for _, v := range votes {
+		if v.country == winner {
+			chosen = v
+			break
+		}
+	}
+	result.ExitIP = chosen.ip
+	result.ExitASN = chosen.asn
+	result.ExitASNorg = chosen.asnOrg
+	result.ExitISP = chosen.isp
+	if chosen.hasNetFlags {
+		result.IPAPIHosting = chosen.hosting
+		result.IPAPIMobile = chosen.mobile
+		result.IPAPIProxy = chosen.proxy
+	}
+}
 
 var asnRegexp = regexp.MustCompile(`^AS(\d+)\s+(.*)`)
 
-// parseIPEcho 解析 IP 情报 API 响应, 返回 (ip, country, asn, asnOrg, isp)
+// parseIPEcho 解析 IP 情报 API 响应, 返回 (ip, country, asn, asnOrg, isp)。
+// 按响应体的字段形状识别格式, 不依赖请求 URL —— 三源并发投票与本地测试桩
+// 的 URL 都不是官方域名, 按 URL 前缀分支会把有效响应判废(2026-09-16 回归)。
 func parseIPEcho(url string, body []byte) (string, string, int64, string, string) {
+	_ = url // 保留签名兼容旧单源调用; 格式识别只看字段
 	var j map[string]any
 	if err := json.Unmarshal(body, &j); err != nil {
 		return "", "", 0, "", ""
@@ -235,43 +365,36 @@ func parseIPEcho(url string, body []byte) (string, string, int64, string, string
 		return "", "", 0, "", ""
 	}
 
-	var country string
+	// 国家码: ip.sb(country_code) / ip-api(countryCode) / ipinfo(country, 小写)
+	country := stringFromMap(j, "country_code", "countryCode", "country")
+	country = strings.ToUpper(strings.TrimSpace(country))
+
 	var asn int64
 	var asnOrg, isp string
 
-	switch {
-	case strings.HasPrefix(url, "https://api.ip.sb"):
-		country = stringFromMap(j, "country_code")
-		if v, ok := j["asn"]; ok {
-			if f, ok := v.(float64); ok {
-				asn = int64(f)
+	// ASN: ip.sb 直接给数字 asn; ipinfo/ip-api 藏在 "AS1234 ORG" 字符串里
+	if v, ok := j["asn"]; ok {
+		if f, ok := v.(float64); ok {
+			asn = int64(f)
+		}
+	}
+	if asn == 0 {
+		for _, k := range []string{"as", "org"} {
+			if s := stringFromMap(j, k); s != "" {
+				if m := asnRegexp.FindStringSubmatch(s); m != nil {
+					fmt.Sscanf(m[1], "%d", &asn)
+					if asnOrg == "" {
+						asnOrg = m[2]
+					}
+					break
+				}
 			}
 		}
-		asnOrg = stringFromMap(j, "asn_organization", "organization")
-		isp = stringFromMap(j, "isp", "organization")
-	case strings.HasPrefix(url, "https://ipinfo.io"):
-		country = stringFromMap(j, "country")
-		if country != "" {
-			country = strings.ToUpper(country)
-		}
-		org := stringFromMap(j, "org")
-		if m := asnRegexp.FindStringSubmatch(org); m != nil {
-			fmt.Sscanf(m[1], "%d", &asn)
-			asnOrg = m[2]
-		}
-		isp = org
-	case strings.Contains(url, "ip-api.com"):
-		country = stringFromMap(j, "countryCode")
-		if country != "" {
-			country = strings.ToUpper(country)
-		}
-		asStr := stringFromMap(j, "as")
-		if m := asnRegexp.FindStringSubmatch(asStr); m != nil {
-			fmt.Sscanf(m[1], "%d", &asn)
-			asnOrg = m[2]
-		}
-		isp = stringFromMap(j, "isp", "org")
 	}
+	if asnOrg == "" {
+		asnOrg = stringFromMap(j, "asn_organization", "organization", "org")
+	}
+	isp = stringFromMap(j, "isp", "organization", "org")
 
 	return ip, country, asn, asnOrg, isp
 }
@@ -354,12 +477,12 @@ func probeNodeSpeed(client *http.Client) (int64, bool) {
 
 // --- MITM + WARP 检测 ---
 
-// probeMITM 经代理访问 gstatic generate_204 并验证 TLS 证书链。
+// probeMITM 经代理访问 gstatic generate_204(HTTPS)并验证 TLS 证书链。
 // 证书验证失败 = 中间人劫持; 异常状态码(重定向/403/407/5xx) = 可能被劫持。
 func probeMITM(client *http.Client) bool {
 	ctx, cancel := context.WithTimeout(context.Background(), nodeProbeRetryTimeout)
 	defer cancel()
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, nodeLivenessURLs[0], nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, nodeMITMURL, nil)
 	if err != nil {
 		return false
 	}

@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"net"
 	"net/url"
+	"os"
 	"strings"
 )
 
@@ -17,11 +18,21 @@ import (
 // 于是 http://169.254.169.254/latest/meta-data/ 这类云元数据地址可以被直接
 // 填进配置, 让网关服务端替攻击者去取 —— 在云主机上部署时会泄露实例凭据。
 //
-// 这里刻意**不**禁止回环与私网地址: 在本机或局域网跑 Ollama / LM Studio /
-// vLLM 再挂到这个网关上是很常见的用法, 一刀切会直接误伤真实需求。所以只封掉
-// 不存在合法上游用途的那一类目标: 链路本地网段(含 169.254.169.254 元数据)、
-// 未指定地址、以及已知的元数据主机名。
+// 这里对**链路本地/未指定/元数据主机名**永远拦截(不存在合法上游用途);
+// 对**私网与回环**默认也拦截(审计 P3-10: 否则网关等于一台内网探测器),
+// 但在本机或局域网跑 Ollama / LM Studio / vLLM 的用户可以用
+// CLINE_PROXY_ALLOW_PRIVATE_UPSTREAM=1 显式放开 —— 一刀切会误伤真实需求,
+// 但"默认放开"又不该是安全默认值。
 // ============================================================================
+
+// AllowPrivateUpstreamEnv 放开私网/回环上游的环境变量(取值 1/true/yes)。
+const AllowPrivateUpstreamEnv = "CLINE_PROXY_ALLOW_PRIVATE_UPSTREAM"
+
+// privateUpstreamAllowed 是否允许把私网/回环地址当作上游。
+func privateUpstreamAllowed() bool {
+	v := strings.TrimSpace(os.Getenv(AllowPrivateUpstreamEnv))
+	return v == "1" || strings.EqualFold(v, "true") || strings.EqualFold(v, "yes")
+}
 
 // blockedOutboundHosts 已知的云元数据主机名。
 var blockedOutboundHosts = map[string]bool{
@@ -51,35 +62,48 @@ func validateOutboundURL(raw string) error {
 	if u.Hostname() == "" {
 		return fmt.Errorf("地址缺少主机名: %q", raw)
 	}
-	if isBlockedOutboundHost(u.Hostname()) {
-		return fmt.Errorf("目标地址被拒绝（链路本地 / 云元数据地址不允许作为上游）: %q", raw)
+	if reason := blockedOutboundReason(u.Hostname()); reason != "" {
+		return fmt.Errorf("目标地址被拒绝（%s）: %q", reason, raw)
 	}
 	return nil
 }
 
-// isBlockedOutboundHost 主机名是否为不允许的出站目标。
-func isBlockedOutboundHost(host string) bool {
+// blockedOutboundReason 返回该主机被拒的原因; 允许时返回空串。
+func blockedOutboundReason(host string) string {
 	host = strings.TrimSuffix(strings.ToLower(strings.TrimSpace(host)), ".")
 	if blockedOutboundHosts[host] {
-		return true
+		return "云元数据主机名不允许作为上游"
 	}
 	ip := net.ParseIP(host)
 	if ip == nil {
-		return false
+		return ""
 	}
 	// 169.254.0.0/16 与 fe80::/10: 链路本地, 云元数据服务就在这一段。
 	if ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() {
-		return true
+		return "链路本地地址 / 云元数据地址不允许作为上游"
 	}
 	// 0.0.0.0 / :: —— 语义上不是"某个上游", 只会带来歧义。
 	if ip.IsUnspecified() {
-		return true
+		return "未指定地址(0.0.0.0/::)不是有效的上游"
 	}
 	// 100.64.0.0/10: 运营商级 NAT 保留段, 不可能是用户自己的上游。
 	if ip4 := ip.To4(); ip4 != nil && ip4[0] == 100 && ip4[1] >= 64 && ip4[1] <= 127 {
-		return true
+		return "运营商级 NAT 保留段不是有效的上游"
 	}
-	return false
+	if !privateUpstreamAllowed() {
+		if ip.IsLoopback() {
+			return "回环地址默认不允许作为上游（本机自建上游请设 " + AllowPrivateUpstreamEnv + "=1）"
+		}
+		if ip.IsPrivate() {
+			return "私网地址默认不允许作为上游（内网自建上游请设 " + AllowPrivateUpstreamEnv + "=1）"
+		}
+	}
+	return ""
+}
+
+// isBlockedOutboundHost 主机名是否为不允许的出站目标。
+func isBlockedOutboundHost(host string) bool {
+	return blockedOutboundReason(host) != ""
 }
 
 // filterOutboundURLs 逐条校验并归一化(去空白、去尾部斜杠)。
