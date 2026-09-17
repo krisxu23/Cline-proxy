@@ -1,26 +1,22 @@
 package app
 
-// 照抄 OmniRoute open-sse/utils/opencodeHeaders.ts（146 行）
-// + executors/opencode.ts:736-789 的合成 CLI 身份逻辑。
+// opencode CLI 身份头 —— 以官方源码为准(sst/opencode
+// packages/opencode/src/session/llm/request.ts:prepare),
+// providerID 以 "opencode" 开头时官方客户端必带:
 //
-// ── 为什么照抄（用户定位 + 参考实证）────────────────────────────
-// opencode 免费 tier 的 "can only be used from within OpenCode" 拒绝字面来自
-// Console 后端，但它前面的 Cloudflare 风控靠的是**请求的 opencode CLI 身份头**
-// 判 "from OpenCode"：非 CLI 形态的 UA + 缺失 x-opencode-project / client 值错
-// 会让数据中心出口被 FreeUsageLimitError 拒绝（参考 opencode.ts #5997 附注）。
-// 我方旧实现(zen_call.go:154-160)用 FreshZenIdentity 随机合成
-// `opencode/latest/x/cli` UA + `x-opencode-client: cli`，既没有 project、session
-// 也不是确定性指纹 —— 与真实 opencode CLI 发的完全对不上，被识别为仿冒。
+//	"User-Agent":      "opencode/<InstallationVersion>"(如 opencode/1.18.31)
+//	"x-opencode-client":  flags.client(OPENCODE_CLIENT, 默认 "cli")
+//	"x-opencode-project": 真实项目 ID(prj_…)
+//	"x-opencode-session": 真实会话 ID(ses_…)
+//	"x-opencode-request": 真实用户 ID(usr_…)
 //
-// 逐字照抄以下语义（opencodeHeaders.ts + opencode.ts:744-789）：
-//   - UA 默认 "opencode"（配置可覆盖）；客户端 UA 若不是 opencode-cli/ 形态
-//     则**替换**成 CLI UA（参考 #5997/#10229：数据中心 IP + 通用 UA 被拒）
-//   - x-opencode-client 默认 "desktop"（真实桌面客户端，非 "cli"）
-//   - x-opencode-project 默认 "global"
-//   - x-opencode-session 用请求体(model/system/首条user/tools)的确定性哈希，
-//     同会话请求命中同 session → 上游 prompt cache 命中（参考 generateSessionId）
-//   - 转发客户端自己的 x-opencode-* / x-session-id / x-title（客户端值优先）
-//   - Muse/Responses 端点要求 session 是 UUID 形态（scoped workaround, :779-789）
+// 实证(2026-09-17, 直连上游): 伪造但结构合法的 ses_/usr_/prj_ ID +
+// UA opencode/1.18.31 + client cli → mimo-v2.5-free 200;
+// 去掉 x-opencode-* 头 → 同一请求 403 FreeTierError。
+// 旧实现(bare "opencode" UA / client desktop / project global / UUID session)
+// 与官方形态完全对不上, 门禁收紧后一律被拒。
+//
+// ID 结构照抄官方 id.ts:create: prefix + "_" + 6 字节时间(hex) + 14 位 base62。
 
 import (
 	"crypto/rand"
@@ -28,13 +24,86 @@ import (
 	"encoding/hex"
 	"sort"
 	"strings"
+	"sync"
+	"time"
 )
 
-// opencodeCliDefaults 对位 opencode.ts:744-757 的 cliDefaults。
+// opencodeClientVersion 官方客户端版本(UA 用)。上游可能校验版本新旧,
+// opencode 发版后若又出现 FreeTierError, 先把这里跟到最新再查别的。
+const opencodeClientVersion = "1.18.31"
+
+// opencodeCliDefaults 默认 CLI 身份(UA/client/project)。
 type opencodeCliDefaults struct {
 	userAgent string
 	client    string
 	project   string
+}
+
+// defaultOpencodeIdentity 官方形态的默认身份: UA 带版本、client cli、
+// project 为进程内稳定的伪造 prj_ ID(官方是真实项目 ID, 网关没有项目概念,
+// 用稳定伪造值; 实测可通过门禁)。
+func defaultOpencodeIdentity() *opencodeCliDefaults {
+	return &opencodeCliDefaults{
+		userAgent: "opencode/" + opencodeClientVersion,
+		client:    "cli",
+		project:   gatewayProjectID(),
+	}
+}
+
+var (
+	gatewayIDsOnce sync.Once
+	gatewayIDs     struct{ project, user string }
+)
+
+// gatewayIDsInit 进程内稳定的伪造身份: project(prj_)与 user(usr_) 在官方
+// 客户端里都是稳定值(项目/账号), 网关同样全进程复用同一对。
+func gatewayIDsInit() {
+	gatewayIDs.project = forgeOpencodeID("prj", nil)
+	gatewayIDs.user = forgeOpencodeID("usr", nil)
+}
+
+func gatewayProjectID() string {
+	gatewayIDsOnce.Do(gatewayIDsInit)
+	return gatewayIDs.project
+}
+
+func gatewayUserID() string {
+	gatewayIDsOnce.Do(gatewayIDsInit)
+	return gatewayIDs.user
+}
+
+const opencodeBase62 = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
+
+// forgeOpencodeID 伪造官方结构 ID: prefix + "_" + 6 字节时间 hex + 14 位 base62。
+// seed 为 nil 时后缀随机; 非 nil 时后缀由 seed 确定性派生(同输入同 ID)。
+func forgeOpencodeID(prefix string, seed []byte) string {
+	var timeBytes [6]byte
+	now := uint64(time.Now().UnixMilli()) * 0x1000
+	if seed != nil {
+		// 确定性会话需要"时间戳看起来新鲜 + 后缀稳定": 时间取当日 UTC 零点,
+		// 同一天同会话同 ID, 既过"新鲜"检查又命中上游 prompt cache。
+		dayStart := time.Now().UTC().Truncate(24 * time.Hour).UnixMilli()
+		now = uint64(dayStart) * 0x1000
+	}
+	for i := 0; i < 6; i++ {
+		timeBytes[i] = byte(now >> (40 - 8*i))
+	}
+	suffix := make([]byte, 14)
+	if seed == nil {
+		var rb [14]byte
+		if _, err := rand.Read(rb[:]); err != nil {
+			return ""
+		}
+		for i := range suffix {
+			suffix[i] = opencodeBase62[rb[i]%62]
+		}
+	} else {
+		sum := sha256.Sum256(seed)
+		for i := range suffix {
+			suffix[i] = opencodeBase62[sum[i]%62]
+		}
+	}
+	return prefix + "_" + hex.EncodeToString(timeBytes[:]) + string(suffix)
 }
 
 // opencodeHeaderKeys 照抄 OPENCODE_HEADER_KEYS（opencodeHeaders.ts:9-14）。
@@ -56,7 +125,7 @@ var opencodeAgentMetaKeys = []string{"x-session-id", "x-title"}
 //	bodyFingerprint: {model, system, firstUser, tools} 生成确定性 session, nil 时用随机 UUID
 func applyOpencodeHeaders(outbound map[string]string, clientHeaders map[string]string, identity *opencodeCliDefaults, bodyFingerprint *opencodeBodyFingerprint) {
 	if identity == nil {
-		identity = &opencodeCliDefaults{userAgent: "opencode", client: "desktop", project: "global"}
+		identity = defaultOpencodeIdentity()
 	}
 	// 1. User-Agent: 客户端有则先用; 非 CLI UA 会被替换(下面 applyCliDefaults 处理)
 	for _, ua := range []string{headerMapValue(clientHeaders, "User-Agent"), headerMapValue(clientHeaders, "user-agent")} {
@@ -90,31 +159,26 @@ func applyOpencodeHeaders(outbound map[string]string, clientHeaders map[string]s
 		outbound["x-opencode-project"] = identity.project
 	}
 	if outbound["x-opencode-request"] == "" {
-		outbound["x-opencode-request"] = randomUUID()
+		outbound["x-opencode-request"] = gatewayUserID()
 	}
 	if outbound["x-opencode-session"] == "" {
 		outbound["x-opencode-session"] = genOpencodeSessionID(bodyFingerprint)
 	}
 }
 
-// opencodeBodyFingerprint 供 session 指纹用的请求体字段(参考 sessionBody)。
+// opencodeBodyFingerprint 供 session 指纹用的请求体字段。
 type opencodeBodyFingerprint struct {
 	model     string
 	system    string
 	firstUser string
 	toolNames []string
-	forceUUID bool // Muse/Responses 端点强制 UUID session(参考 :781-789)
 }
 
-// genOpencodeSessionID 照抄 generateSessionId(sessionManager.ts:103-145)。
-// 顺序: model → system hash → 首条 user hash → tools(排序)hash, sha256[:16]。
-// fp 为 nil / fingerprint 无分片时回退随机 UUID(参考 :144-145 的 || randomUUID())。
+// genOpencodeSessionID 生成官方 ses_ 形态 session。
+// 有指纹时确定性派生(同会话同 ID, 命中上游 prompt cache), 无指纹时随机。
 func genOpencodeSessionID(fp *opencodeBodyFingerprint) string {
-	if fp != nil && fp.forceUUID {
-		return randomUUID()
-	}
 	if fp == nil {
-		return randomUUID()
+		return forgeOpencodeID("ses", nil)
 	}
 	var parts []string
 	if fp.model != "" {
@@ -134,9 +198,10 @@ func genOpencodeSessionID(fp *opencodeBodyFingerprint) string {
 		}
 	}
 	if len(parts) == 0 {
-		return randomUUID()
+		return forgeOpencodeID("ses", nil)
 	}
-	return hash16(strings.Join(parts, "|"))
+	sum := sha256.Sum256([]byte(strings.Join(parts, "|")))
+	return forgeOpencodeID("ses", sum[:])
 }
 
 // hash16 sha256 前 16 位 hex; 空串返回 ""。
@@ -148,13 +213,12 @@ func hash16(s string) string {
 	return hex.EncodeToString(sum[:])[:16]
 }
 
-// bodyFingerprint 从 zen 出站 body 提取 session 指纹所需的字段
-// (对照 opencodeHeaders.ts:764-774 的 sessionBody)。
-func bodyFingerprint(body map[string]any, forceUUID bool) *opencodeBodyFingerprint {
+// bodyFingerprint 从 zen 出站 body 提取 session 指纹所需的字段。
+func bodyFingerprint(body map[string]any) *opencodeBodyFingerprint {
 	if len(body) == 0 {
 		return nil
 	}
-	fp := &opencodeBodyFingerprint{forceUUID: forceUUID}
+	fp := &opencodeBodyFingerprint{}
 	if m, ok := body["model"].(string); ok {
 		fp.model = m
 	}
@@ -249,36 +313,4 @@ func headerMapValue(h map[string]string, name string) string {
 		}
 	}
 	return ""
-}
-
-// randomUUID v4 UUID(参考 crypto.randomUUID)。
-func randomUUID() string {
-	b := make([]byte, 16)
-	if _, err := rand.Read(b); err != nil {
-		return ""
-	}
-	b[6] = (b[6] & 0x0f) | 0x40 // version 4
-	b[8] = (b[8] & 0x3f) | 0x80 // variant 10
-	return formatUUID(b)
-}
-
-func formatUUID(b []byte) string {
-	const hexd = "0123456789abcdef"
-	var out [36]byte
-	idx := 0
-	segs := []int{4, 2, 2, 2, 6}
-	pos := 0
-	for _, n := range segs {
-		for i := 0; i < n; i++ {
-			out[idx] = hexd[b[pos]>>4]
-			out[idx+1] = hexd[b[pos]&0xf]
-			idx += 2
-			pos++
-		}
-		if idx < 36 {
-			out[idx] = '-'
-			idx++
-		}
-	}
-	return string(out[:])
 }

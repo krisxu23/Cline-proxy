@@ -151,9 +151,8 @@ func tryZenResponsesFallback(ctx context.Context, base string, respBody map[stri
 		return nil
 	}
 	outbound := map[string]string{}
-	// /responses 端点要求 session 是 UUID 形态(参考 opencode.ts:779-789 的
-	// Responses workaround), 用 forceUUID 生成。
-	applyOpencodeHeaders(outbound, nil, &opencodeCliDefaults{userAgent: "opencode", client: "desktop", project: "global"}, &opencodeBodyFingerprint{forceUUID: true})
+	// /responses 同样用官方 CLI 身份(ses_ 形态 session, 官方客户端无 UUID 分支)。
+	applyOpencodeHeaders(outbound, nil, defaultOpencodeIdentity(), bodyFingerprint(respBody))
 	req.Header.Set("Authorization", "Bearer "+getZenConfig().Key)
 	req.Header.Set("Content-Type", "application/json")
 	for k, v := range outbound {

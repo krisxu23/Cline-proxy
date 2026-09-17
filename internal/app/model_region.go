@@ -221,7 +221,7 @@ func probeNodeModel(key, modelID string) (regionOK, known bool) {
 	}
 	cfg := getZenConfig()
 	outbound := map[string]string{}
-	applyOpencodeHeaders(outbound, nil, &opencodeCliDefaults{userAgent: "opencode", client: "desktop", project: "global"}, nil)
+	applyOpencodeHeaders(outbound, nil, defaultOpencodeIdentity(), nil)
 	req.Header.Set("Authorization", "Bearer "+cfg.Key)
 	req.Header.Set("Content-Type", "application/json")
 	for k, v := range outbound {

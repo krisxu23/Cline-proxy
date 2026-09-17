@@ -1,30 +1,30 @@
 package app
 
 import (
+	"strings"
 	"testing"
 )
 
-// 照抄 OmniRoute open-sse/utils/opencodeHeaders.ts 的行为级测试。
+// 官方 CLI 身份形态(sst/opencode request.ts:prepare)。
 
 func TestApplyOpencodeHeaders_默认CLI身份(t *testing.T) {
 	out := map[string]string{}
-	applyOpencodeHeaders(out, nil, &opencodeCliDefaults{userAgent: "opencode", client: "desktop", project: "global"}, nil)
-	// UA 默认填 CLI UA
-	if out["User-Agent"] != "opencode" {
-		t.Fatalf("UA 应为 opencode, got %q", out["User-Agent"])
+	applyOpencodeHeaders(out, nil, defaultOpencodeIdentity(), nil)
+	// UA 带官方版本号
+	if out["User-Agent"] != "opencode/"+opencodeClientVersion {
+		t.Fatalf("UA 应为 opencode/<版本>, got %q", out["User-Agent"])
 	}
-	if out["x-opencode-client"] != "desktop" {
-		t.Fatalf("client 应为 desktop, got %q", out["x-opencode-client"])
+	if out["x-opencode-client"] != "cli" {
+		t.Fatalf("client 应为 cli(官方 OPENCODE_CLIENT 默认值), got %q", out["x-opencode-client"])
 	}
-	if out["x-opencode-project"] != "global" {
-		t.Fatalf("project 应为 global, got %q", out["x-opencode-project"])
+	if !strings.HasPrefix(out["x-opencode-project"], "prj_") {
+		t.Fatalf("project 应为 prj_ 形态, got %q", out["x-opencode-project"])
 	}
-	// session/request 缺省时生成
-	if out["x-opencode-session"] == "" {
-		t.Fatal("session 应生成")
+	if !strings.HasPrefix(out["x-opencode-session"], "ses_") {
+		t.Fatalf("session 应为 ses_ 形态, got %q", out["x-opencode-session"])
 	}
-	if out["x-opencode-request"] == "" {
-		t.Fatal("request 应生成")
+	if !strings.HasPrefix(out["x-opencode-request"], "usr_") {
+		t.Fatalf("request 应为 usr_ 形态, got %q", out["x-opencode-request"])
 	}
 }
 
@@ -39,7 +39,7 @@ func TestApplyOpencodeHeaders_客户端头优先(t *testing.T) {
 		"x-title":            "MyClient",
 	}
 	out := map[string]string{}
-	applyOpencodeHeaders(out, client, &opencodeCliDefaults{userAgent: "opencode", client: "desktop", project: "global"}, nil)
+	applyOpencodeHeaders(out, client, defaultOpencodeIdentity(), nil)
 	// 客户端 x-opencode-* 值优先
 	if out["x-opencode-session"] != "client-session" {
 		t.Fatalf("客户端 session 应优先, got %q", out["x-opencode-session"])
@@ -67,9 +67,9 @@ func TestApplyOpencodeHeaders_客户端头优先(t *testing.T) {
 func TestApplyOpencodeHeaders_非CLI_UA被替换(t *testing.T) {
 	client := map[string]string{"User-Agent": "curl/8.5.0"}
 	out := map[string]string{}
-	applyOpencodeHeaders(out, client, &opencodeCliDefaults{userAgent: "opencode", client: "desktop", project: "global"}, nil)
-	if out["User-Agent"] != "opencode" {
-		t.Fatalf("非 CLI UA(curl)应被替换成 opencode, got %q", out["User-Agent"])
+	applyOpencodeHeaders(out, client, defaultOpencodeIdentity(), nil)
+	if out["User-Agent"] != "opencode/"+opencodeClientVersion {
+		t.Fatalf("非 CLI UA(curl)应被替换成官方 UA, got %q", out["User-Agent"])
 	}
 }
 
@@ -86,6 +86,9 @@ func TestGenOpencodeSessionID_确定性(t *testing.T) {
 	if s1 != s2 {
 		t.Fatalf("tools 顺序无关但结果不同: %q vs %q", s1, s2)
 	}
+	if !strings.HasPrefix(s1, "ses_") {
+		t.Fatalf("session 应为 ses_ 形态, got %q", s1)
+	}
 	// 不同内容 → 不同
 	fp3 := &opencodeBodyFingerprint{model: "mimo-v2.5-free", system: "you are claude", firstUser: "different question", toolNames: []string{"bash"}}
 	if s3 := genOpencodeSessionID(fp3); s3 == s1 {
@@ -93,16 +96,10 @@ func TestGenOpencodeSessionID_确定性(t *testing.T) {
 	}
 }
 
-// 空 fingerprint / nil → 回退随机 UUID(参考 :144-145)。
-func TestGenOpencodeSessionID_回退UUID(t *testing.T) {
-	if s := genOpencodeSessionID(nil); s == "" {
-		t.Fatal("nil 应生成非空 session")
-	}
-	// forceUUID 强制 UUID 形态
-	fp := &opencodeBodyFingerprint{model: "muse-spark-1.3-contributor-free", forceUUID: true}
-	s := genOpencodeSessionID(fp)
-	if len(s) != 36 || s[8] != '-' || s[13] != '-' || s[18] != '-' || s[23] != '-' {
-		t.Fatalf("forceUUID 应为 36 位 UUID, got %q(len=%d)", s, len(s))
+// 空 fingerprint / nil → 回退随机 ses_ session。
+func TestGenOpencodeSessionID_回退随机(t *testing.T) {
+	if s := genOpencodeSessionID(nil); !strings.HasPrefix(s, "ses_") {
+		t.Fatalf("nil 应生成 ses_ 形态 session, got %q", s)
 	}
 }
 
@@ -122,7 +119,7 @@ func TestBodyFingerprint_提取(t *testing.T) {
 			map[string]any{"type": "function", "function": map[string]any{"name": "read"}},
 		},
 	}
-	fp := bodyFingerprint(body, false)
+	fp := bodyFingerprint(body)
 	if fp.model != "mimo-v2.5-free" {
 		t.Fatalf("model 提取错误: %q", fp.model)
 	}

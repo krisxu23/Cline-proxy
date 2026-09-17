@@ -149,15 +149,11 @@ func callZenAPI(ctx context.Context, params map[string]any, stream bool) (*http.
 		if err != nil {
 			return nil, rateLimited, fmt.Errorf("create zen request: %w", err)
 		}
-		// 照抄 OmniRoute opencodeHeaders.ts 的 CLI 身份构造(替换旧的 FreshZenIdentity
-		// 随机合成): opencode 免费 tier 的风控认真实 CLI 形态 —— UA="opencode"、
-		// client="desktop"、project="global"、session 用请求体指纹生成(确定性,
-		// 同会话命中同 session → 上游 prompt cache; 随机 session 会被当作仿冒)。
-		// 旧实现 x-opencode-client:"cli" + 随机版本号 UA 是错的。
+		// 官方 opencode CLI 身份形态(见 opencode_headers.go):
+		// UA=opencode/<版本>、client=cli、project/session/request 为 ses_/usr_/prj_
+		// 结构 ID。门禁按此判 "from within OpenCode", 形态不对即 403 FreeTierError。
 		outbound := map[string]string{}
-		applyOpencodeHeaders(outbound, nil, &opencodeCliDefaults{
-			userAgent: "opencode", client: "desktop", project: "global",
-		}, bodyFingerprint(body, useRespAPI))
+		applyOpencodeHeaders(outbound, nil, defaultOpencodeIdentity(), bodyFingerprint(body))
 		req.Header.Set("Authorization", "Bearer "+cfg.Key)
 		req.Header.Set("Content-Type", "application/json")
 		for k, v := range outbound {
