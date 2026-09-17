@@ -92,6 +92,7 @@ func TestClassifyRegionProbe(t *testing.T) {
 	}{
 		{"200 成功", 200, `{"choices":[]}`, true, true},
 		{"403 地区拒绝", 403, regionBody, false, true},
+		{"403 FreeTier 出口拒绝(同构地区被拒)", 403, `{"type":"error","error":{"type":"FreeTierError","message":"Error from provider (Console): OpenCode's free tier can only be used from within OpenCode"}}`, false, true},
 		{"429 限流(地区已放行)", 429, `{"error":{"message":"slow down"}}`, true, true},
 		{"402 额度(地区已放行)", 402, `{"error":{"message":"quota"}}`, true, true},
 		{"500 上游错误(地区已放行)", 500, `boom`, true, true},

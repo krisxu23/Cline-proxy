@@ -250,6 +250,9 @@ func classifyRegionProbe(status int, body string) (regionOK, known bool) {
 	if status == http.StatusForbidden && isRegionError(body) {
 		return false, true // 明确的地区拒绝
 	}
+	if status == http.StatusForbidden && isFreeTierError(body) {
+		return false, true // 明确的免费 tier 出口拒绝(与 RegionError 同构, 都是出口级失败)
+	}
 	if status == 0 {
 		return false, false
 	}

@@ -131,8 +131,7 @@ func callZenAPI(ctx context.Context, params map[string]any, stream bool) (*http.
 	// 429 —— 那种才需要等限流窗口过去。
 	delay := time.Second
 	rateLimited = 0
-	regionRetried := false // 地区拒绝最多主动换出口重试一次, 避免 hopeless 模型烧光重试
-	respTried := false     // Responses 端点自适应回退每次请求只试一次
+	respTried := false // Responses 端点自适应回退每次请求只试一次
 
 	for attempt := 0; ; attempt++ {
 		// 客户端已断开(超时/取消): 立即停止, 再重试也没有人接收结果。
@@ -236,9 +235,10 @@ func callZenAPI(ctx context.Context, params map[string]any, stream bool) (*http.
 			modelID := zenModelIDOf(params)
 			markModelRegionRestricted(modelID)
 			actual := reqExitKey(ctx)
-			if key := nodeLocalKey(actual); key != "" && !regionRetried && attempt < retries {
+			// 出口级失败: 每次命中都在预算内标记并换出口, 直到试出可用出口或预算耗尽。
+			// 此前只换一次 —— 池子几千个出口、可用的屈指可数时, 一次重试几乎不可能命中。
+			if key := nodeLocalKey(actual); key != "" && attempt < retries {
 				setRegionNodeOK(modelID, key, false)
-				regionRetried = true
 				log.Printf("  zen: model %s free-tier rejected via %s, 已标记该出口并换出口重试",
 					modelID, describeExitRaw(actual))
 				continue
@@ -255,9 +255,8 @@ func callZenAPI(ctx context.Context, params map[string]any, stream bool) (*http.
 			// 避开它, 并换一个出口立即重试 —— 撞地区限制时原地重试只会再 403。
 			// 注意 via= 打印的是全局轮询位置, 不代表这条请求的真实出口。
 			actual := reqExitKey(ctx)
-			if key := nodeLocalKey(actual); key != "" && !regionRetried && attempt < retries {
+			if key := nodeLocalKey(actual); key != "" && attempt < retries {
 				setRegionNodeOK(modelID, key, false)
-				regionRetried = true
 				log.Printf("  zen: model %s region rejected via %s, 已标记该出口并换出口重试",
 					modelID, describeExitRaw(actual))
 				continue
