@@ -66,7 +66,11 @@ function providerModels(p) {
       status: m.status, cost: m.cost, syncedAt: m.syncedAt,
       // requiresStream 必须透传: 行渲染靠它画「流式」标记, 漏掉就永远不显示
       // (proxy.go 里同名字段是真实决定走不走流式的依据, 两边口径要一致)。
-      requiresStream: m.requiresStream
+      requiresStream: m.requiresStream,
+      // free 同样必须透传: opencode 行靠它区分「自动免费(锁定勾选)」与
+      // 「未标注 -free 的测试模型(可勾选)」。漏掉时 m.free 为 undefined,
+      // 旧判定 m.free !== false 会把 undefined 当 true → 全部渲染成灰框。
+      free: m.free === true
     };
   });
 }
@@ -209,7 +213,9 @@ function providerCardBody(n, p, stat) {
       // 自动免费的模型(seed / -free 后缀)锁定勾选: 它们本来就免费, 关掉只会误导。
       // 其余的是 opencode 不定期放进、未标注 -free 的(免费)测试模型 —— 开关写入
       // cfg.EnabledModels, 后端 isZenFreeModel 放行后才对网关可用。
-      const free = m.free !== false;
+      // ★ 必须严格判 === true: providerModels 之外直接拼的对象可能没有 free 字段,
+      //   undefined !== false 会误判成"免费"导致灰框。
+      const free = m.free === true;
       const on = free || !!m.on;
       const box = free
         ? '<input type="checkbox" checked disabled title="自动免费模型, 无需手动启用">'
