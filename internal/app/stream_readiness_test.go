@@ -656,6 +656,75 @@ func TestProbeStreamFirstEvent_数据不丢失(t *testing.T) {
 	}
 }
 
+// ★ P0-1 主修复的证据: 纯脚手架帧的流必须判为空流(不提交 → 可换站)。
+//
+// 2026-09-17 审查前, 这两种形态都能骗过探测(原判据只要"非空对象、非 error-only"),
+// 于是探测提交 → 整条流零产出 → 客户端拿到"成功但空"的回合。而提交前是**唯一**
+// 能换站重试的时机, 所以这道判据是整条空流防护里最关键的一环。
+func TestProbeStreamFirstEvent_纯脚手架帧必须判空(t *testing.T) {
+	cases := []struct {
+		name string
+		body string
+	}{
+		{
+			"role 骨架帧",
+			"data: {\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\"}}]}\n\ndata: [DONE]\n\n",
+		},
+		{
+			"finish_reason=stop 空 delta",
+			"data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n",
+		},
+		{
+			"空 delta 无任何字段",
+			"data: {\"choices\":[{\"index\":0,\"delta\":{}}]}\n\ndata: [DONE]\n\n",
+		},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			empty, nb, _ := probeStreamFirstEvent(strBodyOf(c.body))
+			if !empty {
+				if nb != nil {
+					nb.Close()
+				}
+				t.Fatalf("纯脚手架帧的流应判为空流(提交前换站), 实得 empty=false")
+			}
+		})
+	}
+}
+
+// ★ 反向保护: 收紧判据**不得误杀**这几类必须判就绪的流。
+//
+// 前两类是"内容帧"; 后两类是"合法空终止态"与"非 OpenAI 形态" ——
+// 后者是探测的保守边界: 判据只处理 OpenAI 形态, 其余形状一律不介入。
+func TestProbeStreamFirstEvent_必须判就绪的形态(t *testing.T) {
+	cases := []struct {
+		name string
+		body string
+	}{
+		{"内容帧", "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n"},
+		{"工具调用帧", "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"id\":\"c1\"}]}}]}\n\n"},
+		{"推理帧", "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"think\"}}]}\n\n"},
+		// finish_reason=length 是"被 token 上限截断", 本就不该有正文, 是合法成功。
+		// 收紧判据时若漏掉白名单, 这类回合会被误判成空流并白白换站。
+		{"合法空终止态 length", "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"length\"}]}\n\n"},
+		// 非 OpenAI 形态: 判据不介入, 沿用原判据(就绪)。
+		{"Claude 形态", "event: content_block_start\ndata: {\"type\":\"content_block_start\"}\n\n"},
+		{"Gemini 形态", "data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"hi\"}]}}]}\n\n"},
+		{"非 JSON 文本", "data: hello world\n\n"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			empty, nb, _ := probeStreamFirstEvent(strBodyOf(c.body))
+			if empty {
+				t.Fatalf("%s 必须判就绪, 实得 empty=true", c.name)
+			}
+			if nb != nil {
+				nb.Close()
+			}
+		})
+	}
+}
+
 // strBody 把字符串包成 io.ReadCloser, 供 probeStreamFirstEvent 集成测试用。
 type strBody struct {
 	*strings.Reader

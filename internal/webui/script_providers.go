@@ -132,7 +132,12 @@ function providerCard(n, p) {
   const stat = providerStat(n, p);
   const ms = providerModels(p);
   const disp = p.display || n;
-  const kind = p.builtin ? '内置路由' : (p.google ? 'Google Gemini' : (p.apiType === 'anthropic' ? 'Anthropic' : 'OpenAI'));
+  // 展示用的形态标签: 优先反映 APIFormat(协议形态), 其次才是历史字段 apiType(鉴权方言)。
+  const kind = p.builtin ? '内置路由'
+    : (p.google ? 'Google Gemini'
+      : (p.apiFormat === 'messages' ? 'Anthropic Messages'
+        : (p.apiFormat === 'responses' ? 'Responses'
+          : (p.apiType === 'anthropic' ? 'Anthropic 鉴权' : 'OpenAI'))));
   const meta = ['<code>' + esc(n) + '</code>', esc(kind),
     (p.keys || 0) > 0 ? (p.keys + ' key') : null, (ms.length + ' 模型')
   ].filter(Boolean).join('');
@@ -441,6 +446,8 @@ function editProvider(n) {
   _('pvName').value = n;
   _('pvBaseUrl').value = p.baseUrl || '';
   _('pvKey').value = p.apiKey || '';
+  // API 格式: 空值等价 chat(见 providers_api_format.go)
+  if (_('pvApiFormat')) _('pvApiFormat').value = p.apiFormat || 'chat';
   if (_('pvCatalog')) _('pvCatalog').checked = p.catalog !== false;
   const entries = p.modelEntries || [];
   const enabled = entries.length ? entries.filter(e => e.enabled).map(e => e.id) : (p.freeModels || []);
@@ -452,6 +459,7 @@ function resetProviderForm() {
   _('pvName').value = '';
   _('pvBaseUrl').value = '';
   _('pvKey').value = '';
+  if (_('pvApiFormat')) _('pvApiFormat').value = 'chat';
   if (_('pvCatalog')) _('pvCatalog').checked = true;
   _('pvModels').value = '';
   _('pvTestModel').value = '';
@@ -494,6 +502,9 @@ async function saveProvider() {
     provider: Object.assign(existing, {
       baseUrl,
       apiKey,
+      // API 格式: 决定路径 + 请求体 + 响应体转换(见 providers_api_format.go)。
+      // 空值等价于 chat, 所以只在非 chat 时写入, 避免给 chat 供应商塞冗余字段。
+      apiFormat: (_('pvApiFormat').value || 'chat') === 'chat' ? '' : _('pvApiFormat').value,
       catalog: _('pvCatalog').checked,
       models,
       migrated: true,

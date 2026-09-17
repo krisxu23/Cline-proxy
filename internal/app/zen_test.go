@@ -80,6 +80,38 @@ func TestIsZenFreeModelManualEnable(t *testing.T) {
 	}
 }
 
+// TestIsAutoFreeZenModel 展示口径的自动免费判定与"手动启用"严格分离:
+// 只有 seed / -free 后缀才算自动免费, 面板据此锁定或解锁勾选框。
+func TestIsAutoFreeZenModel(t *testing.T) {
+	if !isAutoFreeZenModel(&ZenModel{ID: "x-free", Source: "synced"}) {
+		t.Fatal("-free 后缀应自动免费")
+	}
+	if !isAutoFreeZenModel(&ZenModel{ID: "big-pickle", Source: "seed"}) {
+		t.Fatal("seed 模型应自动免费")
+	}
+	if isAutoFreeZenModel(&ZenModel{ID: "union-alpha", Source: "synced"}) {
+		t.Fatal("未标注且未启用的 synced 模型不应自动免费")
+	}
+
+	// 手动启用只影响 isZenFreeModel, 不影响 isAutoFreeZenModel:
+	// 否则面板会把手动启用的模型显示成"自动免费", 勾选框锁死无法取消。
+	zenEnabledMu.Lock()
+	origSet := zenEnabledModelSet
+	zenEnabledModelSet = map[string]bool{"union-alpha": true}
+	zenEnabledMu.Unlock()
+	defer func() {
+		zenEnabledMu.Lock()
+		zenEnabledModelSet = origSet
+		zenEnabledMu.Unlock()
+	}()
+	if isAutoFreeZenModel(&ZenModel{ID: "union-alpha", Source: "synced"}) {
+		t.Fatal("手动启用不算自动免费")
+	}
+	if isAutoFreeZenModel(nil) {
+		t.Fatal("nil 模型不应自动免费")
+	}
+}
+
 // TestRefreshZenEnabledModels 配置里的 EnabledModels 应被正确重建为集合,
 // 且 trim/去空生效。
 func TestRefreshZenEnabledModels(t *testing.T) {

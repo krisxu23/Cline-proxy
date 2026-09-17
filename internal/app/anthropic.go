@@ -970,6 +970,11 @@ func handleAnthropicStreamWithToolNameMap(w http.ResponseWriter, upstream *http.
 	thinkingIndex := new(int)
 	*thinkingIndex = -1
 	hasThinking := false
+	// reasoningDelivered 与 hasThinking 的区别: hasThinking 管"要不要开/关
+	// thinking 块", reasoningDelivered 管"用户到底看到了东西没有"。
+	// 只发空白的 reasoning_content 会开出一个空的 thinking 块 —— 对用户等于零产出,
+	// 因此交付判定用 trim 后的口径(与 stream_delivery.go 的流级判据一致)。
+	reasoningDelivered := false
 	pendingTools := map[int]*toolAccumulator{}
 	emitIndex := 0
 	nextIndex := func() int {
@@ -1128,6 +1133,9 @@ func handleAnthropicStreamWithToolNameMap(w http.ResponseWriter, upstream *http.
 		// borrowed from hayou2002/clinepass-proxy: CherryStudio 等客户端
 		// 依赖 thinking 块显示思考过程).
 		if rc, ok := delta["reasoning_content"].(string); ok && rc != "" {
+			if strings.TrimSpace(rc) != "" {
+				reasoningDelivered = true
+			}
 			if !hasThinking {
 				hasThinking = true
 				*thinkingIndex = nextIndex()
@@ -1203,6 +1211,39 @@ func handleAnthropicStreamWithToolNameMap(w http.ResponseWriter, upstream *http.
 		if err != nil {
 			break
 		}
+	}
+
+	// ★ 空流守卫(2026-09-17 审查 P0-2)。
+	//
+	// 三条流式入口里, 此前只有 chat 与 responses 有守卫, 本路径**完全没有** ——
+	// 上游 200 空手而归时, Claude 协议客户端会拿到一个干净的 end_turn:
+	// 不报错、不重试, 任务静默中断。暴露面与 chat 路径一样大, 只是没人给它加过。
+	//
+	// 交付判据与另两条路径同源(见 stream_delivery.go):
+	//   - 有正文 / 有**非空白**推理 / 有**可发出**的工具块 → 已交付
+	//   - stop_reason 属于合法空白名单(max_tokens / tool_use) → 合法空回合
+	//     (被 token 上限截断、纯工具调用回合, 本就不该有正文, 不能报错)
+	//
+	// 工具块按"能不能发出"计数: emitToolBlock 会跳过无名的块, 所以
+	// pendingTools 非空并不等于有产出。
+	emittableTools := 0
+	for _, acc := range pendingTools {
+		if acc.name != "" {
+			emittableTools++
+		}
+	}
+	if !hasText && !reasoningDelivered && emittableTools == 0 &&
+		!legitEmptyTerminalReasons[stopReason] {
+		log.Printf("  anthropic stream: 上游未交付任何内容(无正文/推理/可发工具), 发 error 而非静默 end_turn")
+		emit("error", map[string]any{
+			"type": "error",
+			"error": map[string]any{
+				"type": "empty_content",
+				"message": "上游未返回任何内容(整条流无有效 chunk)。这通常是出口节点或上游 worker 异常所致, " +
+					"请重试; 若持续出现请更换出口节点。",
+			},
+		})
+		return
 	}
 
 	// Stop text block if active

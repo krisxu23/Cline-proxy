@@ -50,10 +50,32 @@ type ctxKeyZenModelType struct{}
 
 var ctxKeyZenModel = ctxKeyZenModelType{}
 
+// regionBlockedPhrases 地区封锁常见措辞, 与 error_rules.go 的规则表同源
+// (isRegionBlockedBody 也用同一份)。zen 上游迄今只回 type:RegionError,
+// 其余措辞是候选链其它 provider 实测过的 —— 一并识别, 让地区受限模型无论
+// 从哪个入口撞上都能进入"标记该出口 + 换出口重试"流程, 而不是落进通用
+// 403 直接失败(2026-09-17 审查 I4)。
+var regionBlockedPhrases = []string{
+	"regionerror",
+	"region not supported",
+	"unsupported_region",
+	"not available in your region",
+	"geo-restricted",
+	"not available in your country",
+}
+
 // isRegionError 判定上游响应是否为地区限制错误。
 func isRegionError(body string) bool {
-	return strings.Contains(body, "RegionError") ||
-		strings.Contains(body, "not available in your country")
+	if body == "" {
+		return false
+	}
+	lower := strings.ToLower(body)
+	for _, p := range regionBlockedPhrases {
+		if strings.Contains(lower, p) {
+			return true
+		}
+	}
+	return false
 }
 
 // isFreeTierError 判定上游响应是否为 opencode 免费 tier 的出口风控拒绝。
@@ -139,6 +161,12 @@ func probeRegionModelsAsync() {
 }
 
 // probeModelAllNodes 对全部已就绪节点探测指定模型的地区可用性。
+// regionProbeMaxNodes 单轮全节点探测的节点数上限。
+//
+// 探测发的是**真实请求**(每个烧该出口一份免费额度), 所以必须限量。
+// 正向知识现在由真实请求回写(zen_call.go 成功分支), 探测只是补充。
+const regionProbeMaxNodes = 24
+
 func probeModelAllNodes(modelID string) {
 	regionProbeMu.Lock()
 	if regionProbing[modelID] {
@@ -166,7 +194,22 @@ func probeModelAllNodes(modelID string) {
 	probed := int32(0)
 	sem := make(chan struct{}, 8)
 	var wg sync.WaitGroup
-	for _, k := range keys {
+	// ★ 2026-09-17 审查 P1-1: 单轮探测的节点数上限。
+	//
+	// 探测要发**真实请求**(每个都烧该出口的一份免费额度), 对上百个节点全量扫
+	// 代价过高 —— 这段代码自己的注释就记录过一次事故: 8 并发探测"自己撞出上游
+	// 限流, 144 个节点全被误标为不可用"。
+	//
+	// 现在正向知识由**真实请求回写**(见 zen_call.go 成功分支的 setRegionNodeOK(true)),
+	// 探测只是补充手段, 所以可以放心限流。
+	//
+	// 覆盖性靠 Go 的 map 迭代随机化: `for k := range nodePorts` 每轮顺序不同,
+	// 限流后自然轮换, 不会永远只探同一批。
+	limit := len(keys)
+	if limit > regionProbeMaxNodes {
+		limit = regionProbeMaxNodes
+	}
+	for _, k := range keys[:limit] {
 		wg.Add(1)
 		go func(key string) {
 			defer wg.Done()
@@ -260,6 +303,51 @@ func classifyRegionProbe(status int, body string) (regionOK, known bool) {
 	return true, true
 }
 
+// exitUpstreamFilter 只按"该出口到该上游是否可达"过滤。
+//
+// 单独抽出来是因为 pickZenProxyForModel 的**兜底**要用它而不是完整过滤:
+// 当所有出口都被探测出"地区被拒"时, 退回只按可达性过滤的常规轮询,
+// 而不是直连 —— 对大陆禁售模型, 直连是 100% 失败, 任何一个节点都比它强。
+func exitUpstreamFilter(modelID string) func(string) bool {
+	upstream := upstreamOfModel(modelID)
+	return func(p string) bool {
+		if upstream == "" {
+			return true
+		}
+		return nodeSupportsUpstream(upstream, nodeLocalKey(p))
+	}
+}
+
+// exitFilterForModel 模型相关的**完整**出口过滤谓词(上游可达性 + 地区能力)。
+//
+// ★ 2026-09-17 审查 P1-1: 此前这套判据只存在于 pickZenProxyForModel 里, 而那个
+// 函数**生产零调用**(只有测试调); 生产选路走 pickUnifiedExit →
+// pickZenProxyWhere(func(q string) bool { return true }) —— **空操作过滤器**。
+//
+// 后果: 上游可达性探测(nodeSupportsUpstream)与地区探测(regionNodeUsable)的结果
+// 都不参与选路, 而探测本身要发**真实请求、烧免费额度**。一份真实成本 + 一个不
+// 存在的能力 —— 这也是"探测子系统整块空转"的根因。
+//
+// 抽成谓词是为了让生产路径与展示路径共用同一份判据, 不再各写一套。
+//
+// 注意方向: 只有"已探测确认被拒"才排除, **没有探测数据照样参与** —— 未探测
+// 不等于不可用, 否则刚启动/探测未完成时必然无候选。
+func exitFilterForModel(modelID string) func(string) bool {
+	upstreamOK := exitUpstreamFilter(modelID)
+	regionRestricted := isRegionRestrictedModel(modelID)
+	return func(p string) bool {
+		if !upstreamOK(p) {
+			return false
+		}
+		if regionRestricted {
+			if ok, known := regionNodeUsable(modelID, nodeLocalKey(p)); known && !ok {
+				return false
+			}
+		}
+		return true
+	}
+}
+
 // pickZenProxyForModel 选择出口: 地区受限模型优先从"未被探测出地区拒绝"的
 // 节点中轮询, 其余模型沿用常规轮询。
 //
@@ -271,18 +359,13 @@ func pickZenProxyForModel(modelID string) (string, int) {
 	if exitModeDirectNow() {
 		return "", -1
 	}
-	// 上游可达性: 已探测出"该节点到该上游不通"时跳过它 —— 这正是
-	// "节点全绿但某个 Provider 502"的成因, 不该继续把请求交给它。
-	upstream := upstreamOfModel(modelID)
-	supported := func(p string) bool {
-		if upstream == "" {
-			return true
-		}
-		return nodeSupportsUpstream(upstream, nodeLocalKey(p))
-	}
+	// 完整判据(上游可达性 + 地区能力): 与生产选路共用同一份, 见 exitFilterForModel。
+	supported := exitFilterForModel(modelID)
 	if !isRegionRestrictedModel(modelID) {
 		return pickZenProxyWhere(supported)
 	}
+	// 兜底用的**上游可达性**过滤(不含地区过滤) —— 见 exitUpstreamFilter 的说明。
+	fallbackFilter := exitUpstreamFilter(modelID)
 	list := effectiveProxyList()
 	if len(list) == 0 {
 		log.Printf("  zen: 地区受限模型 %s 选路失败: 出口池为空, 回退直连", modelID)
@@ -292,7 +375,7 @@ func pickZenProxyForModel(modelID string) (string, int) {
 	cand := make([]int, 0, len(list))
 	for i, p := range list {
 		switch {
-		case !zenProxyAvailable(i):
+		case !zenProxyAvailable(p):
 			cooled++
 			continue
 		case !nodeDialable(p):
@@ -314,7 +397,9 @@ func pickZenProxyForModel(modelID string) (string, int) {
 	if len(cand) == 0 {
 		log.Printf("  zen: 地区受限模型 %s 无候选(池 %d: 冷却 %d 未就绪 %d 不健康 %d 上游不通 %d 地区被拒 %d), 回退常规轮询",
 			modelID, len(list), cooled, notDialable, notUsable, unsupported, regionBad)
-		return pickZenProxyWhere(supported)
+		// 兜底用**上游可达性**过滤而不是完整过滤: 地区被拒的节点仍要参与,
+		// 否则全部被拒时会退回直连 —— 对禁售模型那是 100% 失败。
+		return pickZenProxyWhere(fallbackFilter)
 	}
 	idx := cand[int(zenProxyCount.Add(1)-1)%len(cand)]
 	return list[idx], idx

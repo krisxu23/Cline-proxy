@@ -280,6 +280,19 @@ func chatStreamToResponses(w http.ResponseWriter, upstream *http.Response, onUsa
 
 	textEmitted := false
 	callEmitted := false
+	// 空流防护: 与流式 chat 路径**共用同一判据**(stream_delivery.go)。
+	//
+	// 三个放行条件与 chat 路径完全一致, 由 streamDeliveryEmpty 统一回答:
+	//   deliveredValue  累积到过 content-bearing 内容
+	//   validUsage      上游报告了**输出侧** token
+	//   sawLegitEmpty   终止原因是"本就不该有正文"的白名单值
+	//
+	// ★ 此前本路径独立实现了一份判据(只认字符串 content + 非空 reasoning),
+	//   与 chat 路径口径不同 —— 这就是"同一概念多处实现"的实例。
+	//   role 骨架帧 / finish_reason 都不算产出(2026-09-17 审查 P0-1)。
+	deliveredValue := false
+	validUsage := false
+	sawLegitEmpty := false
 	var curCallID, curCallName string
 	var curArgs strings.Builder
 	var outText strings.Builder
@@ -306,8 +319,18 @@ func chatStreamToResponses(w http.ResponseWriter, upstream *http.Response, onUsa
 				if m, ok := obj["model"].(string); ok && m != "" {
 					model = m
 				}
-				if onUsage != nil {
-					if u, ok := obj["usage"].(map[string]any); ok && len(u) > 0 {
+				if u, ok := obj["usage"].(map[string]any); ok && len(u) > 0 {
+					// usage-only 流是合法协议行为(参考实现注释:
+					// "usage-only streams are fine"), 独立于 onUsage 回调判定,
+					// 回调为 nil 时也不能漏记。
+					//
+					// ★ 只认**输出侧** token(hasOutputUsageTokens): 输入侧
+					//   prompt_tokens 有值不能说明上游产出了东西, 那正是
+					//   真·空回包(2026-09-17 审查 P0-1)。
+					if hasOutputUsageTokens(u) {
+						validUsage = true
+					}
+					if onUsage != nil {
 						onUsage(u)
 					}
 				}
@@ -322,6 +345,16 @@ func chatStreamToResponses(w http.ResponseWriter, upstream *http.Response, onUsa
 				delta, _ := ch["delta"].(map[string]any)
 				if delta == nil {
 					delta = ch
+				}
+				// 交付判定(唯一判据, 与 chat 路径共用): 只认 content / reasoning /
+				// tool_calls, 显式排除 role 骨架帧与 finish_reason。
+				if messageDeliversUserContent(delta) {
+					deliveredValue = true
+				}
+				// 合法空终止态按**原始帧**判定: finish_reason=length / tool_calls /
+				// content_filter 这类"本就不该有正文"的回合是合法成功, 不能报错。
+				if legitEmptyTerminalReason(obj) {
+					sawLegitEmpty = true
 				}
 				// 文本
 				if c, ok := delta["content"].(string); ok && c != "" {
@@ -403,6 +436,17 @@ func chatStreamToResponses(w http.ResponseWriter, upstream *http.Response, onUsa
 	}
 
 	// 收尾
+	if streamDeliveryEmpty(deliveredValue, validUsage, sawLegitEmpty) {
+		log.Printf("  responses: 上游流未交付任何有价值内容(文本/推理/工具/usage), 发 error 事件而非静默空完成")
+		s.event("error", map[string]any{
+			"type": "error",
+			"error": map[string]any{
+				"message": "Provider returned empty content — stream forwarded no valuable chunks",
+				"type":    "empty_content",
+			},
+		})
+		return
+	}
 	if textEmitted {
 		s.event("response.output_text.done", map[string]any{"type": "response.output_text.done", "item_id": s.msgID, "output_index": 0, "content_index": 0, "text": outText.String()})
 		s.event("response.content_part.done", map[string]any{"type": "response.content_part.done", "item_id": s.msgID, "output_index": 0, "content_index": 0, "part": map[string]any{"type": "output_text", "text": outText.String(), "annotations": []any{}}})

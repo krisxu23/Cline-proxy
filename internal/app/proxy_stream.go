@@ -158,7 +158,7 @@ func handleStreamResponseWithToolNameMap(w http.ResponseWriter, upstream *http.R
 					onUsage(u)
 				}
 			}
-			if u, ok := obj["usage"].(map[string]any); ok && hasValidUsageTokens(u) {
+			if u, ok := obj["usage"].(map[string]any); ok && hasOutputUsageTokens(u) {
 				hasValidUsage = true
 			}
 			if m, ok := obj["model"].(string); ok && m != "" {
@@ -191,7 +191,12 @@ func handleStreamResponseWithToolNameMap(w http.ResponseWriter, upstream *http.R
 			// 对齐 OmniRoute: 该帧是否值得转发由它是否带 content / tool_calls /
 			// finish_reason 决定。三者都没有(空 choices)的帧仍然照常透传, 但它
 			// 不计入"已交付有价值内容"。
-			if openAIChunkHasValuableContent(normalized) {
+			//
+			// ★ 判据用 chunkDeliversUserContent(流级口径), **不是**参考实现的
+			//   hasValuableContent(帧级口径)。后者把 role / finish_reason 也算
+			//   有价值 —— 那对"这一帧要不要发给客户端"是对的, 对"整条流有没有
+			//   产出"是错的(2026-09-17 审查 P0-1)。详见 stream_delivery.go。
+			if chunkDeliversUserContent(normalized) {
 				forwardedValuableChunk = true
 			}
 			if legitEmptyTerminalReason(normalized) {
@@ -253,13 +258,13 @@ func handleStreamResponseWithToolNameMap(w http.ResponseWriter, upstream *http.R
 				markValuable := func(line string) {
 					var probe map[string]any
 					if json.Unmarshal([]byte(line), &probe) == nil {
-						if openAIChunkHasValuableContent(probe) {
+						if chunkDeliversUserContent(probe) {
 							forwardedValuableChunk = true
 						}
 						if legitEmptyTerminalReason(probe) {
 							sawLegitEmptyTerminal = true
 						}
-						if u, ok := probe["usage"].(map[string]any); ok && hasValidUsageTokens(u) {
+						if u, ok := probe["usage"].(map[string]any); ok && hasOutputUsageTokens(u) {
 							hasValidUsage = true
 						}
 					}
@@ -282,7 +287,7 @@ func handleStreamResponseWithToolNameMap(w http.ResponseWriter, upstream *http.R
 						break
 					}
 				}
-				if !streamDeliveredValue(forwardedValuableChunk, hasValidUsage, sawLegitEmptyTerminal) {
+				if streamDeliveryEmpty(forwardedValuableChunk, hasValidUsage, sawLegitEmptyTerminal) {
 					log.Printf("  stream: NDJSON 流未交付任何有价值内容, 回 error 帧而非静默空 200")
 					writeStreamEmptyContentError(w, hb, lastModel)
 					return
@@ -316,7 +321,7 @@ func handleStreamResponseWithToolNameMap(w http.ResponseWriter, upstream *http.R
 					onUsage(u)
 				}
 			}
-			if u, ok := parsedUsageFromJSONBody(body); ok && hasValidUsageTokens(u) {
+			if u, ok := parsedUsageFromJSONBody(body); ok && hasOutputUsageTokens(u) {
 				hasValidUsage = true
 			}
 			if fullCompletionBodyHasContent(body) {
@@ -328,7 +333,7 @@ func handleStreamResponseWithToolNameMap(w http.ResponseWriter, upstream *http.R
 			if b, ok := parseJSONMap(body); ok && legitEmptyTerminalReason(b) {
 				sawLegitEmptyTerminal = true
 			}
-			if !streamDeliveredValue(forwardedValuableChunk, hasValidUsage, sawLegitEmptyTerminal) {
+			if streamDeliveryEmpty(forwardedValuableChunk, hasValidUsage, sawLegitEmptyTerminal) {
 				log.Printf("  stream: 上游完整 JSON body 不含任何有价值内容, 补 error 帧")
 				writeStreamEmptyContentError(w, hb, lastModel)
 			}
@@ -366,7 +371,7 @@ func handleStreamResponseWithToolNameMap(w http.ResponseWriter, upstream *http.R
 	//
 	// 与上游"空流"的区别: 那种在提交前就被 probeStreamFirstEvent 拦下并换站
 	// (见 routing_dispatch.go), 这里兜的是**已提交之后**每帧都空的情况。
-	if !streamDeliveredValue(forwardedValuableChunk, hasValidUsage, sawLegitEmptyTerminal) {
+	if streamDeliveryEmpty(forwardedValuableChunk, hasValidUsage, sawLegitEmptyTerminal) {
 		log.Printf("  stream: 上游整条流未交付任何有价值内容(model=%s, 已发 finish=%v), 回 502 而非静默空 200",
 			lastModel, sawFinish)
 		writeStreamEmptyContentError(w, hb, lastModel)
@@ -386,75 +391,24 @@ func handleStreamResponseWithToolNameMap(w http.ResponseWriter, upstream *http.R
 	hb.flush()
 }
 
-// openAIChunkHasValuableContent 判断一个 OpenAI 形态的 chunk 是否"有价值",
-// 即 OmniRoute 的 hasValuableContent(chunk, FORMATS.OPENAI)。
+// 注(2026-09-17 审查 P0-1): 此处原有 openAIChunkHasValuableContent 与
+// streamDeliveredValue 两个函数, 已删除。
 //
-// 严格对照 open-sse/utils/streamHelpers.ts:379 的实现, 逐条对应:
+// 删除原因: 它们把**帧级转发过滤**的判据(role / finish_reason 也算"有价值")
+// 用在了**流级产出判定**上。参考实现 OmniRoute utils/streamHelpers.ts:379 的
+// hasValuableContent 用于 stream.ts:1803 `if (!hasValuableContent(...)) continue;`
+// —— 回答的是"这一帧要不要发给客户端", 那里 role / finish_reason 当然算有价值
+// (客户端靠它们收尾)。但拿它回答"整条流有没有产出"是错的: 一条只发了
+// `{"delta":{"role":"assistant"}}` 或 `{"delta":{},"finish_reason":"stop"}`
+// 就结束的流, 对用户等于零产出。
 //
-//	const choices = Array.isArray(chunk.choices) ? chunk.choices : [];
-//	const firstChoice = isRecord(choices[0]) ? choices[0] : null;
-//	const delta = isRecord(firstChoice?.delta) ? firstChoice.delta : null;
-//	if (!firstChoice || !delta) return false;
-//	if (typeof delta.content === "string" && delta.content.length > 0) return true;
-//	if (hasAnyReasoningSignal(delta)) return true;
-//	if (Array.isArray(delta.tool_calls) && delta.tool_calls.length > 0) return true;
-//	if (firstChoice.finish_reason) return true;
-//	if (typeof delta.role === "string" && delta.role.length > 0) return true;
-//	return false;
+// 实测(临时用例, 已删): role 帧 / finish_reason 帧 / 空格 reasoning /
+// 只有 prompt_tokens 的 usage —— 四种形态全部穿过守卫。
 //
-// 三条容易写错的要点(此前本函数都写错了, 由 Test空流_完整JSON空壳body必须失败 抓出):
-//  1. **只认 choices[0]**, 不是遍历所有 choice;
-//  2. **delta 缺失即 false** —— 非流式的 message 形态在这里一律"无价值",
-//     不能因为 message.content / finish_reason 好看就放行;
-//     否则上游回一个 "choices[0].message.content=”" 的空壳 body 会被当成
-//     有内容交付, 静默空回合的防护就此失效(正是要根治的中断场景);
-//  3. **reasoning 信号也算价值**, 且 role 骨架帧也算 —— 这一条比 streamEmptyChoices
-//     的注释描述更宽, 以 streamHelpers.ts 的实现为准。
-func openAIChunkHasValuableContent(obj map[string]any) bool {
-	choices, ok := obj["choices"].([]any)
-	if !ok || len(choices) == 0 {
-		return false
-	}
-	firstChoice, ok := choices[0].(map[string]any)
-	if !ok {
-		return false
-	}
-	delta, ok := firstChoice["delta"].(map[string]any)
-	if !ok {
-		return false
-	}
-	if c, ok := delta["content"].(string); ok && len(c) > 0 {
-		return true
-	}
-	// hasAnyReasoningSignal(delta)
-	if hasAnyReasoningSignal(delta) {
-		return true
-	}
-	if tc, ok := delta["tool_calls"].([]any); ok && len(tc) > 0 {
-		return true
-	}
-	if fr, ok := firstChoice["finish_reason"].(string); ok && fr != "" {
-		return true
-	}
-	if role, ok := delta["role"].(string); ok && len(role) > 0 {
-		return true
-	}
-	return false
-}
-
-// streamDeliveredValue 对应 OmniRoute rejectEmptyChoicesStream 的首行守卫:
-//
-//	if (ctx.forwardedValuableChunk || ctx.hasValidUsage) return false;
-//
-// 返回 true 表示"这条流确实交付了东西, 不该判为空流"。
-// 两个条件任一成立即放行 —— 有价值 chunk, 或上游报告了真实 usage
-// (usage-only 流是合法协议行为, 原注释: "usage-only streams are fine")。
-//
-// legitEmpty 是第三个放行条件, 对应 OmniRoute streamReadiness.ts:166 的
-// LEGIT_EMPTY_TERMINAL_REASONS 白名单(详见 legitEmptyTerminalReason 注释)。
-func streamDeliveredValue(forwardedValuableChunk, hasValidUsage, legitEmpty bool) bool {
-	return forwardedValuableChunk || hasValidUsage || legitEmpty
-}
+// 唯一判据现集中在 stream_delivery.go:
+//   chunkDeliversUserContent  逐帧判"是否携带用户可见产出"
+//   hasOutputUsageTokens      只认输出侧 token
+//   streamDeliveryEmpty       空流守卫的唯一聚合入口
 
 // legitEmptyTerminalReasons 照抄 OmniRoute open-sse/utils/streamReadiness.ts:166:
 //
@@ -502,28 +456,16 @@ func legitEmptyTerminalReason(obj map[string]any) bool {
 	return false
 }
 
-// hasValidUsageTokens 对应 OmniRoute usageTracking.ts:639 的 hasValidUsage:
-// 已知 token 字段任一 > 0 才算有效用量。全为 0 或缺失 → false
-// (上游常回 "usage":{"prompt_tokens":0,...} 这类全零壳, 不能算数)。
-func hasValidUsageTokens(usage map[string]any) bool {
-	if usage == nil {
-		return false
-	}
-	for _, field := range []string{
-		"prompt_tokens",
-		"completion_tokens",
-		"total_tokens", // OpenAI
-		"input_tokens",
-		"output_tokens", // Claude
-		"promptTokenCount",
-		"candidatesTokenCount", // Gemini
-	} {
-		if v, ok := usage[field].(float64); ok && v > 0 {
-			return true
-		}
-	}
-	return false
-}
+// 注(2026-09-17 审查 P0-1): 此处原有 hasValidUsageTokens, 已删除。
+//
+// 它的判据是"已知 token 字段任一 > 0"(照抄 OmniRoute usageTracking.ts:639),
+// 其中包含 prompt_tokens / input_tokens / promptTokenCount 三个**输入侧**字段。
+// 输入有值只说明上游收到了我们的 prompt, 完全不能说明它产出了东西 ——
+// {prompt_tokens:1500, completion_tokens:0} 正是最典型的真·空回包, 却被判成
+// "已交付", 于是空流守卫被绕过。
+//
+// 替代: stream_delivery.go 的 hasOutputUsageTokens —— 只认输出侧
+// (completion_tokens / output_tokens / candidatesTokenCount)。
 
 // looksLikeFullCompletionBody 判断一个合法 JSON 对象是不是"一次完整回包"
 // (非流式 chat.completion), 而不是 NDJSON 的一行流式 chunk。
@@ -594,6 +536,20 @@ func fullCompletionBodyHasContent(body []byte) bool {
 		}
 		if c, ok := msg["content"].(string); ok && len(c) > 0 {
 			return true
+		}
+		// content 数组形态(OpenAI content-parts / Anthropic blocks 经翻译后):
+		// 任一块带非空 text 即视为有内容。否则一个带 content[] 的完整 JSON
+		// body 会被判成空壳, 对正常回包误打 502(2026-09-17 审查 R2-6)。
+		if blocks, ok := msg["content"].([]any); ok && len(blocks) > 0 {
+			for _, rawBlock := range blocks {
+				block, ok := rawBlock.(map[string]any)
+				if !ok {
+					continue
+				}
+				if t, ok := block["text"].(string); ok && len(t) > 0 {
+					return true
+				}
+			}
 		}
 		if hasAnyReasoningSignal(msg) {
 			return true

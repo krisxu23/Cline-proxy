@@ -64,8 +64,21 @@ var (
 	candidateCools  = map[string]candidateCool{}
 	// candidatePerms 永久剔除(无免费层 / 已下架 / 非 chat 模型)。
 	// 进程内保存, 面板可查看与清空。
-	candidatePerms = map[string]string{}
+	candidatePerms = map[string]candidatePerm{}
 )
+
+// candidatePerm 永久剔除条目: 原因 + 下次自动复查时间。
+//
+// "永久"实为**软永久** —— 上游(模型目录 / 免费层配额)随时可能恢复, 到期后
+// 放行让候选重新参与尝试, 减少"一次瞬时失败永久吞掉健康模型、只能手动清空"
+// 的风险(2026-09-17 审查 R2-7); 面板的"清空永久剔除"仍然即时生效。
+type candidatePerm struct {
+	reason string
+	until  int64
+}
+
+// permanentRetryAfterMs 软永久剔除的复查周期: 24h 后自动重新尝试一次。
+const permanentRetryAfterMs = int64(24 * 60 * 60 * 1000)
 
 // candidateKey 冷却与账本共用的候选标识。
 func candidateKey(upstream, model string) string {
@@ -153,7 +166,10 @@ func markCandidatePermanent(upstream, model, reason string) {
 	}
 	k := candidateKey(upstream, model)
 	candidateCoolMu.Lock()
-	candidatePerms[k] = kit.Truncate(reason, 200)
+	candidatePerms[k] = candidatePerm{
+		reason: kit.Truncate(reason, 200),
+		until:  time.Now().UnixMilli() + permanentRetryAfterMs,
+	}
 	delete(candidateCools, k)
 	candidateCoolMu.Unlock()
 }
@@ -177,8 +193,12 @@ func candidateSkipReason(upstream, model string) string {
 	k := candidateKey(upstream, model)
 	candidateCoolMu.Lock()
 	defer candidateCoolMu.Unlock()
-	if why, ok := candidatePerms[k]; ok {
-		return "永久剔除: " + why
+	if perm, ok := candidatePerms[k]; ok {
+		if perm.until > time.Now().UnixMilli() {
+			return "永久剔除: " + perm.reason
+		}
+		// 软永久到期: 放行重试(下次成功/失败按正常冷却流程处理)。
+		delete(candidatePerms, k)
 	}
 	if c, ok := candidateCools[k]; ok {
 		if c.until > time.Now().UnixMilli() {
@@ -202,6 +222,11 @@ func clearExpiredCandidateCooldowns() {
 	for k, c := range candidateCools {
 		if c.until <= now {
 			delete(candidateCools, k)
+		}
+	}
+	for k, p := range candidatePerms {
+		if p.until <= now {
+			delete(candidatePerms, k)
 		}
 	}
 	candidateCoolMu.Unlock()
@@ -256,7 +281,7 @@ func candidateCoolingSnapshot() []map[string]any {
 func resetCandidateState() {
 	candidateCoolMu.Lock()
 	candidateCools = map[string]candidateCool{}
-	candidatePerms = map[string]string{}
+	candidatePerms = map[string]candidatePerm{}
 	candidateCoolMu.Unlock()
 }
 

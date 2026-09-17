@@ -316,8 +316,9 @@ func handleZenNodesCheck(w http.ResponseWriter, r *http.Request) {
 }
 
 // GET /admin/api/zen/models — 返回**全部**已同步的 zen 模型, 并逐个标注:
-//   - free:    自动判定为免费(seed 白名单 / -free 后缀), 面板上锁定勾选
-//   - enabled: 当前对网关可用(free 或用户手动启用), 未启用的可在面板勾选启用
+//   - free:    自动免费(seed 白名单 / -free 后缀), 面板上锁定勾选
+//   - enabled: 当前对网关可用(自动免费或用户手动启用), 未启用的可在面板勾选启用
+//   - manually: 用户手动启用的非自动免费模型(可随时取消勾选)
 //
 // 之前只返回免费模型, opencode 不定期放进的免费测试模型(如 union-alpha,
 // 不带 -free 后缀)在目录里拉得到、却永远不显示, 用户无从启用。
@@ -330,16 +331,20 @@ func handleZenModels(w http.ResponseWriter, r *http.Request) {
 	zenModelsMu.RLock()
 	models := make([]map[string]any, 0, len(zenModels))
 	for _, m := range zenModels {
-		free := isZenFreeModel(m)
+		// 展示层必须用"自动免费"口径: isZenFreeModel 会把手动启用也算作免费,
+		// 那样面板会把一个手动启用的测试模型渲染成自动免费、勾选框锁死,
+		// 用户再也无法取消(2026-09-17 审查 C1)。
+		autoFree := isAutoFreeZenModel(m)
+		enabled := (autoFree || zenModelEnabled(m.ID)) && !zenModelUnavailable(m.ID)
 		models = append(models, map[string]any{
 			"id":       m.ID,
 			"aliases":  m.Aliases,
 			"context":  m.Context,
 			"output":   m.Output,
 			"source":   m.Source,
-			"free":     free,
-			"enabled":  free && !zenModelUnavailable(m.ID),
-			"manually": !free && zenModelEnabled(m.ID), // 用户手动启用的非免费模型
+			"free":     autoFree,
+			"enabled":  enabled,
+			"manually": !autoFree && zenModelEnabled(m.ID), // 用户手动启用的非免费模型
 		})
 	}
 	zenModelsMu.RUnlock()

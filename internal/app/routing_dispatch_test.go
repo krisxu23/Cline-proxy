@@ -209,7 +209,11 @@ func TestChainStreamPassesThroughWinner(t *testing.T) {
 	}
 }
 
-// 内容判定: 只有真正带 content / tool_calls 的 200 才算成功。
+// 内容判定: 只有真正带 content / tool_calls / reasoning 的 200 才算成功。
+//
+// ★ 2026-09-17 审查 P1-2: 后 5 条是本次新增的边界用例 —— 此前本函数只认
+// **字符串** content, 于是带 content[] 的正常回包会被判成空、白白换下一站
+// (用户侧表现: 某个模型明明能答, 网关总说它空、老是换模型)。
 func TestChatBodyHasContent(t *testing.T) {
 	cases := []struct {
 		name string
@@ -224,6 +228,12 @@ func TestChatBodyHasContent(t *testing.T) {
 		{"空 content", `{"choices":[{"message":{"content":""}}]}`, false},
 		{"空 body", ``, false},
 		{"非 JSON", `<html>oops</html>`, false},
+		// ── P1-2 新增: 与流式路径统一口径后必须认得的形态 ──
+		{"content 数组形态", `{"choices":[{"message":{"content":[{"type":"text","text":"hi"}]}}]}`, true},
+		{"content 数组全空", `{"choices":[{"message":{"content":[{"type":"text","text":""}]}}]}`, false},
+		{"reasoning", `{"choices":[{"message":{"reasoning_content":"想一下"}}]}`, true},
+		{"多 choice 任一有内容", `{"choices":[{"message":{"content":""}},{"message":{"content":"hi"}}]}`, true},
+		{"只有 role 骨架", `{"choices":[{"message":{"role":"assistant"}}]}`, false},
 	}
 	for _, c := range cases {
 		if got := chatBodyHasContent([]byte(c.body)); got != c.want {

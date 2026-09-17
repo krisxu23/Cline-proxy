@@ -85,9 +85,13 @@ func TestToolRemap接线_detach在marshal前(t *testing.T) {
 		t.Fatalf("detachToolNameMap(params) 出现 %d 次, 期望 1", got)
 	}
 	idxDetach := idxOrFail(t, src, "detachToolNameMap(params)", "detach")
-	// 必须用**真实调用形态**定位 marshal —— 裸 token `json.Marshal(params)`
-	// 会先命中上方注释里的同一串文字（本轮已实测踩到）。
-	idxMarshal := idxOrFail(t, src, "payload, err := json.Marshal(params)", "marshal")
+	// 必须用**真实调用形态**定位 marshal —— 裸 token `json.Marshal(` 会先命中
+	// 上方注释里的同一串文字（本轮已实测踩到）。
+	//
+	// ★ 2026-09-17: marshal 的目标从 params 变成 outbound —— 新增了 APIFormat
+	// 协议形态转换, chat 形态下 outbound **就是** params 本身(原样返回), 因此
+	// 序列化内容不变, 但顺序约束多了一条: 旁路键回填必须在 marshal **之后**。
+	idxMarshal := idxOrFail(t, src, "payload, err := json.Marshal(outbound)", "marshal")
 	if idxDetach >= idxMarshal {
 		t.Fatalf("detach(%d) 必须在 marshal(%d) 之前", idxDetach, idxMarshal)
 	}
@@ -99,6 +103,13 @@ func TestToolRemap接线_detach在marshal前(t *testing.T) {
 	idxDelete := idxOrFail(t, src, "delete(params, toolNameMapSideChannelKey)", "delete 旁路键")
 	if idxDelete >= idxMarshal {
 		t.Fatalf("旁路键 delete(%d) 必须在 marshal(%d) 之前", idxDelete, idxMarshal)
+	}
+
+	// ★ 回填必须在 marshal **之后**: chat 形态下 outbound 就是 params 本身,
+	// 提前回填会把旁路键序列化进上行 body(Anthropic 会回 400 Extra inputs)。
+	idxReadd := idxOrFail(t, src, "params[toolNameMapSideChannelKey] = wireToolNameMap", "回填旁路键")
+	if idxReadd <= idxMarshal {
+		t.Fatalf("旁路键回填(%d) 必须在 marshal(%d) 之后 —— 否则会进 body", idxReadd, idxMarshal)
 	}
 }
 

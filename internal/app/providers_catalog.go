@@ -369,8 +369,8 @@ func catalogExitBudget() int {
 		return 1
 	}
 	healthy, unknown := 0, 0
-	for i, p := range list {
-		if !zenProxyAvailable(i) || !nodeDialable(p) {
+	for _, p := range list {
+		if !zenProxyAvailable(p) || !nodeDialable(p) {
 			continue // 冷却中 / 本地入站没起来: 试了也是白等一次超时
 		}
 		switch healthOf(nodeLocalKey(p)) {

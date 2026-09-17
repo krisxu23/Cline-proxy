@@ -150,3 +150,27 @@ func TestCandidatePermanentRejection(t *testing.T) {
 		t.Fatal("reset must drop permanent rejections for a clean slate")
 	}
 }
+
+// TestCandidatePermanentSoftExpiry 软永久剔除到期后应自动放行:
+// 一次瞬时失败不能把候选永久吞掉, 24h 复查周期到期即重新参与。
+func TestCandidatePermanentSoftExpiry(t *testing.T) {
+	resetCandidateState()
+	defer resetCandidateState()
+
+	markCandidatePermanent("gemini", "gone", "该模型无免费层")
+	if candidateSkipReason("gemini", "gone") == "" {
+		t.Fatal("未到期的永久剔除应跳过")
+	}
+
+	// 直接把复查时间拨到过去, 模拟到期
+	candidateCoolMu.Lock()
+	candidatePerms["gemini:gone"] = candidatePerm{reason: "已到期", until: time.Now().UnixMilli() - 1}
+	candidateCoolMu.Unlock()
+
+	if candidateSkipReason("gemini", "gone") != "" {
+		t.Fatal("到期的软永久剔除应放行")
+	}
+	if candidateSkipReason("gemini", "gone") != "" {
+		t.Fatal("放行后软永久条目应已清除, 再次查询仍为空")
+	}
+}

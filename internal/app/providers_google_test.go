@@ -142,7 +142,7 @@ func TestExitModeDirectBypassesProxyPool(t *testing.T) {
 // clearZenProxyCooldowns 清空出口冷却表(测试用)。
 func clearZenProxyCooldowns() {
 	zenProxyCooldownsMu.Lock()
-	zenProxyCooldowns = map[int]time.Time{}
+	zenProxyCooldowns = map[string]time.Time{}
 	zenProxyCooldownsMu.Unlock()
 }
 

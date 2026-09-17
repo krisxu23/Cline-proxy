@@ -485,6 +485,17 @@ body:not([data-theme="dark"]) .theme-toggle .dark-label{display:none}
       <div class="field"><label>API 地址 *</label><input type="text" id="pvBaseUrl" placeholder="https://openrouter.ai/api/v1"></div>
     </div>
     <div class="form-row">
+      <div class="field"><label>API 格式</label>
+        <select id="pvApiFormat">
+          <option value="chat">Chat Completions (/chat/completions)</option>
+          <option value="messages">Anthropic Messages (/messages)</option>
+          <option value="responses">Responses (/responses)</option>
+        </select>
+        <div class="hint" style="margin-top:4px">上游说哪种协议就选哪种。API 地址要<strong>含版本段</strong>（如 <code>https://opencode.ai/zen/v1</code>），路径按格式自动追加。</div>
+      </div>
+      <div class="field"></div>
+    </div>
+    <div class="form-row">
       <div class="field"><label>API Key *</label><input type="password" id="pvKey" placeholder="sk-..."></div>
       <div class="field"><label>模型目录</label>
         <label style="display:flex;align-items:center;gap:var(--sp-2);font-weight:normal"><input type="checkbox" id="pvCatalog" checked style="width:auto;min-width:0"> 拉取 /models 目录（关闭则只用下方手填模型）</label>

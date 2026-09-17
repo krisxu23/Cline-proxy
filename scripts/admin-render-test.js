@@ -195,7 +195,7 @@ const SAMPLE = {
       { id: 'gemini-3.8-flash', disabled: false },
     ],
     models: [
-      { id: 'opencode:deepseek-v4-flash', model: 'deepseek-v4-flash', context: 1000000, output: 65536 },
+      { id: 'opencode:deepseek-v4-flash', model: 'deepseek-v4-flash', context: 1000000, output: 65536, free: true },
       { id: 'opencode:gemini-3.8-flash', model: 'gemini-3.8-flash', context: 1000000, output: 65536 },
     ],
   },
@@ -299,7 +299,11 @@ check('所有复制 ID 前缀格式正确', all.every(s => /^(cline\\/|zen\\/|[a
 console.log('\\n[5] 勾选框只对通用 Provider 出现');
 const cb = n => (cardHtml(n).match(/type="checkbox"/g) || []).length;
 check('cline 卡片 0 个勾选框', cb('cline') === 0, cb('cline') + ' 个');
-check('opencode 卡片 0 个勾选框', cb('opencode') === 0, cb('opencode') + ' 个');
+check('opencode 卡片 2 个勾选框(1 锁定 + 1 可勾选)', cb('opencode') === 2, cb('opencode') + ' 个');
+const ocRows = cardHtml('opencode');
+check('opencode 自动免费行锁定勾选(checked disabled)', /checked disabled title="自动免费模型/.test(ocRows), '缺少锁定行');
+const ocActive = (ocRows.match(/data-ocmodel="gemini-3.8-flash"[^>]*onchange="toggleOcModel\(this\)"/) || ['未找到'])[0];
+check('opencode 测试模型可勾选(非锁定)', ocActive !== '未找到', ocActive);
 check('bai 卡片 2 个勾选框', cb('bai') === 2, cb('bai') + ' 个');
 const row = id => (cardHtml('bai').match(new RegExp('<td><input[^>]*' + id.replace(/\\./g, '\\\\.') + '[^>]*></td>')) || ['未找到'])[0];
 check('glm-5.3-flash 已勾选', /checked/.test(row('glm-5.3-flash')), row('glm-5.3-flash'));
@@ -613,3 +617,4 @@ if (js === script) {
 js += '\n/* ===== TEST PROBE ===== */\n' + PROBE;
 
 eval(js);
+

@@ -73,8 +73,12 @@ func callZenAPI(ctx context.Context, params map[string]any, stream bool) (*http.
 	// 服务, chat/completions 会被后端崩成 500。已登记的模型直接走 Responses
 	// 形态, 响应在这里翻译回 chat 格式, 对上层调用方完全透明。
 	// 注意用 body["model"](buildZenBody 已解析为 zen ID), 未注册模型也能命中。
+	// 端点选择(2026-09-17 补齐): 官方文档给出 **4 种**端点, 不同模型走不同形态。
+	// 此前只有 chat / responses 两个分支, 缺 /messages —— 于是 union-alpha
+	// (免费, 只在 /messages)会被发到 /chat/completions 必然失败。
+	// 判据与端点矩阵见 zen_endpoints.go 与 docs/opencode-zen-facts.md。
 	zenResolvedModel, _ := body["model"].(string)
-	useRespAPI := zenUseResponsesAPI(zenResolvedModel)
+	zenEndpoint := zenEndpointFor(zenResolvedModel)
 	// reasoning_effort 会被 buildZenBody 删除(chat 端点上上游不接受), 这里
 	// 先留存, 供 Responses 形态使用。
 	reasoningEffort := zenReasoningEffortOf(params)
@@ -87,7 +91,8 @@ func callZenAPI(ctx context.Context, params map[string]any, stream bool) (*http.
 	if zenBudget == 0 && isMuseSparkModel(zenResolvedModel) {
 		zenBudget = museSparkDefaultOutputTokens
 	}
-	if useRespAPI {
+	switch zenEndpoint {
+	case zenEndpointResponses:
 		body = translate_registry.TranslateRequest(translate_registry.Chat, translate_registry.Responses, body)
 		applyResponsesReasoning(body, reasoningEffort)
 		// 出站体形态不变量(P1-9): 违例说明转换层有 bug(如重复转换把 input
@@ -95,7 +100,17 @@ func callZenAPI(ctx context.Context, params map[string]any, stream bool) (*http.
 		if problems := translate_registry.ValidateOutbound(translate_registry.Responses, body); len(problems) > 0 {
 			return nil, 0, fmt.Errorf("responses outbound shape invalid: %s", strings.Join(problems, "; "))
 		}
+	case zenEndpointMessages:
+		// Anthropic Messages 形态: 用 internal/translate 的 openai→claude 方向。
+		// 失败即返回, 不把畸形请求发给上游。
+		converted, cerr := translateZenMessagesRequest(zenResolvedModel, body, stream)
+		if cerr != nil {
+			return nil, 0, cerr
+		}
+		body = converted
 	}
+	// 保留给下方"Responses 端点自适应回退"分支的既有判据。
+	// (已被 zenEndpoint 取代, 保留注释说明来源)
 
 	bodyJSON, err := json.Marshal(body)
 	if err != nil {
@@ -132,6 +147,7 @@ func callZenAPI(ctx context.Context, params map[string]any, stream bool) (*http.
 	delay := time.Second
 	rateLimited = 0
 	respTried := false // Responses 端点自适应回退每次请求只试一次
+	msgTried := false  // Messages 端点自适应回退每次请求只试一次
 
 	for attempt := 0; ; attempt++ {
 		// 客户端已断开(超时/取消): 立即停止, 再重试也没有人接收结果。
@@ -141,10 +157,9 @@ func callZenAPI(ctx context.Context, params map[string]any, stream bool) (*http.
 		// 端点轮换: 第 N 次尝试用第 N % len(baseURLs) 个端点,
 		// 官方地址失败后自然落到 CDN 镜像。
 		base := baseURLs[attempt%len(baseURLs)]
-		endpoint := base + "/chat/completions"
-		if useRespAPI {
-			endpoint = base + "/responses"
-		}
+		// 相对路径由端点形态决定。★ base 已含 /v1, 所以 /messages 端点的相对
+		// 路径是 "/messages" 而不是 "/v1/messages"(后者拼出 .../zen/v1/v1/messages)。
+		endpoint := base + zenEndpoint.pathFor(zenResolvedModel)
 		req, err := http.NewRequestWithContext(ctx, "POST", endpoint, bytes.NewReader(bodyJSON))
 		if err != nil {
 			return nil, rateLimited, fmt.Errorf("create zen request: %w", err)
@@ -154,7 +169,17 @@ func callZenAPI(ctx context.Context, params map[string]any, stream bool) (*http.
 		// 结构 ID。门禁按此判 "from within OpenCode", 形态不对即 403 FreeTierError。
 		outbound := map[string]string{}
 		applyOpencodeHeaders(outbound, nil, defaultOpencodeIdentity(), bodyFingerprint(body))
-		req.Header.Set("Authorization", "Bearer "+cfg.Key)
+		// 多 key: 按出口**确定性**选一把(同一出口永远用同一把 key, 见 zen_keys.go),
+		// 退役中的 key 自动跳过。
+		reqKey := zenSelectKey(cfg, reqExitKey(ctx))
+		// 鉴权按端点形态分流: Anthropic Messages 用 x-api-key + 版本头, 其余用
+		// Bearer。漏掉这步会拿到 401, 而 401 很容易被误判成"key 不对"。
+		if zenEndpoint.usesAnthropicAuth() {
+			req.Header.Set("x-api-key", reqKey)
+			req.Header.Set("anthropic-version", "2023-06-01")
+		} else {
+			req.Header.Set("Authorization", "Bearer "+reqKey)
+		}
 		req.Header.Set("Content-Type", "application/json")
 		for k, v := range outbound {
 			req.Header.Set(k, v)
@@ -204,7 +229,26 @@ func callZenAPI(ctx context.Context, params map[string]any, stream bool) (*http.
 		if resp.StatusCode == http.StatusOK {
 			markZenSuccess()
 			recordZenModelResult(zenModelIDOf(params), false)
-			if useRespAPI {
+			// 这个出口调通了 → 清零它的连续 429 计数, 让冷却时长回到基准。
+			// 不清零的话计数单调递增, 出口被限流一次后就再也回不到短冷却。
+			clearActualExitQuotaStrike(ctx)
+			// 地区能力**正向**学习: 这个出口对该模型可用。
+			//
+			// ★ 2026-09-17 审查 P1-1: 此前只有负向回写(失败时 setRegionNodeOK(false)),
+			//   正向知识的唯一来源是 probeModelAllNodes —— 那要对**全部**节点发真实
+			//   请求、烧免费额度。于是"哪些出口对该模型可用"这个信息, 代价是上百个请求。
+			//
+			//   用真实请求当探测器是零开销的: 每一次成功都在回答"这个出口对这个模型
+			//   可用"。补上这一步之后, 全节点探测退化为罕见补充而非常规手段。
+			//
+			//   只对地区受限模型记 —— 其余模型选路时不查这张表(见 exitFilterForModel)。
+			if modelID := zenModelIDOf(params); isRegionRestrictedModel(modelID) {
+				if key := nodeLocalKey(reqExitKey(ctx)); key != "" {
+					setRegionNodeOK(modelID, key, true)
+				}
+			}
+			switch zenEndpoint {
+			case zenEndpointResponses:
 				if stream {
 					resp = wrapResponsesStreamToChat(resp, zenResolvedModel, zenBudget)
 				} else {
@@ -214,12 +258,33 @@ func callZenAPI(ctx context.Context, params map[string]any, stream bool) (*http.
 					}
 					resp = converted
 				}
+			case zenEndpointMessages:
+				// Anthropic 响应 / SSE → chat 形态。流式走 io.Pipe 实时转换, 因此
+				// 下游的空流守卫、坏帧清洗、心跳全部照常生效, 无需单独实现一套。
+				if stream {
+					resp = wrapClaudeStreamToChat(resp, zenResolvedModel)
+				} else {
+					converted, cerr := convertClaudeResponseToChat(resp, zenResolvedModel)
+					if cerr != nil {
+						return nil, rateLimited, fmt.Errorf("zen messages convert: %w", cerr)
+					}
+					resp = converted
+				}
+				// 实测调通 → 持久化登记, 之后直接走 /messages(负向结论不落盘)。
+				zenLearnMessagesOnly(zenResolvedModel)
 			}
 			return resp, rateLimited, nil
 		}
 
 		bodyBytes := kit.ReadBody(resp)
 		resp.Body.Close()
+		// 401: 这把 key 失效(被吊销 / 冻结) → 临时退役, 受影响出口自动落到下一把
+		// key(zenSelectKey 会跳过退役的)。这是多 key 的**确定收益**: 一把 key 坏掉
+		// 不影响整体服务。退役状态不落盘 —— 上游随时可能恢复。
+		if resp.StatusCode == http.StatusUnauthorized {
+			zenRetireKey(reqKey)
+			log.Printf("  zen: key %s 认证失败(401), 临时退役 %v 后重试", maskZenKey(reqKey), zenKeyRetireDuration)
+		}
 		// FreeTierError("can only be used from within OpenCode"): opencode 免费
 		// tier 的风控按**出口 IP** 判定 —— 实测(2026-09-17)同一 mimo-v2.5-free
 		// 走香港/大陆中转节点 200、走美/法节点与本机直连一律 403, 且与请求头无关
@@ -262,14 +327,20 @@ func callZenAPI(ctx context.Context, params map[string]any, stream bool) (*http.
 
 		if isRateLimited(resp.StatusCode, bodyBytes) {
 			rateLimited++
-			// 冷却本次真实出口代理(429 是等限流窗口, 保留退避睡眠)
-			cooldownActualExit(ctx, func() time.Duration {
-				d := parseRetryAfter(resp.Header.Get("Retry-After"))
-				if d <= 0 {
-					d = 10 * time.Minute
-				}
-				return d
-			}())
+			// 429: 冷却本次真实出口。
+			//
+			// ★ 冷却对象是**出口**而不是候选(模型): opencode 的免费额度按出口 IP
+			//   计 —— 一个 IP 用完就 429, 换一个 IP 就能继续(用户实测)。所以这里
+			//   绝不能标记模型失败, 那会把一个好模型在好节点轮回来之前就误杀。
+			//
+			// ★ 时长按连续命中次数指数升级(cooldownZenProxyQuota): 额度重置窗口
+			//   未知(标 [未知]), 固定时长要么太短(白烧尝试)要么太长(出口闲置)。
+			//   上游给了 Retry-After 则取较大者。
+			cooled := cooldownActualExitQuota(ctx, parseRetryAfter(resp.Header.Get("Retry-After")))
+			if cooled > 0 {
+				log.Printf("  zen: 出口 %s 额度冷却 %v(429, 连续命中升级), 换出口重试",
+					describeExitRaw(reqExitKey(ctx)), cooled.Round(time.Second))
+			}
 			if attempt < retries {
 				wait := delay
 				if retryAfter := parseRetryAfter(resp.Header.Get("Retry-After")); retryAfter > wait {
@@ -285,16 +356,32 @@ func callZenAPI(ctx context.Context, params map[string]any, stream bool) (*http.
 			return nil, rateLimited, &zenUpstreamError{Status: resp.StatusCode, Body: kit.Truncate(bodyBytes, 500)}
 		}
 
-		// 5xx: 先给 Responses 端点一次自适应回退的机会(上游把"该模型只在
-		// /responses 提供"崩成 500), 再冷却本次真实出口换下一个重试, 不退避
+		// 5xx: 先给其他端点各一次自适应回退的机会(上游把"该模型只在某端点提供"
+		// 崩成 500, 而不是翻译成 4xx), 再冷却本次真实出口换下一个重试, 不退避
 		// —— 上游 500 常与出口线路相关, 换一个出口就是全新的机会。
 		if resp.StatusCode >= http.StatusInternalServerError {
-			if !useRespAPI && !respTried {
-				respTried = true
-				altBody := translate_registry.TranslateRequest(translate_registry.Chat, translate_registry.Responses, body)
-				applyResponsesReasoning(altBody, reasoningEffort)
-				if problems := translate_registry.ValidateOutbound(translate_registry.Responses, altBody); len(problems) == 0 {
-					if alt := tryZenResponsesFallback(ctx, base, altBody, stream, client, zenBudget); alt != nil {
+			// 端点回退: 首选 chat 时依次试 responses → messages。
+			//
+			// 为什么只从 chat 出发: 静态表与学习机制都已把模型定向到正确端点,
+			// 能走到这里说明"我们不知道这个模型该走哪个端点" —— 也就是首选必然是
+			// chat。反向(从 responses/messages 回退到 chat)只会重复同一个失败,
+			// 且 body 已转成目标形态, 反向转换没有依据。
+			if zenEndpoint == zenEndpointChat {
+				if !respTried {
+					respTried = true
+					altBody := translate_registry.TranslateRequest(translate_registry.Chat, translate_registry.Responses, body)
+					applyResponsesReasoning(altBody, reasoningEffort)
+					if problems := translate_registry.ValidateOutbound(translate_registry.Responses, altBody); len(problems) == 0 {
+						if alt := tryZenResponsesFallback(ctx, base, altBody, stream, client, zenBudget); alt != nil {
+							markZenSuccess()
+							recordZenModelResult(zenModelIDOf(params), false)
+							return alt, rateLimited, nil
+						}
+					}
+				}
+				if !msgTried {
+					msgTried = true
+					if alt := tryZenMessagesFallback(ctx, base, body, stream, client); alt != nil {
 						markZenSuccess()
 						recordZenModelResult(zenModelIDOf(params), false)
 						return alt, rateLimited, nil

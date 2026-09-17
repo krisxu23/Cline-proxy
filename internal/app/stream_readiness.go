@@ -401,7 +401,24 @@ func processStreamReadinessEvent(st *streamReadinessState) bool {
 		}
 	}
 
-	return hasNonPingStructuredPayload(payload, eventType)
+	if !hasNonPingStructuredPayload(payload, eventType) {
+		return false
+	}
+	// ★ 收紧(2026-09-17 审查 P0-1): 纯脚手架帧不算"流已就绪"。
+	//
+	// 原判据只要"非空对象、非 error-only"就算就绪, 于是
+	//   {"choices":[{"delta":{"role":"assistant"}}]}       (role 骨架帧)
+	//   {"choices":[{"delta":{},"finish_reason":"stop"}]}   (终止帧)
+	// 都能骗过它 → 探测提交 → 整条流零产出 → 客户端拿到"成功但空"的回合,
+	// 不报错不重试, 任务静默中断。
+	//
+	// 提交前是**唯一能换站重试**的时机(提交后响应头已发出, 只能报错), 所以
+	// 这道判据必须严。判据本体在 stream_delivery.go 的 readinessScaffoldingOnly,
+	// 与流级产出判据同源 —— 只处理 OpenAI 形态, 其余形态不介入。
+	if readinessScaffoldingOnly(payload) {
+		return false
+	}
+	return true
 }
 
 // processStreamReadinessLine 照抄 :354-370。

@@ -8,6 +8,24 @@ import (
 	"testing"
 )
 
+// TestFullCompletionBodyArrayContent 完整 JSON body 的 content 若为数组形态
+// (OpenAI content-parts / 翻译后的 blocks), 任一块带非空 text 即算有内容,
+// 不能把正常回包误判成空壳打 502(2026-09-17 审查 R2-6)。
+func TestFullCompletionBodyArrayContent(t *testing.T) {
+	withText := []byte(`{"choices":[{"message":{"content":[{"type":"text","text":"hello"}]}}]}`)
+	if !fullCompletionBodyHasContent(withText) {
+		t.Fatal("带非空 text 的 content 数组应判为有内容")
+	}
+	emptyBlocks := []byte(`{"choices":[{"message":{"content":[{"type":"text","text":""}]}}]}`)
+	if fullCompletionBodyHasContent(emptyBlocks) {
+		t.Fatal("content 数组里全是空 text 不应判为有内容")
+	}
+	stringContent := []byte(`{"choices":[{"message":{"content":"hello"}}]}`)
+	if !fullCompletionBodyHasContent(stringContent) {
+		t.Fatal("字符串 content 应照旧判为有内容")
+	}
+}
+
 // 本测试对应用户要求照抄的 OmniRoute 参考用例:
 //
 //	open-sse/utils/streamEmptyChoices.ts       → rejectEmptyChoicesStream(空流拒绝)
@@ -20,9 +38,18 @@ import (
 // controller.error 表达 502; 本网关的流式 200 已提交, HTTP 状态码改不了,
 // 因此失败信息走 SSE 帧(error.type = "empty_content" + finish_reason)。
 
-// ─────────────────── openAIChunkHasValuableContent 判定 ───────────────────
+// ─────────────────── chunkDeliversUserContent 判定（流级口径）───────────────────
+//
+// ★ 本测试于 2026-09-17 审查 P0-1 时**有意改了四处期望值**。
+//
+// 原测试锁定的是**帧级转发过滤**的判据(照抄 OmniRoute hasValuableContent),
+// 那里 role / finish_reason 算"有价值"是对的 —— 客户端靠它们收尾, 这一帧
+// 必须转发。但该函数被当成了**流级产出判据**, 于是这些脚手架帧能让空流
+// 穿过守卫。现改用流级口径(chunkDeliversUserContent), 期望值随之调整。
+//
+// 详见 stream_delivery.go 顶部注释与 proxy_stream.go 里被删函数的说明。
 
-func TestOpenAIChunkHasValuableContent(t *testing.T) {
+func TestChunkDeliversUserContent(t *testing.T) {
 	cases := []struct {
 		name string
 		obj  map[string]any
@@ -45,42 +72,93 @@ func TestOpenAIChunkHasValuableContent(t *testing.T) {
 			want: true,
 		},
 		{
-			name: "带 finish_reason → 有价值",
+			// ★ 改动 1/4: 原为 true(帧级判据接受 finish_reason)。
+			// 流级口径下 finish_reason 是**脚手架**, 不是产出 ——
+			// 一条只发 finish_reason 就结束的流对用户等于零产出, 必须判空。
+			name: "带 finish_reason 但零产出 → 无价值(脚手架帧)",
 			obj: map[string]any{"choices": []any{
 				map[string]any{"index": 0, "delta": map[string]any{}, "finish_reason": "stop"},
-			}},
-			want: true,
-		},
-		{
-			name: "非流式 message 形态 → 无价值(hasValuableContent 只认 delta)",
-			obj: map[string]any{"choices": []any{
-				map[string]any{"index": 0, "message": map[string]any{"content": "hi"}},
 			}},
 			want: false,
 		},
 		{
-			name: "只有 role 骨架帧 → 有价值(hasValuableContent 显式接受 role)",
+			// ★ 改动 2/4: 原为 false(帧级判据只认 delta)。
+			// 流级口径也接受非流式的 message 形态 —— 完整回包合成路径用它承载正文,
+			// 只认 delta 会让有内容的回包被判空。
+			name: "非流式 message 形态带 content → 有价值",
 			obj: map[string]any{"choices": []any{
-				map[string]any{"index": 0, "delta": map[string]any{"role": "assistant"}},
+				map[string]any{"index": 0, "message": map[string]any{"content": "hi"}},
 			}},
 			want: true,
 		},
 		{
-			name: "delta 带 reasoning_content → 有价值(hasAnyReasoningSignal)",
+			// ★ 改动 3/4: 原为 true(帧级判据显式接受 role)。
+			// role 骨架帧是**脚手架**, 不是产出。
+			name: "只有 role 骨架帧 → 无价值(脚手架帧)",
+			obj: map[string]any{"choices": []any{
+				map[string]any{"index": 0, "delta": map[string]any{"role": "assistant"}},
+			}},
+			want: false,
+		},
+		{
+			name: "delta 带 reasoning_content → 有价值",
 			obj: map[string]any{"choices": []any{
 				map[string]any{"index": 0, "delta": map[string]any{"reasoning_content": "想一下"}},
 			}},
 			want: true,
 		},
 		{
-			name: "多 choice 时只看 choices[0] → 第一个空即无价值",
+			// ★ 改动 4/4: 原为 false(帧级判据只认 choices[0])。
+			// 流级问题问的是"有没有产出", 任一 choice 有产出即算交付。
+			name: "多 choice: 任一有内容即有价值",
 			obj: map[string]any{"choices": []any{
 				map[string]any{"index": 0, "delta": map[string]any{"content": ""}},
 				map[string]any{"index": 1, "delta": map[string]any{"content": "有内容"}},
 			}},
+			want: true,
+		},
+		// ── 以下为流级口径新增的边界用例 ──
+		{
+			// reasoning 只发空白: 帧级判据不 trim(流式 delta 的首尾空格有意义),
+			// 但流级口径要的是"用户能不能看到东西", 纯空白等于零产出。
+			name: "reasoning 只有空格 → 无价值",
+			obj: map[string]any{"choices": []any{
+				map[string]any{"index": 0, "delta": map[string]any{"reasoning_content": "   "}},
+			}},
 			want: false,
 		},
-		// ── 以下均对应参考用例里的 "emptyChoicesChunk" / 骨架帧 ──
+		{
+			name: "reasoning 带内容与空格 → 有价值",
+			obj: map[string]any{"choices": []any{
+				map[string]any{"index": 0, "delta": map[string]any{"reasoning_content": " 想 "}},
+			}},
+			want: true,
+		},
+		{
+			name: "content 为数组且块带 text → 有价值",
+			obj: map[string]any{"choices": []any{
+				map[string]any{"index": 0, "delta": map[string]any{
+					"content": []any{map[string]any{"type": "text", "text": "hi"}},
+				}},
+			}},
+			want: true,
+		},
+		{
+			name: "content 为数组但块全空 → 无价值",
+			obj: map[string]any{"choices": []any{
+				map[string]any{"index": 0, "delta": map[string]any{
+					"content": []any{map[string]any{"type": "text", "text": ""}},
+				}},
+			}},
+			want: false,
+		},
+		{
+			name: "包了一层 data 的 choices 也能识别",
+			obj: map[string]any{"data": map[string]any{"choices": []any{
+				map[string]any{"index": 0, "delta": map[string]any{"content": "hi"}},
+			}}},
+			want: true,
+		},
 		{
 			name: "空 choices 数组 → 无价值(#9268 核心场景)",
 			obj:  map[string]any{"id": "chatcmpl-1", "model": "m", "choices": []any{}},
@@ -95,13 +173,6 @@ func TestOpenAIChunkHasValuableContent(t *testing.T) {
 			name: "content 为空字符串 → 无价值",
 			obj: map[string]any{"choices": []any{
 				map[string]any{"index": 0, "delta": map[string]any{"content": ""}},
-			}},
-			want: false,
-		},
-		{
-			name: "finish_reason 为空字符串 → 无价值",
-			obj: map[string]any{"choices": []any{
-				map[string]any{"index": 0, "delta": map[string]any{}, "finish_reason": ""},
 			}},
 			want: false,
 		},
@@ -124,11 +195,45 @@ func TestOpenAIChunkHasValuableContent(t *testing.T) {
 			}},
 			want: false,
 		},
+		{
+			name: "nil → 无价值",
+			obj:  nil,
+			want: false,
+		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			if got := openAIChunkHasValuableContent(tc.obj); got != tc.want {
-				t.Fatalf("openAIChunkHasValuableContent = %v, 期望 %v", got, tc.want)
+			if got := chunkDeliversUserContent(tc.obj); got != tc.want {
+				t.Fatalf("chunkDeliversUserContent = %v, 期望 %v (obj=%#v)", got, tc.want, tc.obj)
+			}
+		})
+	}
+}
+
+// TestHasOutputUsageTokens 输出侧 token 判定: 输入侧有值不算"已交付"。
+//
+// 这是 P0-1 的第二处漏洞 —— 原判据(任一 token 字段 > 0)把
+// {prompt_tokens:1500, completion_tokens:0} 这类真·空回包当成已交付。
+func TestHasOutputUsageTokens(t *testing.T) {
+	cases := []struct {
+		name  string
+		usage map[string]any
+		want  bool
+	}{
+		{"只有 prompt_tokens → 不算产出", map[string]any{"prompt_tokens": float64(1500)}, false},
+		{"只有 input_tokens → 不算产出", map[string]any{"input_tokens": float64(1500)}, false},
+		{"只有 promptTokenCount → 不算产出", map[string]any{"promptTokenCount": float64(1500)}, false},
+		{"只有 total_tokens → 不算产出", map[string]any{"total_tokens": float64(1500)}, false},
+		{"completion_tokens>0 → 算产出", map[string]any{"prompt_tokens": float64(1500), "completion_tokens": float64(1)}, true},
+		{"output_tokens>0 → 算产出", map[string]any{"output_tokens": float64(1)}, true},
+		{"candidatesTokenCount>0 → 算产出", map[string]any{"candidatesTokenCount": float64(1)}, true},
+		{"全零 → 不算产出", map[string]any{"prompt_tokens": float64(0), "completion_tokens": float64(0)}, false},
+		{"nil → 不算产出", nil, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := hasOutputUsageTokens(tc.usage); got != tc.want {
+				t.Fatalf("hasOutputUsageTokens(%#v) = %v, 期望 %v", tc.usage, got, tc.want)
 			}
 		})
 	}
@@ -210,34 +315,78 @@ func Test空流_真实内容之后的空choices不影响通过(t *testing.T) {
 	}
 }
 
-// role 骨架帧本身**算**有价值内容(hasValuableContent 显式接受 role)——
-// 这条与直觉相反, 但必须照抄。因此"只有骨架帧 + [DONE]"的流会正常收尾。
-// 真正会被判空的是"一件事都没做"的情形, 见 Test空流_只有usage没有choices必须失败。
-func Test空流_仅骨架帧按参考实现算有价值(t *testing.T) {
+// role 骨架帧**不算**有价值内容。
+//
+// ★ 2026-09-17 审查 P0-1 修正: 原测试断言"骨架帧按 hasValuableContent 应算
+// 有价值, 不应判空流"。那是**帧级转发过滤**的判据 —— role 帧必须转发给客户端
+// (客户端靠它收尾), 所以帧级算"有价值"是对的。但把它当**流级产出判据**就错了:
+// 一条只发了 role 骨架帧就 [DONE] 的流, 对用户等于零产出, 必须判空并换站。
+func Test空流_仅骨架帧必须判空(t *testing.T) {
 	skeleton := "data: " + `{"choices":[{"index":0,"delta":{"role":"assistant"}}]}` + "\n\n"
 	out := drainStream(t, skeleton+"data: [DONE]\n\n")
 
-	if strings.Contains(out, "empty_content") {
-		t.Fatalf("骨架帧按 hasValuableContent 应算有价值, 不应判空流, 实得:\n%s", out)
+	if !strings.Contains(out, "empty_content") {
+		t.Fatalf("只有 role 骨架帧的流应判为空流(骨架帧不是产出), 实得:\n%s", out)
 	}
 }
 
-// usage-only 流是**合法**的(OmniRoute: "usage-only streams are fine")。
-// 上游报告了真实 token 用量, 说明这一回合确实发生过, 不该判成静默中断。
-func Test空流_仅真实usage算有效交付(t *testing.T) {
+// 只有 finish_reason 的流同样必须判空 —— 它是另一个脚手架帧。
+func Test空流_仅finish_reason必须判空(t *testing.T) {
+	out := drainStream(t, "data: "+`{"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}`+"\n\n")
+
+	if !strings.Contains(out, "empty_content") {
+		t.Fatalf("只有 finish_reason=stop 的流应判为空流, 实得:\n%s", out)
+	}
+}
+
+// 只有 finish_reason=length 的流**不应**判空 —— 它是"合法空终止态"
+// (被 token 上限截断, 本就不该有正文)。这条防的是"收紧判据时误杀合法空回包"。
+func Test空流_finish_reason为length属合法空不判空(t *testing.T) {
+	out := drainStream(t, "data: "+`{"choices":[{"index":0,"delta":{},"finish_reason":"length"}]}`+"\n\n")
+
+	if strings.Contains(out, "empty_content") {
+		t.Fatalf("finish_reason=length 是合法空终止态, 不应判空流, 实得:\n%s", out)
+	}
+}
+
+// ★ 2026-09-17 审查 P0-1 修正: 原测试断言"带真实 usage 的流不应判空",
+// 而输入是 {"usage":{"prompt_tokens":1},"choices":[]} —— 纯**输入侧** token、
+// 零输出、choices 为空。这正是最典型的真·空回包, 却被当成正确行为守护着。
+//
+// 输入 token 有值只说明上游收到了 prompt, 完全不能说明它产出了东西。
+func Test空流_仅输入侧usage必须判空(t *testing.T) {
 	out := drainStream(t, "data: "+`{"id":"c1","model":"m","usage":{"prompt_tokens":1},"choices":[]}`+"\n\n")
 
-	if strings.Contains(out, "empty_content") {
-		t.Fatalf("带真实 usage 的流不应判空(usage-only 合法), 实得:\n%s", out)
+	if !strings.Contains(out, "empty_content") {
+		t.Fatalf("只有 prompt_tokens(输入侧)的流应判为空流, 实得:\n%s", out)
 	}
 }
 
-// 全零 usage 是空壳, 不算有效用量(对应 hasValidUsage 的 `> 0` 判据)。
+// 只有**输出侧** token 的流是合法交付 —— 上游确实生成了东西(可能因
+// finish_reason=length 被截断成 0 字符, 但 completion_tokens 有值)。
+func Test空流_输出侧usage算有效交付(t *testing.T) {
+	out := drainStream(t, "data: "+`{"id":"c1","model":"m","usage":{"prompt_tokens":10,"completion_tokens":5},"choices":[]}`+"\n\n")
+
+	if strings.Contains(out, "empty_content") {
+		t.Fatalf("带输出侧 token 的流不应判空, 实得:\n%s", out)
+	}
+}
+
+// 全零 usage 是空壳, 不算有效用量。
 func Test空流_全零usage不算有效(t *testing.T) {
 	out := drainStream(t, "data: "+`{"id":"c1","model":"m","usage":{"prompt_tokens":0,"completion_tokens":0},"choices":[]}`+"\n\n")
 
 	if !strings.Contains(out, "empty_content") {
 		t.Fatalf("全零 usage 应判为空流, 实得:\n%s", out)
+	}
+}
+
+// reasoning 只发空白: 流级口径要的是"用户能不能看到东西", 纯空白等于零产出。
+func Test空流_仅空格reasoning必须判空(t *testing.T) {
+	out := drainStream(t, "data: "+`{"choices":[{"index":0,"delta":{"reasoning_content":"   "}}]}`+"\n\n")
+
+	if !strings.Contains(out, "empty_content") {
+		t.Fatalf("只有空白 reasoning 的流应判为空流, 实得:\n%s", out)
 	}
 }
 
@@ -512,30 +661,52 @@ func Test空流_完整JSON纯工具调用必须通过(t *testing.T) {
 	}
 }
 
-// 对照用例: 说明 finish_reason=stop 的空 delta 帧在参考实现语义下**确实算有价值**。
+// 对照用例: 说明 **"转发" 与 "交付" 是两件事** —— 这是 P0-1 的核心。
 //
-// 这不是疏漏, 是照抄 hasValuableContent(streamHelpers.ts:379)的必然结果 ——
-// 它显式 `if (firstChoice.finish_reason) return true;`。OmniRoute 自己的参考
-// 用例(tests/unit/stream-empty-choices-interceptor.test.ts)也从未用
-// "finish_reason=stop + 空 delta" 来构造"空流"场景, 它构造空流只用一个东西:
-// **choices 为空数组**(emptyChoicesChunk: `choices: []`)。
+// ★ 2026-09-17 审查修正。本用例原先断言"finish_reason=stop + 空 delta 不应判空流",
+// 理由是"照抄 hasValuableContent(streamHelpers.ts:379) 的必然结果, 且 OmniRoute
+// 自己的参考用例从不用它构造空流场景"。**这两条理由都成立, 但结论是错的** ——
+// 因为它们证明的是"这个函数用于帧级转发过滤时, finish_reason 算有价值", 而
+// 本网关把它用在了**流级产出判定**上。
 //
-// 因此本网关的"空流"定义与参考实现完全一致:
-//   - 空流 = 整条流没有任何 choices 非空的帧(或全零 usage)
-//   - 有 finish_reason 的终止帧 → 有价值, 不判空流
+// 参考实现为什么不需要处理"整条流零产出"?
 //
-// 该用例锁定这一语义, 防止后人"顺手加强"判定而与参考实现漂移。
-func Test空流_finish_reason帧按参考实现算有价值(t *testing.T) {
+//	因为 OmniRoute 靠**异常与超时**兜底(见 streaming_handler 的异常路径),
+//	它的 hasValuableContent 只回答"这一帧要不要发给客户端"。
+//
+// 本网关把它升级成流级判据之后, 语义就变了:
+//
+//	帧级: finish_reason 帧 → 有价值 → **必须转发**(客户端靠它收尾)  ← 仍然成立
+//	流级: finish_reason 帧 → 不是产出 → **不算交付**              ← 本用例锁定的新语义
+//
+// 一条只发 finish_reason 就结束的流, 客户端会拿到一个"成功但空"的回合 ——
+// 不报错、不重试、任务静默中断。这正是要根治的症状。
+//
+// 因此本用例同时锁定两件相反的事: **帧要转发, 但流要判空**。
+func Test空流_仅finish_reason帧必须判空但帧仍要转发(t *testing.T) {
 	body := "data: " + `{"id":"c1","object":"chat.completion.chunk","model":"mimo-test","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}` + "\n\n" +
 		"data: [DONE]\n\n"
 	out := drainStream(t, body)
 
-	// 照抄语义: 有 finish_reason → hasValuableContent 判真 → 不算空流。
-	if strings.Contains(out, "empty_content") {
-		t.Fatalf("参考实现显式接受 finish_reason 作为价值信号, 不应报空流, 实得:\n%s", out)
+	// ① 流级: 零产出 → 必须判空(与 P0-1 修复方向一致)
+	if !strings.Contains(out, "empty_content") {
+		t.Fatalf("只有 finish_reason 的流应判为空流(零产出), 实得:\n%s", out)
 	}
+	// ② 帧级: 终止帧**仍然必须转发**给客户端 —— 收紧流级判据不得影响转发
 	if !strings.Contains(out, `"finish_reason":"stop"`) {
-		t.Fatalf("终止帧必须转发给客户端, 实得:\n%s", out)
+		t.Fatalf("终止帧必须转发给客户端(转发 ≠ 交付), 实得:\n%s", out)
+	}
+}
+
+// 反向保护: 收紧流级判据**不得误杀**合法空回包。
+// finish_reason=length 表示被 token 上限截断, 本就不该有正文, 是合法成功。
+func Test空流_length截断的合法空回包不判空(t *testing.T) {
+	body := "data: " + `{"id":"c1","object":"chat.completion.chunk","model":"mimo-test","choices":[{"index":0,"delta":{},"finish_reason":"length"}]}` + "\n\n" +
+		"data: [DONE]\n\n"
+	out := drainStream(t, body)
+
+	if strings.Contains(out, "empty_content") {
+		t.Fatalf("finish_reason=length 是合法空终止态, 不得判空流, 实得:\n%s", out)
 	}
 }
 

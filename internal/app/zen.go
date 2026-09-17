@@ -110,6 +110,20 @@ func isZenFreeModel(m *ZenModel) bool {
 	return zenModelEnabled(m.ID)
 }
 
+// isAutoFreeZenModel 自动免费判定: 只看 seed 白名单 / ID 带 -free 后缀,
+// **不含**用户手动启用。
+//
+// 与 isZenFreeModel 的区别: 后者把"用户手动启用"也算作免费 —— 那是给
+// 路由/可用性判断用的(启用即放行); 面板展示"自动免费锁定勾选"必须用它,
+// 否则一个手动启用的测试模型会被显示成自动免费, 勾选框被锁死, 用户再也
+// 无法从面板取消(2026-09-17 审查 C1)。
+func isAutoFreeZenModel(m *ZenModel) bool {
+	if m == nil {
+		return false
+	}
+	return m.Source == "seed" || strings.HasSuffix(m.ID, "-free")
+}
+
 // zenModelEnabled 该模型 ID 是否被用户在面板上手动启用。
 // 热路径(routeModel 每次请求都调)读克隆配置太重, 用一个读多写少的集合缓存,
 // 配置变更时由 refreshZenEnabledModels 重建。
@@ -285,9 +299,20 @@ type zenCompactConfig struct {
 
 type zenConfigData struct {
 	// SchemaVersion 配置结构版本, 由 migrateZenConfig 链式升级(见 config_migrate.go)。
-	SchemaVersion   int                       `json:"schemaVersion,omitempty"`
-	Enabled         bool                      `json:"enabled"`
-	Key             string                    `json:"key"`
+	SchemaVersion int    `json:"schemaVersion,omitempty"`
+	Enabled       bool   `json:"enabled"`
+	Key           string `json:"key"`
+	// Keys 额外的 zen API Key(多 key)。
+	//
+	// 动机: 一个 key 从上千个 IP 打是明显的代理特征; 把出口按 key 分成若干组、
+	// 每组固定用一把 key, 更接近正常用户的网络特征。同时提供冗余 —— 一把 key
+	// 收到 401 时其他 key 照常工作。
+	//
+	// ★ 收益边界: 隐蔽性收益取决于 key 数量(2-3 把 key 对上上千个出口, 每把仍
+	//   会从数百个 IP 打, 改善有限); **冗余性是确定的收益**。详见 zen_keys.go。
+	//
+	// 配对是确定性的(按出口标识哈希), 不需要额外配置出口分组。
+	Keys            []string                  `json:"keys,omitempty"`
 	BaseURL         string                    `json:"baseURL"`                  // 主端点(兼容旧配置字段)
 	BaseURLs        []string                  `json:"baseURLs"`                 // 全部端点: 主端点 + CDN 镜像, 重试时轮换
 	Proxies         []string                  `json:"proxies"`                  // http(s)/socks5 代理与节点链接,轮询出口

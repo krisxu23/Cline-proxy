@@ -49,12 +49,29 @@ type providerConfig struct {
 	// DisplayName 面板展示名; APIType 上游方言("openai" 默认, "anthropic" 可选);
 	// Enabled 总开关(nil = true); APIKeys 显式 key 列表; Models 显式模型开关;
 	// Migrated 是否已从 legacy 字段回填。
-	DisplayName string               `json:"name,omitempty"`
-	APIType     string               `json:"apiType,omitempty"`
-	Enabled     *bool                `json:"enabled,omitempty"`
-	APIKeys     []providerAPIKey     `json:"apiKeys,omitempty"`
-	Models      []providerModelEntry `json:"models,omitempty"`
-	Migrated    bool                 `json:"migrated,omitempty"`
+	DisplayName string `json:"name,omitempty"`
+	APIType     string `json:"apiType,omitempty"`
+	// APIFormat 上游**协议形态**: "chat"(默认) / "messages" / "responses"。
+	//
+	// 与 APIType 的分工(两个字段不是重复的):
+	//   APIType   只决定**鉴权方言** —— "anthropic" 表示用 x-api-key + 版本头,
+	//             其余用 Bearer。它是历史字段, **不决定路径与请求体形态**。
+	//   APIFormat 决定**协议形态** —— 路径 + 请求体 + 响应体转换, 三者一起变。
+	//
+	// 为什么不把 APIType 直接扩成三值: 现有配置里 APIType="anthropic" 的语义是
+	// "走 /chat/completions 但用 x-api-key 鉴权"(某些中转站如此)。把它直接解释成
+	// Anthropic Messages 协议会**改坏这些配置**。新字段是加法式的, 零破坏 ——
+	// APIFormat 为空或 "chat" 时行为与改动前完全一致。
+	//
+	// ★ BaseURL 必须含版本段(与既有约定一致): 例如 https://opencode.ai/zen/v1。
+	//   路径按 APIFormat 追加 /chat/completions、/messages 或 /responses。
+	//   (官方文档里 Anthropic 的完整路径自带 /v1, 所以这里追加的是相对路径 ——
+	//    写成 /v1/messages 会拼出 .../v1/v1/messages。)
+	APIFormat string               `json:"apiFormat,omitempty"`
+	Enabled   *bool                `json:"enabled,omitempty"`
+	APIKeys   []providerAPIKey     `json:"apiKeys,omitempty"`
+	Models    []providerModelEntry `json:"models,omitempty"`
+	Migrated  bool                 `json:"migrated,omitempty"`
 }
 
 var providerIDRe = regexp.MustCompile(`^[a-z][a-z0-9_-]*$`)
@@ -144,12 +161,15 @@ func googleNativeCatalogURL(c providerConfig) string {
 }
 
 // chatEndpoint 本次请求要打到上游的完整地址。
+//
+// 路径按 APIFormat 决定(chat / messages / responses), 见 providers_api_format.go。
+// APIFormat 为空时返回 /chat/completions —— 与改动前完全一致。
 func (c providerConfig) chatEndpoint() string {
 	base := strings.TrimRight(strings.TrimSpace(c.BaseURL), "/")
 	if isGoogleProvider(c) {
 		base = googleOpenAIBase(base)
 	}
-	return base + "/chat/completions"
+	return base + c.apiFormatPath()
 }
 
 // googleUsesBearer 只有 Google 的 OpenAI 兼容方言认 Bearer。
@@ -171,12 +191,13 @@ func (c providerConfig) applyAuth(target string, set func(key, value string)) {
 }
 
 // applyAuthWithKey 按单 key 写入鉴权头(Chat 多 key 轮换逐 key 调用)。
-// APIType "anthropic" 走 x-api-key + 版本头, 否则沿用 Google 方言/Bearer。
+// 需要 Anthropic 方言时走 x-api-key + 版本头, 否则沿用 Google 方言/Bearer。
+// 判据见 usesAnthropicAuth(APIFormat=messages 或 APIType=anthropic)。
 func (c providerConfig) applyAuthWithKey(target, key string, set func(key, value string)) {
 	if key == "" {
 		return
 	}
-	if c.APIType == "anthropic" {
+	if c.usesAnthropicAuth() {
 		set("x-api-key", key)
 		set("anthropic-version", "2023-06-01")
 		return

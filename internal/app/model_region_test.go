@@ -5,6 +5,33 @@ import (
 	"testing"
 )
 
+// TestIsRegionErrorPhrasings 地区封锁的识别应覆盖与 error_rules.go 同源的
+// 常见措辞(审查 R2-6/I4: 只认两条会让漏网的措辞落进通用 403, 拿不到
+// "标记出口 + 换出口重试"的处理)。
+func TestIsRegionErrorPhrasings(t *testing.T) {
+	cases := []string{
+		`{"type":"error","error":{"type":"RegionError","message":"region is not supported"}}`,
+		`not available in your country`,
+		`{"error":{"type":"unsupported_region"}}`,
+		`not available in your region`,
+		`geo-restricted`,
+	}
+	for _, c := range cases {
+		if !isRegionError(c) {
+			t.Fatalf("isRegionError(%q) = false, want true", c)
+		}
+	}
+	for _, c := range []string{
+		`{"error":{"code":"1010"}}`,
+		`rate limit exceeded`,
+		``,
+	} {
+		if isRegionError(c) {
+			t.Fatalf("isRegionError(%q) = true, want false", c)
+		}
+	}
+}
+
 // 注册一个地区受限模型(不触发探测 goroutine, 直接置位以便测试选路)。
 func markRegionModelForTest(t *testing.T, modelID string) {
 	t.Helper()

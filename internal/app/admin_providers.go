@@ -86,8 +86,10 @@ func builtinProviderEntries() map[string]map[string]any {
 	zenModels := []map[string]any{}
 	zenCatalog := []map[string]any{}
 	for _, m := range zenAllCatalog() {
-		free := isZenFreeModel(&m)
-		on := free && !zenModelUnavailable(m.ID)
+		// 展示口径与 handleZenModels 一致: free 只代表"自动免费锁定勾选",
+		// 手动启用的模型必须可取消(2026-09-17 审查 C1)。
+		free := isAutoFreeZenModel(&m)
+		on := (free || zenModelEnabled(m.ID)) && !zenModelUnavailable(m.ID)
 		zenModels = append(zenModels, map[string]any{
 			"id": "opencode:" + m.ID, "model": m.ID, "context": m.Context, "output": m.Output,
 			"free": free, "on": on,

@@ -26,21 +26,59 @@ var (
 	zenProxyCount  atomic.Uint64
 	zenTransportMu sync.Mutex
 
-	zenProxyCooldowns   = map[int]time.Time{} // 代理索引 -> 冷却截止
+	// zenProxyCooldowns 出口冷却表: **稳定出口标识 -> 冷却截止**。
+	//
+	// 键必须是出口自身的稳定标识, 不能用 effectiveProxyList() 的下标。
+	// 下标不是出口的属性 —— 列表是每次调用现场拼的(cfg.Proxies +
+	// subNodeKeysSnapshot() + filterByExitRegion), 订阅刷新会重建节点快照,
+	// 地区过滤开关会改变列表长度。任一种变化都让下标整体漂移, 于是此前写进去的
+	// 冷却时间会落在**别的出口**上: 真正出问题的出口留在轮询里继续被选中,
+	// 表现是"时好时坏、无法复现"(2026-09-17 审查 P0-3)。
+	zenProxyCooldowns   = map[string]time.Time{}
 	zenProxyCooldownsMu sync.Mutex
 )
 
-// cooldownZenProxy 标记某出口代理冷却,冷却期内轮询跳过
-func cooldownZenProxy(idx int, d time.Duration) {
-	if idx < 0 {
+// zenProxyCooldownKey 出口的稳定冷却键。
+// 节点出口用 nodeLocalKey(本地入站地址, 由订阅条目确定性派生);
+// 普通代理用 URL 本身。两者都与列表位置无关。
+func zenProxyCooldownKey(proxy string) string {
+	if proxy == "" {
+		return ""
+	}
+	if key := nodeLocalKey(proxy); key != "" {
+		return key
+	}
+	return proxy
+}
+
+// cooldownZenProxy 标记某出口冷却,冷却期内轮询跳过。
+func cooldownZenProxy(proxy string, d time.Duration) {
+	key := zenProxyCooldownKey(proxy)
+	if key == "" {
 		return
 	}
 	if d <= 0 {
 		d = 10 * time.Minute
 	}
 	zenProxyCooldownsMu.Lock()
-	zenProxyCooldowns[idx] = time.Now().Add(d)
+	zenProxyCooldowns[key] = time.Now().Add(d)
 	zenProxyCooldownsMu.Unlock()
+}
+
+// cooldownZenProxyByIndex 按**当前**列表下标解析出出口再冷却。
+//
+// 仅保留给"手上只有轮询位置"的旧调用点。下标在这里只用于现场定位是哪个出口,
+// 落库的键仍是出口标识 —— 所以列表之后重排也不会让这条冷却漂到别的出口上。
+// 新增调用点应优先直接传出口标识。
+func cooldownZenProxyByIndex(idx int, d time.Duration) {
+	if idx < 0 {
+		return
+	}
+	list := effectiveProxyList()
+	if idx >= len(list) {
+		return
+	}
+	cooldownZenProxy(list[idx], d)
 }
 
 // cooldownActualExit 冷却本次请求真实使用的出口(由拨号层经 ctx 回写),
@@ -50,41 +88,143 @@ func cooldownActualExit(ctx context.Context, d time.Duration) {
 	if key == "" {
 		return // 直连没有可冷却的出口
 	}
-	for i, p := range effectiveProxyList() {
-		if nodeLocalKey(p) == nodeLocalKey(key) {
-			cooldownZenProxy(i, d)
-			return
-		}
-	}
+	// reqExitKey 本身就是出口标识, 直接入表, 不再按下标反查。
+	cooldownZenProxy(key, d)
 }
 
-func zenProxyAvailable(idx int) bool {
+func zenProxyAvailable(proxy string) bool {
+	key := zenProxyCooldownKey(proxy)
+	if key == "" {
+		return true
+	}
 	zenProxyCooldownsMu.Lock()
 	defer zenProxyCooldownsMu.Unlock()
-	until, ok := zenProxyCooldowns[idx]
+	until, ok := zenProxyCooldowns[key]
 	if !ok {
 		return true
 	}
 	if time.Now().After(until) {
-		delete(zenProxyCooldowns, idx)
+		delete(zenProxyCooldowns, key)
 		return true
 	}
 	return false
 }
 
+// zenProxyCooldownStatus 冷却中的出口 -> 截止时刻(供管理面板展示)。
+//
+// 展示键用出口 URL 本身(面板上认得出是哪个节点), 而不是内部冷却键;
+// 池里已经不存在的出口(订阅刷新后消失)保留内部键, 以免冷却信息在面板上凭空消失。
 func zenProxyCooldownStatus() map[string]string {
 	list := effectiveProxyList()
+	display := make(map[string]string, len(list))
+	for _, p := range list {
+		if k := zenProxyCooldownKey(p); k != "" {
+			display[k] = p
+		}
+	}
+	now := time.Now()
 	zenProxyCooldownsMu.Lock()
 	defer zenProxyCooldownsMu.Unlock()
 	out := map[string]string{}
-	for idx, until := range zenProxyCooldowns {
-		if idx >= 0 && idx < len(list) {
-			if time.Now().Before(until) {
-				out[list[idx]] = until.Format("15:04:05")
-			}
+	for key, until := range zenProxyCooldowns {
+		if !now.Before(until) {
+			continue
 		}
+		label := key
+		if p, ok := display[key]; ok {
+			label = p
+		}
+		out[label] = until.Format("15:04:05")
 	}
 	return out
+}
+
+// ============ 出口额度冷却(429 专用, 指数升级) ============
+
+// 背景: opencode 的免费额度按**出口 IP** 计 —— 一个 IP 用完了就 429, 换一个
+// IP 就能继续用(用户实测)。所以 429 冷却的对象是**出口**, 不是候选(模型)。
+//
+// 为什么用指数升级而不是固定时长: 额度**重置窗口未知**(标 `[未知]`, 见
+// docs/opencode-zen-facts.md 第 4 节)。固定 10 分钟太短 —— 若实际按日重置,
+// 到期后再试同一 IP 还是 429, 白烧一次尝试; 固定 24 小时又太长 —— 若实际按
+// 小时重置, 出口白闲置一整天。
+//
+// 升级策略不依赖知道窗口, 自己能收敛:
+//
+//	连续第 1 次 429 → 10 分钟
+//	连续第 2 次      → 20 分钟
+//	连续第 3 次      → 40 分钟 … 上限 6 小时
+//	该出口成功一次   → 计数清零, 回到 10 分钟
+//
+// 这样: 额度若确实 10 分钟就恢复, 出口很快回来; 若按日重置, 计数会升级并稳定
+// 在上限。两种情况都不需要人工配置。
+const (
+	zenQuotaCooldownBase = 10 * time.Minute
+	zenQuotaCooldownCap  = 6 * time.Hour
+)
+
+// zenProxyQuotaStrikes 出口的连续 429 计数(与冷却表共用 zenProxyCooldownsMu)。
+var zenProxyQuotaStrikes = map[string]int{}
+
+// cooldownZenProxyQuota 429 时冷却出口, 时长按连续命中次数指数升级。
+//
+// retryAfter > 0 时取它与升级时长的**较大者** —— 上游明确说了等多久就听它的,
+// 但绝不因此缩短冷却(缩短只会换来又一次 429)。最终时长封顶 zenQuotaCooldownCap,
+// 防上游回一个离谱的 Retry-After 把出口锁死。
+//
+// 返回实际冷却时长(0 表示没有可冷却的出口, 如直连)。
+func cooldownZenProxyQuota(proxy string, retryAfter time.Duration) time.Duration {
+	key := zenProxyCooldownKey(proxy)
+	if key == "" {
+		return 0
+	}
+	zenProxyCooldownsMu.Lock()
+	defer zenProxyCooldownsMu.Unlock()
+	n := zenProxyQuotaStrikes[key] + 1
+	zenProxyQuotaStrikes[key] = n
+	d := zenQuotaCooldownBase
+	for i := 1; i < n && d < zenQuotaCooldownCap; i++ {
+		d *= 2
+	}
+	if retryAfter > d {
+		d = retryAfter
+	}
+	if d > zenQuotaCooldownCap {
+		d = zenQuotaCooldownCap
+	}
+	zenProxyCooldowns[key] = time.Now().Add(d)
+	return d
+}
+
+// clearZenProxyQuotaStrike 该出口成功一次 → 连续 429 计数清零。
+// 不清零的话计数会单调递增, 出口一旦被限流就再也回不到短冷却。
+func clearZenProxyQuotaStrike(proxy string) {
+	key := zenProxyCooldownKey(proxy)
+	if key == "" {
+		return
+	}
+	zenProxyCooldownsMu.Lock()
+	defer zenProxyCooldownsMu.Unlock()
+	delete(zenProxyQuotaStrikes, key)
+}
+
+// cooldownActualExitQuota 429 专用: 冷却本次请求**真实使用**的出口。
+//
+// 用 reqExitKey(ctx) 而不是全局轮询位置 —— 后者可能属于别的并发请求, 冷却它会
+// 误伤(与 cooldownActualExit 同一理由)。
+func cooldownActualExitQuota(ctx context.Context, retryAfter time.Duration) time.Duration {
+	key := reqExitKey(ctx)
+	if key == "" {
+		return 0 // 直连没有可冷却的出口
+	}
+	return cooldownZenProxyQuota(key, retryAfter)
+}
+
+// clearActualExitQuotaStrike 本次请求真实使用的出口成功了 → 清零它的 429 计数。
+func clearActualExitQuotaStrike(ctx context.Context) {
+	if key := reqExitKey(ctx); key != "" {
+		clearZenProxyQuotaStrike(key)
+	}
 }
 
 // rebuildZenTransport 代理池或配置变化时重建 zen 上游 HTTP 客户端。
@@ -128,7 +268,10 @@ func directHTTPClient() *http.Client {
 		}
 	})
 	directClientOnce.Do(func() {
-		directClient = &http.Client{Transport: directTransport}
+		// 控制面兜底客户端: 给总超时, 避免目录/模型同步在慢响应或僵持连接上
+		// 无限挂起(拨号与 TLS 已有超时, 但整请求没有上限)。
+		// 数据面请求不走这个客户端, 加超时不影响长流。
+		directClient = &http.Client{Transport: directTransport, Timeout: 60 * time.Second}
 	})
 	directClientOnceMu.Lock()
 	defer directClientOnceMu.Unlock()
@@ -205,7 +348,7 @@ func pickZenProxyWhere(extra func(p string) bool) (string, int) {
 	// 语义相同但 latency 策略需要完整的候选集合)。
 	avail := make([]int, 0, n)
 	for i := 0; i < n; i++ {
-		if zenProxyAvailable(i) && nodeDialable(list[i]) && nodeUsable(list[i]) &&
+		if zenProxyAvailable(list[i]) && nodeDialable(list[i]) && nodeUsable(list[i]) &&
 			!nodeManuallyBlacklisted(nodeLocalKey(list[i])) &&
 			(extra == nil || extra(list[i])) {
 			avail = append(avail, i)
@@ -241,12 +384,17 @@ func pickUnifiedExit(ctx context.Context, modelID string) (string, int) {
 	if tr := traceFrom(ctx); tr != nil {
 		clientIP = tr.ClientIP
 	}
+	// ★ 2026-09-17 审查 P1-1: 模型相关过滤(上游可达性 + 地区能力探测结果)
+	// 此前在生产路径上**完全没生效** —— 这里传的是空操作过滤器, 而唯一会读
+	// regionNodeOK 的 pickZenProxyForModel 生产零调用。现在两条路径共用同一份判据。
+	modelFilter := exitFilterForModel(modelID)
 	list := effectiveProxyList()
 	if stickySessionEnabled() && clientIP != "" && len(list) > 0 {
 		if pin, ok := stickyPinFor(clientIP); ok {
 			// 健康复核: 钉住的出口必须仍在池里且可用, 否则按正常选路走
 			for i, p := range list {
-				if p == pin.Proxy && zenProxyAvailable(i) && nodeDialable(p) && nodeUsable(p) {
+				if p == pin.Proxy && zenProxyAvailable(p) && nodeDialable(p) && nodeUsable(p) &&
+					!nodeManuallyBlacklisted(nodeLocalKey(p)) && modelFilter(p) {
 					stickyPinSave(clientIP, p, nodeLocalKey(p)) // 续期
 					return p, i
 				}
@@ -256,7 +404,9 @@ func pickUnifiedExit(ctx context.Context, modelID string) (string, int) {
 			stickyMu.Unlock()
 		}
 	}
-	p, idx := pickZenProxyWhere(func(q string) bool { return true })
+	// 走模型相关选路(内部已含 exitFilterForModel): 地区受限模型会避开
+	// 已探测确认被拒的出口, 全被拒时退回常规轮询而不是直连。
+	p, idx := pickZenProxyForModel(modelID)
 	if p != "" {
 		if stickySessionEnabled() && clientIP != "" {
 			stickyPinSave(clientIP, p, nodeLocalKey(p))
@@ -481,6 +631,12 @@ func zenDialContext(ctx context.Context, network, addr string) (net.Conn, error)
 			return nil, lastErr
 		}
 		return nil, fmt.Errorf("没有可用节点，且已禁用直连兜底")
+	}
+	if !exitModeDirectNow() {
+		// 显式直连模式不需要这条日志(那是正当配置); 只有"代理模式节点全挂、
+		// 悄悄走直连"才要大声打出来, 否则用户看到行为异常却无从排查
+		// (2026-09-17 审查 R2-9)。
+		log.Printf("  exit: 节点池无可用出口, 触发直连兜底(rescueDirect=%v, 可在 zen 设置里关闭)", rescueDirectEnabled())
 	}
 	if local := catchAllLocalAddr(); local != "" {
 		u := &url.URL{Scheme: "socks5", Host: local}

@@ -38,7 +38,7 @@ func TestPickZenProxyRefusesCooledDownExit(t *testing.T) {
 		t.Fatalf("冷却前应选中池内唯一出口, 得到 %q %d", p, idx)
 	}
 
-	cooldownZenProxy(0, time.Minute)
+	cooldownZenProxy("socks5://127.0.0.1:1080", time.Minute)
 
 	if p, idx := pickZenProxy(); p != "" || idx != -1 {
 		t.Fatalf("唯一出口处于冷却时必须返回直连决策, 得到 %q %d", p, idx)

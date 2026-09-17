@@ -478,7 +478,7 @@ func clearAllCandidateCooldowns() {
 // clearAllCandidatePermanents 清掉永久剔除, 让之前被判死的候选重新参与。
 func clearAllCandidatePermanents() {
 	candidateCoolMu.Lock()
-	candidatePerms = map[string]string{}
+	candidatePerms = map[string]candidatePerm{}
 	candidateCoolMu.Unlock()
 }
 
@@ -487,7 +487,7 @@ func permanentRejectionList() []map[string]string {
 	candidateCoolMu.Lock()
 	out := make([]map[string]string, 0, len(candidatePerms))
 	for k, v := range candidatePerms {
-		out = append(out, map[string]string{"key": k, "reason": v})
+		out = append(out, map[string]string{"key": k, "reason": v.reason})
 	}
 	candidateCoolMu.Unlock()
 	sort.Slice(out, func(i, j int) bool { return out[i]["key"] < out[j]["key"] })

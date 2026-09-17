@@ -516,3 +516,69 @@ func TestChatStreamToResponses(t *testing.T) {
 		}
 	})
 }
+
+// TestChatStreamToResponsesEmptyGuard 空流不得静默完成: 上游只回空 delta /
+// 没有任何文本/推理/工具/usage 时, 必须发 error 事件而不是 response.completed
+// (2026-09-17 审查 R2-5)。
+func TestChatStreamToResponsesEmptyGuard(t *testing.T) {
+	sse := "data: {\"choices\":[{\"delta\":{}}]}\n\n" +
+		"data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n"
+	resp := &http.Response{
+		StatusCode: 200,
+		Body:       io.NopCloser(strings.NewReader(sse)),
+		Header:     make(http.Header),
+	}
+	rec := httptest.NewRecorder()
+	chatStreamToResponses(rec, resp, nil)
+	body := rec.Body.String()
+	if strings.Contains(body, "response.completed") {
+		t.Fatalf("空流不应发 response.completed\n%s", body)
+	}
+	if !strings.Contains(body, "event: error") {
+		t.Fatalf("空流应发 error 事件\n%s", body)
+	}
+}
+
+// TestChatStreamToResponsesUsageOnlyStream 只有 usage 的流是合法协议行为,
+// 不应被空流防护误杀 —— **前提是 usage 里带输出侧 token**。
+//
+// ★ 2026-09-17 审查 P0-1 修正: 本用例原 fixture 是
+// {prompt_tokens:5, completion_tokens:0, total_tokens:5} —— 纯输入侧、零输出。
+// 那不是"合法 usage-only 流", 那是**真·空回包**, 断言它"应正常完成"等于把
+// 缺陷锁进回归基线。现拆成两个用例: 带输出 token 的应通过, 只有输入 token 的应判空。
+func TestChatStreamToResponsesUsageOnlyStream(t *testing.T) {
+	sse := "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":5,\"completion_tokens\":5,\"total_tokens\":10}}\n\n"
+	resp := &http.Response{
+		StatusCode: 200,
+		Body:       io.NopCloser(strings.NewReader(sse)),
+		Header:     make(http.Header),
+	}
+	rec := httptest.NewRecorder()
+	chatStreamToResponses(rec, resp, nil)
+	body := rec.Body.String()
+	if !strings.Contains(body, "response.completed") {
+		t.Fatalf("带输出侧 token 的 usage-only 流应正常完成\n%s", body)
+	}
+}
+
+// TestChatStreamToResponsesInputOnlyUsageIsEmpty 只有输入侧 token 的流必须判空。
+//
+// 输入 token 有值只说明上游收到了 prompt, 完全不能说明它产出了东西 ——
+// 这正是"成功但空"的回合, 客户端会静默结束任务。
+func TestChatStreamToResponsesInputOnlyUsageIsEmpty(t *testing.T) {
+	sse := "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":1500,\"completion_tokens\":0,\"total_tokens\":1500}}\n\n"
+	resp := &http.Response{
+		StatusCode: 200,
+		Body:       io.NopCloser(strings.NewReader(sse)),
+		Header:     make(http.Header),
+	}
+	rec := httptest.NewRecorder()
+	chatStreamToResponses(rec, resp, nil)
+	body := rec.Body.String()
+	if strings.Contains(body, "response.completed") {
+		t.Fatalf("只有输入侧 token 的流不应正常完成(应判空)\n%s", body)
+	}
+	if !strings.Contains(body, "empty_content") {
+		t.Fatalf("只有输入侧 token 的流应发 empty_content 错误\n%s", body)
+	}
+}

@@ -29,8 +29,10 @@ const (
 // 池内健康出口数), 打印出来才能一眼看出"还能换几个", 而不是永远显示分母 2。
 // 直连模式下池内没有可选出口, 调用方不会走到这里。
 func rotateProviderExit(provider, reason string, attempt, budget int) {
+	// 这里手上只有全局轮询位置, 所以用 ByIndex 现场解析出是哪个出口 ——
+	// 落库的键仍是出口标识, 列表之后重排不会让这条冷却漂到别的出口上。
 	if idx := lastZenProxyIdx(); idx >= 0 {
-		cooldownZenProxy(idx, providerExitCooldown)
+		cooldownZenProxyByIndex(idx, providerExitCooldown)
 	}
 	log.Printf("  providers: %s %s, retry %d/%d on the next exit", provider, reason, attempt, budget)
 }
@@ -567,7 +569,16 @@ func (p *modelProvider) chatWithKey(ctx context.Context, cfg providerConfig, par
 	for attempt := 1; attempt <= attempts; attempt++ {
 		// 旁路键在 marshal 前移除 —— 它只是 Go 侧的进程内通道，绝不参与线序化。
 		delete(params, toolNameMapSideChannelKey)
-		payload, err := json.Marshal(params)
+		// 协议形态转换: APIFormat 不是 chat 时, 把 chat 形态的 params 转成目标形态
+		// 再序列化。★ params 本身保持 chat 形态不变 —— 下游还要用它(旁路键回填、
+		// 响应侧工具名还原)。
+		outbound, cerr := cfg.convertOutboundRequest(p.name, params, stream)
+		if cerr != nil {
+			return nil, cerr
+		}
+		payload, err := json.Marshal(outbound)
+		// 旁路键回填必须在 marshal **之后**: chat 形态下 outbound 就是 params 本身
+		// (convertOutboundRequest 原样返回), 提前回填会把它序列化进上行 body。
 		if wireToolNameMap != nil && wireToolNameMap.len() > 0 {
 			params[toolNameMapSideChannelKey] = wireToolNameMap
 		}
@@ -612,7 +623,18 @@ func (p *modelProvider) chatWithKey(ctx context.Context, cfg providerConfig, par
 			}
 			resp = r
 			if resp.StatusCode == http.StatusOK {
-				return p.finishResponse(resp, stream, needsSig)
+				out, ferr := p.finishResponse(resp, stream, needsSig)
+				if ferr != nil {
+					return nil, ferr
+				}
+				// 协议形态转换: APIFormat 不是 chat 时, 把上游响应转回 chat 形态。
+				//
+				// 放在 finishResponse 之后: 后者负责读完非流式响应体(必须在超时
+				// 上下文内完成)与挂 Gemini 签名提取, 那两件事都该看到**上游原始
+				// 字节**。转换本身对流式走 io.Pipe 实时做, 因此下游的空流守卫、
+				// 坏帧清洗、心跳全部照常生效。
+				modelStr, _ := params["model"].(string)
+				return cfg.convertProviderResponse(out, modelStr, stream)
 			}
 			body, _ = io.ReadAll(io.LimitReader(resp.Body, 64<<10))
 			resp.Body.Close()

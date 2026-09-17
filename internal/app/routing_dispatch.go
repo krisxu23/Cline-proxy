@@ -441,6 +441,18 @@ func writeChainNonStreamWithMap(w http.ResponseWriter, body []byte, tgt chainTar
 // 有些上游用 200 + 空壳(choices 为空, 或 content 为空且没有 tool_calls)
 // 表示"这个模型现在不可用"。这类响应既不该回给客户端,
 // 也不该让该候选留在链首反复被选中。
+//
+// ★ 2026-09-17 审查 P1-2 修正: 此前本函数**只认字符串 content + tool_calls**,
+// 漏了 content 数组形态与 reasoning。而 proxy_stream.go 的
+// fullCompletionBodyHasContent 已经补过数组形态(当时的理由: "带 content[] 的
+// 正常回包会被误判成空壳、对正常回包误打 502")。
+//
+// 同一 bug 只修了被点名的那一条路径, 于是候选链这里仍会把带 content[] 的正常
+// 回包判成"空内容"→ 换下一站。用户侧表现: **某个模型明明能答, 网关总说它空、
+// 老是换模型**。
+//
+// 现在统一复用 stream_delivery.go 的 chunkDeliversUserContent —— 与流式路径
+// 同一口径(遍历全部 choice; 认 content 字符串/数组、reasoning 各别名、tool_calls)。
 func chatBodyHasContent(body []byte) bool {
 	if len(bytes.TrimSpace(body)) == 0 {
 		return false
@@ -453,24 +465,11 @@ func chatBodyHasContent(body []byte) bool {
 	if d, ok := raw["data"].(map[string]any); ok {
 		out = d
 	}
-	choices, _ := out["choices"].([]any)
-	if len(choices) == 0 {
-		return false
-	}
+	// completions API 形态(choices[].text): 统一判据不认这个字段, 单独判。
 	if s, ok := getNested(out, "choices", 0, "text").(string); ok && s != "" {
 		return true
 	}
-	msg, _ := getNested(out, "choices", 0, "message").(map[string]any)
-	if msg == nil {
-		return false
-	}
-	if s, _ := msg["content"].(string); s != "" {
-		return true
-	}
-	if tc, _ := msg["tool_calls"].([]any); len(tc) > 0 {
-		return true
-	}
-	return false
+	return chunkDeliversUserContent(out)
 }
 
 // chainBodyOnlyBrokenToolCalls 响应声称发起了工具调用, 但修补后一条都不剩
