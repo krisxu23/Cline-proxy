@@ -266,9 +266,10 @@ func resetCandidateState() {
 // 400 一般不因冷却而好转, 但若解析出永久性拒绝(无免费层/已下架/非 chat)
 // 就直接永久剔除, 否则按 serverError 短冷却一次。
 func classifyCandidateFailure(status int, body []byte) (string, string) {
+	bodyStr := string(body)
 	var payload map[string]any
-	_ = json.Unmarshal(body, &payload)
-	reason := kit.Truncate(string(body), 200)
+	_ = json.Unmarshal([]byte(bodyStr), &payload)
+	reason := kit.Truncate(bodyStr, 200)
 
 	// 这两类永久拒绝必须先判, 且与状态码无关:
 	// Gemini 用 429 表达"全部免费层 limit=0"(= 该模型没有免费层),
@@ -277,12 +278,25 @@ func classifyCandidateFailure(status int, body []byte) (string, string) {
 	if qf := parseQuotaFailure(payload); qf != nil && qf.NoFreeTier {
 		return classPermanent, "该模型无免费层"
 	}
+	// 请求级资源 404(file/item/upload 等不存在)显式不冷却模型: 换模型不会让
+	// 不存在的 file_id 变合法。**必须排在 permanentRejectionReason 之前** ——
+	// 参考实现 isResourceNotFoundResponse 对 resource 404 显式返回 null(优先级
+	// 高于外层 model_not_found 判定), 否则 resource 404 会被万物皆 404→permanent
+	// 的规则错打成"模型已下架"。仅对 404 生效, 不碰其它状态码的永久判定。
+	if status == 404 && isResourceNotFoundResponseStr(bodyStr) {
+		return classResourceNotFound, "请求资源不存在: " + kitTruncateHead(bodyStr)
+	}
 	if p := permanentRejectionReason(status, payload); p != "" {
 		return classPermanent, p
 	}
+	// Cloudflare 1010 指纹拒绝: 独立分类, 短冷却换节点, 绝不进账号级 banned。
+	// 判定在规则表之前(且 403 专属), 避免被 generic forbidden 之类吞掉。
+	if status == 403 && isCloudflareFingerprintRejection(bodyStr) {
+		return classFingerprint, "Cloudflare 指纹拒绝: " + kitTruncateHead(bodyStr)
+	}
 	// 声明式规则表(P1-10): 正文特征优先于状态码 —— 状态码相同的 403 可能是
 	// 地区封锁(24h 长冷却)也可能是 key 被拒, 只看状态码会混为一谈。
-	if class, note := matchErrorRules(string(body)); class != "" {
+	if class, note := matchErrorRules(bodyStr); class != "" {
 		return class, note
 	}
 	switch {

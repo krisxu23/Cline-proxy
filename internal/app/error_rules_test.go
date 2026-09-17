@@ -36,6 +36,121 @@ func TestMatchErrorRulesGeoBlock(t *testing.T) {
 	}
 }
 
+// 上下文超限信号集补全: 参考 CONTEXT_OVERFLOW_SIGNALS 的常见措辞都要命中 permanent,
+// 不能落成 generic serverError 短冷却让用户反复撞墙。
+func TestMatchErrorRulesContextOverflow(t *testing.T) {
+	signals := []string{
+		"context overflow",
+		"prompt too large",
+		"context window",
+		"maximum context",
+		"exceeds context",
+		"input too long",
+		"token limit",
+		"too many tokens",
+		"context length",
+		"messages exceed",
+		"context_length_exceeded",
+		"maximum context length",
+	}
+	for _, sig := range signals {
+		body := `{"error":{"message":"` + sig + `"}}`
+		class, _ := matchErrorRules(body)
+		if class != classPermanent {
+			t.Errorf("上下文超限信号 %q 应归 permanent, got %q", sig, class)
+		}
+	}
+	// 不相关正文不命中
+	if class, _ := matchErrorRules("rate limit exceeded"); class != "" {
+		t.Fatal("限流正文不应命中上下文超限")
+	}
+}
+
+// Cloudflare 指纹拒绝: 显式 error_code + 1010 / browser_signature_banned 命中,
+// 裸数字 1010 不命中(避免 port/request-id/model-token 误伤), 绝不进 permanent。
+func TestCloudflareFingerprintRejection(t *testing.T) {
+	trueCases := []string{
+		`{"error":{"error_code":"1010","message":"Access denied"}}`,
+		`{"error":{"error-code":1010}}`,
+		`error_code: 1010 blocked`,
+		`browser_signature_banned`,
+		`fingerprint_rejection`,
+		// 被 JSON 包裹后转义的引号形式
+		`{"error":"{\\"error_code\\":\\"1010\\"}"}`,
+	}
+	for _, c := range trueCases {
+		if !isCloudflareFingerprintRejection(c) {
+			t.Errorf("应识别为指纹拒绝: %s", c)
+		}
+	}
+	falseCases := []string{
+		"", `{"error":{"message":"access denied"}}`,
+		// 裸数字 1010 绝不误伤: port / count / request-id / model token
+		`{"error":{"message":"connect to 10.1.1.1010 timeout"}}`,
+		`{"error":{"message":"retry after 1010 seconds"}}`,
+		`{"error":{"message":"model foo-1010 is not supported"}}`,
+		`ray-id: 101010`, // 不是 error_key + 1010
+	}
+	for _, c := range falseCases {
+		if isCloudflareFingerprintRejection(c) {
+			t.Errorf("不应识别为指纹拒绝: %s", c)
+		}
+	}
+	// 端到端: 403 + CF 指纹 → fingerprint(短冷却), 绝不 permannt/forbidden 打标
+	class, _ := classifyCandidateFailure(403, []byte(`{"error":{"error_code":"1010","message":"browser signature banned"}}`))
+	if class != classFingerprint {
+		t.Fatalf("403+CF指纹 应归 fingerprint, got %q", class)
+	}
+	if got := defaultCooldownMs[classFingerprint]; got != 5*60*1000 {
+		t.Fatalf("fingerprint 默认冷却应为 5m, got %v", got)
+	}
+}
+
+// 请求级资源 404(file/item/upload 等)不该冷却模型, 换模型不会让不存在的
+// file_id 变合法。model not found / Requested entity 仍是模型级(保持原分类)。
+func TestResourceNotFoundClassification(t *testing.T) {
+	strCases := []string{
+		// 参考 isResourceNotFoundResponse 正则覆盖的真实形态:
+		//  file- 前缀 ID + not found / File 单独成词 + not found
+		`{"error":{"message":"file-abc123 not found"}}`,
+		`{"error":{"message":"File fx_xyz does not exist"}}`,
+		`{"error":{"message":"File not found: f_123"}}`,
+		`{"error":{"message":"The file 123.txt was not found"}}`, // files? 词 + not found
+		`{"error":{"message":"upload not found"}}`,
+		`{"error":{"message":"vector store vs_x not found"}}`,
+		`{"error":{"message":"item not found"}}`,
+	}
+	for _, c := range strCases {
+		if !isResourceNotFoundResponseStr(c) {
+			t.Errorf("应识别为请求资源不存在: %s", c)
+		}
+	}
+	modelCases := []string{
+		`{"error":{"message":"model not found"}}`,
+		`{"error":{"message":"Requested entity was not found."}}`,
+		`{"error":{"message":"Requested model was not found."}}`,
+		"", `{"error":{"message":"rate limit"}}`,
+	}
+	for _, c := range modelCases {
+		if isResourceNotFoundResponseStr(c) {
+			t.Errorf("不应识别为请求资源不存在(是模型/实体级): %s", c)
+		}
+	}
+	// 端到端 classify: 资源 404 → resourceNotFound(1m 短冷却), 模型 404 仍 model 级。
+	class, _ := classifyCandidateFailure(404, []byte(`{"error":{"message":"file-abc123 not found"}}`))
+	if class != classResourceNotFound {
+		t.Fatalf("资源 404 应归 resourceNotFound, got %q", class)
+	}
+	if got := defaultCooldownMs[classResourceNotFound]; got != 60*1000 {
+		t.Fatalf("resourceNotFound 默认冷却应为 1m, got %v", got)
+	}
+	// 我方 cooldown_test 已锁定: "Requested entity was not found" 归 classPermanent
+	class2, _ := classifyCandidateFailure(404, []byte(`{"error":{"message":"Requested entity was not found."}}`))
+	if class2 != classPermanent {
+		t.Fatalf("模型/实体 404 应保持 classPermanent, got %q", class2)
+	}
+}
+
 func TestClassifyCandidateFailureGeoBlock(t *testing.T) {
 	// 端到端: 403 + RegionError → geoBlocked(此前是 forbidden, 60 分钟);
 	// 冷却表里 geoBlocked 应为 24 小时。
