@@ -118,3 +118,44 @@ func TestReqExitKeyRoundTrip(t *testing.T) {
 		t.Fatalf("直连时 reqExitKey 应为空, 得到 %q", got)
 	}
 }
+
+// isFreeTierError 识别 opencode 免费 tier 的出口风控拒绝。
+// 实测(2026-09-17): 同一 mimo 走香港/大陆节点 200、美/法节点与直连 403,
+// 与请求头无关 —— "within OpenCode" 按出口 IP 判定。
+func TestIsFreeTierError(t *testing.T) {
+	trueCases := []string{
+		`{"type":"error","error":{"type":"FreeTierError","message":"Error from provider (Console): OpenCode's free tier can only be used from within OpenCode"}}`,
+		`upstream said: can only be used from within OpenCode`,
+		`FreeTierError: quota`,
+	}
+	for _, c := range trueCases {
+		if !isFreeTierError(c) {
+			t.Errorf("应识别为 FreeTierError: %s", c)
+		}
+	}
+	falseCases := []string{
+		`{"error":{"message":"rate limited"}}`,
+		`{"type":"error","error":{"type":"RegionError","message":"region not supported"}}`,
+		``,
+		`{"error":{"message":"free tier ok"}}`, // 无特征词
+	}
+	for _, c := range falseCases {
+		if isFreeTierError(c) {
+			t.Errorf("不应识别为 FreeTierError: %s", c)
+		}
+	}
+}
+
+// FreeTierError 的 (模型,出口) 组合标记应被选路层消费: 被拒出口跳过。
+func TestFreeTierExitMarkingSkipsNode(t *testing.T) {
+	regionProxyConfig(t)
+	markRegionModelForTest(t, "mimo-test")
+	// 节点 A(http://127.0.0.1:19301) 被标记为该模型不可用
+	setRegionNodeOK("mimo-test", "http://127.0.0.1:19301", false)
+	for i := 0; i < 8; i++ {
+		p, _ := pickZenProxyForModel("mimo-test")
+		if p == "http://127.0.0.1:19301" {
+			t.Fatalf("被 FreeTier 拒绝的出口不应再被选中(第 %d 次): %s", i, p)
+		}
+	}
+}

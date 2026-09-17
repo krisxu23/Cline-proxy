@@ -11,8 +11,6 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
-
-	"cline-go-proxy/internal/kit"
 )
 
 // 地区受限模型的节点能力标记。
@@ -56,6 +54,20 @@ var ctxKeyZenModel = ctxKeyZenModelType{}
 func isRegionError(body string) bool {
 	return strings.Contains(body, "RegionError") ||
 		strings.Contains(body, "not available in your country")
+}
+
+// isFreeTierError 判定上游响应是否为 opencode 免费 tier 的出口风控拒绝。
+//
+// 原文: {"type":"error","error":{"type":"FreeTierError","message":"Error from
+// provider (Console): OpenCode's free tier can only be used from within OpenCode"}}
+//
+// 实测(2026-09-17): 同一 mimo-v2.5-free 走香港/大陆中转节点 200、走美/法节点与
+// 本机直连一律 403 —— "within OpenCode" 的判定在 Console 后端按**出口 IP** 做,
+// 与请求头(UA/x-opencode-*)无关(带参考实现的完整 CLI 身份头同样被拒)。
+// 因此这是**出口级**失败: 该冷却/换出口, 不是冷却模型。
+func isFreeTierError(body string) bool {
+	return strings.Contains(body, "FreeTierError") ||
+		strings.Contains(body, "can only be used from within OpenCode")
 }
 
 // markModelRegionRestricted 记录某模型存在地区限制并触发节点能力探测。
@@ -208,13 +220,13 @@ func probeNodeModel(key, modelID string) (regionOK, known bool) {
 		return false, false
 	}
 	cfg := getZenConfig()
-	sess, user, ua := kit.FreshZenIdentity()
+	outbound := map[string]string{}
+	applyOpencodeHeaders(outbound, nil, &opencodeCliDefaults{userAgent: "opencode", client: "desktop", project: "global"}, nil)
 	req.Header.Set("Authorization", "Bearer "+cfg.Key)
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("User-Agent", ua)
-	req.Header.Set("x-opencode-session", sess)
-	req.Header.Set("x-opencode-request", user)
-	req.Header.Set("x-opencode-client", "cli")
+	for k, v := range outbound {
+		req.Header.Set(k, v)
+	}
 	req.Header.Set("x-opencode-model", modelID)
 
 	client := &http.Client{

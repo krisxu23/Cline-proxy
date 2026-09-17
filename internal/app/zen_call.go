@@ -150,21 +150,27 @@ func callZenAPI(ctx context.Context, params map[string]any, stream bool) (*http.
 		if err != nil {
 			return nil, rateLimited, fmt.Errorf("create zen request: %w", err)
 		}
-		// 客户端身份轮换: 每次请求模拟全新 opencode 客户端,规避 session/UA 维度限流
-		sess, user, ua := kit.FreshZenIdentity()
+		// 照抄 OmniRoute opencodeHeaders.ts 的 CLI 身份构造(替换旧的 FreshZenIdentity
+		// 随机合成): opencode 免费 tier 的风控认真实 CLI 形态 —— UA="opencode"、
+		// client="desktop"、project="global"、session 用请求体指纹生成(确定性,
+		// 同会话命中同 session → 上游 prompt cache; 随机 session 会被当作仿冒)。
+		// 旧实现 x-opencode-client:"cli" + 随机版本号 UA 是错的。
+		outbound := map[string]string{}
+		applyOpencodeHeaders(outbound, nil, &opencodeCliDefaults{
+			userAgent: "opencode", client: "desktop", project: "global",
+		}, bodyFingerprint(body, useRespAPI))
 		req.Header.Set("Authorization", "Bearer "+cfg.Key)
 		req.Header.Set("Content-Type", "application/json")
-		req.Header.Set("User-Agent", ua)
-		req.Header.Set("x-opencode-session", sess)
-		req.Header.Set("x-opencode-request", user)
-		req.Header.Set("x-opencode-client", "cli")
+		for k, v := range outbound {
+			req.Header.Set(k, v)
+		}
 
 		model, _ := params["model"].(string)
 		if m, ok := resolveZenModel(model); ok {
 			req.Header.Set("x-opencode-model", m.ID)
 		}
 		log.Printf("  zen upstream: model=%s stream=%v msgs=%d via=%s endpoint=%s attempt=%d session=%s",
-			body["model"], stream, getMsgCount(params), describeZenProxy(), base, attempt+1, kit.Truncate(sess, 24))
+			body["model"], stream, getMsgCount(params), describeZenProxy(), base, attempt+1, kit.Truncate(outbound["x-opencode-session"], 24))
 
 		client := getZenHTTPClient()
 		// 地区受限模型绝不能吃共享连接池: 池里的 h2 连接是启动早期建立的
@@ -219,6 +225,28 @@ func callZenAPI(ctx context.Context, params map[string]any, stream bool) (*http.
 
 		bodyBytes := kit.ReadBody(resp)
 		resp.Body.Close()
+		// FreeTierError("can only be used from within OpenCode"): opencode 免费
+		// tier 的风控按**出口 IP** 判定 —— 实测(2026-09-17)同一 mimo-v2.5-free
+		// 走香港/大陆中转节点 200、走美/法节点与本机直连一律 403, 且与请求头无关
+		// (带参考实现的完整 CLI 身份头同样被拒)。这是**出口级**失败, 处理与
+		// RegionError 完全同构: 标记 (模型,出口) 组合不可用 + 登记地区受限触发
+		// 全节点能力探测(自动找出被认可的节点), 并换出口立即重试。绝不冷却模型
+		// 或记模型硬失败 —— 否则好节点轮回来之前模型就被误杀了。
+		if isFreeTierError(bodyBytes) {
+			modelID := zenModelIDOf(params)
+			markModelRegionRestricted(modelID)
+			actual := reqExitKey(ctx)
+			if key := nodeLocalKey(actual); key != "" && !regionRetried && attempt < retries {
+				setRegionNodeOK(modelID, key, false)
+				regionRetried = true
+				log.Printf("  zen: model %s free-tier rejected via %s, 已标记该出口并换出口重试",
+					modelID, describeExitRaw(actual))
+				continue
+			}
+			log.Printf("  zen: model %s free-tier rejected via %s (重试预算已用完, 等待节点能力探测找出可用出口)",
+				modelID, describeExitRaw(actual))
+			return nil, rateLimited, &zenUpstreamError{Status: resp.StatusCode, Body: kit.Truncate(bodyBytes, 500)}
+		}
 		// 首次遇到地区限制时自动登记该模型, 并触发节点能力探测
 		if isRegionError(bodyBytes) {
 			modelID := zenModelIDOf(params)
