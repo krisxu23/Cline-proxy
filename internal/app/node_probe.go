@@ -53,17 +53,40 @@ const (
 // 活性探测 URL(三权威 captive-portal 探测源, 并发取最快成功):
 //   - gstatic 明文 generate_204: 经典探测, 回 204 即链路通(明文是故意的,
 //     探测体本身不含任何敏感信息, 且 captive 门户只劫持明文)
+//   - gstatic generate_204: 老牌 captive 源
 //   - Cloudflare generate_204: 第二独立源, 回 204 即活
 //   - Apple captive: 回 200(体为 Success 文本, 只认状态码不校验体)即活
+//
+// ⚠️⚠️ 2026-09-18 实测修正: **绝不能再用 gstatic / apple 当探测目标**。
+//
+//	本机(广东)所有国内解析器对 `www.gstatic.com` 一律返回**中国联通 IP**
+//	(`58.254.137.162` / `58.254.149.162`; doh.pub、dns.alidns.com、119.29.29.29、
+//	223.5.5.5、114.114.114.114 全都一样), `captive.apple.com` 返回国内 IPv6。
+//	也就是说: 无论把 dnsMode 换成哪个国内 DoH 都躲不开。
+//
+//	后果有两层, 合起来就是"一个有效节点都没有":
+//	  1. 出口拿着这个**国内 IP** 去连, 连不上 → 活性探测失败;
+//	  2. 更致命的是 MITM 探测(见 nodeMITMURL)打的也是这个域名 —— 出口连到
+//	     国内 IP, TLS 证书对不上 → 判定"被劫持" → MITM_Risk=true →
+//	     checkNodeHealth 的 `Alive && !MITMRisk && !IsStalled` **对每个节点都返回 false**。
+//
+//	修法: 换成 (a) **IP 字面量**(DNS 无从污染) 与 (b) 国内也能正确解析到真实
+//	Cloudflare(AS13335) 的端点。`cp.cloudflare.com` 实测解析为
+//	`2606:4700::6810:84e5`(真实 Cloudflare)且本机直连 204。
 var nodeLivenessURLs = []string{
-	"http://www.gstatic.com/generate_204",
-	"https://cp.cloudflare.com/generate_204",
-	"https://captive.apple.com",
+	"https://1.1.1.1/cdn-cgi/trace",          // IP 字面量: 完全不经过 DNS, 污染无从下手
+	"https://cp.cloudflare.com/generate_204", // 国内解析正确(真实 Cloudflare)
+	"https://www.cloudflare.com/cdn-cgi/trace",
 }
 
-// nodeMITMURL MITM 复核专用: 必须走 HTTPS 才能验证 TLS 证书链,
-// 不能复用上面的明文 gstatic 源。
-const nodeMITMURL = "https://www.gstatic.com/generate_204"
+// nodeMITMURL MITM 复核专用: 必须走 HTTPS 才能验证 TLS 证书链。
+//
+// 用 **IP 字面量**: 1.1.1.1 的证书自带该 IP 的 SAN, 因此既不需要 DNS(污染无
+// 从下手), 又能真正验证证书链 —— 被中间设备劫持时证书必然对不上, 检出能力不减。
+// (旧值 https://www.gstatic.com/generate_204 会被解析到国内 IP, 导致合法节点
+//
+//	被误判为 MITM —— 见上方 nodeLivenessURLs 的说明。)
+const nodeMITMURL = "https://1.1.1.1/cdn-cgi/trace"
 
 // 出口 IP 情报 URL(freesub IP_ECHO_URLS, 多路冗余)
 var nodeIPEchoURLs = []string{
