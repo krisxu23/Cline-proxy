@@ -313,6 +313,110 @@ func syncNodeBox() {
 	}()
 }
 
+// sanitizeOutboundShape 修正出站里会让 sing-box **整条剔除**的字段取值。
+//
+// 与 sanitizeOutboundTLS(修 TLS 块形态) 并列, 同在 buildNodeParts 的收口处调用。
+// 动机(2026-09-18 实测日志): 订阅源普遍使用 v2ray/Xray 的写法, 而 sing-box 只认
+// 自己那套取值, 不认识就报错整条剔除。实测被剔除 72 条, 前四类都属"值方言不同、
+// 语义完全可以表达" —— 直接映射/省略即可, 不该丢节点:
+//
+//	22× unknown uTLS fingerprint: unsafe   ← v2ray 的"不校验指纹", sing-box 无对应值
+//	12× unsupported flow: none              ← 显式 none 等价于不设 flow
+//	 2× unsupported flow: xtls-rprx-vision-udp443  ← 旧名, 现名去掉 -udp443
+//	 9× unknown transport type: tcp / raw    ← 就是"无传输层"(裸 TCP), 应省略该字段
+//
+// **刻意不处理** `unknown transport type: xhttp`: 那是 Xray 的传输, sing-box 没有
+// 对应实现, 剥掉后只会退化成裸 TCP 并在连接阶段失败 —— 静默降级比明确剔除更难排查。
+func sanitizeOutboundShape(ob map[string]any) {
+	// 1) VLESS flow: 只保留 sing-box 认的 xtls-rprx-vision; none/空/未知一律省略。
+	if flow, ok := ob["flow"].(string); ok {
+		switch normalizeVLESSFlow(flow) {
+		case "":
+			delete(ob, "flow")
+		default:
+			ob["flow"] = normalizeVLESSFlow(flow)
+		}
+	}
+	// 2) transport: **只**剥掉"表示无传输层"的写法(tcp/raw/空) —— 那是 v2ray 对
+	//    裸 TCP 的表达, 省略该字段就是等价语义。其余未知取值(xhttp/kcp/…)一概
+	//    原样留下, 让 sing-box 把它剔除: 它们是真不支持的传输, 剥掉只会静默退化
+	//    成裸 TCP, 节点"通过校验却连不上", 比明确剔除更难排查。
+	if tr, ok := ob["transport"].(map[string]any); ok {
+		if t, _ := tr["type"].(string); isNoTransportMarker(t) {
+			delete(ob, "transport")
+		}
+	}
+	// 3) TLS 块内的 uTLS 指纹: 不认识的指纹整块省略(v2ray 的 unsafe/未知拼写)。
+	//    注意只动 utls, 不动 tls 本身 —— 省略掉 utls 就是"不做指纹伪装", 语义可表达。
+	if tls, ok := ob["tls"].(map[string]any); ok {
+		if u, ok := tls["utls"].(map[string]any); ok {
+			fp, _ := u["fingerprint"].(string)
+			if normalizeUTLSFingerprint(fp) == "" {
+				delete(tls, "utls")
+			} else {
+				u["fingerprint"] = normalizeUTLSFingerprint(fp)
+			}
+		}
+	}
+	// 4) xtls 是 v2ray 的旧字段, sing-box 无此块(它用 flow + reality), 省略。
+	delete(ob, "xtls")
+}
+
+// singboxUTLSFingerprints sing-box 认可的 uTLS 指纹全集。
+// 来源: sing-box option/uTLSFingerprint 的常量表。
+var singboxUTLSFingerprints = map[string]bool{
+	"chrome": true, "firefox": true, "safari": true, "ios": true,
+	"android": true, "edge": true, "360": true, "qq": true,
+	"random": true, "randomized": true,
+}
+
+// normalizeUTLSFingerprint 归一 uTLS 指纹; 不认识返回 ""(调用方据此省略 utls 块)。
+// 大小写不敏感: 订阅里 "Chrome" / "CHROME" 都存在。
+func normalizeUTLSFingerprint(fp string) string {
+	f := strings.ToLower(strings.TrimSpace(fp))
+	if f == "" || !singboxUTLSFingerprints[f] {
+		return ""
+	}
+	return f
+}
+
+// normalizeVLESSFlow 归一 VLESS flow。返回 "" 表示"不设 flow"(等价 none)。
+//
+// xtls-rprx-vision-udp443 是 xtls-rprx-vision 的旧写法(多带 UDP443 语义),
+// sing-box 只认后者。其余未知取值一律归空(宁可不设, 也不把上游不认的值发上去)。
+func normalizeVLESSFlow(flow string) string {
+	f := strings.ToLower(strings.TrimSpace(flow))
+	switch f {
+	case "":
+		return ""
+	case "xtls-rprx-vision", "xtls-rprx-vision-udp443":
+		return "xtls-rprx-vision"
+	default:
+		return ""
+	}
+}
+
+// isNoTransportMarker 该取值是否意为"没有传输层"(v2ray 用 tcp 表示裸 TCP)。
+// 只有这类写法才可安全省略 transport 字段 —— 省略即等价语义。
+func isNoTransportMarker(t string) bool {
+	switch strings.ToLower(strings.TrimSpace(t)) {
+	case "", "tcp", "raw":
+		return true
+	}
+	return false
+}
+
+// isSingboxTransportType sing-box 支持的 transport.type 取值。
+// 用于测试与文档, 不用于净化决策: 净化只剥 isNoTransportMarker, 其余未知取值
+// 原样留给 sing-box 剔除(见 sanitizeOutboundShape 第 2 点)。
+func isSingboxTransportType(t string) bool {
+	switch strings.ToLower(strings.TrimSpace(t)) {
+	case "http", "ws", "quic", "grpc", "httpupgrade":
+		return true
+	}
+	return false
+}
+
 // sanitizeOutboundTLS 修正出站里会让 sing-box 直接崩溃的 TLS 写法。
 //
 // sing-box v1.14.0 的 vless / trojan 出站是这么写的:

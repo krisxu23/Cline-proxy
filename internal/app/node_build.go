@@ -75,6 +75,13 @@ func buildNodeParts(entries []any) (ports map[string]int, inbounds, outbounds, r
 				log.Printf("  node %d: 解析失败已跳过: %v", i+1, err)
 				continue
 			}
+			// ★ 净化必须先于校验。validateOutboundEntry 走 sing-box 的 box.New,
+			// 对任何它不认的取值一律判无效; 而订阅源普遍用 v2ray/Xray 的写法
+			// (tcp/raw 表示裸 TCP、fp=unsafe 表示不校验指纹、flow=none 表示不设 flow),
+			// 这些**语义都能表达**, 净化为等价的 sing-box 写法后就是可用节点。
+			// 旧顺序(先校验后净化)会把这批节点白白丢掉 —— 2026-09-18 实测 72 条。
+			sanitizeOutboundTLS(ob)
+			sanitizeOutboundShape(ob)
 			// 链接解析出的出站必须同样过 sing-box 校验。订阅聚合源里常有 sing-box
 			// 不认的写法(实测 ss 的 chacha20-poly1305), 只校验 map 分支会让这类坏
 			// 节点一路进到 box.New, 把**整个实例**打死 → nodePorts 归零 → 健康检测
@@ -96,21 +103,24 @@ func buildNodeParts(entries []any) (ports map[string]int, inbounds, outbounds, r
 				continue
 			}
 			hasMap = true
-			if verr := validateOutboundEntry(v); verr != nil {
-				log.Printf("  node %d(%s): 出站无效已剔除: %v", i+1, name, verr)
-				continue
-			}
 			cp := map[string]any{"tag": fmt.Sprintf("out-%d", i)}
 			for k, val := range v {
 				if k != "tag" {
 					cp[k] = val
 				}
 			}
+			// 同 string 分支: 净化先于校验(订阅下发的 sing-box JSON 是这类方言问题
+			// 最集中的来源 —— transport:{"type":"tcp"} 正是从这里进来的)。
+			sanitizeOutboundTLS(cp)
+			sanitizeOutboundShape(cp)
+			if verr := validateOutboundEntry(cp); verr != nil {
+				log.Printf("  node %d(%s): 出站无效已剔除: %v", i+1, name, verr)
+				continue
+			}
 			ob = cp
 		default:
 			continue
 		}
-		sanitizeOutboundTLS(ob)
 		items = append(items, nodeBuildItem{key: key, name: name, ob: ob})
 	}
 
@@ -194,7 +204,15 @@ func startNodeInstance(ctx context.Context, inbounds, outbounds, rules []map[str
 	return box.New(box.Options{Context: ctx, Options: opts})
 }
 
-// validateOutboundEntry 单独构建校验一个订阅出站, 单个坏节点不影响其他节点
+// validateOutboundEntry 单独构建校验一个订阅出站, 单个坏节点不影响其他节点。
+//
+// ⚠️ 覆盖范围有限(2026-09-18 实测确认): 它只抓 sing-box 在 box.New 阶段就会
+// 报的错 —— 未知 outbound type、未知 transport type(如 xhttp)。**它不校验**
+// uTLS 指纹、vless flow、以及 transport=tcp: 这几类在 box.New 时静默通过,
+// 到握手/初始化 TLS 才失败。所以:
+//   - 别把"过了这个校验"当成"节点能用";
+//   - 这些取值必须靠 sanitizeOutboundShape 在**送进真实实例之前**处理掉,
+//     不能指望校验兜底。
 func validateOutboundEntry(ob map[string]any) error {
 	entry := map[string]any{"tag": "check"}
 	for k, v := range ob {
@@ -205,6 +223,7 @@ func validateOutboundEntry(ob map[string]any) error {
 	// 按实际运行形态校验: buildNodeParts 落盘前必经 sanitize, 这里先对副本做同样的事,
 	// 否则"校验时剔除、运行时能跑"(或反过来), 两边结论打架。
 	sanitizeOutboundTLS(entry)
+	sanitizeOutboundShape(entry)
 	dnsCfg, resolverTag := buildNodeDNS(getZenConfig())
 	boxCfg := map[string]any{
 		"log":       map[string]any{"disabled": true},
