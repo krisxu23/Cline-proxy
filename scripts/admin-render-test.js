@@ -302,7 +302,12 @@ check('cline 卡片 0 个勾选框', cb('cline') === 0, cb('cline') + ' 个');
 check('opencode 卡片 2 个勾选框(1 锁定 + 1 可勾选)', cb('opencode') === 2, cb('opencode') + ' 个');
 const ocRows = cardHtml('opencode');
 check('opencode 自动免费行锁定勾选(checked disabled)', /checked disabled title="自动免费模型/.test(ocRows), '缺少锁定行');
-const ocActive = (ocRows.match(/data-ocmodel="gemini-3.8-flash"[^>]*onchange="toggleOcModel\(this\)"/) || ['未找到'])[0];
+// ★ 反斜杠必须写两层: 本文件整体是 JS 模板字符串(PROBE), 模板层会把 \( 吃成 (。
+// 只写一层时运行时正则会变成 /toggleOcModel(this)/ —— (this) 成了**捕获组**,
+// 要求匹配字面量 toggleOcModelthis, 于是永远匹配不上(2026-09-18 定位)。
+// 相邻几处(324/382/441/451/491 行)作者都正确写了两层, 只有这一行漏了。
+// ★ 本段在模板字符串内: 注释里也不能出现反引号, 否则会提前终止模板。
+const ocActive = (ocRows.match(/data-ocmodel="gemini-3.8-flash"[^>]*onchange="toggleOcModel\\(this\\)"/) || ['未找到'])[0];
 check('opencode 测试模型可勾选(非锁定)', ocActive !== '未找到', ocActive);
 check('bai 卡片 2 个勾选框', cb('bai') === 2, cb('bai') + ' 个');
 const row = id => (cardHtml('bai').match(new RegExp('<td><input[^>]*' + id.replace(/\\./g, '\\\\.') + '[^>]*></td>')) || ['未找到'])[0];
