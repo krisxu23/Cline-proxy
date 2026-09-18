@@ -102,9 +102,15 @@ const (
 	providerCatalogTimeout  = 90 * time.Second
 
 	// catalogExitMaxRotations 单次目录刷新的换出口次数硬上限。
-	// 预算本身 = 池内健康出口数, 这里只是兜底: 万一冷却没生效(例如出口无法
-	// 被冷却), 也不能让轮换无限进行。
-	catalogExitMaxRotations = 16
+	//
+	// 从 16 降到 4: 轮换本身由 pickZenProxyWhere 的全局 round-robin 计数驱动,
+	// 每次拨号天然换一个出口, 不需要靠"多试几次"来碰运气。而 16 的代价实测是
+	// 灾难性的 —— 健康出口只有 25~95 个时, 9 个 provider 各轮换 16 次 = 144 次
+	// 出口冷却, 直接把池子抽干(2026-09-17 实证: 池空 → 全量走直连 → 全部失败)。
+	catalogExitMaxRotations = 4
+	// catalogFailBackoffMax 连续失败后退避上限。超过半天还没拉到的 provider
+	// 继续高频重试没有收益(目录只用于展示与勾选, 不阻塞对话)。
+	catalogFailBackoffMax = 6 * time.Hour
 	// catalogExitRotateMax 单次目录刷新的轮换总时长上限。
 	// 订阅池几十上百个节点时, 即便只挑健康的也可能试很久, 而这段时间里
 	// 管理面板与业务请求都要跟它抢出口。
@@ -425,8 +431,89 @@ func (p *modelProvider) retryCatalogOnNextExit(err error) bool {
 	if regionRejected {
 		reason = fmt.Sprintf("exit region rejected: %s", kit.Truncate(string(body), 160))
 	}
-	rotateProviderExit(p.name, "catalog "+reason, p.catalogExitRetries, catalogExitBudget())
+	// ★ 控制面失败**不冷却数据面出口池**。
+	//
+	// 旧实现调 rotateProviderExit → cooldownZenProxyByIndex(2 分钟)。语义是错的:
+	// 一个节点可能拉不到某上游的 /models(控制面), 但对话(数据面)完全正常;
+	// 而且聚合冷却量无上界 —— 9 个 provider × 每次 16 轮换 = 144 次冷却, 而
+	// 实测健康出口只有 25~95 个, 于是池子被抽干, 所有请求退化成直连并失败
+	// (2026-09-17 实证: 日志末尾满屏"节点池无可用出口")。
+	//
+	// 轮换不依赖冷却: pickZenProxyWhere 的全局 round-robin 计数每次拨号都 +1,
+	// 下一次尝试天然落在另一个出口上。数据面失败仍照常冷却(providers_chat.go),
+	// 那才是冷却该发生的地方。
+	log.Printf("  providers: %s catalog %s, retry %d/%d on the next exit (控制面失败不计入出口冷却)",
+		p.name, reason, p.catalogExitRetries, catalogExitBudget())
 	return true
+}
+
+// catalogRefreshInterval 该 provider 当前的目录刷新间隔(指数退避)。
+//
+// 连续失败会放大间隔: 15min → 30min → 1h → 2h → 4h → 6h(封顶), 成功清零。
+// 动机(2026-09-17 实证): 目录刷新失败时每次都会轮换出口, 而"请求路径按需刷新"
+// (providers_chat.go) 在目录为空时每分钟就会触发一次 —— 一个永久拉不到目录的
+// provider 因此每分钟烧掉一轮出口轮换, 把只有几十个健康出口的池子抽干, 最终
+// 所有请求无出口可用、全部走直连而失败。退避把这种空转压到可忽略。
+func (p *modelProvider) catalogRefreshInterval() time.Duration {
+	p.mu.Lock()
+	streak := p.catalogFailStreak
+	p.mu.Unlock()
+	return catalogIntervalFor(streak)
+}
+
+// catalogIntervalFor 纯函数版退避计算(不取锁), 供已持 p.mu 的调用点内联使用。
+//
+// 基准 15min; 首次失败仍维持基准(单次抖动应能很快恢复), 从第 2 次连续失败起
+// 逐步翻倍, 封顶 6h:
+//
+//	streak  0/1 → 15min
+//	        2   → 30min
+//	        3   → 1h
+//	        4   → 2h
+//	        5   → 4h
+//	        6+  → 6h(封顶)
+func catalogIntervalFor(streak int) time.Duration {
+	iv := providerCatalogRefresh
+	for i := 1; i < streak && iv < catalogFailBackoffMax; i++ {
+		iv *= 2
+	}
+	if iv > catalogFailBackoffMax {
+		iv = catalogFailBackoffMax
+	}
+	return iv
+}
+
+// catalogFastRetryStreak 请求路径保持"1 分钟快速重试"的连续失败次数上限。
+// 达到该次数后, 请求路径改用 catalogIntervalFor 的退避门限:
+// 暂态抖动要能快速恢复, 而**持续拉不到目录**的 provider 不能无限期每分钟空转。
+const catalogFastRetryStreak = 3
+
+// catalogRequestGateMs 请求路径的目录刷新门限(毫秒)。
+//
+//	连续失败 < catalogFastRetryStreak → 1 分钟(目录空着要尽快补上)
+//	否则                            → 退避间隔(15min→…→6h)
+//
+// 这条分级是必需的: 只用 1 分钟会让永久失败的 provider 被每个请求触发刷新,
+// 每分钟烧掉一轮出口轮换; 只用退避又会让单次上游抖动锁死目录几十分钟。
+func catalogRequestGateMs(streak int) int64 {
+	if streak < catalogFastRetryStreak {
+		return providerCatalogRetryMs
+	}
+	return int64(catalogIntervalFor(streak) / time.Millisecond)
+}
+
+// noteCatalogFailure 记录一次目录刷新失败(放大退避间隔)。
+func (p *modelProvider) noteCatalogFailure() {
+	p.mu.Lock()
+	p.catalogFailStreak++
+	p.mu.Unlock()
+}
+
+// noteCatalogSuccess 目录刷新成功: 清零退避, 恢复基准间隔。
+func (p *modelProvider) noteCatalogSuccess() {
+	p.mu.Lock()
+	p.catalogFailStreak = 0
+	p.mu.Unlock()
 }
 
 // catalogHTTPError 把 fetchCatalogPage 的非 200 带结构化状态码, 供换出口判定。
@@ -459,7 +546,9 @@ func (p *modelProvider) refreshCatalog(ctx context.Context, force bool) error {
 		return nil
 	}
 	now := time.Now().UnixMilli()
-	if !force && now-p.attemptedAt < int64(providerCatalogRefresh/time.Millisecond) &&
+	// 间隔用**退避后**的值: 连续失败的 provider 逐步拉长到 6h, 不再每分钟空转。
+	minInterval := int64(catalogIntervalFor(p.catalogFailStreak) / time.Millisecond)
+	if !force && now-p.attemptedAt < minInterval &&
 		(len(p.catalog) > 0 || p.catalogErr != "") {
 		p.mu.Unlock()
 		return nil
@@ -502,6 +591,7 @@ func (p *modelProvider) refreshCatalog(ctx context.Context, force bool) error {
 		}
 	}
 	if lastErr != nil {
+		p.noteCatalogFailure()
 		p.mu.Lock()
 		p.catalogErr = lastErr.Error()
 		p.mu.Unlock()
@@ -509,6 +599,7 @@ func (p *modelProvider) refreshCatalog(ctx context.Context, force bool) error {
 	}
 	if len(listed) == 0 {
 		err := fmt.Errorf("catalog response listed no models")
+		p.noteCatalogFailure()
 		p.mu.Lock()
 		p.catalogErr = err.Error()
 		p.mu.Unlock()
@@ -537,6 +628,8 @@ func (p *modelProvider) refreshCatalog(ctx context.Context, force bool) error {
 	p.fetchedAt = time.Now().UnixMilli()
 	p.catalogErr = ""
 	p.mu.Unlock()
+	// 成功: 清零退避, 下次恢复基准 15 分钟间隔。
+	p.noteCatalogSuccess()
 	p.maybeBackfillExplicitModels()
 	return nil
 }

@@ -742,10 +742,18 @@ func handleProviderChat(w http.ResponseWriter, r *http.Request, params map[strin
 
 	if cfg.Catalog {
 		p.mu.Lock()
-		// 目录为空时按短退避强制刷新。后台周期用的 15 分钟间隔不能直接用在请求路径上:
+		// 目录为空时按短退避刷新。后台周期用的 15 分钟间隔不能直接用在请求路径上:
 		// refreshCatalog 见到 attemptedAt/catalogErr 就会跳过, 沿用间隔会让该 provider
 		// 一直 400 到下一个后台周期。
-		need := len(p.catalog) == 0 && time.Now().UnixMilli()-p.attemptedAt >= providerCatalogRetryMs
+		//
+		// ★ 门限分级(见 catalogRequestGateMs): 暂态失败保持 1 分钟快速重试,
+		// 连续失败(catalogFastRetryStreak 次以上)才切到退避间隔。
+		// 旧实现恒用 1 分钟, 于是一个永久拉不到目录的 provider 被每个请求触发刷新,
+		// 每分钟烧掉一轮出口轮换 —— 9 个 provider × 每次 16 轮换 = 144 次冷却/分钟,
+		// 而健康出口只有 25~95 个, 出口池被抽干, 所有请求退化成直连并失败
+		// (2026-09-17 实证: 日志满屏"节点池无可用出口")。
+		gateMs := catalogRequestGateMs(p.catalogFailStreak)
+		need := len(p.catalog) == 0 && time.Now().UnixMilli()-p.attemptedAt >= gateMs
 		p.mu.Unlock()
 		if need {
 			ctx, cancel := context.WithTimeout(r.Context(), providerCatalogTimeout)

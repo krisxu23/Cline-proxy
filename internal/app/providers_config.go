@@ -365,12 +365,17 @@ type modelProvider struct {
 	fetchedAt          int64 // unix ms
 	attemptedAt        int64
 	catalogErr         string
-	catalogExitRetries int               // 本次目录刷新已用的换出口次数(预算 = 池内健康出口数)
-	catalogExitAt      time.Time         // 本次目录刷新开始轮换的时刻(用于总时长上限)
-	catalogDirectTried bool              // 本次目录刷新是否已用过直连兜底
-	catalogInflight    bool              // 是否已有一次目录刷新在跑(防并发重复刷新)
-	rejected           map[string]string // modelID -> 永久拒绝原因
-	sigCache           *thoughtSignatureCache
+	catalogExitRetries int       // 本次目录刷新已用的换出口次数(预算 = 池内健康出口数)
+	catalogExitAt      time.Time // 本次目录刷新开始轮换的时刻(用于总时长上限)
+	catalogDirectTried bool      // 本次目录刷新是否已用过直连兜底
+	catalogInflight    bool      // 是否已有一次目录刷新在跑(防并发重复刷新)
+	// catalogFailStreak 连续失败的目录刷新次数; 成功清零。
+	// 用于把刷新间隔指数放大(15min→30→60…封顶 6h), 见 catalogRefreshInterval。
+	// 意义: 一个长期拉不到目录的 provider(如 key 失效、地区被拒)不该每 15 分钟
+	// 就烧掉一轮出口轮换 —— 实测这会把健康出口池抽干(见 retryCatalogOnNextExit)。
+	catalogFailStreak int
+	rejected          map[string]string // modelID -> 永久拒绝原因
+	sigCache          *thoughtSignatureCache
 }
 
 func newModelProvider(name string) *modelProvider {
