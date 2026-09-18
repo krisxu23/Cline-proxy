@@ -285,17 +285,17 @@ func (p *modelProvider) fetchCatalogPage(ctx context.Context, cfg providerConfig
 	return page, nil
 }
 
-// catalogFallbackClient 目录抓取的兜底客户端。
-//
-// 走网关统一出口: 代理模式经节点(节点池全试一遍仍失败时, 由出口决策按
-// "节点全挂兜底"开关决定是否直连), 直连模式经 sing-box 的 direct 出站。
-// 原先这里是"强制直连"的旁路, 会绕过出口模式, 现已收回统一决策。
 // catalogFallbackClient 目录抓取的**直连**兜底客户端(不经出口池)。
 //
 // 此前它返回的是同一个出口客户端, 所谓"兜底"等于再撞一次同样的死节点 ——
 // 日志实证: `直连兜底也失败: socks5: general SOCKS server failure`。
 // 目录抓取是控制面请求: 目标站点通常直连就通(实测 opencode.ai 直连 1.3s 200),
 // 不该被数据面出口池的整体状况拖死。显式关闭 rescueDirect 时返回 nil, 调用方跳过兜底。
+//
+// (此处原有第二段与本节矛盾的旧注释 —— "走网关统一出口, 代理模式经节点…现已收回
+//
+//	统一决策"。代码从来是直连(directHTTPClient), 且"收回统一决策"会让控制面被数据面
+//	的整体故障拖死。2026-09-18 复核后删除, 以本段为准。)
 func catalogFallbackClient() *http.Client {
 	if !rescueDirectEnabled() {
 		return nil

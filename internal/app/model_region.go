@@ -50,32 +50,23 @@ type ctxKeyZenModelType struct{}
 
 var ctxKeyZenModel = ctxKeyZenModelType{}
 
-// regionBlockedPhrases 地区封锁常见措辞, 与 error_rules.go 的规则表同源
-// (isRegionBlockedBody 也用同一份)。zen 上游迄今只回 type:RegionError,
-// 其余措辞是候选链其它 provider 实测过的 —— 一并识别, 让地区受限模型无论
-// 从哪个入口撞上都能进入"标记该出口 + 换出口重试"流程, 而不是落进通用
-// 403 直接失败(2026-09-17 审查 I4)。
-var regionBlockedPhrases = []string{
-	"regionerror",
-	"region not supported",
-	"unsupported_region",
-	"not available in your region",
-	"geo-restricted",
-	"not available in your country",
-}
-
 // isRegionError 判定上游响应是否为地区限制错误。
+//
+// ★ 单一来源: 直接复用 error_rules.go 的地区封锁规则(classGeoBlocked),
+// 不再维护第二份措辞表。
+//
+// 历史上这里有一份与 error_rules.go **各自复制**的 6 条短语表, 注释还声称
+// "同源(isRegionBlockedBody 也用同一份)" —— 但那个函数根本不存在, 两份表
+// 也早已行为分叉: error_rules.go 那份带反误伤豁免(`error code: 1010` /
+// `just a moment` / `attention required`), 这份没有。后果是 Cloudflare 1010
+// 指纹拒绝的正文里只要出现 "region" 字样, 就会被当地区封锁处理 —— 于是
+// zen_call 会把一个**只是当前出口指纹被拒**的模型登记成"地区受限"并触发
+// 全节点探测, 属于误判(2026-09-18 复核)。
+//
+// 收口后两处判定必然一致: 措辞表与豁免都在 error_rules.go 一处维护。
 func isRegionError(body string) bool {
-	if body == "" {
-		return false
-	}
-	lower := strings.ToLower(body)
-	for _, p := range regionBlockedPhrases {
-		if strings.Contains(lower, p) {
-			return true
-		}
-	}
-	return false
+	class, _ := matchErrorRules(body)
+	return class == classGeoBlocked
 }
 
 // isFreeTierError 判定上游响应是否为 opencode 免费 tier 的出口风控拒绝。

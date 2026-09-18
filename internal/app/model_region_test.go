@@ -187,3 +187,53 @@ func TestFreeTierExitMarkingSkipsNode(t *testing.T) {
 		}
 	}
 }
+
+// isRegionError 必须与 error_rules.go 的地区封锁规则**完全一致**(单一来源)。
+//
+// 收口前这里是第二份各自复制的短语表, 且缺 error_rules 的反误伤豁免 ——
+// Cloudflare 1010 指纹拒绝的正文只要提到 "region" 就会被误判成地区封锁,
+// 进而把一个只是"当前出口指纹被拒"的模型登记为地区受限并触发全节点探测。
+func TestIsRegionErrorSharesRuleTable(t *testing.T) {
+	// 真地区封锁: 命中
+	trueCases := []string{
+		`{"type":"error","error":{"type":"RegionError","message":"nope"}}`,
+		`{"error":{"message":"Model is not available in your region"}}`,
+		`{"error":{"message":"region not supported"}}`,
+		`{"error":{"message":"unsupported_region"}}`,
+		`{"error":{"message":"geo-restricted"}}`,
+		`{"error":{"message":"not available in your country"}}`,
+	}
+	for _, c := range trueCases {
+		if !isRegionError(c) {
+			t.Errorf("应判为地区封锁: %s", c)
+		}
+	}
+
+	// ★ 反误伤: CF-1010 指纹拒绝即便夹带地区文案也不得判为地区封锁
+	// (豁免来自 error_rules.go 的地区规则, 这次收口后才生效)。
+	vetoCases := []string{
+		`{"error":{"message":"error code: 1010 region not supported"}}`,
+		`{"error":{"message":"just a moment... region not supported"}}`,
+		`{"error":{"message":"attention required — not available in your region"}}`,
+	}
+	for _, c := range vetoCases {
+		if isRegionError(c) {
+			t.Errorf("CF 1010/质询页应被豁免, 不得判为地区封锁: %s", c)
+		}
+	}
+
+	// 不相关正文不命中
+	for _, c := range []string{"", "rate limit exceeded", `{"error":{"message":"context window exceeded"}}`} {
+		if isRegionError(c) {
+			t.Errorf("不应判为地区封锁: %s", c)
+		}
+	}
+
+	// 与规则表判定必须一致(单一来源断言): 逐例比对
+	for _, c := range append(append([]string{}, trueCases...), vetoCases...) {
+		class, _ := matchErrorRules(c)
+		if got, want := isRegionError(c), class == classGeoBlocked; got != want {
+			t.Errorf("isRegionError 与规则表分叉: body=%s got=%v want=%v", c, got, want)
+		}
+	}
+}
