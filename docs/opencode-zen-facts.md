@@ -83,10 +83,17 @@ Gemini 同理：`base + "/models/" + modelID`。
 
 | 端点 | 鉴权头 | 来源 |
 |---|---|---|
-| `/chat/completions` | `Authorization: Bearer <key>` | `[实测]` 本项目在用 |
+| `/chat/completions` | `Authorization: Bearer <key>` | `[实测]` 本项目在用；2026-09-18 复测：伪造 key → `401 AuthError: Invalid API key.`，**说明该端点确实校验 Bearer** |
 | `/responses` | `Authorization: Bearer <key>` | `[实测]` 本项目在用 |
-| `/messages` | `[未知]` — 推测 `x-api-key` + `anthropic-version`（Anthropic 惯例） | **落地前必须实测** |
-| `/models/<id>` | `[未知]` — 推测 Google 方言（`x-goog-api-key`）或 Bearer | **落地前必须实测** |
+| `/messages` | `Authorization: Bearer <key>`（与全体一致） | `[实测]` 2026-09-18：`/messages` **不暴露鉴权差异** —— 传合法 key / 伪造 key / **完全不传**，对同一 body 返回完全相同的响应。原因是它**先校验 model、后（或不）校验鉴权**：model 合法但上游不可用时直接回 `400 Model is unavailable`，根本走不到鉴权层。所以只能确认「zen 全站用 Bearer」，无法用该端点单独验证鉴权 |
+| `/models/<id>` | `[实测]` **该路径不是 JSON API** | 2026-09-18：`GET https://opencode.ai/zen/v1/models/<id>` 返回的是官网 SPA 的 HTML（不是 JSON）。官方端点矩阵里的 `/models/<model-id>` 指的应是**另一个 base/路径**，不能按 `zen/v1/models/<id>` 拼 |
+
+### 2026-09-18 端点探针的附带发现 `[实测]`
+- `union-alpha` 当前**上游不可用**：`POST /zen/v1/messages {"model":"union-alpha"}` → `400 Model is unavailable`。
+  加上 `opencode/` 前缀反而变成 `401 ModelError: Model opencode/union-alpha is not supported`
+  → 该端点上模型名**不带** `opencode/` 前缀（前缀只在客户端配置层用）。
+  → 即：union-alpha 现在无论怎么路由都拿不到结果，属上游侧状态，不是本项目的问题。
+- 同一次探针里 `/chat/completions` + 免费模型 + 合法 key 仍回 `403 FreeTierError`（与本机直连 IP 相关，见第 4 节）。
 
 ---
 
@@ -102,16 +109,23 @@ Gemini 同理：`base + "/models/" + modelID`。
 | 403 `FreeTierError`（"can only be used from within OpenCode"） | **按出口 IP 判定**，与请求头无关 | codex 2026-09-17 实测：同一 `mimo-v2.5-free` 走香港/大陆中转节点 200、走美/法节点与本机直连一律 403；带参考实现的完整 CLI 身份头同样被拒 |
 | 429 | **换一个 IP 就能继续用**（用户实测） | 用户口述，未留存日志 |
 | CLI 身份头形态 | `UA=opencode/<版本>` + `x-opencode-client=cli` + `x-opencode-project=prj_` + `x-opencode-session=ses_` + `x-opencode-request=usr_`（结构化 ID，非 UUID） | commit `d0a7bae` 直连实测：伪造结构合法 ID + UA 1.18.31 + cli 即 200，**去头即 403** |
+| **额度重置窗口** = **按日，边界 00:00 UTC（= 08:00 北京）** | 由两个独立采样反推：上游 429 回的 `Retry-After` 头①`18h53m35s`(13:06:25 采样) ②`17h47m25s`(14:12:36 采样)，两者相加**都精确落在次日 08:00:00/08:00:01** | 部署实例 `data/cline-proxy.log` 2026-09-17 两行 `zen rate limited (429), retry 1/6 after ...` |
+| **429 的重置时刻可直接读 `Retry-After` 头** | 不需要解析响应体 —— 上游主动给了精确时刻，且本项目已在读它 | 同上（`parseRetryAfter(resp.Header.Get("Retry-After"))`） |
+
+> ★ 「日重置 / 00:00 UTC」这条直接决定了冷却时长：冷却**不能**短于 Retry-After，
+> 否则会在额度恢复前反复打同一个已耗尽的出口。实现见
+> `proxy_pool.go` 的 `zenQuotaRetryAfterCap`（此前被无条件截成 6h，2026-09-18 修正）。
 
 ### 尚未确认的 `[未知]` —— 禁止据此写代码
 
 | 问题 | 为什么重要 | 怎么验证 |
 |---|---|---|
-| **额度粒度**：一个 IP 的额度是全局共享（所有模型共用）还是 per-model？ | 决定状态是「出口级」还是「出口×模型」级 | 同一 IP 连续打两个不同免费模型，看第二个是否也 429 |
-| **额度重置窗口**：日重置？小时？滑动窗口？ | 决定冷却时长 | 429 之后按 1h/6h/24h 分别重试同一 IP，找到恢复点 |
-| **429 响应体是否含配额信息** | 有的话可以直接读，不用猜 | 抓一次 429 的完整 body |
-| **`/messages` 与 `/models/<id>` 的鉴权方式** | 决定新端点能否打通 | 用 curl 直连试 |
-| **多 key 是否降低风控率** | 决定是否值得做 key+IP 配对 | 同 key 轮换多 IP vs 每 key 固定 IP，比 403/429 率 |
+| **额度粒度**：一个 IP 的额度是全局共享（所有模型共用）还是 per-model？ | 决定状态是「出口级」还是「出口×模型」级 | 同一出口 IP 连续打**两个不同免费模型**，看第二个是否也 429。**需要消耗真实额度，须用户批准后专门做** |
+| **多 key 是否降低风控率** | 决定是否值得做 key+IP 配对 | 同 key 轮换多 IP vs 每 key 固定 IP，比 403/429 率。**需要统计量级请求，须用户批准后专门做** |
+
+> 已从 `[未知]` 移除的条目（结论见上表）：额度重置窗口、429 是否含配额信息、
+> `/messages` 与 `/models/<id>` 的鉴权方式。**前两条已可落地使用**，第三条
+> 落地为「/models/<id> 不可按该路径调用」，故 Gemini 原生端点一行保持不做。
 
 ---
 

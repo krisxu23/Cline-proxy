@@ -90,9 +90,22 @@ func TestCooldownZenProxyQuota_RetryAfter取较大者(t *testing.T) {
 	if got := cooldownZenProxyQuota("socks5://b:2", time.Second); got != zenQuotaCooldownBase {
 		t.Fatalf("Retry-After 更短时不得缩短冷却, 实得 %v", got)
 	}
-	// 离谱的 Retry-After 要封顶, 否则出口被锁死
-	if got := cooldownZenProxyQuota("socks5://c:3", 72*time.Hour); got != zenQuotaCooldownCap {
-		t.Fatalf("超长 Retry-After 应封顶到 %v, 实得 %v", zenQuotaCooldownCap, got)
+	// ★ 实测量级必须被**完整采纳**: 18h53m35s 是线上真实出现过的 Retry-After
+	// (2026-09-18 部署实例日志; 两次采样都精确落在次日 08:00 = 00:00 UTC,
+	//  即额度按日重置)。旧实现无条件封顶到 6h, 会把这个**已知耗尽到明天**的
+	// 出口在 6 小时后放回池子 → 再撞一次 429 → 13 小时内反复打同一个 IP。
+	if want := 18*time.Hour + 53*time.Minute + 35*time.Second; true {
+		if got := cooldownZenProxyQuota("socks5://c:3", want); got != want {
+			t.Fatalf("实测量级的 Retry-After 必须完整采纳, 期望 %v 实得 %v", want, got)
+		}
+	}
+	// 但异常值仍要封顶(上限独立于指数升级的 6h), 否则出口被锁死
+	if got := cooldownZenProxyQuota("socks5://d:4", 72*time.Hour); got != zenQuotaRetryAfterCap {
+		t.Fatalf("超长 Retry-After 应封顶到 %v, 实得 %v", zenQuotaRetryAfterCap, got)
+	}
+	// 无 Retry-After 时, 指数升级那条仍封顶在 6h(这条没变)
+	if got := cooldownZenProxyQuota("socks5://e:5", 25*time.Hour); got != zenQuotaRetryAfterCap {
+		t.Fatalf("Retry-After 超上限时应停在 %v, 实得 %v", zenQuotaRetryAfterCap, got)
 	}
 }
 

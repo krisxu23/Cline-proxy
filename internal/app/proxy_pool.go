@@ -161,6 +161,21 @@ func zenProxyCooldownStatus() map[string]string {
 const (
 	zenQuotaCooldownBase = 10 * time.Minute
 	zenQuotaCooldownCap  = 6 * time.Hour
+	// zenQuotaRetryAfterCap Retry-After 的独立上限。
+	//
+	// ★ 为什么不能沿用 zenQuotaCooldownCap(6h): Retry-After 是**上游亲口给的**
+	// 重置时刻, 权威性高于我们的指数猜测。实测(2026-09-18, 部署实例日志)两次采样:
+	//
+	//	13:06:25  retry 1/6 after 18h53m35s  → 次日 08:00:00
+	//	14:12:36  retry 1/6 after 17h47m25s  → 次日 08:00:01
+	//
+	// 两次独立采样都精确落在次日 08:00(= 00:00 UTC) —— 额度按日重置。
+	// 旧实现在最后无条件 `if d > zenQuotaCooldownCap { d = cap }`, 把 18h53m
+	// 截成 6h: 6 小时后这个**已知耗尽到明天**的出口会被放回池子, 再撞一次 429,
+	// 13 小时内反复打同一个已耗尽的 IP —— 既是白烧尝试, 也毫无必要地增加风控面。
+	//
+	// 上限仍然保留(24h), 但只用于挡**异常值**(上游返回离谱数字时别把出口永久锁死)。
+	zenQuotaRetryAfterCap = 24 * time.Hour
 )
 
 // zenProxyQuotaStrikes 出口的连续 429 计数(与冷却表共用 zenProxyCooldownsMu)。
@@ -169,8 +184,10 @@ var zenProxyQuotaStrikes = map[string]int{}
 // cooldownZenProxyQuota 429 时冷却出口, 时长按连续命中次数指数升级。
 //
 // retryAfter > 0 时取它与升级时长的**较大者** —— 上游明确说了等多久就听它的,
-// 但绝不因此缩短冷却(缩短只会换来又一次 429)。最终时长封顶 zenQuotaCooldownCap,
-// 防上游回一个离谱的 Retry-After 把出口锁死。
+// 但绝不因此缩短冷却(缩短只会换来又一次 429)。
+//
+// 两者各有独立上限(见 zenQuotaRetryAfterCap 的实测依据): Retry-After 是权威值,
+// 上限只挡异常；指数升级那条是我们自己的猜测, 上限沿用 zenQuotaCooldownCap。
 //
 // 返回实际冷却时长(0 表示没有可冷却的出口, 如直连)。
 func cooldownZenProxyQuota(proxy string, retryAfter time.Duration) time.Duration {
@@ -186,11 +203,17 @@ func cooldownZenProxyQuota(proxy string, retryAfter time.Duration) time.Duration
 	for i := 1; i < n && d < zenQuotaCooldownCap; i++ {
 		d *= 2
 	}
-	if retryAfter > d {
-		d = retryAfter
-	}
 	if d > zenQuotaCooldownCap {
 		d = zenQuotaCooldownCap
+	}
+	if retryAfter > 0 {
+		ra := retryAfter
+		if ra > zenQuotaRetryAfterCap {
+			ra = zenQuotaRetryAfterCap
+		}
+		if ra > d {
+			d = ra
+		}
 	}
 	zenProxyCooldowns[key] = time.Now().Add(d)
 	return d
