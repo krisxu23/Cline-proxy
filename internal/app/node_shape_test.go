@@ -363,3 +363,25 @@ func TestSanitizeOutboundShapeSSBase64Method(t *testing.T) {
 		}
 	})
 }
+
+// URL 编码过的 base64 padding: 实测 node 1117 的 method 是
+// "YWVzLTI1Ni1nY206aXR6dnBuQDMyMQ%3D%3D"(%3D = "="), 直接解 base64 会失败。
+func TestSanitizeOutboundShapeSSURLEncodedBase64Method(t *testing.T) {
+	ob := map[string]any{
+		"type": "shadowsocks", "server": "1.2.3.4", "server_port": 8388,
+		"method": "YWVzLTI1Ni1nY206aXR6dnBuQDMyMQ%3D%3D", // b64("aes-256-gcm:itzvpn@321")
+	}
+	sanitizeOutboundShape(ob)
+	if ob["method"] != "aes-256-gcm" {
+		t.Fatalf("URL 编码的 base64 也应还原, got %v", ob["method"])
+	}
+	if ob["password"] != "itzvpn@321" {
+		t.Fatalf("password 应为解出的值, got %v", ob["password"])
+	}
+	// 纯垃圾(URL 解码后仍不是 base64)不得被"修"出个假方法
+	ob2 := map[string]any{"type": "shadowsocks", "method": "Channel%3Atelegram%3ATurboConfigs"}
+	sanitizeOutboundShape(ob2)
+	if ob2["method"] != "Channel%3Atelegram%3ATurboConfigs" {
+		t.Fatalf("垃圾值必须原样保留, got %v", ob2["method"])
+	}
+}

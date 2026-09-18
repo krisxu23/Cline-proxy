@@ -5,6 +5,7 @@ import (
 	"flag"
 	"fmt"
 	"log"
+	"net/url"
 	"os"
 	"sort"
 	"strings"
@@ -372,7 +373,15 @@ func sanitizeOutboundShape(ob map[string]any) {
 	// ss:// 的权威来源, 畸形 outbound 里单独的 password 字段反而不可信。
 	if typ, _ := ob["type"].(string); typ == "shadowsocks" {
 		if m, _ := ob["method"].(string); m != "" && !isKnownSSMethod(m) {
-			if dec, err := b64String(m); err == nil {
+			// 先直接解; 失败再试 URL 解码后解 —— 订阅里存在把 base64 的
+			// padding 写成 %3D 的形态(实测 node 1117: "…MQ%3D%3D")。
+			dec, err := b64String(m)
+			if err != nil {
+				if unescaped, uerr := url.QueryUnescape(m); uerr == nil {
+					dec, err = b64String(unescaped)
+				}
+			}
+			if err == nil {
 				// 用 Cut(首个冒号): 2022-blake3 家族的密码本身含冒号, 不能全切。
 				if method, pw, ok := strings.Cut(dec, ":"); ok && isKnownSSMethod(method) {
 					ob["method"] = normalizeSSMethod(method)
