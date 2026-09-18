@@ -149,6 +149,7 @@ func buildNodeParts(entries []any) (ports map[string]int, inbounds, outbounds, r
 	persistNodeStablePorts()
 
 	n := 0
+	endpoints := make(map[string]string, len(items))
 	for _, it := range items {
 		if it.port == 0 {
 			continue
@@ -163,8 +164,13 @@ func buildNodeParts(entries []any) (ports map[string]int, inbounds, outbounds, r
 			"action": "route", "inbound": []string{fmt.Sprintf("in-%d", n)}, "outbound": tag,
 		})
 		ports[it.key] = it.port
+		// 顺手记下该节点对应的上游服务器, 供健康检测按服务器分组(见 nodeRemoteEndpoints)。
+		if hp := outboundHostPort(it.ob); hp != "" {
+			endpoints[it.key] = hp
+		}
 		n++
 	}
+	setNodeRemoteEndpoints(endpoints)
 	return ports, inbounds, outbounds, rules, hasMap
 }
 

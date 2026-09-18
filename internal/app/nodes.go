@@ -5,9 +5,11 @@ import (
 	"flag"
 	"fmt"
 	"log"
+	"net"
 	"net/url"
 	"os"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -312,6 +314,47 @@ func syncNodeBox() {
 		time.Sleep(nodeStartupHealthDelay)
 		checkAllNodeHealth()
 	}()
+}
+
+// nodeRemoteEndpoints 节点 key -> 上游服务器 "host:port"。
+//
+// 用途: 健康检测按**同一台服务器**分组。订阅源常为同一台服务器生成多个
+// SNI 变体(实测 13,841 个实例去重后只有 3,722 个 host:port, 平均 3.7 个变体,
+// 最极端的单台服务器挂了 94 个)。同一 host:port 的变体共享**连接层**可达性:
+// 服务器连不上时, 它的几十个变体逐个去探是纯浪费(每个都要跑
+// 活性+测速+MITM+WARP), 而且会让"X/Y 可达"的分母虚高数倍。
+//
+// 由 buildNodeParts 在组装时整批替换(不是增量写), 保证读者看到的是一致快照。
+var (
+	nodeRemoteEndpoints   = map[string]string{}
+	nodeRemoteEndpointsMu sync.RWMutex
+)
+
+// setNodeRemoteEndpoints 整批替换(key -> host:port)。空 map 也替换, 清掉陈条目。
+func setNodeRemoteEndpoints(m map[string]string) {
+	nodeRemoteEndpointsMu.Lock()
+	nodeRemoteEndpoints = m
+	nodeRemoteEndpointsMu.Unlock()
+}
+
+// nodeRemoteEndpointOf 取节点对应的上游服务器 host:port; 取不到返回 ""。
+func nodeRemoteEndpointOf(key string) string {
+	nodeRemoteEndpointsMu.RLock()
+	defer nodeRemoteEndpointsMu.RUnlock()
+	return nodeRemoteEndpoints[key]
+}
+
+// outboundHostPort 从出站配置取 "host:port"(取不到端口时只返回 host)。
+func outboundHostPort(ob map[string]any) string {
+	host, _ := ob["server"].(string)
+	if host == "" {
+		return ""
+	}
+	port, err := toInt(ob["server_port"])
+	if err != nil || port <= 0 {
+		return host
+	}
+	return net.JoinHostPort(host, strconv.Itoa(port))
 }
 
 // sanitizeOutboundShape 修正出站里会让 sing-box **整条剔除**的字段取值。

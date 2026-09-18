@@ -110,32 +110,92 @@ func checkAllNodeHealth() {
 	var okCount int32
 	var mu sync.Mutex
 	sem := make(chan struct{}, workers)
-	var wg sync.WaitGroup
+
+	// 按**上游服务器**分组(见 nodeRemoteEndpoints 注释)。取不到远端信息的节点
+	// 自成一组 —— 不能让它与别的节点共享结论。
+	groupIdx := make(map[string]int, len(keys)/4+1)
+	groups := make([][]string, 0, len(keys))
 	for _, k := range keys {
+		g := nodeRemoteEndpointOf(k)
+		if g == "" {
+			g = "\x00solo\x00" + k
+		}
+		i, ok := groupIdx[g]
+		if !ok {
+			i = len(groups)
+			groupIdx[g] = i
+			groups = append(groups, nil)
+		}
+		groups[i] = append(groups[i], k)
+	}
+
+	record := func(key string, r nodeTestResult) {
+		ok := r.Alive && !r.MITMRisk && !r.IsStalled
+		mu.Lock()
+		if ok {
+			okCount++
+		}
+		mu.Unlock()
+		nodeHealthMu.Lock()
+		nodeHealth[key] = nodeHealthState{Ok: ok, At: time.Now(), Result: r}
+		nodeHealthMu.Unlock()
+		// 记下实测出口国家: 地区过滤依赖它, 落盘后重启仍可用(见 exit_region.go)
+		rememberNodeCountry(key, r.ExitCountry)
+	}
+
+	// 阶段 1: 每组只先探**代表变体**。
+	serverDead := make([]bool, len(groups))
+	var wg sync.WaitGroup
+	for i := range groups {
 		wg.Add(1)
-		go func(key string) {
+		go func(i int) {
 			defer wg.Done()
+			key := groups[i][0]
 			sem <- struct{}{}
 			defer func() { <-sem }()
 			r := testNodeComprehensiveFn(key)
-			ok := r.Alive && !r.MITMRisk && !r.IsStalled
-			mu.Lock()
-			if ok {
-				okCount++
+			record(key, r)
+			serverDead[i] = !r.Alive
+		}(i)
+	}
+	wg.Wait()
+
+	// 阶段 2: 代表变体连不上(Alive=false)的组, 其余变体**不再探测** —— 同一台
+	// 服务器连不上, 它的 SNI 变体不可能连得上。
+	// 必须显式记为不可用, 而不是留空: nodeUsable 对"未探测"是按可用处理的,
+	// 留空会让几十个死变体继续参与选路。
+	// (代表探测成功时仍逐个探: SNI 变体在 MITM/测速/断流上确实可能不同。)
+	skipped := 0
+	for i := range groups {
+		if serverDead[i] {
+			for _, k := range groups[i][1:] {
+				nodeHealthMu.Lock()
+				nodeHealth[k] = nodeHealthState{Ok: false, At: time.Now()}
+				nodeHealthMu.Unlock()
+				skipped++
 			}
-			mu.Unlock()
-			nodeHealthMu.Lock()
-			nodeHealth[key] = nodeHealthState{Ok: ok, At: time.Now(), Result: r}
-			nodeHealthMu.Unlock()
-			// 记下实测出口国家: 地区过滤依赖它, 落盘后重启仍可用(见 exit_region.go)
-			rememberNodeCountry(key, r.ExitCountry)
-		}(k)
+			continue
+		}
+		for _, k := range groups[i][1:] {
+			wg.Add(1)
+			go func(key string) {
+				defer wg.Done()
+				sem <- struct{}{}
+				defer func() { <-sem }()
+				record(key, testNodeComprehensiveFn(key))
+			}(k)
+		}
 	}
 	wg.Wait()
 	persistNodeCountries()
 	// 整批检测完再失效一次出口列表缓存(逐节点失效会把缓存打穿)
 	invalidateExitListCache()
-	log.Printf("  nodes: 增强检测完成(%d 并发), %d/%d 个出口可达", workers, okCount, len(keys))
+	if skipped > 0 {
+		log.Printf("  nodes: %d 个变体与其服务器代表同判不可达, 已跳过探测(%d 台服务器分组)",
+			skipped, len(groups))
+	}
+	log.Printf("  nodes: 增强检测完成(%d 并发), %d/%d 个出口可达(去重服务器 %d 台)",
+		workers, okCount, len(keys), len(groups))
 	// 出口级去重(P2, freesub 语义): 按最新结果折叠同出口 IP 的重复节点,
 	// 选路只保留每组最快的 —— 之后 nodeUsable 对折叠副本返回 false。
 	recomputeExitFold()
