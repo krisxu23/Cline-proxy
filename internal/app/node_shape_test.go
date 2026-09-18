@@ -270,3 +270,96 @@ func TestShapeSanitizeKeepsGenuinelyInvalidRejected(t *testing.T) {
 		t.Fatal("xhttp 无 sing-box 对应实现, 必须被继续剔除")
 	}
 }
+
+func TestIsKnownSSMethod(t *testing.T) {
+	yes := []string{"aes-256-gcm", "chacha20-ietf-poly1305", "CHACHA20-POLY1305",
+		"2022-blake3-aes-256-gcm", "rc4-md5", "none"}
+	for _, m := range yes {
+		if !isKnownSSMethod(m) {
+			t.Errorf("%q 应被识别为合法 SS 方法", m)
+		}
+	}
+	no := []string{"", "unsafe", "Y2hhY2hhMjAtaWV0Zi1wb2x5MTMwNTplVkM2MzRRdlZrNWw=",
+		"totally-made-up", "aes-999-gcm"}
+	for _, m := range no {
+		if isKnownSSMethod(m) {
+			t.Errorf("%q 不应被识别为合法 SS 方法", m)
+		}
+	}
+}
+
+// ★ 实测 19 条: sing-box JSON 订阅把 base64("<method>:<password>") 塞进了 method,
+// sing-box 报 "unknown method: <base64>" 整条剔除。这里断言还原成正确的 method+password。
+func TestSanitizeOutboundShapeSSBase64Method(t *testing.T) {
+	const b64Userinfo = "Y2hhY2hhMjAtaWV0Zi1wb2x5MTMwNTplVkM2MzRRdlZrNWw=" // b64("chacha20-ietf-poly1305:eVC634QvVk5l")
+
+	t.Run("base64 userinfo 还原为 method+password", func(t *testing.T) {
+		ob := map[string]any{
+			"type": "shadowsocks", "server": "1.2.3.4", "server_port": 8388,
+			"method": b64Userinfo, "password": "garbage",
+		}
+		sanitizeOutboundShape(ob)
+		if ob["method"] != "chacha20-ietf-poly1305" {
+			t.Fatalf("method 应还原, got %v", ob["method"])
+		}
+		// 密码以解出的 userinfo 为准(那才是原始 ss:// 的权威值)
+		if ob["password"] != "eVC634QvVk5l" {
+			t.Fatalf("password 应取自解出的 userinfo, got %v", ob["password"])
+		}
+	})
+
+	t.Run("2022-blake3 家族的密码含冒号不许被切断", func(t *testing.T) {
+		// b64("2022-blake3-aes-256-gcm:user:key")
+		ob := map[string]any{
+			"type": "shadowsocks", "server": "1.2.3.4", "server_port": 8388,
+			"method": "MjAyMi1ibGFrZTMtYWVzLTI1Ni1nY206dXNlcjprZXk=",
+		}
+		sanitizeOutboundShape(ob)
+		if ob["method"] != "2022-blake3-aes-256-gcm" {
+			t.Fatalf("method 应还原, got %v", ob["method"])
+		}
+		if ob["password"] != "user:key" {
+			t.Fatalf("密码含冒号必须完整保留, got %v", ob["password"])
+		}
+	})
+
+	t.Run("已是合法 method 则原样不动", func(t *testing.T) {
+		ob := map[string]any{"type": "shadowsocks", "method": "aes-256-gcm", "password": "pw"}
+		sanitizeOutboundShape(ob)
+		if ob["method"] != "aes-256-gcm" || ob["password"] != "pw" {
+			t.Fatalf("合法节点不应被改动: %v / %v", ob["method"], ob["password"])
+		}
+	})
+
+	t.Run("非法 method 且解不出合法方法名则原样保留", func(t *testing.T) {
+		// b64("not-a-method:pw") —— 解出来前半段不是已登记方法, 不做还原(不猜)
+		ob := map[string]any{"type": "shadowsocks", "method": "bm90LWEtbWV0aG9kOnB3", "password": "pw"}
+		sanitizeOutboundShape(ob)
+		if ob["method"] != "bm90LWEtbWV0aG9kOnB3" {
+			t.Fatalf("解不出合法方法名时不应改动, got %v", ob["method"])
+		}
+		if ob["password"] != "pw" {
+			t.Fatalf("密码不应被覆盖, got %v", ob["password"])
+		}
+	})
+
+	t.Run("非 base64 的未知 method 不动", func(t *testing.T) {
+		ob := map[string]any{"type": "shadowsocks", "method": "!!not-base64!!", "password": "pw"}
+		sanitizeOutboundShape(ob)
+		if ob["method"] != "!!not-base64!!" {
+			t.Fatalf("非 base64 不应被改动, got %v", ob["method"])
+		}
+	})
+
+	t.Run("还原后能被 sing-box 校验接受", func(t *testing.T) {
+		withTestConfig(t, &zenConfigData{})
+		ob := map[string]any{
+			"type": "shadowsocks", "server": "1.2.3.4", "server_port": 8388,
+			"method": b64Userinfo, "password": "garbage",
+		}
+		sanitizeOutboundShape(ob)
+		if err := validateOutboundEntry(ob); err != nil {
+			t.Fatalf("还原后应通过 sing-box 校验(它对 SS method 是真校验的): %v", err)
+		}
+	})
+}

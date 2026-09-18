@@ -360,6 +360,34 @@ func sanitizeOutboundShape(ob map[string]any) {
 	}
 	// 4) xtls 是 v2ray 的旧字段, sing-box 无此块(它用 flow + reality), 省略。
 	delete(ob, "xtls")
+
+	// 5) SS: method 字段里塞了 base64("<method>:<password>") 的畸形写法。
+	//
+	// 实测(2026-09-18) 19 条来自 **sing-box JSON 订阅**(该路径原样透传 outbound),
+	// 上游把整段 ss:// userinfo 放进了 method, 于是 sing-box 报
+	// "unknown method: <base64>" 整条剔除。分享链接路径本身是对的, 只有这条路径中招。
+	//
+	// 判据是**明确的**(不是猜测): base64 解出来的前半段必须命中 ssMethodCanonical
+	// 已登记的 SS 方法名。密码一律以解出的 userinfo 为准 —— 那段 userinfo 是原始
+	// ss:// 的权威来源, 畸形 outbound 里单独的 password 字段反而不可信。
+	if typ, _ := ob["type"].(string); typ == "shadowsocks" {
+		if m, _ := ob["method"].(string); m != "" && !isKnownSSMethod(m) {
+			if dec, err := b64String(m); err == nil {
+				// 用 Cut(首个冒号): 2022-blake3 家族的密码本身含冒号, 不能全切。
+				if method, pw, ok := strings.Cut(dec, ":"); ok && isKnownSSMethod(method) {
+					ob["method"] = normalizeSSMethod(method)
+					ob["password"] = pw
+				}
+			}
+		}
+	}
+}
+
+// isKnownSSMethod 该取值是否为 ssMethodCanonical 已登记的 SS 方法名(大小写不敏感)。
+// 用作"畸形 method"的识别判据 —— 只有解出来确实是个合法方法名才做还原。
+func isKnownSSMethod(m string) bool {
+	_, ok := ssMethodCanonical[strings.ToLower(strings.TrimSpace(m))]
+	return ok
 }
 
 // singboxUTLSFingerprints sing-box 认可的 uTLS 指纹全集。
