@@ -114,9 +114,16 @@ func claudeChatEmpty(chat map[string]any) bool {
 // 靠这里实测纠正 —— 试通了就持久化登记, 之后直接走 /messages。
 //
 // 纪律: **负向结论不落盘**(与 zen_responses.go 一致)。上游随时可能修复端点支持。
-func tryZenMessagesFallback(ctx context.Context, base string, chatBody map[string]any, stream bool, client *http.Client) *http.Response {
+// key 为调用方按出口选好的那把(经 zenSelectKey: TrimSpace / 去重 / 跳过退役),
+// 与 tryZenResponsesFallback 同口径 —— 不再裸取 getZenConfig().Key(P2-15)。
+func tryZenMessagesFallback(ctx context.Context, base string, chatBody map[string]any, stream bool, client *http.Client, key string) *http.Response {
 	modelID, _ := chatBody["model"].(string)
 	if modelID == "" || zenEndpointChatOnlyKnown(modelID) {
+		return nil
+	}
+	// 没有可用 key: 不构造空 x-api-key 头打过去换回一个 401(见 P2-15)。
+	if key == "" {
+		log.Printf("  zen: model %s 的 /messages 回退跳过(没有可用的 zen key)", modelID)
 		return nil
 	}
 	msgBody, err := translateZenMessagesRequest(modelID, chatBody, stream)
@@ -135,7 +142,7 @@ func tryZenMessagesFallback(ctx context.Context, base string, chatBody map[strin
 	outbound := map[string]string{}
 	// /messages 同样用官方 CLI 身份 —— 门禁判的是"来自 OpenCode", 与端点无关。
 	applyOpencodeHeaders(outbound, nil, defaultOpencodeIdentity(), bodyFingerprint(chatBody))
-	req.Header.Set("x-api-key", getZenConfig().Key)
+	req.Header.Set("x-api-key", key)
 	req.Header.Set("anthropic-version", "2023-06-01")
 	req.Header.Set("Content-Type", "application/json")
 	for k, v := range outbound {
@@ -150,9 +157,10 @@ func tryZenMessagesFallback(ctx context.Context, base string, chatBody map[strin
 	if resp.StatusCode != http.StatusOK {
 		rawBody := kit.ReadBody(resp)
 		resp.Body.Close()
-		// 4xx 说明模型/端点层面明确不买账(而非出口线路问题), 进程内记住不再回退;
-		// 5xx 可能只是这条线路坏, 不记。
-		if resp.StatusCode < 500 {
+		// 只对表明「端点不支持该模型」的失败记负向(404 / not found / unsupported);
+		// 401(key)、429(额度)、408 及其它 4xx 是瞬时/凭据问题, 与端点无关,
+		// 不落 memo 按正常错误返回; 5xx 可能只是这条线路坏, 同样不记(P2-14)。
+		if zenEndpointUnsupported(resp.StatusCode, rawBody) {
 			zenMemoEndpointChatOnly(modelID)
 		}
 		log.Printf("  zen: model %s 的 /messages 回退未命中(%d): %s", modelID, resp.StatusCode, kit.Truncate(rawBody, 200))

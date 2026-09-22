@@ -41,6 +41,22 @@ func TestProbeUpstreamMatrixNoConcurrentMapAccess(t *testing.T) {
 	if exits == 0 {
 		t.Fatal("测试配置里应有出口")
 	}
+	// [W5-P2-2 适配] probeUpstreamMatrixAsync 已改为真异步(调用立即返回,
+	// 探测体在独立协程里跑完再整批写 nodeUpstreamOK)。原断言在调用后同步读
+	// 结果必然读到空 map, 改为轮询等待探测协程收尾(置 probing=false 时结果已落盘)。
+	deadline := time.Now().Add(15 * time.Second)
+	for {
+		nodeUpstreamMu.RLock()
+		done := !nodeUpstreamProbing && !nodeUpstreamLastAt.IsZero()
+		nodeUpstreamMu.RUnlock()
+		if done {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("等待上游可达性探测完成超时")
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
 	nodeUpstreamMu.RLock()
 	defer nodeUpstreamMu.RUnlock()
 	if len(nodeUpstreamOK) == 0 {

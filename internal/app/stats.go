@@ -140,19 +140,27 @@ func (t *zenStatsTracker) observeUsage(u map[string]any) {
 	// 记账同样走统一归一(P2-18): 三协议字段名兼容, 推理/缓存单列,
 	// cache 读写不重复计入 prompt。
 	if p, c, r, cache, ok := parseUsageFields(u); ok {
+		// 各字段与 prompt 同口径: 仅非零才覆盖。流式里真实 usage 之后常跟一个
+		// completion_tokens: 0 的收尾 chunk, 无条件赋值会把先前计数清零(P3-8)。
 		if p > 0 {
 			t.rec.PromptTokens = p
 		}
-		t.rec.CompletionTokens = c
-		t.rec.ReasoningTokens = r
-		t.rec.CacheTokens = cache
+		if c > 0 {
+			t.rec.CompletionTokens = c
+		}
+		if r > 0 {
+			t.rec.ReasoningTokens = r
+		}
+		if cache > 0 {
+			t.rec.CacheTokens = cache
+		}
 		return
 	}
 	// 兜底: 未识别字段名时沿用旧逻辑
 	if v, ok := u["prompt_tokens"].(float64); ok && v > 0 {
 		t.rec.PromptTokens = int(v)
 	}
-	if v, ok := u["completion_tokens"].(float64); ok {
+	if v, ok := u["completion_tokens"].(float64); ok && v > 0 {
 		t.rec.CompletionTokens = int(v)
 	}
 }

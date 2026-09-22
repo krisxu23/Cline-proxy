@@ -4,11 +4,16 @@
 # 维护一份构建矩阵, 此处刻意不做多平台以免引入未验证的架构组合。
 FROM golang:1.26-alpine AS builder
 
+# 构建版本号(P3-29): 与 .github/workflows/build.yml 用同一注入点
+# -X cline-go-proxy/internal/app.buildVersion, 未传时回退 dev ——
+# 否则容器 /health 恒报硬编码默认值 go-1.1, 无法区分线上构建版本。
+ARG VERSION=dev
+
 WORKDIR /build
 COPY go.mod ./
 RUN go mod download
 COPY . .
-RUN CGO_ENABLED=0 go build -tags with_quic,with_grpc,with_utls -buildvcs=false -ldflags="-s -w" -o cline-proxy ./cmd/cline-proxy
+RUN CGO_ENABLED=0 go build -tags with_quic,with_grpc,with_utls -buildvcs=false -ldflags="-s -w -X cline-go-proxy/internal/app.buildVersion=${VERSION}" -o cline-proxy ./cmd/cline-proxy
 
 FROM alpine:3.21
 
@@ -32,7 +37,8 @@ HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
 
 VOLUME ["/app/data"]
 
-ENV PORT=3457
+# 这里刻意不设 PORT 环境变量(P3-30): 程序只认 -port flag, 全仓无任何
+# Getenv("PORT"), 设了也是假旋钮。端口由下方 CMD 的 -port(及 HEALTHCHECK)决定。
 
 ENTRYPOINT ["/app/cline-proxy"]
 # 容器内必须显式 0.0.0.0, 否则端口映射不可达; 这与「镜像内绑定 0.0.0.0」是两回事 ——

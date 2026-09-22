@@ -41,6 +41,10 @@ var (
 	subNodes    []any                 // 解析后的节点: 节点链接 string 或 sing-box 出站 map
 	subNodeKeys []string              // 与 subNodes 一一对应的池内键(节点链接或 sbox://tag)
 	subStatus   = map[string]string{} // 订阅 URL -> 最近抓取结果
+	// subNodesByURL 订阅 URL -> 该订阅上一轮解析出的节点(P2-10 归属表, 随 subMu 走)。
+	// 部分订阅抓取失败时, 失败订阅沿用这里记着的上一轮结果, 而不是整体丢弃 ——
+	// 旧实现只防了"全部失败", 1 成 1 败时失败订阅的节点会当轮从出口池消失并落盘。
+	subNodesByURL = map[string][]any{}
 )
 
 func subCacheFile() string { return kit.ResolveDataPath("subs_cache.json") }
@@ -135,6 +139,7 @@ func resolveSubscriptions(urls []string) {
 		subNodes = nil
 		subNodeKeys = nil
 		subStatus = map[string]string{}
+		subNodesByURL = map[string][]any{} // 订阅列表被清空: 归属表一并清掉
 		subMu.Unlock()
 		// 慢操作(文件 I/O)放到释放 subMu 之后, 不在持锁期间做(§2.3 第 10 项)。
 		saveSubCache(nil)
@@ -153,10 +158,11 @@ func resolveSubscriptions(urls []string) {
 		}
 		if !found {
 			delete(subStatus, k)
+			delete(subNodesByURL, k) // 被移除的订阅不再保留其节点归属
 		}
 	}
 	subMu.Unlock()
-	var merged []any
+	fetched := map[string][]any{} // 本轮成功的订阅 -> 新节点
 	for _, u := range clean {
 		nodes, err := fetchSubscription(u)
 		if err != nil {
@@ -170,18 +176,66 @@ func resolveSubscriptions(urls []string) {
 		subMu.Lock()
 		subStatus[u] = fmt.Sprintf("✅ %s · %d 节点", time.Now().Format("01-02 15:04"), len(nodes))
 		subMu.Unlock()
-		merged = append(merged, nodes...)
+		fetched[u] = nodes
 	}
 	subMu.Lock()
 	prevCount := len(subNodes)
-	if len(merged) == 0 && prevCount > 0 {
-		// 全部订阅本次都抓取失败: 保留上一次的节点与缓存。
+	if len(fetched) == 0 && prevCount > 0 {
+		// 全部订阅本次都抓取失败: 保留上一次的节点与缓存(旧行为不变)。
 		// 出口池全靠订阅供给, 一次网络抖动不该把它清空 —— 否则面板上
 		// "暂无出口节点"、请求全部失败, 而空结果还会覆盖订阅缓存,
 		// 连重启都救不回来, 只能干等下一次刷新成功。
 		log.Printf("  订阅: %d 个订阅本次全部抓取失败, 保留原有 %d 个节点", len(clean), prevCount)
 		subMu.Unlock()
 		return
+	}
+	// 归属键集必须用**本轮更新前**的 subNodesByURL 计算: 成功订阅的新结果稍后才覆盖。
+	claimed := map[string]bool{}
+	for _, ns := range subNodesByURL {
+		for _, e := range ns {
+			if k := subEntryKey(e); k != "" {
+				claimed[k] = true
+			}
+		}
+	}
+	// 旧节点里归属不到任何订阅的(典型: 重启后从 subs_cache 恢复的扁平列表,
+	// 归属表是空的): 有订阅失败时按"未认领的上一轮结果"兜底保留。
+	var orphan []any
+	if len(fetched) < len(clean) {
+		for _, e := range subNodes {
+			if k := subEntryKey(e); k != "" && !claimed[k] {
+				orphan = append(orphan, e)
+			}
+		}
+	}
+	for u, ns := range fetched {
+		subNodesByURL[u] = ns
+	}
+	// 按订阅分组合并(P2-10): 成功订阅用本轮新结果, 失败订阅沿用它上一轮的结果。
+	// 旧实现只把成功订阅的节点放进 merged —— 1 成 1 败时失败订阅的全部节点当轮
+	// 从出口池消失, 残缺结果还被 saveSubCache 落盘, 重启也恢复不回来。
+	merged := make([]any, 0, prevCount)
+	seen := map[string]bool{}
+	add := func(list []any) {
+		for _, e := range list {
+			k := subEntryKey(e)
+			if k == "" || seen[k] {
+				continue
+			}
+			seen[k] = true
+			merged = append(merged, e)
+		}
+	}
+	for _, u := range clean {
+		if ns, ok := fetched[u]; ok {
+			add(ns)
+			continue
+		}
+		if ns, ok := subNodesByURL[u]; ok {
+			add(ns)
+			continue
+		}
+		add(orphan) // 该订阅在本进程内从未成功过: 兜底保留未认领的旧节点
 	}
 	subNodes = merged
 	rebuildSubKeysLocked()
@@ -328,19 +382,29 @@ func parseSubContent(body string) ([]any, error) {
 	return nodes, nil
 }
 
-// isNodeOrProxyLine 判断行是否为节点/代理链接: scheme 已知且不含资源路径
+// isNodeOrProxyLine 判断行是否为节点/代理链接。
+// 本意: 收下"节点/手动代理形态"的行(仅 authority), 排除普通网页链接。
 func isNodeOrProxyLine(line string) bool {
 	scheme, rest, ok := strings.Cut(line, "://")
 	if !ok {
 		return false
 	}
-	if !nodeSchemes[scheme] && scheme != "http" && scheme != "https" && scheme != "socks5" && scheme != "socks5h" {
-		return false
-	}
 	if i := strings.IndexAny(rest, "#"); i >= 0 {
 		rest = rest[:i]
 	}
-	return !strings.Contains(rest, "/")
+	// 节点 scheme 的载荷不是网页资源路径: vmess 是整段 base64, 而**标准 base64
+	// 字母表就含 "/"**, 用"含 / 即资源路径"判据会把几乎全部未用 URL-safe 变体的
+	// vmess 载荷误杀; vless/trojan 的 query 里也可能有未编码的 "/?ed=2048"(P3-27)。
+	// 这些 scheme 以节点行收下, 真正解析不了的交给 nodeOutbound 逐条剔除。
+	if nodeSchemes[scheme] {
+		return true
+	}
+	// 手动代理(http/socks5 等)与普通网页同形, 仍按"仅 authority、无资源路径"
+	// 区分 —— 否则 https://example.com/path 会被误收成代理节点。
+	if scheme == "http" || scheme == "https" || scheme == "socks5" || scheme == "socks5h" {
+		return !strings.Contains(rest, "/")
+	}
+	return false
 }
 
 // parseSingBoxSub sing-box JSON 配置: 取可用出站(跳过 direct/block/分组等)

@@ -38,6 +38,11 @@ var (
 )
 
 // loadNodeStablePorts 惰性加载持久化的端口分配。
+//
+// 调用方**必须已持 nodeStableMu**: 惰性初始化(置 loaded 标记 / 建 map /
+// 写入)落在锁外时, 启动阶段的并发首访会同时初始化并写同一个 map —— Go 对此
+// 是 fatal error: concurrent map writes(不可 recover), 进程直接死亡(P2-5)。
+// 全部五个调用点均已调整为「先 Lock 再 load」。
 func loadNodeStablePorts() {
 	if nodeStableLoaded {
 		return
@@ -52,8 +57,17 @@ func loadNodeStablePorts() {
 }
 
 // persistNodeStablePorts 落盘(失败仅告警, 下次重建会重试)。
+// 持锁拷贝快照、放锁后再做文件 I/O: 读 map 必须在锁内(裸读会与并发写竞争),
+// 慢 I/O 不占锁(§2.3 第 10 项)。本函数自身取锁, 调用方不得已持 nodeStableMu。
 func persistNodeStablePorts() {
-	if b := mustJSONIndent(nodeStablePorts); b != nil {
+	nodeStableMu.Lock()
+	loadNodeStablePorts()
+	snap := make(map[string]int, len(nodeStablePorts))
+	for k, p := range nodeStablePorts {
+		snap[k] = p
+	}
+	nodeStableMu.Unlock()
+	if b := mustJSONIndent(snap); b != nil {
 		if err := kit.WriteFileAtomicDefault(kit.ResolveDataPath(nodePortsFile), b); err != nil {
 			log.Printf("node ports persist failed: %v", err)
 		}
@@ -63,17 +77,20 @@ func persistNodeStablePorts() {
 // assignStablePort 给节点分配本地端口: 优先复用历史端口(且该端口当前未被占),
 // 否则分配新的空闲端口并更新记录。返回 (端口, 是否复用了旧端口)。
 func assignStablePort(key string) (int, bool, error) {
-	loadNodeStablePorts()
 	nodeStableMu.Lock()
-	defer nodeStableMu.Unlock()
+	loadNodeStablePorts()
 	if old, ok := nodeStablePorts[key]; ok && old > 0 && !portReservedByService(old) && tcpPortFree(old) {
+		nodeStableMu.Unlock()
 		return old, true, nil
 	}
 	p, err := freeNodePortInRange()
 	if err != nil {
+		nodeStableMu.Unlock()
 		return 0, false, err
 	}
 	nodeStablePorts[key] = p
+	nodeStableMu.Unlock()
+	// 落盘放到放锁之后(persist 自己持锁取快照), 持锁期间不做慢 I/O。
 	persistNodeStablePorts()
 	return p, false, nil
 }
@@ -84,9 +101,8 @@ func purgeStablePorts(ports map[string]int) {
 	if len(ports) == 0 {
 		return
 	}
-	loadNodeStablePorts()
 	nodeStableMu.Lock()
-	defer nodeStableMu.Unlock()
+	loadNodeStablePorts()
 	bad := map[int]bool{}
 	for _, p := range ports {
 		bad[p] = true
@@ -96,6 +112,7 @@ func purgeStablePorts(ports map[string]int) {
 			delete(nodeStablePorts, k)
 		}
 	}
+	nodeStableMu.Unlock()
 	persistNodeStablePorts()
 }
 
@@ -122,9 +139,10 @@ func reserveServicePort(port int) {
 	reservedPortMu.Lock()
 	defer reservedPortMu.Unlock()
 	reservedPorts[port] = true
-	// 已写进稳定端口表的记录一并清除(升级后首次启动的自愈)
-	loadNodeStablePorts()
+	// 已写进稳定端口表的记录一并清除(升级后首次启动的自愈);
+	// load 必须在 nodeStableMu 内执行(P2-5, 见 loadNodeStablePorts 注释)。
 	nodeStableMu.Lock()
+	loadNodeStablePorts()
 	for k, p := range nodeStablePorts {
 		if reservedPorts[p] {
 			delete(nodeStablePorts, k)
@@ -143,8 +161,8 @@ func portReservedByService(port int) bool {
 // stablePortOf 查询某 key 的稳定端口记录; 记录不存在/被服务保留/与本批
 // 已分配冲突/当前被占, 都返回 0(走顺序分配)。
 func stablePortOf(key string, used map[int]bool) int {
-	loadNodeStablePorts()
 	nodeStableMu.Lock()
+	loadNodeStablePorts() // 锁内惰性加载(P2-5)
 	p, ok := nodeStablePorts[key]
 	nodeStableMu.Unlock()
 	if !ok || p <= 0 || portReservedByService(p) || used[p] || !tcpPortFree(p) {
@@ -155,9 +173,9 @@ func stablePortOf(key string, used map[int]bool) int {
 
 // recordStablePorts 批量写入稳定端口记录(不落盘, 由调用方统一 persist)。
 func recordStablePorts(m map[string]int) {
-	loadNodeStablePorts()
 	nodeStableMu.Lock()
 	defer nodeStableMu.Unlock()
+	loadNodeStablePorts() // 锁内惰性加载(P2-5)
 	for k, p := range m {
 		nodeStablePorts[k] = p
 	}

@@ -144,10 +144,10 @@ func StartProxy(host string, port int) error {
 	})
 
 	mux.HandleFunc("/v1/health", corsHandler(func(w http.ResponseWriter, r *http.Request) {
-		writeJSON(w, http.StatusOK, healthInfo(activeCount))
+		writeJSON(w, http.StatusOK, healthInfo())
 	}))
 	mux.HandleFunc("/health", corsHandler(func(w http.ResponseWriter, r *http.Request) {
-		writeJSON(w, http.StatusOK, healthInfo(activeCount))
+		writeJSON(w, http.StatusOK, healthInfo())
 	}))
 
 	// Admin API (frontend + REST)
@@ -313,7 +313,12 @@ func StartProxy(host string, port int) error {
 			return
 		}
 
-		if activeCount == 0 && len(poolSnapshot().Accounts) == 0 {
+		// 无账户守卫: active 数必须**实时**计算(P3-38) —— 启动期捕获的
+		// activeCount 快照永不刷新, 拿它判断会让"运行中账号新增/失效"永远
+		// 看不到, 守卫分支长期基于过期数据。poolSnapshot 是持 poolMu 的
+		// 深拷贝快照, 锁外读取无竞争。
+		snap := poolSnapshot()
+		if activeAccountCountOf(snap) == 0 && len(snap.Accounts) == 0 {
 			writeJSON(w, http.StatusServiceUnavailable, map[string]any{
 				"error": map[string]string{
 					"message": "No Cline accounts in pool. Add one in the admin panel (/admin/), or use *-free / cline-pass/* models.",
@@ -388,6 +393,10 @@ func StartProxy(host string, port int) error {
 		if upstreamStream {
 			out, err := collectStreamResponse(resp)
 			if err != nil {
+				// 内部 500 必须同步 status(P3-37): 否则下方 defer 的
+				// tracker.finish(status < 400, status) 仍按 200 记账,
+				// 失败请求被 request-log/统计记成成功, 成功率指标失真。
+				status = http.StatusInternalServerError
 				writeJSON(w, http.StatusInternalServerError, map[string]any{
 					"error": map[string]string{"message": err.Error(), "type": "parse_error"},
 				})
@@ -483,6 +492,19 @@ func StartProxy(host string, port int) error {
 	return err
 }
 
+// activeAccountCountOf 统计快照里的 active 账号数(调用方传 poolSnapshot() 的
+// 深拷贝快照, 锁外读取无竞争)。健康接口与请求守卫都必须用它实时计算 ——
+// 启动期捕获的 activeCount 快照永不刷新, 会把过期并发数长期上报给运维(P3-38)。
+func activeAccountCountOf(snap poolSnapshotData) int {
+	n := 0
+	for _, a := range snap.Accounts {
+		if a.Status == "active" {
+			n++
+		}
+	}
+	return n
+}
+
 // healthInfo 把网关自身健康指标并入 /health 响应。除了"有几个账号可用",
 // 还要能回答"网关自己还好吗": 出口节点池、出口实际可达数、能否优雅退出、
 // 订阅刷新时间、日志体积与丢弃计数都在这一并暴露。
@@ -490,10 +512,13 @@ func StartProxy(host string, port int) error {
 // status 不再是硬编码的 "ok": 此前出口池几乎全死(实测 24/3958 可达)时它仍回 ok,
 // 于是"托盘亮着、面板打得开、所有上游请求都在失败"成了最典型的静默故障。
 // 现在只要订阅里确实有节点、也探测过, 但可达数为 0, 就报 degraded。
-func healthInfo(activeCount int) map[string]any {
+//
+// activeAccounts 同样不再吃启动期快照(P3-38): 每次请求实时经 poolSnapshot
+// (持 poolMu 深拷贝)统计, 运行中账号新增/失效能立刻反映, 锁外读取无竞争。
+func healthInfo() map[string]any {
 	info := map[string]any{
 		"version":        buildVersion,
-		"activeAccounts": activeCount,
+		"activeAccounts": activeAccountCountOf(poolSnapshot()),
 	}
 
 	// nodePool: 当前出口节点隧道数(出口池未初始化时为 0)。nodePorts 由 nodeMu 保护,

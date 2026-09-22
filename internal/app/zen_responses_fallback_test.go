@@ -159,8 +159,11 @@ func TestZenResponsesFallbackNegativeMemo(t *testing.T) {
 			w.Write([]byte(`{"error":"500"}`))
 		case "/responses":
 			respHits.Add(1)
-			w.WriteHeader(http.StatusBadRequest)
-			w.Write([]byte(`{"type":"error","error":{"type":"MissingSessionID","message":"nope"}}`))
+			// 404 + "not found" 才是「端点不支持该模型」的证据(P2-14 新语义):
+			// 只有这类失败才记进程内负向 memo; 401/429/408 及其它 4xx 视为瞬时
+			// 失败不落 memo。此处按 404 断言"回退失败后记入负向名单"。
+			w.WriteHeader(http.StatusNotFound)
+			w.Write([]byte(`{"type":"error","error":{"type":"NotFoundError","message":"model not found on this endpoint"}}`))
 		}
 	}))
 	defer srv.Close()

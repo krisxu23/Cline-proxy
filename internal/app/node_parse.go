@@ -180,13 +180,17 @@ func parseVmess(rest, tag string) (map[string]any, error) {
 		ob["security"] = scy
 	}
 	net, _ := info["net"].(string)
-	if tr, ok := transportBlock(net, url.Values{"path": {fmt.Sprint(info["path"])}, "host": {fmt.Sprint(info["host"])}}); ok {
+	// comma-ok 断言取字符串: fmt.Sprint(nil) 会得到字面量 "<nil>", 被当成
+	// ws Host/path 发出去, 表现为"该节点哪里都连不上"但换工具一切正常(P3-1)。
+	wsHost, _ := info["host"].(string)
+	wsPath, _ := info["path"].(string)
+	if tr, ok := transportBlock(net, url.Values{"path": {wsPath}, "host": {wsHost}}); ok {
 		ob["transport"] = tr
 	}
 	if s, _ := info["tls"].(string); s == "tls" {
 		sni, _ := info["sni"].(string)
 		if sni == "" {
-			sni = fmt.Sprint(info["host"])
+			sni, _ = info["host"].(string) // 缺失时得到 "", 绝不 "<nil>"
 		}
 		if sni == "" {
 			sni = host
@@ -331,6 +335,12 @@ func parseSS(rest, tag string) (map[string]any, error) {
 	base := rest
 	if i := strings.Index(base, "?"); i >= 0 {
 		base = base[:i]
+	}
+	// SIP002 允许 host:port 后带路径斜杠(ss://userinfo@host:8388/?plugin=...),
+	// 不截掉会让 portStr 变成 "8388/" → Atoi 失败 → 整条标准 SS 链接被静默丢弃(P2-4)。
+	// 只对 userinfo 形态截: 整段 base64 形态的尾部 "/" 可能是合法 base64 字符。
+	if strings.Contains(base, "@") {
+		base = strings.TrimSuffix(base, "/")
 	}
 	var method, password, hostport string
 	if at := strings.LastIndex(base, "@"); at >= 0 {

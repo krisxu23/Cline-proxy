@@ -205,10 +205,11 @@ func (p *modelProvider) Chat(ctx context.Context, params map[string]any, stream 
 			recordKeyResult(p.name, key, 0, true)
 			lastErr = err
 		}
-		if i == len(keys)-1 {
-			return nil, lastErr
-		}
 	}
+	// 注意: 这里曾按 keys 下标(`i == len(keys)-1`)提前返回 —— 当 keys 的最后一个
+	// 元素不在 order 队尾(被降级的 key 排在 demoted 段)时, 迭代到它就 return,
+	// order 中排其后尚未尝试的降级 key 被跳过, 实际 failover 次数少于设计。
+	// order 恰好覆盖全部下标, 循环自然走完后返回 lastErr 即可。
 	return nil, lastErr
 }
 

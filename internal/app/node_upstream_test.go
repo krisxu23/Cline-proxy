@@ -88,7 +88,8 @@ func TestUpstreamTargetsIncludesProviders(t *testing.T) {
 		},
 	})
 	targets := upstreamTargets()
-	if h := targets["bai"]; h != "api.b.ai" {
+	// [W5-P2-1 适配] upstreamTargets 返回 upstreamTarget(host/port/useTLS), 字段访问随签名调整
+	if h := targets["bai"]; h.host != "api.b.ai" {
 		t.Fatalf("Provider host 未纳入探测: %v", targets)
 	}
 	if _, ok := targets["nokey"]; ok {

@@ -55,12 +55,12 @@ async function loadLogs() {
         '<td class="mono" style="font-size:var(--fs-xs)">' + esc(l.client || '-') + '</td>' +
         '<td>' + esc(l.method || '-') + '</td>' +
         '<td class="mono" style="font-size:var(--fs-xs);max-width:140px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">' + esc(l.path || '-') + '</td>' +
-        '<td class="mono" style="font-size:var(--fs-xs);max-width:220px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="' + esc(modelPair) + '">' + esc(modelPair) + '</td>' +
+        '<td class="mono" style="font-size:var(--fs-xs);max-width:220px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="' + escAttr(modelPair) + '">' + esc(modelPair) + '</td>' +
         '<td><span class="model-tag">' + esc(upstream + exit) + '</span></td>' +
         '<td style="font-weight:600;color:' + STATUS_CLASS(st) + '">' + st + '</td>' +
         '<td class="mono" style="font-size:var(--fs-xs)">' + dur + '</td>' +
         '<td class="mono" style="font-size:var(--fs-xs)">' + toks + '</td>' +
-        '<td style="font-size:var(--fs-xs);max-width:180px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:' + (l.status >= 400 ? 'var(--amber)' : 'var(--text3)') + '" title="' + esc(note) + '">' + esc(note || '-') + '</td>' +
+        '<td style="font-size:var(--fs-xs);max-width:180px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:' + (l.status >= 400 ? 'var(--amber)' : 'var(--text3)') + '" title="' + escAttr(note) + '">' + esc(note || '-') + '</td>' +
       '</tr>';
     }).join('');
     tbody.innerHTML = html;

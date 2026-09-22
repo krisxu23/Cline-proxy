@@ -28,7 +28,23 @@ type zenModelsCacheFile struct {
 const zenModelsCacheTTL = 7 * 24 * time.Hour
 
 // saveZenModelsCacheLocked 落盘当前 synced 来源的模型。调用方持有 zenModelsMu。
+//
+// 这里**不刷新** SyncedAt: 它表示"最后一次成功同步全量目录"的时间, 只有
+// decodeZenModels(真正成功同步且目录可用)才配推进它 —— 每次落盘都无脑刷新
+// 会把 7 天 TTL 一路往后推, 过期淘汰永远不触发, 上游下架的模型跨重启永久
+// 驻留(与本文件头注释矛盾, P2-16)。无历史时间戳(首次写入)时取当前时间。
 func saveZenModelsCacheLocked() {
+	saveZenModelsCacheWithSyncedAtLocked(false)
+}
+
+// saveZenModelsCacheSyncedLocked 与 saveZenModelsCacheLocked 相同, 但把 SyncedAt
+// 刷新为当前时间 —— 只供"真正成功同步了全量目录"的路径调用(见 P2-16)。
+func saveZenModelsCacheSyncedLocked() {
+	saveZenModelsCacheWithSyncedAtLocked(true)
+}
+
+// saveZenModelsCacheWithSyncedAtLocked 落盘公共实现。调用方持有 zenModelsMu。
+func saveZenModelsCacheWithSyncedAtLocked(refresh bool) {
 	models := make([]ZenModel, 0, len(zenModels))
 	for _, m := range zenModels {
 		if m != nil && m.Source == "synced" {
@@ -38,7 +54,14 @@ func saveZenModelsCacheLocked() {
 	if len(models) == 0 {
 		return
 	}
-	payload, err := json.Marshal(zenModelsCacheFile{SyncedAt: time.Now().Unix(), Models: models})
+	syncedAt := time.Now().Unix()
+	if !refresh {
+		// 保留文件里已有的时间戳; 没有(首次写入)才用当前时间。
+		if old, ok := readZenModelsCacheSyncedAt(); ok {
+			syncedAt = old
+		}
+	}
+	payload, err := json.Marshal(zenModelsCacheFile{SyncedAt: syncedAt, Models: models})
 	if err != nil {
 		return
 	}
@@ -52,6 +75,19 @@ func saveZenModelsCacheLocked() {
 		os.Remove(tmp)
 		log.Printf("  zen: 模型缓存改名失败: %v", err)
 	}
+}
+
+// readZenModelsCacheSyncedAt 读缓存文件里已有的 SyncedAt(不存在/损坏/为 0 返回 false)。
+func readZenModelsCacheSyncedAt() (int64, bool) {
+	raw, err := os.ReadFile(zenModelsCachePath())
+	if err != nil {
+		return 0, false
+	}
+	var cf zenModelsCacheFile
+	if json.Unmarshal(raw, &cf) != nil || cf.SyncedAt <= 0 {
+		return 0, false
+	}
+	return cf.SyncedAt, true
 }
 
 // loadZenModelsCache 恢复上次同步到的模型, 与种子合并。调用方持有 zenModelsMu。

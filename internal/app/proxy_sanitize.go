@@ -16,6 +16,15 @@ func (r *controlSanitizingReader) Read(p []byte) (int, error) {
 	n, err := r.src.Read(p)
 	for i := 0; i < n; i++ {
 		c := p[i]
+		// 按行重置状态机(P3-35): 状态机逐字节翻转 inString 却不校验所在行
+		// 是否为合法 JSON —— 含奇数个双引号的非 JSON 数据行会让 inString 卡死,
+		// 其后所有 \n 都被当成"字符串内控制字符"替换为空格, 帧边界全部粘连,
+		// 直到流结束。行边界必须永远保留: 遇到 \n 先归零状态再原样放行。
+		if c == '\n' {
+			r.inString = false
+			r.escaped = false
+			continue
+		}
 		if r.inString {
 			if r.escaped {
 				r.escaped = false

@@ -83,7 +83,8 @@ func handleAdminAccountAdd(w http.ResponseWriter, r *http.Request) {
 	}
 
 	addAccount(acc)
-	log.Printf("Account added via API: %s", req.Email)
+	// %q + 去换行: 含 \n 的 email 可伪造日志行(日志注入, P3-10)。
+	log.Printf("Account added via API: %q", strings.NewReplacer("\r", " ", "\n", " ").Replace(req.Email))
 
 	writeAPI(w, http.StatusOK, apiResponse{
 		Success: true,
@@ -177,6 +178,7 @@ func handleOAuthStart(w http.ResponseWriter, r *http.Request) {
 			state.Done = true
 			state.Success = false
 			oauthSessionsMu.Unlock()
+			expireOAuthSessionLater(sessionID, state)
 			return
 		}
 
@@ -187,6 +189,7 @@ func handleOAuthStart(w http.ResponseWriter, r *http.Request) {
 			state.Done = true
 			state.Success = false
 			oauthSessionsMu.Unlock()
+			expireOAuthSessionLater(sessionID, state)
 			return
 		}
 
@@ -211,6 +214,7 @@ func handleOAuthStart(w http.ResponseWriter, r *http.Request) {
 		state.Success = true
 		state.Email = email
 		oauthSessionsMu.Unlock()
+		expireOAuthSessionLater(sessionID, state)
 		log.Printf("OAuth account added: %s", email)
 	}()
 
@@ -233,7 +237,14 @@ func handleOAuthStatus(w http.ResponseWriter, r *http.Request) {
 	}
 
 	oauthSessionsMu.Lock()
-	state, ok := oauthSessions[sessionID]
+	st, ok := oauthSessions[sessionID]
+	// 锁内做值快照再解锁使用: 写侧 goroutine 持锁改 st 的同一批字段,
+	// 解锁后再读 state.Done/Success/Email/Error 就是数据竞争(P2-13)。
+	var done, success bool
+	var email, errMsg string
+	if ok {
+		done, success, email, errMsg = st.Done, st.Success, st.Email, st.Error
+	}
 	oauthSessionsMu.Unlock()
 
 	if !ok {
@@ -242,17 +253,34 @@ func handleOAuthStatus(w http.ResponseWriter, r *http.Request) {
 	}
 
 	resp := map[string]any{
-		"done":    state.Done,
-		"success": state.Success,
+		"done":    done,
+		"success": success,
 	}
-	if state.Done {
-		resp["email"] = state.Email
-		if !state.Success {
-			resp["error"] = state.Error
+	if done {
+		resp["email"] = email
+		if !success {
+			resp["error"] = errMsg
 		}
 	}
 
 	writeAPI(w, http.StatusOK, apiResponse{Success: true, Data: resp})
+}
+
+// oauthSessionTTL 完成后的 OAuth 登录会话在 map 里的保留时长。
+// 轮询端要能读到最终结果(刚完成就删会让 status 轮询撞上 404),
+// 但条目不能只增不减 —— 内存缓慢泄漏且 sessionId 长期可查(P2-13)。
+const oauthSessionTTL = 5 * time.Minute
+
+// expireOAuthSessionLater 完成态写入后安排 TTL 到期删除该会话条目。
+// 用指针身份校验: 同一 sessionID 若已被新条目顶替, 不动它。
+func expireOAuthSessionLater(id string, st *oauthSessionState) {
+	time.AfterFunc(oauthSessionTTL, func() {
+		oauthSessionsMu.Lock()
+		if oauthSessions[id] == st {
+			delete(oauthSessions, id)
+		}
+		oauthSessionsMu.Unlock()
+	})
 }
 
 // POST /admin/api/sso/import  body: { ssoCookies: string, email?: string }
@@ -291,8 +319,14 @@ func handleSSOImport(w http.ResponseWriter, r *http.Request) {
 	lines := strings.Split(req.SSOCookies, "\n")
 	imported := 0
 	errors := []string{}
+	// 错误信息只带行号与 email, 不带 token 任何片段 —— 对照 proxy.go 不打印
+	// token 的既有约定, 前 16 字符进 API 响应同样算凭据外泄(P3-11)。
+	failEmail := req.Email
+	if failEmail == "" {
+		failEmail = "unknown"
+	}
 
-	for _, line := range lines {
+	for i, line := range lines {
 		line = strings.TrimSpace(line)
 		if line == "" {
 			continue
@@ -302,7 +336,7 @@ func handleSSOImport(w http.ResponseWriter, r *http.Request) {
 			token := strings.TrimPrefix(line, "workos:")
 			resp, err := cline.RefreshClineToken(token)
 			if err != nil {
-				errors = append(errors, fmt.Sprintf("token %s...: %v", kit.Truncate(token, 16), err))
+				errors = append(errors, fmt.Sprintf("line %d (email %s): %v", i+1, failEmail, err))
 				continue
 			}
 			email := req.Email

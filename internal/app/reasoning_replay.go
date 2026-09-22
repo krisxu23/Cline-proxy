@@ -146,6 +146,14 @@ var reasoningReplayModelPatterns = []*regexp.Regexp{
 // deepseekV4ModelPattern 对应 DEEPSEEK_V4_MODEL_PATTERN。
 var deepseekV4ModelPattern = regexp.MustCompile(`(?i)deepseek[-/]v4[-.](flash|pro)`)
 
+// deepseekLegacyReasonerPatterns 对应参考实现 :108-111 的两条内联正则
+// (/deepseek-reasoner/i、/deepseek-r1/i)。模式与 reasoningReplayModelPatterns
+// 前两条一致, 但语义独立(反向契约分支), 单独声明为包级变量避免每次调用重编译。
+var deepseekLegacyReasonerPatterns = []*regexp.Regexp{
+	regexp.MustCompile(`(?i)deepseek-reasoner`),
+	regexp.MustCompile(`(?i)deepseek-r1`),
+}
+
 // K3 / 原生 K2.7 判定复用 zen_reasoning.go 里已照抄的同名正则:
 //
 //	k3AuthenticReasoningPattern        ← K3_REASONING_REPLAY_MODEL_PATTERN
@@ -197,9 +205,11 @@ func requiresReasoningReplay(provider, model, interleavedField string, thinkingE
 	}
 
 	// :108-111 DeepSeek 旧 reasoner 家族是**反向**契约: 不回放。
-	if regexp.MustCompile(`(?i)deepseek-reasoner`).MatchString(normalizedModel) ||
-		regexp.MustCompile(`(?i)deepseek-r1`).MatchString(normalizedModel) {
-		return false
+	// (复用包级已编译正则, 不再在每请求路径上重新 MustCompile。)
+	for _, re := range deepseekLegacyReasonerPatterns {
+		if re.MatchString(normalizedModel) {
+			return false
+		}
 	}
 
 	// :113-114 显式已知契约: DeepSeek V4 thinking + 工具调用必须回放。

@@ -255,6 +255,15 @@ func handleStreamResponseWithToolNameMap(w http.ResponseWriter, upstream *http.R
 			if !looksLikeFullCompletionBody(trimmedFirst) {
 				// NDJSON 模式: 逐行转 data: 帧
 				log.Printf("%s", sseSynthesisLog("NDJSON", len(firstLine)))
+				// 解析前先剥掉 SSE `data:` 前缀(P2-23③): 上游可能在 NDJSON
+				// 流里混发带 data: 前缀的行, 旧实现直接丢弃 → 混合行内容丢失。
+				stripData := func(s string) string {
+					t := strings.TrimSpace(s)
+					if strings.HasPrefix(t, "data:") {
+						return strings.TrimSpace(t[5:])
+					}
+					return t
+				}
 				markValuable := func(line string) {
 					var probe map[string]any
 					if json.Unmarshal([]byte(line), &probe) == nil {
@@ -264,8 +273,16 @@ func handleStreamResponseWithToolNameMap(w http.ResponseWriter, upstream *http.R
 						if legitEmptyTerminalReason(probe) {
 							sawLegitEmptyTerminal = true
 						}
-						if u, ok := probe["usage"].(map[string]any); ok && hasOutputUsageTokens(u) {
-							hasValidUsage = true
+						if u, ok := probe["usage"].(map[string]any); ok && len(u) > 0 {
+							// 流式 usage 必须入账(P2-23①): 旧实现只捕获
+							// hasValidUsage 给空流判定用, 全程不调 onUsage
+							// → NDJSON 路径的 token 用量永远漏记。
+							if onUsage != nil {
+								onUsage(u)
+							}
+							if hasOutputUsageTokens(u) {
+								hasValidUsage = true
+							}
 						}
 					}
 				}
@@ -275,12 +292,16 @@ func handleStreamResponseWithToolNameMap(w http.ResponseWriter, upstream *http.R
 				}
 				for {
 					line, lerr := reader.ReadString('\n')
-					if t := strings.TrimSpace(line); t != "" {
+					if t := stripData(line); t != "" {
 						markValuable(t)
-						if frame, ok := ndjsonLineToSSE(t); ok {
+						if t == "[DONE]" {
+							// 旧实现在这里就发 [DONE], 之后收尾又补 finish chunk +
+							// 第二个 [DONE] —— 多数客户端在首个 DONE 后停止解析,
+							// finish chunk 直接丢失。这里只标记不发, 统一在 finish
+							// 之后发**唯一一次** [DONE]。
+							continue
+						} else if frame, ok := ndjsonLineToSSE(t); ok {
 							hb.writeFlush(frame)
-						} else if t == "[DONE]" {
-							hb.writeFlush([]byte("data: [DONE]\n\n"))
 						}
 					}
 					if lerr != nil {
@@ -292,6 +313,7 @@ func handleStreamResponseWithToolNameMap(w http.ResponseWriter, upstream *http.R
 					writeStreamEmptyContentError(w, hb, lastModel)
 					return
 				}
+				// 合成 finish chunk 之后才发 [DONE], 且**全程只发这一次**(P2-23②)。
 				if b, mErr := json.Marshal(protocol.EmptyOpenAIChunk("").Payload); mErr == nil {
 					hb.writeFlush([]byte("data: " + string(b) + "\n\n"))
 				}
@@ -343,10 +365,16 @@ func handleStreamResponseWithToolNameMap(w http.ResponseWriter, upstream *http.R
 		if _, ok := ndjsonLineToSSE(firstLine); !ok {
 			log.Printf("  stream: 上游返回无法识别的非 SSE 数据(%d 字节首行), 将按坏行丢弃而非透传", len(firstLine))
 		}
-	} else if ferr == nil {
+	} else if ferr == nil || (ferr == io.EOF && firstLine != "") {
 		// 首行是正常 SSE: 走统一实现处理一次再进主循环(F2 修复点 —— 此处
 		// 旧代码是独立的精简版循环体, 现收敛)。
-		handleLine(firstLine, false)
+		//
+		// 首行遇到 EOF 且非 JSON-looking(上游回无换行的单行非 JSON body:
+		// 纯文本/HTML 错误页)时也必须无条件处理一次(P2-25): 否则首行内容
+		// 不进任何分支, 主循环随后读到 "" + EOF 直接 break —— 响应体被整体
+		// 吞掉, 客户端只拿到空流 502, 上游错误信息无从排查。
+		// 正常(非 EOF)首行仍走 ferr == nil 分支, 行为不变。
+		handleLine(firstLine, ferr == io.EOF)
 	}
 
 	for {
@@ -680,17 +708,39 @@ func handleNonStreamResponseWithToolNameMap(w http.ResponseWriter, upstream *htt
 		}
 	}
 
-	if onUsage != nil {
-		if u, ok := raw["usage"].(map[string]any); ok && len(u) > 0 {
-			onUsage(u)
-		}
-	}
-
-	// Some Cline responses wrap in {data: {...}}
+	// Some Cline responses wrap in {data: {...}} / {message: {...}}
 	out := raw
 	if data, ok := raw["data"]; ok {
 		if d, ok := data.(map[string]any); ok {
 			out = d
+		}
+	}
+
+	// usage 必须在解包**之后**再取(与 handleLine 的 F2 顺序一致, 见上方注释):
+	// 旧实现先取顶层 raw["usage"] 再解包, 于是 usage 位于 data 载荷或 message
+	// 内层时永远取不到 → stats / 账户配额 / request-log 全记 0(P1-14)。
+	// 逐层查找并保证只调一次 onUsage: 解包后的载荷 → 载荷的 message 内层 →
+	// 外层原包 → 外层 message 内层。
+	if onUsage != nil {
+		pick := func(m map[string]any) map[string]any {
+			if u, ok := m["usage"].(map[string]any); ok && len(u) > 0 {
+				return u
+			}
+			return nil
+		}
+		var u map[string]any
+		for _, m := range []map[string]any{out, raw} { // out 与 raw 相同时等价于只查一层
+			if u = pick(m); u != nil {
+				break
+			}
+			if msg, ok := m["message"].(map[string]any); ok {
+				if u = pick(msg); u != nil {
+					break
+				}
+			}
+		}
+		if u != nil {
+			onUsage(u)
 		}
 	}
 

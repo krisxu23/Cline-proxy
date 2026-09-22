@@ -114,6 +114,17 @@ func nodeLocalAddr(link string) string {
 	return ""
 }
 
+// nodePortOf 加锁读取节点的本地 mixed 端口(P2-3)。nodeViews/withHealthResult
+// 等读者都在不持 nodeMu 的路径上, 裸读 nodePorts 会与 syncNodeBox 成功分支里
+// `nodeMu.Lock()` 内的 `nodePorts = ports` 构成数据竞争 —— Go 对 map 的并发
+// 读写是 fatal error(不可 recover)。同包读 nodePorts 一律走本访问器。
+func nodePortOf(key string) (int, bool) {
+	nodeMu.Lock()
+	defer nodeMu.Unlock()
+	p, ok := nodePorts[key]
+	return p, ok
+}
+
 // nodeBoxSkipEnv 设置后, 测试进程不再实例化真实 sing-box。
 //
 // 为什么需要: sing-box 的 Box 起来后会拉起自己的后台 goroutine(网络接口变更
@@ -213,7 +224,17 @@ func syncNodeBox() {
 
 	// ---- 构建阶段: 锁外完成可达秒级的 I/O(freeLocalPort / box.New / Start) ----
 	// 三条失败路径均不修改全局状态: 旧实例继续服务, 出口池不被清空, catch-all 保留旧值。
-	ports, inbounds, outbounds, rules, hasMap := buildNodeParts(entries)
+	ports, inbounds, outbounds, rules, endpoints := buildNodeParts(entries)
+	// hasMap(entries 是否含订阅原始 map 出站)改由调用方判定: buildNodeParts 的
+	// 返回位腾给了 endpoints(P3-6)。语义不变 —— 只要入口里有 map 条目, 全量构建
+	// 失败时就允许退回"仅手动节点链接"重建。
+	hasMap := false
+	for _, e := range entries {
+		if _, ok := e.(map[string]any); ok {
+			hasMap = true
+			break
+		}
+	}
 
 	// 常驻 catch-all 入站: 与节点数量无关, 保证"只要网关联网就经过 sing-box"。
 	// 零节点时也建实例 —— 直连模式下流量仍走 sing-box 的 direct 出站。
@@ -249,7 +270,7 @@ func syncNodeBox() {
 		// 订阅提供的原始出站可能有个别不合法: 退回仅手动节点链接重建,
 		// 避免单个坏节点拖垮全部出口
 		log.Printf("  nodes: 全量构建失败(%v), 退回仅手动节点重建", err)
-		var p2, inb2, outb2, rules2, _ = buildNodeParts(stringEntries(entries))
+		var p2, inb2, outb2, rules2, ep2 = buildNodeParts(stringEntries(entries))
 		if len(outb2) > 0 {
 			// 退回重建同样要保留 catch-all, 否则"全部经 sing-box"在这条路径上失效
 			if newCatchAll != 0 {
@@ -260,7 +281,7 @@ func syncNodeBox() {
 			}
 			outb2 = append(outb2, map[string]any{"type": "direct", "tag": "direct"})
 			if inst2, err2 := startNodeInstanceFn(ctx, inb2, outb2, rules2); err2 == nil {
-				instance, ports, err = inst2, p2, nil
+				instance, ports, err, endpoints = inst2, p2, nil, ep2
 			} else {
 				err = err2
 			}
@@ -301,6 +322,10 @@ func syncNodeBox() {
 		nodePorts = ports
 		nodePortsKeys = joined
 		catchAllPort = newCatchAll
+		// 端点表与 nodePorts 在**同一成功分支**同步赋值(P3-6): 构建期就写全局表
+		// 会在 failKeepOld(重建失败保留旧实例)时留下"新端点表 + 旧端口表"的错配,
+		// 健康检测按服务器去重分组用错键, 直到下次成功重建。失败分支保持旧表不动。
+		setNodeRemoteEndpoints(endpoints)
 		log.Printf("  nodes: %d 个高级节点出口已就绪", len(ports))
 	} else {
 		// 期间已被其它 sync 替换: 丢弃本次刚建好的新实例, 保留现有实例。
@@ -324,7 +349,8 @@ func syncNodeBox() {
 // 服务器连不上时, 它的几十个变体逐个去探是纯浪费(每个都要跑
 // 活性+测速+MITM+WARP), 而且会让"X/Y 可达"的分母虚高数倍。
 //
-// 由 buildNodeParts 在组装时整批替换(不是增量写), 保证读者看到的是一致快照。
+// 由 syncNodeBox 在实例启动成功的替换分支整批写入(构建产物 endpoints 随成功一起
+// 落表, P3-6), 不是增量写, 保证读者看到的是一致快照。
 var (
 	nodeRemoteEndpoints   = map[string]string{}
 	nodeRemoteEndpointsMu sync.RWMutex

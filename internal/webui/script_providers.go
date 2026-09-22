@@ -271,8 +271,10 @@ function providerCardBody(n, p, stat) {
     '<tr><td colspan="' + cols + '" style="text-align:center;color:var(--text3);font-size:var(--fs-sm);padding:var(--sp-4)">该供应商暂无模型 — ' +
     (builtin ? '等待上游同步' : '配置 API Key 后刷新目录, 或在下方添加表单里手填模型') + '</td></tr>';
 
-  return '<div class="pd-head"><p>' + note + '</p><div class="pacts">' + acts.join('') + '</div></div>' +
-    '<input type="text" placeholder="在 ' + esc(n) + ' 内搜索模型" oninput="filterCardModels(\'' + escJs(n) + '\',this)" style="max-width:280px;margin-bottom:9px">' +
+  // note 里拼了 provider 名(n, 导入路径曾可绕过 providerIDRe 校验), innerHTML
+  // 插入前必须整体转义(文本上下文用 esc); placeholder 是双引号属性, 用 escAttr(P2-12)。
+  return '<div class="pd-head"><p>' + esc(note) + '</p><div class="pacts">' + acts.join('') + '</div></div>' +
+    '<input type="text" placeholder="在 ' + escAttr(n) + ' 内搜索模型" oninput="filterCardModels(\'' + escJs(n) + '\',this)" style="max-width:280px;margin-bottom:9px">' +
     '<div class="table-wrap"><table><thead>' + head + '</thead><tbody>' + rows + emptyRow + '</tbody></table></div>' +
     (ms.length ? '<div class="hint" style="margin-top:9px">' + stat.count + '/' + ms.length + ' 个已启用' +
       (p.google ? ' · Google 的端点与鉴权约定已由程序内置补齐' : '') + '</div>' : '');

@@ -10,6 +10,12 @@
 // 形态不变量校验"(防重复转换事故, 已在生产使用), 本包是"协议格式互转实现"。
 // (两包 2026-09-16 之前同名 `translate`, 已按职责改名去歧义。)
 //
+// Deprecated: 本包未接线 —— 生产调用点为零, 仅被测试引用
+// (translate 包自身测试与 internal/app/node_filter_test.go); 中继仍走
+// internal/app 内的既有转换路径, 接线计划见 docs/omniroute-mapping.md 批次⑤。
+// P2-22 / P3-24 / P3-25 已修, 但接入生产前仍须整体复核(逐方向端到端用例、
+// 错误路径与真实上游形态), 不要直接引用后上线。请勿删除本包(有测试引用)。
+//
 // 已注册方向:
 //
 //	openai → claude(请求方向): OpenAIChatToClaudeRequest
@@ -134,6 +140,11 @@ func OpenAIChatToClaudeRequest(model string, body map[string]any, stream bool) (
 	tools, _ := body["tools"].([]any)
 
 	msgs, _ := body["messages"].([]any)
+	// P3-25: 连续的 tool 消息合并进同一个 user 轮次。逐条各成一轮会产生连续
+	// 多条 user 消息, Anthropic Messages API 对同 role 连续轮次有严格校验, 可能 400。
+	// lastToolTurn 记录"由 tool 消息生成"的最后一个 user 轮在 messages 中的下标,
+	// 仅当它仍是最后一条时才并入; 非 tool 消息的既有行为不变。
+	lastToolTurn := -1
 	for _, raw := range msgs {
 		m, ok := raw.(map[string]any)
 		if !ok {
@@ -145,13 +156,23 @@ func OpenAIChatToClaudeRequest(model string, body map[string]any, stream bool) (
 			system = append(system, systemBlocks(m)...)
 		case "user", "assistant":
 			messages = append(messages, userAssistantBlock(role, m, tools))
+			lastToolTurn = -1
 		case "tool":
 			// OpenAI 的工具结果消息 → user 轮次里的 tool_result 块
 			content, _ := m["content"].(string)
-			blocks := []any{map[string]any{
+			block := map[string]any{
 				"type": "tool_result", "tool_use_id": m["tool_call_id"], "content": content,
-			}}
-			messages = append(messages, map[string]any{"role": "user", "content": blocks})
+			}
+			if lastToolTurn >= 0 && lastToolTurn == len(messages)-1 {
+				if prev, ok := messages[lastToolTurn].(map[string]any); ok {
+					if blocks, ok := prev["content"].([]any); ok {
+						prev["content"] = append(blocks, block)
+						continue
+					}
+				}
+			}
+			messages = append(messages, map[string]any{"role": "user", "content": []any{block}})
+			lastToolTurn = len(messages) - 1
 		}
 	}
 

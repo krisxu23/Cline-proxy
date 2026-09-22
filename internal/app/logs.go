@@ -376,13 +376,20 @@ func requestLogMiddleware(next http.Handler) http.Handler {
 		// 就够 —— 若截断后 JSON 解析失败, 退化为空 model, 不影响功能。
 		model := ""
 		limit := int64(reqLogBodyProbeBytes)
-		if r.ContentLength != 0 && r.ContentLength < limit {
+		// ContentLength==-1(Transfer-Encoding: chunked, 长度未知)**不能**收窄
+		// limit: io.LimitReader(r.Body, -1) 会立即 EOF → 只读到 0 字节 →
+		// model 恒空 → route 退化为 other → 成功的对话请求被 isRequestNoise
+		// 当噪声丢弃(P3-12)。只有"已知长度且小于探针上限"才收窄,
+		// -1/0 一律保持 8KB 探针上限。
+		if r.ContentLength > 0 && r.ContentLength < limit {
 			limit = r.ContentLength
 		}
 		bodyBytes, _ := io.ReadAll(io.LimitReader(r.Body, limit))
 		if len(bodyBytes) > 0 {
 			// 放回剩余部分, 避免影响下游处理。
-			if r.ContentLength > int64(len(bodyBytes)) {
+			// chunked(ContentLength<0)长度未知, 必须走"读回剩余再拼接"的分支,
+			// 否则只放回探针读到的前 8KB, 下游拿到的 body 被截断(转发即坏)。
+			if r.ContentLength < 0 || r.ContentLength > int64(len(bodyBytes)) {
 				rest, _ := io.ReadAll(r.Body)
 				r.Body = io.NopCloser(bytes.NewReader(append(bodyBytes, rest...)))
 			} else {
@@ -429,6 +436,14 @@ func requestLogMiddleware(next http.Handler) http.Handler {
 			route = "cline"
 		case strings.Contains(r.URL.Path, "models") || strings.Contains(r.URL.Path, "health"):
 			route = "meta"
+		case strings.HasSuffix(r.URL.Path, "/chat/completions") ||
+			strings.HasSuffix(r.URL.Path, "/messages") ||
+			strings.Contains(r.URL.Path, "/v1/messages") ||
+			strings.Contains(r.URL.Path, "/responses"):
+			// 对话调用按路径兜底(P3-12): chunked/超探针上限时 model 可能提取
+			// 不到, 但这类请求绝不是可丢弃的 other 噪声 —— 否则成功的对话请求
+			// 会被 isRequestNoise 按 other+status<400 整类丢弃, 凭空消失。
+			route = "cline"
 		}
 
 		// 路由判定优先采用 handler 实际选择的出口(X-Proxy-Route):

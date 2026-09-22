@@ -13,6 +13,14 @@ import (
 	"time"
 )
 
+// zenRetryAfterMaxWait 429 退避睡眠的上限。
+//
+// 上游 Retry-After 头对纯数字秒数没有上限(proxy_util parseRetryAfter,
+// "999999999"≈31 年), 无上限 time.Sleep 会全程占着并发信号量(默认仅 8 槽)
+// 且循环顶的 ctx 检查打不断它。超过上限就不再占槽干等, 直接把 429 交还
+// 客户端自重试(与冷却表侧 zenQuotaRetryAfterCap 同口径, P1-4)。
+const zenRetryAfterMaxWait = 60 * time.Second
+
 // buildZenBody 构造 zen 请求体:只带 OpenAI 兼容字段,改写模型为 zen ID
 func buildZenBody(params map[string]any, stream bool) map[string]any {
 	body := map[string]any{}
@@ -228,7 +236,10 @@ func callZenAPI(ctx context.Context, params map[string]any, stream bool) (*http.
 		}
 		if resp.StatusCode == http.StatusOK {
 			markZenSuccess()
-			recordZenModelResult(zenModelIDOf(params), false)
+			// 健康门的"成功"记录挪到下方转换与空回合判定全部通过之后:
+			// 200 就清零 consecFails 的话, 随后转换发现空回合 return 错误,
+			// 健康门却已被清零 —— zenModelUnavailable 永不触发, 模型每次空
+			// 回合都白走全链路(P2-17, 口径见 zen_model_health.go)。
 			// 这个出口调通了 → 清零它的连续 429 计数, 让冷却时长回到基准。
 			// 不清零的话计数单调递增, 出口被限流一次后就再也回不到短冷却。
 			clearActualExitQuotaStrike(ctx)
@@ -254,6 +265,9 @@ func callZenAPI(ctx context.Context, params map[string]any, stream bool) (*http.
 				} else {
 					converted, cerr := convertResponsesResponseToChat(resp, zenResolvedModel, zenBudget)
 					if cerr != nil {
+						// 空回合类转换失败按硬失败计数(zen_model_health.go:
+						// 5xx/超时/网络/空响应), 否则健康门对空回合模型永不触发。
+						recordZenModelResult(zenModelIDOf(params), true)
 						return nil, rateLimited, fmt.Errorf("zen responses convert: %w", cerr)
 					}
 					resp = converted
@@ -266,6 +280,8 @@ func callZenAPI(ctx context.Context, params map[string]any, stream bool) (*http.
 				} else {
 					converted, cerr := convertClaudeResponseToChat(resp, zenResolvedModel)
 					if cerr != nil {
+						// 同上: 空回合类转换失败计一次硬失败(P2-17)。
+						recordZenModelResult(zenModelIDOf(params), true)
 						return nil, rateLimited, fmt.Errorf("zen messages convert: %w", cerr)
 					}
 					resp = converted
@@ -273,6 +289,8 @@ func callZenAPI(ctx context.Context, params map[string]any, stream bool) (*http.
 				// 实测调通 → 持久化登记, 之后直接走 /messages(负向结论不落盘)。
 				zenLearnMessagesOnly(zenResolvedModel)
 			}
+			// 端点转换与空回合判定全部通过 —— 到这里才是真的"模型这一轮可用"。
+			recordZenModelResult(zenModelIDOf(params), false)
 			return resp, rateLimited, nil
 		}
 
@@ -284,6 +302,12 @@ func callZenAPI(ctx context.Context, params map[string]any, stream bool) (*http.
 		if resp.StatusCode == http.StatusUnauthorized {
 			zenRetireKey(reqKey)
 			log.Printf("  zen: key %s 认证失败(401), 临时退役 %v 后重试", maskZenKey(reqKey), zenKeyRetireDuration)
+			// 换 key 重试: 下一轮 reqKey 重新走 zenSelectKey(会跳过刚退役的
+			// 这把), 受影响出口自动落到下一把 key。预算耗尽才把 401 原样交还
+			// 客户端(P3-19 —— 此前日志说"重试"却不 continue, 401 直接回给客户端)。
+			if attempt < retries {
+				continue
+			}
 		}
 		// FreeTierError("can only be used from within OpenCode"): opencode 免费
 		// tier 的风控按**出口 IP** 判定 —— 实测(2026-09-17)同一 mimo-v2.5-free
@@ -346,11 +370,23 @@ func callZenAPI(ctx context.Context, params map[string]any, stream bool) (*http.
 				if retryAfter := parseRetryAfter(resp.Header.Get("Retry-After")); retryAfter > wait {
 					wait = retryAfter
 				}
-				log.Printf("  zen rate limited (%d), retry %d/%d after %v (next endpoint: %s)",
-					resp.StatusCode, attempt+1, retries, wait, baseURLs[(attempt+1)%len(baseURLs)])
-				time.Sleep(kit.WithRetryJitter(wait))
-				delay *= 2
-				continue
+				if wait <= zenRetryAfterMaxWait {
+					log.Printf("  zen rate limited (%d), retry %d/%d after %v (next endpoint: %s)",
+						resp.StatusCode, attempt+1, retries, wait, baseURLs[(attempt+1)%len(baseURLs)])
+					// 睡眠必须可被客户端取消: ctx 已死还继续占槽睡, 只会拖住
+					// 整个并发窗口(信号量容量默认仅 8)。取消时立即返回。
+					select {
+					case <-time.After(kit.WithRetryJitter(wait)):
+					case <-ctx.Done():
+						return nil, rateLimited, fmt.Errorf("zen request aborted: %v", ctx.Err())
+					}
+					delay *= 2
+					continue
+				}
+				// Retry-After 超过上限: 不再占槽睡眠几小时, 直接把 429 交还客户端,
+				// 让它按自己的节奏重试(P1-4)。
+				log.Printf("  zen rate limited (%d), Retry-After %v 超过 %v 上限 — 不占槽等待, 直接返回 429 让客户端自重试",
+					resp.StatusCode, wait, zenRetryAfterMaxWait)
 			}
 			markZenFail()
 			return nil, rateLimited, &zenUpstreamError{Status: resp.StatusCode, Body: kit.Truncate(bodyBytes, 500)}
@@ -372,7 +408,7 @@ func callZenAPI(ctx context.Context, params map[string]any, stream bool) (*http.
 					altBody := translate_registry.TranslateRequest(translate_registry.Chat, translate_registry.Responses, body)
 					applyResponsesReasoning(altBody, reasoningEffort)
 					if problems := translate_registry.ValidateOutbound(translate_registry.Responses, altBody); len(problems) == 0 {
-						if alt := tryZenResponsesFallback(ctx, base, altBody, stream, client, zenBudget); alt != nil {
+						if alt := tryZenResponsesFallback(ctx, base, altBody, stream, client, reqKey, zenBudget); alt != nil {
 							markZenSuccess()
 							recordZenModelResult(zenModelIDOf(params), false)
 							return alt, rateLimited, nil
@@ -381,7 +417,7 @@ func callZenAPI(ctx context.Context, params map[string]any, stream bool) (*http.
 				}
 				if !msgTried {
 					msgTried = true
-					if alt := tryZenMessagesFallback(ctx, base, body, stream, client); alt != nil {
+					if alt := tryZenMessagesFallback(ctx, base, body, stream, client, reqKey); alt != nil {
 						markZenSuccess()
 						recordZenModelResult(zenModelIDOf(params), false)
 						return alt, rateLimited, nil

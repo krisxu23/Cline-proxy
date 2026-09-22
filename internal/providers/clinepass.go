@@ -74,14 +74,34 @@ func (p *clinepassProvider) load() {
 		return
 	}
 	var arr []*cpKey
-	if json.Unmarshal(data, &arr) == nil {
-		p.keys = arr
+	if err := json.Unmarshal(data, &arr); err != nil {
+		// 解析失败不能静默吞掉: 之前半截 JSON 会让全部 key 无声消失且无任何
+		// 痕迹。至少 log 留证; 语义保持不变(不覆盖 p.keys, 不中断启动)。
+		fmt.Printf("clinepass load keys: parse %s failed: %v\n", p.path, err)
+		return
 	}
+	p.keys = arr
 }
 
+// save 落盘 key 池: 锁内取快照、放锁后再做慢 I/O(本仓 §2.3 第 10 项),
+// 且必须用原子写 —— 此前在锁外 json.Marshal(p.keys) 与锁内 mutate 构成
+// data race, 非原子 os.WriteFile 会留下半截 JSON, load() 解析失败时静默
+// return, 全部 key 无声消失。
 func (p *clinepassProvider) save() {
-	data, _ := json.MarshalIndent(p.keys, "", "  ")
-	if err := os.WriteFile(p.path, data, 0600); err != nil {
+	p.mu.Lock()
+	snap := make([]*cpKey, len(p.keys))
+	for i, k := range p.keys {
+		c := *k
+		snap[i] = &c
+	}
+	p.mu.Unlock()
+
+	data, err := json.MarshalIndent(snap, "", "  ")
+	if err != nil {
+		fmt.Printf("clinepass save keys: marshal: %v\n", err)
+		return
+	}
+	if err := kit.WriteFileAtomicDefault(p.path, data); err != nil {
 		fmt.Printf("clinepass save keys: %v\n", err)
 	}
 }
@@ -166,7 +186,11 @@ func (p *clinepassProvider) RawChat(ctx context.Context, req ChatRequest, stream
 		return nil, fmt.Errorf("clinepass key %s rate limited, cooldown %s", maskKey(k.Key), clinepassCooldown)
 	}
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("clinepass API %d: %s", resp.StatusCode, kit.Truncate(kit.ReadBody(resp), 300))
+		// 错误分支读完 body 必须 Close(P2-6): 否则 keep-alive 连接既不回池
+		// 也不回收, 错误风暴时 fd 持续增长。
+		msg := kit.Truncate(kit.ReadBody(resp), 300)
+		resp.Body.Close()
+		return nil, fmt.Errorf("clinepass API %d: %s", resp.StatusCode, msg)
 	}
 	return resp, nil
 }
@@ -280,28 +304,32 @@ func (p *clinepassProvider) AddKey(key string) {
 		return
 	}
 	p.mu.Lock()
-	defer p.mu.Unlock()
 	for _, k := range p.keys {
 		if k.Key == key {
 			k.Status = "active"
 			k.CooldownExp = time.Time{}
+			p.mu.Unlock()
 			return
 		}
 	}
 	p.keys = append(p.keys, &cpKey{Key: key, Status: "active"})
+	// 先放锁再 save(): save 内部要取锁快照(见其注释), 持锁调用会死锁。
+	p.mu.Unlock()
 	p.save()
 }
 
 func (p *clinepassProvider) RemoveKey(masked string) {
 	p.mu.Lock()
-	defer p.mu.Unlock()
 	for i, k := range p.keys {
 		if maskKey(k.Key) == masked || k.Key == masked {
 			p.keys = append(p.keys[:i], p.keys[i+1:]...)
+			// 先放锁再 save(): save 内部要取锁快照, 持锁调用会死锁。
+			p.mu.Unlock()
 			p.save()
 			return
 		}
 	}
+	p.mu.Unlock()
 }
 
 func (p *clinepassProvider) KeyStatuses() []map[string]any {

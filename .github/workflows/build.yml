@@ -3,13 +3,19 @@ name: Build Release
 on:
   push:
     branches: [ main ]
+  # PR 也跑同一套门禁(P3-31): 否则坏提交要先落 main 才变红。
+  pull_request:
+    branches: [ main ]
 
 concurrency:
   group: release-main
   cancel-in-progress: false
 
+# workflow 级只读(P3-32): test/build 只需要读代码; 真正要写的只有 release job
+# (创建 release/上传资产), 它在自己的 job 内单独申请 contents: write ——
+# 否则第三方 action 会拿到可写 token, 扩大供应链攻击面。
 permissions:
-  contents: write
+  contents: read
 
 jobs:
   test:
@@ -25,6 +31,18 @@ jobs:
         uses: actions/setup-go@v5
         with:
           go-version: '1.26'
+
+      - name: gofmt
+        # 格式化门禁(P3-31): gofmt -l 列出未格式化的 .go 文件, 输出非空即失败。
+        # gofmt 遍历时自动跳过 . / _ 前缀目录(.git、.github 等), 也不会碰
+        # 模块缓存(在仓库外), 所以 `gofmt -l .` 只扫本仓库源码。
+        run: |
+          out=$(gofmt -l .)
+          if [ -n "$out" ]; then
+            echo "以下文件未通过 gofmt:"
+            echo "$out"
+            exit 1
+          fi
 
       - name: go vet
         run: go vet -tags with_quic,with_grpc,with_utls ./...
@@ -153,6 +171,10 @@ jobs:
     name: Create Release
     needs: build
     runs-on: ubuntu-latest
+    # 仅此 job 需要写仓库(P3-32): softprops/action-gh-release 要创建 release
+    # 并上传资产; job 级 permissions 会整体覆盖 workflow 级的 contents: read。
+    permissions:
+      contents: write
     steps:
       - name: Checkout tags
         uses: actions/checkout@v4

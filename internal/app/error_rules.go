@@ -65,8 +65,17 @@ var candidateErrorRules = []errorRule{
 		// 上下文超限信号集补全(沿参考 CONTEXT_OVERFLOW_SIGNALS, errorClassifier.ts:93-105):
 		// 旧表只有 context_length_exceeded / maximum context length / context window
 		// 三个, 上游常见的 "prompt too large" / "exceeds context" / "input too long" /
-		// "token limit" / "too many tokens" / "messages exceed" 全都漏掉, 会落成
-		// generic serverError 短冷却, 用户反复撞墙。
+		// "token limit" / "too many tokens" / "messages exceed" 全都漏掉。
+		// 用规则表命中是为了落**专属原因串**(面板能看出是超限), 但类别必须是短冷却。
+		//
+		// 类别为什么不是 classPermanent(P1-3): 上下文超限最常见成因是**用户这轮
+		// prompt/上下文本身超长** —— 属用户输入问题, 与该 upstream:model 的健康无关;
+		// 而规则表先于状态码 switch、任意状态码都命中, 判 permanent 会让一条超长
+		// prompt 把整个 upstream:model 对**所有用户**停服 24 小时。
+		//
+		// classPermanent 的界线: 只留给真正的**模型级硬信号** —— 无免费层、已下架、
+		// 非 chat 模型、模型/实体级 404 这类"换账号/换请求也过不去"的拒绝;
+		// 换一份输入就能成功的(超限、资源不存在), 一律短冷却。
 		name: "上下文超限",
 		patterns: []string{
 			"context_length_exceeded", "maximum context length", "context window",
@@ -74,7 +83,7 @@ var candidateErrorRules = []errorRule{
 			"maximum context", "input too long", "token limit",
 			"too many tokens", "context length", "messages exceed",
 		},
-		class: classPermanent, // 换站也大概率超, 且不是暂态; 由调用方按永久拒绝处理
+		class: classServerError, // 请求级超限: 用户改短 prompt 即恢复, 短冷却即可
 	},
 }
 

@@ -339,8 +339,10 @@ func quotaDayExhausted(body []byte) bool {
 func applyCandidateFailure(cand routeCandidate, class, reason string, body []byte) {
 	// 硬失败记入模型可用性门(429/4xx 不计): 连续挂掉的模型自动从列表与选路中摘除。
 	//
-	// 只认两类**上游明确表达**的信号: 5xx(上游自己报错)与空响应(上游正常收尾但没
-	// 产出内容)。超时/网络属线路问题 —— 把它算成模型硬失败, 会让出口池抖动期间
+	// 只认两类**上游明确表达**的信号: 5xx(上游自己报错 —— classifyCandidateFailure
+	// 已把未匹配的 4xx 归入 classClientError, 不再冒充 serverError 落到这里,
+	// "4xx 不计"的承诺因此与实现一致, P2-9)与空响应(上游正常收尾但没产出内容)。
+	// 超时/网络属线路问题 —— 把它算成模型硬失败, 会让出口池抖动期间
 	// 健康模型被连续暂停 30 分钟并从列表消失(2026-09-16 实证)。
 	if class == classServerError || class == classEmpty {
 		recordZenModelResult(cand.Model, true)

@@ -8,7 +8,6 @@ import (
 
 func normalizeOpenAIResponse(obj map[string]any) map[string]any {
 	out := make(map[string]any)
-	sawToolCalls := false
 	for k, v := range obj {
 		if k == "provider_metadata" || k == "proxy_metadata" {
 			continue
@@ -30,9 +29,6 @@ func normalizeOpenAIResponse(obj map[string]any) map[string]any {
 				if msg, ok := nc["message"].(map[string]any); ok {
 					nm := normalizeMessage(msg)
 					nc["message"] = nm
-					if tc, ok := nm["tool_calls"].([]any); ok && len(tc) > 0 {
-						sawToolCalls = true
-					}
 				}
 				if delta, ok := nc["delta"].(map[string]any); ok {
 					nd := make(map[string]any)
@@ -47,7 +43,6 @@ func normalizeOpenAIResponse(obj map[string]any) map[string]any {
 						if nd["content"] == nil {
 							nd["content"] = ""
 						}
-						sawToolCalls = true
 					}
 					// 对齐 OmniRoute 流式 delta 处理: 与 normalizeMessage 同一份
 					// 归一逻辑, 保证流式/非流式两条路径不漂移。
@@ -74,13 +69,23 @@ func normalizeOpenAIResponse(obj map[string]any) map[string]any {
 				// 就当成回合正常结束 —— 于是工具调用被静默丢弃, 任务无故中断且无提示。
 				// 必须在本回合确实出现了 tool_calls 时把它归一为 "tool_calls"。
 				//
-				// 注意判定依据是本 choice **自身**是否带 tool_calls(非流式形态),
-				// 而非整个响应的 sawToolCalls —— 与 OmniRoute 逐 choice 的写法对齐。
+				// 注意判定依据是本 choice **自身**是否带 tool_calls(非流式的
+				// message.tool_calls 与流式的 delta.tool_calls 两种形态),
+				// 而非整个响应跨 choice 累计的标志 —— 与 OmniRoute 逐 choice 的
+				// 写法对齐: n>1 时 choice 0 的工具调用不得把 choice 1 的
+				// finish_reason="stop" 误改成 "tool_calls"。
 				if fr, ok := nc["finish_reason"].(string); ok && fr != "" && fr != "tool_calls" {
-					choiceHasToolCalls := sawToolCalls
+					choiceHasToolCalls := false
 					if msg, ok := nc["message"].(map[string]any); ok {
 						if tc, ok := msg["tool_calls"].([]any); ok && len(tc) > 0 {
 							choiceHasToolCalls = true
+						}
+					}
+					if !choiceHasToolCalls {
+						if d, ok := nc["delta"].(map[string]any); ok {
+							if tc, ok := d["tool_calls"].([]any); ok && len(tc) > 0 {
+								choiceHasToolCalls = true
+							}
 						}
 					}
 					if choiceHasToolCalls {

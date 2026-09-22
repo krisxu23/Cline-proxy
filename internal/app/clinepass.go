@@ -74,9 +74,23 @@ func callClinePassChain(ctx context.Context, params map[string]any, stream bool)
 	return &http.Response{
 		StatusCode: http.StatusOK,
 		Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
-		Body:       io.NopCloser(io.MultiReader(bytes.NewReader(buf[:n]), pr)),
+		Body:       &pipeReadCloser{r: io.MultiReader(bytes.NewReader(buf[:n]), pr), pr: pr},
 	}, nil
 }
+
+// pipeReadCloser 把「已读出的首段缓冲 + io.Pipe 读端」拼成一个有效 Close 的
+// ReadCloser。此前外层是 NopCloser —— Close() 是空操作, pr 永远没人关:
+// 上层 relay 停止读取后 pw.Write 同步永久阻塞(ctx 取消也解不开, 阻塞在 write
+// 而非 select), ChatStream 协程卡死, 其内部 defer resp.Body.Close() 不执行,
+// 每次断流泄漏 1 个 goroutine + 1 条上游连接。Close 时关掉 pr, 写端收到
+// ErrClosedPipe 自然退出, goroutine 走 pw.CloseWithError + errCh(缓冲 1) 收尾。
+type pipeReadCloser struct {
+	r  io.Reader
+	pr *io.PipeReader
+}
+
+func (c *pipeReadCloser) Read(p []byte) (int, error) { return c.r.Read(p) }
+func (c *pipeReadCloser) Close() error               { return c.pr.Close() }
 
 // clinePassReady ClinePass 订阅池是否至少有一个可用 key(active)。
 // 候选链用它判断"ClinePass 这一站现在能不能打", 全部冷却时直接跳过而不是白撞一次。
@@ -130,7 +144,8 @@ func handleClinePassChat(w http.ResponseWriter, r *http.Request, params map[stri
 		w.Header().Set("Connection", "keep-alive")
 		setCORSOrigin(w)
 		w.WriteHeader(http.StatusOK)
-		if err := cp.ChatStream(r.Context(), req, w, nil); err != nil {
+		// usage 回调接入统计(P2-8): 否则 clinepass 流式路径 CompletionTokens 恒 0。
+		if err := cp.ChatStream(r.Context(), req, w, tracker.observeUsage); err != nil {
 			log.Printf("  clinepass stream error: %v", err)
 			tracker.finish(false, http.StatusBadGateway)
 			return
@@ -148,6 +163,8 @@ func handleClinePassChat(w http.ResponseWriter, r *http.Request, params map[stri
 		tracker.finish(false, http.StatusBadGateway)
 		return
 	}
+	// 非流式同样要把上游 usage 计入统计(P2-8), take-last 语义在 observeUsage 内。
+	tracker.observeUsage(resp.Usage)
 	tracker.finish(true, http.StatusOK)
 	writeJSON(w, http.StatusOK, resp.Body)
 }
@@ -183,7 +200,7 @@ func handleClinePassAnthropic(w http.ResponseWriter, r *http.Request, req anthro
 		w.Header().Set("Connection", "keep-alive")
 		setCORSOrigin(w)
 		w.WriteHeader(http.StatusOK)
-		handleAnthropicStreamWithUsage(w, up, req.Model, toolSchemas, nil)
+		handleAnthropicStreamWithUsage(w, up, req.Model, toolSchemas, tracker.observeUsage)
 		tracker.finish(true, up.StatusCode)
 		return
 	}
@@ -203,6 +220,10 @@ func handleClinePassAnthropic(w http.ResponseWriter, r *http.Request, req anthro
 	anthropicResp := openAIToAnthropic(chatOut)
 	if tc, ok := getNested(chatOut, "choices", 0, "message", "tool_calls").([]any); ok && len(tc) > 0 {
 		anthropicResp["stop_reason"] = "tool_use"
+	}
+	// 非流式: 把上游 usage 计入统计(P2-8)。
+	if u, ok := raw["usage"].(map[string]any); ok {
+		tracker.observeUsage(u)
 	}
 	writeJSON(w, http.StatusOK, anthropicResp)
 	tracker.finish(true, up.StatusCode)
@@ -239,7 +260,7 @@ func handleClinePassResponses(w http.ResponseWriter, r *http.Request, params, ch
 		w.Header().Set("Connection", "keep-alive")
 		setCORSOrigin(w)
 		w.WriteHeader(http.StatusOK)
-		chatStreamToResponses(w, up, nil)
+		chatStreamToResponses(w, up, tracker.observeUsage)
 		tracker.finish(true, up.StatusCode)
 		return
 	}
@@ -252,6 +273,10 @@ func handleClinePassResponses(w http.ResponseWriter, r *http.Request, params, ch
 	}
 	if d, ok := raw["data"].(map[string]any); ok {
 		raw = d
+	}
+	// 非流式: 把上游 usage 计入统计(P2-8)。
+	if u, ok := raw["usage"].(map[string]any); ok {
+		tracker.observeUsage(u)
 	}
 	writeJSON(w, http.StatusOK, chatToResponses(raw))
 	tracker.finish(true, up.StatusCode)

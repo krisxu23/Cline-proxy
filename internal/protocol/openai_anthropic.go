@@ -15,18 +15,21 @@ type AnthropicMessage struct {
 
 // AnthropicRequest is the wire shape of POST /v1/messages.
 type AnthropicRequest struct {
-	Model       string             `json:"model"`
-	MaxTokens   int                `json:"max_tokens"`
-	Messages    []AnthropicMessage `json:"messages"`
-	System      json.RawMessage    `json:"system,omitempty"`
-	Stream      bool               `json:"stream,omitempty"`
-	Temperature float64            `json:"temperature,omitempty"`
-	TopP        float64            `json:"top_p,omitempty"`
-	TopK        int                `json:"top_k,omitempty"`
-	Stop        json.RawMessage    `json:"stop_sequences,omitempty"`
-	Tools       json.RawMessage    `json:"tools,omitempty"`
-	ToolChoice  json.RawMessage    `json:"tool_choice,omitempty"`
-	Metadata    json.RawMessage    `json:"metadata,omitempty"`
+	Model     string             `json:"model"`
+	MaxTokens int                `json:"max_tokens"`
+	Messages  []AnthropicMessage `json:"messages"`
+	System    json.RawMessage    `json:"system,omitempty"`
+	Stream    bool               `json:"stream,omitempty"`
+	// P1-7: 温度字段用指针判存在性 —— float64 上「未传」与「显式 0」同为零值,
+	// 旧写法 `!= 0` 会把客户端显式传的 temperature:0 / top_p:0(贪心解码)当缺省
+	// 丢掉, 上游按默认温度跑。非 nil 才透传(显式 0 也要下发)。
+	Temperature *float64        `json:"temperature,omitempty"`
+	TopP        *float64        `json:"top_p,omitempty"`
+	TopK        int             `json:"top_k,omitempty"`
+	Stop        json.RawMessage `json:"stop_sequences,omitempty"`
+	Tools       json.RawMessage `json:"tools,omitempty"`
+	ToolChoice  json.RawMessage `json:"tool_choice,omitempty"`
+	Metadata    json.RawMessage `json:"metadata,omitempty"`
 }
 
 // AnthropicToOpenAIRequest converts an Anthropic Messages request to a
@@ -43,11 +46,12 @@ func AnthropicToOpenAIRequest(req AnthropicRequest) map[string]any {
 		"stream":     req.Stream,
 		"messages":   []any{},
 	}
-	if req.Temperature != 0 {
-		out["temperature"] = req.Temperature
+	// P1-7: 非 nil 才透传 —— 显式 0(贪心解码)必须原样下发, 不得当缺省丢弃。
+	if req.Temperature != nil {
+		out["temperature"] = *req.Temperature
 	}
-	if req.TopP != 0 {
-		out["top_p"] = req.TopP
+	if req.TopP != nil {
+		out["top_p"] = *req.TopP
 	}
 	if req.TopK != 0 {
 		out["top_k"] = req.TopK

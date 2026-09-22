@@ -437,6 +437,25 @@ func handleConfigImport(w http.ResponseWriter, r *http.Request) {
 			writeAPI(w, http.StatusBadRequest, apiResponse{Error: name + " 不是合法 JSON: " + err.Error()})
 			return
 		}
+		// provider 名必须与正常写入路径(providers_config.go 的 providerIDRe)同源校验:
+		// 导入此前只做 JSON/结构检查, 恶意 provider 名会绕过校验直接落盘, 再经面板
+		// 渲染(script_providers 拼进 innerHTML)形成存储型 XSS(P2-12)。
+		// 通用上游只存在 .zen-config.json 的 providers 字段里。
+		if name == ".zen-config.json" {
+			var z struct {
+				Providers map[string]json.RawMessage `json:"providers"`
+			}
+			if err := json.Unmarshal([]byte(content), &z); err == nil {
+				for pname := range z.Providers {
+					if !providerIDRe.MatchString(pname) {
+						writeAPI(w, http.StatusBadRequest, apiResponse{
+							Error: fmt.Sprintf("provider 名不合法(文件 %s): %q, 需匹配 ^[a-z][a-z0-9_-]*$", name, pname),
+						})
+						return
+					}
+				}
+			}
+		}
 	}
 	// 全部校验通过才落盘(避免半套配置); 覆盖前把现有文件另存为
 	// <name>.bak-import-<时间戳> 并只保留最近若干份 —— 单份 .bak-import 会被

@@ -33,16 +33,23 @@ func ScanSSE(r io.Reader) (<-chan SSEEvent, <-chan error) {
 		reader := bufio.NewReaderSize(r, 64*1024)
 		var buf strings.Builder
 		flush := func() {
-			line := buf.String()
+			raw := buf.String()
 			buf.Reset()
-			line = strings.TrimRight(line, "\r\n")
-			if line == "" {
-				return
+			// 按行解析整帧: 只提取 data: 行(多行 data 按 SSE 规范逐行拼接),
+			// event:/id: 等其它字段行丢弃, 但不得连带丢掉本帧其余的 data: 行 ——
+			// 否则 Anthropic 风格 `event: <type>` 前缀帧的所有事件都会被静默丢弃。
+			var dataLines []string
+			for _, l := range strings.Split(raw, "\n") {
+				l = strings.TrimRight(l, "\r")
+				if !strings.HasPrefix(l, "data:") {
+					continue
+				}
+				dataLines = append(dataLines, strings.TrimSpace(strings.TrimPrefix(l, "data:")))
 			}
-			if !strings.HasPrefix(line, "data:") {
-				return
+			if len(dataLines) == 0 {
+				return // 空帧 / 无 data: 行的帧
 			}
-			payload := strings.TrimSpace(strings.TrimPrefix(line, "data:"))
+			payload := strings.Join(dataLines, "\n")
 			if payload == "" {
 				return
 			}
@@ -65,9 +72,6 @@ func ScanSSE(r io.Reader) (<-chan SSEEvent, <-chan error) {
 			line, err := reader.ReadString('\n')
 			if line != "" {
 				buf.WriteString(line)
-				if strings.HasSuffix(strings.TrimRight(line, "\r\n"), "\n") {
-					// already terminated by newline inside line; flush below
-				}
 				// Flush on blank line (event boundary).
 				if strings.TrimRight(line, "\r\n") == "" {
 					flush()

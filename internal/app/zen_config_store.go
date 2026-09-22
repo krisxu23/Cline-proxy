@@ -34,6 +34,9 @@ func loadZenConfig() *zenConfigData {
 			cfg = next
 		}
 	}
+	// P3-17: 先 TrimSpace 再兜底 —— 旧判定只查 == "" 会放行 " " 这种纯空白 key,
+	// 落盘后 zenSelectKey TrimSpace 取到空串, 请求不带鉴权头 → 全量 401。
+	cfg.Key = strings.TrimSpace(cfg.Key)
 	if cfg.Key == "" {
 		cfg.Key = "public"
 	}
@@ -111,6 +114,13 @@ func setZenConfig(c *zenConfigData) {
 	zenConfigMu.Lock()
 	zenConfig = c.clone()
 	zenConfigMu.Unlock()
+	applyZenConfigSideEffects()
+}
+
+// applyZenConfigSideEffects 配置变更后的锁外后处理(落盘 + 各缓存/单例刷新)。
+// 统一由 setZenConfig / updateZenConfig 在**放锁之后**调用, 保持一致的锁/IO 纪律:
+// 计算与赋值在临界区内, 慢 I/O 与重建在临界区外。
+func applyZenConfigSideEffects() {
 	// 勾选地区/代理/订阅都可能变, 出口列表缓存立即失效(否则最长 2 秒内还在用旧池)
 	invalidateExitListCache()
 	// 手动启用的模型集合也要同步: isZenFreeModel 热路径读的是缓存集合
@@ -119,6 +129,35 @@ func setZenConfig(c *zenConfigData) {
 	rebuildZenTransport()
 	rebuildZenSem()
 	syncNodeBox()
+}
+
+// updateZenConfig 在**同一临界区**内完成「读当前配置 → 修改 → 写回」(P3-16)。
+//
+// 此前 admin 面板的保存是两步: getZenConfig() 拿快照 → 锁外改几十行 →
+// setZenConfig(next) 整体替换并落盘。读写窗口不在同一临界区, 多标签页/脚本
+// 与 UI 并发保存时, 窗口期内另一方的修改被旧快照整体覆盖并落盘, 重启后仍丢失。
+//
+// 约定(与 mutateProvidersConfig 相同):
+//   - 回调在持锁状态下执行, 里面**不得**再调用 getZenConfig / setZenConfig 等
+//     配置读写函数(sync.Mutex 不可重入, 会自锁), 只做校验与纯内存改动;
+//   - 回调返回非 nil 错误时不写回(配置保持原样), 错误原样返回给调用方;
+//   - 落盘与单例刷新在放锁之后执行, 持锁期间不做慢 I/O。
+func updateZenConfig(fn func(cfg *zenConfigData) error) error {
+	zenConfigMu.Lock()
+	next := zenConfig.clone()
+	if next == nil {
+		next = defaultZenConfig()
+	}
+	err := fn(next)
+	if err == nil {
+		zenConfig = next
+	}
+	zenConfigMu.Unlock()
+	if err != nil {
+		return err
+	}
+	applyZenConfigSideEffects()
+	return nil
 }
 
 // validateProxyList 校验代理列表格式: http/https/socks5/socks5h 代理 URL,

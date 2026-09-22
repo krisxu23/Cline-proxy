@@ -119,7 +119,9 @@ func withHealthResult(v nodeView, key string) nodeView {
 		v.IsWarp = r.IsWarp
 		v.NetworkType = r.NetworkType
 	}
-	if p, ok := nodePorts[key]; ok {
+	// 加锁访问器: nodeViews 全程不持 nodeMu, 裸读 nodePorts 会与 syncNodeBox
+	// 成功分支的写构成数据竞争(Go map 并发读写是 fatal error, P2-3)。
+	if p, ok := nodePortOf(key); ok {
 		v.LocalPort = p
 	}
 	if tc, ok := nodeTrafficCounterOf(key); ok {

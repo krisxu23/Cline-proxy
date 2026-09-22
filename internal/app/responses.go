@@ -260,6 +260,19 @@ func (s *responsesSSEWriter) event(event string, data any) {
 	}
 }
 
+// responsesFnCall 是流式转换中单个工具调用的累加器。
+// 并行工具调用(≥2)必须各自成项, 严禁合并进同一个 function_call(P1-11)。
+type responsesFnCall struct {
+	key      string // 上游 tool_calls.index 的字符串键; 缺失时为空
+	itemID   string // added/delta/done 共用的 item id, 创建时定死
+	callID   string
+	name     string
+	outIndex int // output_index, 从 1 起单调递增(0 留给文本 message)
+	args     strings.Builder
+	emitted  bool // 是否已发 output_item.added
+	deltaed  int  // 已作为 arguments.delta 发出的 args 字节数
+}
+
 // chatStreamToResponses 将上游 chat.completions SSE 流转换为 Responses SSE 流
 func chatStreamToResponses(w http.ResponseWriter, upstream *http.Response, onUsage func(map[string]any)) {
 	model := ""
@@ -279,7 +292,6 @@ func chatStreamToResponses(w http.ResponseWriter, upstream *http.Response, onUsa
 	s.event("response.in_progress", map[string]any{"type": "response.in_progress", "response": map[string]any{"id": s.respID}})
 
 	textEmitted := false
-	callEmitted := false
 	// 空流防护: 与流式 chat 路径**共用同一判据**(stream_delivery.go)。
 	//
 	// 三个放行条件与 chat 路径完全一致, 由 streamDeliveryEmpty 统一回答:
@@ -293,8 +305,34 @@ func chatStreamToResponses(w http.ResponseWriter, upstream *http.Response, onUsa
 	deliveredValue := false
 	validUsage := false
 	sawLegitEmpty := false
-	var curCallID, curCallName string
-	var curArgs strings.Builder
+	// 工具调用累加器: 按 index(或新 id/新 name)切换, 每个调用独立 emit(P1-11)。
+	var fcalls []*responsesFnCall
+	nextOutIndex := 1 // 0 留给文本 message item, 工具调用从 1 起单调递增
+	pickCall := func(key, idStr, name string) *responsesFnCall {
+		if key != "" {
+			for _, fc := range fcalls {
+				// index 相同但 id 不同视为不同调用(容错上游复用 index)
+				if fc.key == key && (idStr == "" || fc.callID == "" || idStr == fc.callID) {
+					return fc
+				}
+			}
+		} else if len(fcalls) > 0 {
+			// 无 index 的退化路径: id/name 与最近累加器不一致才切分
+			latest := fcalls[len(fcalls)-1]
+			if (idStr == "" || latest.callID == "" || idStr == latest.callID) &&
+				(name == "" || latest.name == "" || name == latest.name) {
+				return latest
+			}
+		}
+		fc := &responsesFnCall{key: key, callID: idStr, name: name, outIndex: nextOutIndex}
+		nextOutIndex++
+		// outIndex 唯一, 保证并行同名调用的 item_id 也不撞车
+		fc.itemID = fmt.Sprintf("fc_%d_%x", fc.outIndex, time.Now().UnixNano())
+		fcalls = append(fcalls, fc)
+		return fc
+	}
+	// 暂存最后一次 usage, 收尾时回填 response.completed, 不再硬编码全 0(P1-12)。
+	var lastUsage map[string]any
 	var outText strings.Builder
 
 	reader := bufio.NewReader(upstream.Body)
@@ -320,6 +358,8 @@ func chatStreamToResponses(w http.ResponseWriter, upstream *http.Response, onUsa
 					model = m
 				}
 				if u, ok := obj["usage"].(map[string]any); ok && len(u) > 0 {
+					// 暂存最后一次 usage, 收尾回填 response.completed(P1-12)
+					lastUsage = u
 					// usage-only 流是合法协议行为(参考实现注释:
 					// "usage-only streams are fine"), 独立于 onUsage 回调判定,
 					// 回调为 nil 时也不能漏记。
@@ -392,39 +432,62 @@ func chatStreamToResponses(w http.ResponseWriter, upstream *http.Response, onUsa
 						"delta":         r,
 					})
 				}
-				// 工具调用
+				// 工具调用: 按 index(或新 id/新 name)切换累加器, 各自独立 emit(P1-11)
 				if tc, ok := delta["tool_calls"].([]any); ok {
 					for _, c := range tc {
 						cm, ok := c.(map[string]any)
 						if !ok {
 							continue
 						}
-						if id, ok := cm["id"].(string); ok && id != "" {
-							curCallID = id
+						idStr, _ := cm["id"].(string)
+						name, argFrag := "", ""
+						if fn, _ := cm["function"].(map[string]any); fn != nil {
+							name, _ = fn["name"].(string)
+							argFrag, _ = fn["arguments"].(string)
 						}
-						fn, _ := cm["function"].(map[string]any)
-						if fn != nil {
-							if n, ok := fn["name"].(string); ok && n != "" {
-								curCallName = n
-							}
-							if a, ok := fn["arguments"].(string); ok && a != "" {
-								curArgs.WriteString(a)
-							}
+						// 累加器定位: index 是流式 tool_calls 的协议键, 缺失时走退化判据
+						key := ""
+						if iv, ok := cm["index"]; ok {
+							key = fmt.Sprintf("%v", iv)
 						}
-						if !callEmitted && curCallName != "" {
-							callEmitted = true
+						cur := pickCall(key, idStr, name)
+						if idStr != "" {
+							cur.callID = idStr
+						}
+						if name != "" {
+							cur.name = name
+						}
+						// 名字到位才发 output_item.added(与原逻辑一致), 每个调用各发一次
+						if !cur.emitted && cur.name != "" {
+							cur.emitted = true
 							s.event("response.output_item.added", map[string]any{
 								"type":         "response.output_item.added",
-								"output_index": 1,
+								"output_index": cur.outIndex,
 								"item": map[string]any{
 									"type":      "function_call",
-									"id":        "fc_" + curCallName,
-									"call_id":   curCallID,
-									"name":      curCallName,
+									"id":        cur.itemID,
+									"call_id":   cur.callID,
+									"name":      cur.name,
 									"arguments": "",
 									"status":    "in_progress",
 								},
 							})
+						}
+						if argFrag != "" {
+							cur.args.WriteString(argFrag)
+						}
+						// P2-21: 参数分片补发 arguments.delta;
+						// added 之前先到的片段在此一并补齐, 已发部分不重发。
+						if cur.emitted {
+							if n := len(cur.args.String()); n > cur.deltaed {
+								s.event("response.function_call_arguments.delta", map[string]any{
+									"type":         "response.function_call_arguments.delta",
+									"item_id":      cur.itemID,
+									"output_index": cur.outIndex,
+									"delta":        cur.args.String()[cur.deltaed:],
+								})
+								cur.deltaed = n
+							}
 						}
 					}
 				}
@@ -452,9 +515,13 @@ func chatStreamToResponses(w http.ResponseWriter, upstream *http.Response, onUsa
 		s.event("response.content_part.done", map[string]any{"type": "response.content_part.done", "item_id": s.msgID, "output_index": 0, "content_index": 0, "part": map[string]any{"type": "output_text", "text": outText.String(), "annotations": []any{}}})
 		s.event("response.output_item.done", map[string]any{"type": "response.output_item.done", "output_index": 0, "item": map[string]any{"id": s.msgID, "type": "message", "role": "assistant", "status": "completed", "content": []any{map[string]any{"type": "output_text", "text": outText.String(), "annotations": []any{}}}}})
 	}
-	if callEmitted {
-		s.event("response.function_call_arguments.done", map[string]any{"type": "response.function_call_arguments.done", "item_id": "fc_" + curCallName, "output_index": 1, "arguments": curArgs.String()})
-		s.event("response.output_item.done", map[string]any{"type": "response.output_item.done", "output_index": 1, "item": map[string]any{"type": "function_call", "id": "fc_" + curCallName, "call_id": curCallID, "name": curCallName, "arguments": curArgs.String(), "status": "completed"}})
+	// 每个工具调用各自收尾, item_id/output_index 与 added/delta 一致(P1-11)
+	for _, fc := range fcalls {
+		if !fc.emitted {
+			continue
+		}
+		s.event("response.function_call_arguments.done", map[string]any{"type": "response.function_call_arguments.done", "item_id": fc.itemID, "output_index": fc.outIndex, "arguments": fc.args.String()})
+		s.event("response.output_item.done", map[string]any{"type": "response.output_item.done", "output_index": fc.outIndex, "item": map[string]any{"type": "function_call", "id": fc.itemID, "call_id": fc.callID, "name": fc.name, "arguments": fc.args.String(), "status": "completed"}})
 	}
 	s.event("response.completed", map[string]any{
 		"type": "response.completed",
@@ -466,9 +533,29 @@ func chatStreamToResponses(w http.ResponseWriter, upstream *http.Response, onUsa
 			"model":       model,
 			"output":      []any{},
 			"output_text": outText.String(),
-			"usage":       map[string]any{"input_tokens": 0, "output_tokens": 0, "total_tokens": 0},
+			"usage":       responsesUsageFromChat(lastUsage),
 		},
 	})
+}
+
+// responsesUsageFromChat 将上游 chat 用法键名映射为 Responses 键名
+// (prompt_tokens→input_tokens、completion_tokens→output_tokens、total_tokens→total_tokens)。
+// 上游完全没回 usage 时才回退全 0(P1-12)。
+func responsesUsageFromChat(u map[string]any) map[string]any {
+	out := map[string]any{"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}
+	if len(u) == 0 {
+		return out
+	}
+	if v, ok := u["prompt_tokens"]; ok {
+		out["input_tokens"] = v
+	}
+	if v, ok := u["completion_tokens"]; ok {
+		out["output_tokens"] = v
+	}
+	if v, ok := u["total_tokens"]; ok {
+		out["total_tokens"] = v
+	}
+	return out
 }
 
 // ============ /v1/responses 入口 ============

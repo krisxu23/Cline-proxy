@@ -71,12 +71,10 @@ func handleZenChat(w http.ResponseWriter, r *http.Request, params map[string]any
 	usageFn := func(u map[string]any) {
 		// 镜像进请求轨迹(多协议字段名归一; 与 stats 记账互不影响)。
 		tracker.trace.ObserveUsage(u)
-		if pt, ok := u["prompt_tokens"].(float64); ok {
-			tracker.rec.CompletionTokens += int(pt) - tracker.rec.PromptTokens
-			if tracker.rec.CompletionTokens < 0 {
-				tracker.rec.CompletionTokens = 0
-			}
-		}
+		// completion_tokens 缺失时保持原值(P3-36): 旧实现先执行
+		// `CompletionTokens += int(pt) - PromptTokens` 兜底, 而差值是
+		// **prompt 的增量**、不是 completion 量 —— 输入一变长输出 token
+		// 就被虚高。这里只认 completion_tokens, 缺就保持 0/入站估算。
 		if ct, ok := u["completion_tokens"].(float64); ok {
 			tracker.rec.CompletionTokens = int(ct)
 		}
@@ -365,7 +363,23 @@ func callClineAPI(ctx context.Context, params map[string]any, stream bool) (*htt
 
 // accountUsageFn 构造账号 token 记账回调：从上游 usage 提取
 // prompt_tokens + completion_tokens，计入该账号今日/累计消耗。
+//
+// take-last 语义(P2-24): 流式上游会把**同一份累计** usage 在多个 chunk 里
+// 重复发送 —— stats 侧取最后一次(stats.go observeUsage 注释自认"重复调用取
+// 最后一次"), 而 recordAccountTokens 是 `+=` 累加, 逐 chunk 直接入账会按
+// chunk 数成倍放大 TokensToday/TokensTotal, 账户配额被虚假用量耗尽。
+// 闭包因此记录"本请求已入账的上一次值", 每次只补差额: 重复发送同一份累计
+// usage 时差额为 0(recordAccountTokens 对 <=0 直接忽略), 最终入账量恰等于
+// 最后一次 usage 的值, 与 stats 的 take-last 对齐; 非流式只调用一次,
+// 差额即全额, 行为与旧实现等价。
+// (注: 本函数有 4 个调用点, 其中 anthropic/responses/adapters 在本包修复
+// 清单之外的文件里, 无法改造成"收尾时 flush"的形态 —— 差额入账是等价且
+// 调用点零改动的实现。)
+//
+// params 估算兜底(上游未返回 usage 时按入站请求估算)同理只在"本请求尚无
+// 任何入账"时生效一次, 不再按 chunk 数重复兜底。
 func accountUsageFn(acc *Account, params map[string]any) func(map[string]any) {
+	var applied float64 // 本请求已入账的上一次 usage 合计(take-last 的差额基准)
 	return func(u map[string]any) {
 		var pt, ct float64
 		if v, ok := u["prompt_tokens"].(float64); ok {
@@ -374,12 +388,27 @@ func accountUsageFn(acc *Account, params map[string]any) func(map[string]any) {
 		if v, ok := u["completion_tokens"].(float64); ok {
 			ct = v
 		}
-		tokens := int64(pt + ct)
-		if tokens <= 0 && params != nil {
-			// 上游未返回 usage 时用入站请求估算兜底（与 zen 统计一致）
-			tokens = int64(estimateJSON(params))
+		cur := pt + ct
+		if cur <= 0 {
+			// 上游未返回 usage: 用入站请求估算兜底（与 zen 统计一致）——
+			// 只兜底一次, 已入过账就跳过。
+			if applied > 0 || params == nil {
+				return
+			}
+			est := float64(estimateJSON(params))
+			if est <= 0 {
+				return
+			}
+			recordAccountTokens(acc, int64(est))
+			applied = est
+			return
 		}
-		recordAccountTokens(acc, tokens)
+		// usage 是累计值: 只补与上次入账的差额(重复/回退的 chunk 差额 <=0,
+		// recordAccountTokens 直接忽略)。
+		if delta := int64(cur - applied); delta > 0 {
+			recordAccountTokens(acc, delta)
+			applied = cur
+		}
 	}
 }
 

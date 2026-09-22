@@ -344,9 +344,11 @@ func GeminiSSEToOpenAISSE(src io.Reader, dst io.Writer, model string) error {
 		}
 		message, finish := geminiCandidatesToOpenAI(frameCandidates(frame))
 		delta, _ := message["content"].(string)
-		if delta != "" || len(message["tool_calls"].([]any)) > 0 {
+		// 安全断言: 缺 tool_calls 键时不得 panic(纯文本流式帧很常见)。
+		tcs, hasTCs := message["tool_calls"].([]any)
+		if delta != "" || len(tcs) > 0 {
 			d := map[string]any{"content": delta}
-			if tcs, ok := message["tool_calls"].([]any); ok {
+			if hasTCs {
 				d["tool_calls"] = tcs
 			}
 			if err := writeChunk(map[string]any{"choices": []any{map[string]any{

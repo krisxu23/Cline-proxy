@@ -106,15 +106,24 @@ func decodeZenModels(resp *http.Response) (int, error) {
 	if err := json.NewDecoder(resp.Body).Decode(&payload); err != nil {
 		return 0, err
 	}
+	// 空目录不当作"成功同步": 既不做差量删除(上游结构变化/权限问题时, 一次
+	// 空响应不该把整个 synced 目录清空), 也不刷新缓存 SyncedAt —— 目录不可用
+	// 不配推进 7 天 TTL(P2-16)。
+	if len(payload.Data) == 0 {
+		log.Printf("  zen: 目录同步返回空列表, 保留现有模型与缓存时间戳")
+		return 0, nil
+	}
 
 	zenModelsMu.Lock()
 	defer zenModelsMu.Unlock()
 	added := 0
+	present := make(map[string]bool, len(payload.Data))
 	for _, item := range payload.Data {
 		id := item.ID
 		if id == "" {
 			continue
 		}
+		present[id] = true
 		if _, ok := zenModels[id]; ok {
 			continue
 		}
@@ -131,9 +140,26 @@ func decodeZenModels(resp *http.Response) (int, error) {
 		}
 		added++
 	}
-	if added > 0 {
-		saveZenModelsCacheLocked()
+	// 差量删除(P2-16): 本次全量目录里已经没有的 synced 条目视为上游下架,
+	// 从内存目录里摘除 —— 否则模型目录只增不删, 死模型跨重启永久驻留, 上游
+	// 对其回 400/404 时不计健康门(只记 5xx), 每次请求白走全链路后报错。
+	// 只动 synced 来源: seed 条目归目录初始化管, 不由上游目录决定。
+	removed := 0
+	for id, m := range zenModels {
+		if m == nil || m.Source != "synced" {
+			continue
+		}
+		if present[id] {
+			continue
+		}
+		delete(zenModels, id)
+		removed++
 	}
+	if removed > 0 {
+		log.Printf("  zen: 目录同步摘除 %d 个已下架的模型", removed)
+	}
+	// 真正成功同步且目录可用 → 刷新 SyncedAt 并重写缓存(含上面的差量删除)。
+	saveZenModelsCacheSyncedLocked()
 	return added, nil
 }
 

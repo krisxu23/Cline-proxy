@@ -25,6 +25,11 @@ const (
 	classRateLimit   = "rateLimit"
 	classTimeout     = "timeout"
 	classServerError = "serverError"
+	// classClientError 未匹配的其它 4xx(400/413/422…): 客户端侧坏请求,
+	// 既不是上游 5xx, 也不该记成模型硬失败(P2-9)。单独成类:
+	// 冷却类别正确, 且 routing_dispatch 的模型可用性门只认 serverError/empty,
+	// 于是"4xx 不计"的承诺不再被兜底分类击穿。
+	classClientError = "clientError"
 	classEmpty       = "empty"
 	classNotFound    = "notFound"
 	classForbidden   = "forbidden"
@@ -38,6 +43,7 @@ var defaultCooldownMs = map[string]int64{
 	classRateLimit:   10 * 60 * 1000,
 	classTimeout:     5 * 60 * 1000,
 	classServerError: 2 * 60 * 1000,
+	classClientError: 2 * 60 * 1000, // 客户端坏请求: 短冷却, 与 serverError 同档
 	classEmpty:       5 * 60 * 1000,
 	classNotFound:    60 * 60 * 1000,
 	classForbidden:   60 * 60 * 1000,
@@ -216,11 +222,16 @@ func candidateSkipReason(upstream, model string) string {
 }
 
 // clearExpiredCandidateCooldowns 清掉已过期的冷却项, 避免 map 无限增长。
+// 半开探测态(probing)的到期项**不删**: 升级计数依赖该条目存活
+// (markCandidateCooldown 读 prev.probing/prev.probeFails 做翻倍), janitor
+// 提前删掉会让"一直坏"的候选每次都被当成首次失败, 永远享受 1× 最短冷却、
+// 翻倍状态机被打漏(P3-2)。probing 项交给 markCandidateSuccess /
+// 下次失败覆盖 / resetCandidateState 收口。
 func clearExpiredCandidateCooldowns() {
 	now := time.Now().UnixMilli()
 	candidateCoolMu.Lock()
 	for k, c := range candidateCools {
-		if c.until <= now {
+		if c.until <= now && !c.probing {
 			delete(candidateCools, k)
 		}
 	}
@@ -289,7 +300,8 @@ func resetCandidateState() {
 //
 // status = 0 表示连接层失败(超时/中断), 归入 timeout。
 // 400 一般不因冷却而好转, 但若解析出永久性拒绝(无免费层/已下架/非 chat)
-// 就直接永久剔除, 否则按 serverError 短冷却一次。
+// 就直接永久剔除, 否则按 clientError 短冷却一次 —— 未匹配 4xx 是客户端侧
+// 坏请求, 归 serverError 会被模型可用性门当成上游硬失败(P2-9)。
 func classifyCandidateFailure(status int, body []byte) (string, string) {
 	bodyStr := string(body)
 	var payload map[string]any
@@ -335,6 +347,11 @@ func classifyCandidateFailure(status int, body []byte) (string, string) {
 		return classForbidden, reason
 	case status >= 500:
 		return classServerError, reason
+	case status >= 400:
+		// 未匹配的其它 4xx(400/413/422…): 客户端侧坏请求。既不能顶着
+		// serverError 的名义被记成模型硬失败(健康模型会被坏请求摘除约
+		// 30 分钟), 冷却类别本身也该如实反映(P2-9)。
+		return classClientError, reason
 	}
 	return classServerError, reason
 }
@@ -395,6 +412,14 @@ func recordKeyResult(provider, key string, status int, netErr bool) {
 		m[key] = st
 	}
 	if fail {
+		// 降级窗口已过期: 先把失败计数清零再计数(P3-3)。否则曾被降级的 key
+		// 带着累计值(≥5)跨过 5 分钟窗口, 再遇到**一次**偶发失败就立刻重新降级
+		// —— 与"连续 N 次失败才降级"的设计语义不符, 抖动期多 key 池会被
+		// 雪崩式逐个排空。清零后需要重新累计满 keyFailThreshold 才再次降级。
+		if st.demotedAt > 0 && time.Now().UnixMilli()-st.demotedAt >= keyCooldownMs {
+			st.failures = 0
+			st.demotedAt = 0
+		}
 		st.failures++
 		if st.failures >= keyFailThreshold {
 			st.demotedAt = time.Now().UnixMilli()

@@ -510,7 +510,14 @@ func synthesizeChatJSONResponse(body []byte) *http.Response {
 	}
 }
 
-func synthesizeChatSSEResponse(pipeReader io.Reader) *http.Response {
+// synthesizeChatSSEResponse 合成 SSE 形态的 http.Response。
+//
+// Body 必须直接用 *io.PipeReader(它自带有效 Close): 此前包了一层
+// io.NopCloser, Close() 是空操作, 调用方的 defer resp.Body.Close() 全部失效 ——
+// 客户端断流后写侧 io.Pipe 同步写永久阻塞, 转换 goroutine 与上游连接每次断流
+// 各泄漏一条, 上游 resp.Body 永远不关(P1-2)。消费方 Close 后写侧收到
+// ErrClosedPipe, goroutine 关掉上游 body 即退出。
+func synthesizeChatSSEResponse(pipeReader *io.PipeReader) *http.Response {
 	hdr := http.Header{}
 	hdr.Set("Content-Type", "text/event-stream")
 	hdr.Set("Cache-Control", "no-cache")
@@ -519,7 +526,7 @@ func synthesizeChatSSEResponse(pipeReader io.Reader) *http.Response {
 		Status:     "200 OK",
 		Proto:      "HTTP/1.1", ProtoMajor: 1, ProtoMinor: 1,
 		Header: hdr,
-		Body:   io.NopCloser(pipeReader),
+		Body:   pipeReader,
 	}
 }
 

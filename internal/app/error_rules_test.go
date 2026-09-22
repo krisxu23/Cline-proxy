@@ -36,8 +36,11 @@ func TestMatchErrorRulesGeoBlock(t *testing.T) {
 	}
 }
 
-// 上下文超限信号集补全: 参考 CONTEXT_OVERFLOW_SIGNALS 的常见措辞都要命中 permanent,
-// 不能落成 generic serverError 短冷却让用户反复撞墙。
+// 上下文超限信号集补全(P1-3): 参考 CONTEXT_OVERFLOW_SIGNALS 的常见措辞都要命中
+// **专属规则名**(面板能看出是超限, 而非笼统的 5xx), 但类别必须是短冷却
+// classServerError —— 最常见成因是用户这轮 prompt/上下文本身超长(用户输入问题,
+// 与上游健康无关); 规则表先于状态码 switch、任意状态码都命中, 判 classPermanent
+// 会让一条超长 prompt 把整个 upstream:model 对**所有用户**停服 24 小时。
 func TestMatchErrorRulesContextOverflow(t *testing.T) {
 	signals := []string{
 		"context overflow",
@@ -55,9 +58,16 @@ func TestMatchErrorRulesContextOverflow(t *testing.T) {
 	}
 	for _, sig := range signals {
 		body := `{"error":{"message":"` + sig + `"}}`
-		class, _ := matchErrorRules(body)
-		if class != classPermanent {
-			t.Errorf("上下文超限信号 %q 应归 permanent, got %q", sig, class)
+		class, note := matchErrorRules(body)
+		if class != classServerError {
+			t.Errorf("上下文超限信号 %q 应归 serverError(短冷却), got %q", sig, class)
+		}
+		// 绝不能判 permanent: 那是 24h 停服的类别(P1-3 核心断言)
+		if class == classPermanent {
+			t.Errorf("上下文超限信号 %q 不得归 permanent(24h 剔除), got %q", sig, class)
+		}
+		if !strings.Contains(note, "上下文超限") {
+			t.Errorf("原因串应带专属规则名, got %q", note)
 		}
 	}
 	// 不相关正文不命中

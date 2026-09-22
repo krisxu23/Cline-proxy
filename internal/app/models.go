@@ -243,10 +243,20 @@ func getDefaultModel() string {
 	if m, ok := modelsCache[defaultModel]; ok && m.Status == ModelActive {
 		return defaultModel
 	}
+	// 兜底不能随机: Go map 遍历顺序随机, 同一缓存下每次可能返回不同模型,
+	// 默认选路/日志不可复现。modelsCache 没有稳定顺序字段, 按 ID 取最小的
+	// active(单趟最小值, 不引入每次全量排序的开销)。
+	first := ""
 	for _, m := range modelsCache {
-		if m.Status == ModelActive {
-			return m.ID
+		if m.Status != ModelActive {
+			continue
 		}
+		if first == "" || m.ID < first {
+			first = m.ID
+		}
+	}
+	if first != "" {
+		return first
 	}
 	return defaultModel
 }

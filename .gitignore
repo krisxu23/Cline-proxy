@@ -16,10 +16,18 @@
 *.out
 
 # Local data (根目录下的数据文件; data/ 整目录忽略)
+# 注意: ResolveDataPath 兼容历史根目录存放(internal/kit/data.go), 所以这些
+# 敏感/数据文件也可能直接落在仓库根 —— 条目一律前导斜杠锚定(理由见文件头)。
 /data/
 /.cline-accounts.json
 /.cline-credentials.json
+/.clinepass-keys.json
 /.zen-config.json
+/.proxy-config.json
+/subs_cache.json
+/usage-ledger.json
+/admin-token
+/requests*.jsonl
 /zen-stats.jsonl
 /cline-proxy.log
 /cline-proxy-stream.log

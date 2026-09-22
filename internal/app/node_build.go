@@ -47,8 +47,13 @@ type nodeBuildItem struct {
 //
 // 端口分配两轮: 先复用稳定记录(订阅更新端口不漂移), 再顺序扫描补齐。
 // 顺序分配 + 构建内 used 集合保证同批端口绝对唯一 —— 旧随机分配在
-// 4269 次选择里按生日悖论必然自撞(实测每次重建都死在随机的某个 inbound)。
-func buildNodeParts(entries []any) (ports map[string]int, inbounds, outbounds, rules []map[string]any, hasMap bool) {
+// 4269 次选择里按生日悖论必然自撞(实测每次重建都死在某个 inbound)。
+//
+// 返回值含 endpoints(key -> 上游服务器 host:port): 构建阶段**不再直接写**
+// 全局端点表 —— 成败判定在调用方 syncNodeBox 的替换分支, 失败走 failKeepOld
+// 保留旧实例时, 端点表必须跟着旧实例保持不动(P3-6)。原 hasMap 返回值移由
+// 调用方自行判定(entries 里是否含 map 条目)。
+func buildNodeParts(entries []any) (ports map[string]int, inbounds, outbounds, rules []map[string]any, endpoints map[string]string) {
 	ports = map[string]int{}
 	// 阶段 A: 按 key 去重 + 解析 + 校验(同一节点可能在多个订阅源重复出现,
 	// 稳定端口下重复条目 = 同端口两个 inbound, 必须收敛)。
@@ -102,7 +107,6 @@ func buildNodeParts(entries []any) (ports map[string]int, inbounds, outbounds, r
 				log.Printf("  node %d(%s): 命中排除关键词已跳过", i+1, name)
 				continue
 			}
-			hasMap = true
 			cp := map[string]any{"tag": fmt.Sprintf("out-%d", i)}
 			for k, val := range v {
 				if k != "tag" {
@@ -149,7 +153,7 @@ func buildNodeParts(entries []any) (ports map[string]int, inbounds, outbounds, r
 	persistNodeStablePorts()
 
 	n := 0
-	endpoints := make(map[string]string, len(items))
+	endpoints = make(map[string]string, len(items)) // 命名返回值, 不用 := 遮蔽
 	for _, it := range items {
 		if it.port == 0 {
 			continue
@@ -164,14 +168,14 @@ func buildNodeParts(entries []any) (ports map[string]int, inbounds, outbounds, r
 			"action": "route", "inbound": []string{fmt.Sprintf("in-%d", n)}, "outbound": tag,
 		})
 		ports[it.key] = it.port
-		// 顺手记下该节点对应的上游服务器, 供健康检测按服务器分组(见 nodeRemoteEndpoints)。
+		// 顺手记下该节点对应的上游服务器, 供健康检测按服务器分组(见 nodeRemoteEndpoints);
+		// 由调用方在实例启动成功后与 nodePorts 一起同步写入全局表(P3-6)。
 		if hp := outboundHostPort(it.ob); hp != "" {
 			endpoints[it.key] = hp
 		}
 		n++
 	}
-	setNodeRemoteEndpoints(endpoints)
-	return ports, inbounds, outbounds, rules, hasMap
+	return ports, inbounds, outbounds, rules, endpoints
 }
 
 // portsFromItems 收集已分配端口(key -> port), 供稳定表批量落盘。

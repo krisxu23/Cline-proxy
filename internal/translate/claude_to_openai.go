@@ -103,6 +103,17 @@ func addNums(a, b any) int {
 	return sum
 }
 
+// claudeUsageToOpenAI Anthropic usage(input_tokens/output_tokens) → OpenAI
+// usage(prompt_tokens/completion_tokens/total_tokens)。Anthropic 的键名原样透传
+// 会让 OpenAI 客户端读不到任何 token 数, 必须映射后再投递。
+func claudeUsageToOpenAI(u map[string]any) map[string]any {
+	return map[string]any{
+		"prompt_tokens":     u["input_tokens"],
+		"completion_tokens": u["output_tokens"],
+		"total_tokens":      addNums(u["input_tokens"], u["output_tokens"]),
+	}
+}
+
 // ClaudeSSEToOpenAISSE 流式: Anthropic Messages SSE → chat completions SSE。
 // 事件覆盖: message_start, content_block_start(tool_use 声明),
 // content_block_delta(text_delta/input_json_delta/thinking_delta),
@@ -172,10 +183,17 @@ func ClaudeSSEToOpenAISSE(src io.Reader, dst io.Writer, model string) error {
 					return err
 				}
 			}
-			// message_start.usage → prompt_tokens(经 onUsage 由调用方取, 这里透传)
+			// message_start.usage → 输入侧 token: 必须真正投递一帧 usage
+			// (此前只拷进局部 ev、从不写出, 输入 token 永不到端), 键名同步映射
+			// 为 OpenAI 形态。
 			if u, ok := ev["message"].(map[string]any); ok {
 				if uu, ok := u["usage"].(map[string]any); ok {
-					ev["usage"] = uu
+					if err := writeChunk(map[string]any{
+						"choices": []any{},
+						"usage":   claudeUsageToOpenAI(uu),
+					}); err != nil {
+						return err
+					}
 				}
 			}
 		case "content_block_start":
@@ -228,11 +246,17 @@ func ClaudeSSEToOpenAISSE(src io.Reader, dst io.Writer, model string) error {
 				finish = "tool_calls"
 			}
 			sawStop = true
+			// usage 键名必须映射为 OpenAI 形态, 原样透传 Anthropic 键名
+			// (output_tokens)会让客户端读不到任何 token 数。
+			var usageOut any
+			if u, ok := ev["usage"].(map[string]any); ok {
+				usageOut = claudeUsageToOpenAI(u)
+			}
 			if err := writeChunk(map[string]any{
 				"choices": []any{map[string]any{
 					"index": 0, "delta": map[string]any{}, "finish_reason": finish,
 				}},
-				"usage": ev["usage"],
+				"usage": usageOut,
 			}); err != nil {
 				return err
 			}

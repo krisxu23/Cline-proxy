@@ -2,8 +2,10 @@ package main
 
 import (
 	"cline-go-proxy/internal/app"
+	"encoding/json"
 	"flag"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
 	"os"
@@ -83,14 +85,19 @@ func main() {
 // runDesktop 桌面模式主流程: 后台起服务 → 打开管理窗口 → 托盘阻塞。
 func runDesktop(host string, port int) {
 	adminURL := adminPanelURL(port)
+	// errCh 只会收到一次(StartProxy 只返回一次), 必须保证只被消费一次:
+	// 之前两段 select 各 <-errCh, 第一段取走后第二段的 goroutine 会永久阻塞,
+	// 靠进程退出掩盖(P3-13)。consumed 标记保证二次监听只在未被取走时挂上。
 	errCh := make(chan error, 1)
 	go func() { errCh <- app.StartProxy(host, port) }()
 
+	consumed := false
 	select {
 	case err := <-errCh:
 		// 1.2s 内就拿到结果: 服务起不来且没有其他实例在跑, 直接弹窗报错;
 		// 否则(成功, 或端口被已有实例占用)继续往下走正常进入流程。
-		if err != nil && !isServiceAlive(adminPanelBase(port)) {
+		consumed = true
+		if err != nil && !isServiceAlive(adminHealthBase(port)) {
 			msgboxFail(err)
 			return
 		}
@@ -100,11 +107,14 @@ func runDesktop(host string, port int) {
 	// 要数秒), 那时窗口已开、errCh 也没人读, 错误会被静默吞掉——而 GUI 无控制台,
 	// 用户什么都看不到。这里一直监听, 收到非 nil 错误且当前没有其他实例在跑,
 	// 就弹窗告知。成功(nil)或端口被已有实例占用则忽略。
-	go func() {
-		if err := <-errCh; err != nil && !isServiceAlive(adminPanelBase(port)) {
-			msgboxFail(err)
-		}
-	}()
+	// 仅在第一段没消费掉 errCh 时才挂: 否则这个 <-errCh 永远等不到第二次发送。
+	if !consumed {
+		go func() {
+			if err := <-errCh; err != nil && !isServiceAlive(adminHealthBase(port)) {
+				msgboxFail(err)
+			}
+		}()
+	}
 	go app.OpenAdminWindow(adminURL)
 	app.RunTray(adminURL)
 }
@@ -113,20 +123,32 @@ func runDesktop(host string, port int) {
 // 不带令牌打开只会看到 401, 所以托盘与横幅统一开带令牌的地址。
 func adminPanelURL(port int) string { return app.AdminPanelURL(port) }
 
-// adminPanelBase 不带令牌的面板地址, 仅用于探测已有实例是否存活。
-func adminPanelBase(port int) string {
-	return fmt.Sprintf("http://127.0.0.1:%d/admin/", port)
+// adminHealthBase 健康端点地址, 仅用于探测已有实例是否真正可用。
+func adminHealthBase(port int) string {
+	return fmt.Sprintf("http://127.0.0.1:%d/health", port)
 }
 
-// isServiceAlive 探测管理入口是否已有实例在响应。
-func isServiceAlive(adminURL string) bool {
+// isServiceAlive 探测已有实例是否真的在正常服务。
+//
+// 之前打 /admin/ 只判 200: 未登录的令牌提示页恒 200(admin.go), 半启动 /
+// 配置错误的实例同样会被判成"活着", 探活形同虚设(P3-14)。改为打 /health
+// 并校验响应 JSON 里带预期标识 version 字段(见 proxy.go healthInfo)。
+func isServiceAlive(healthURL string) bool {
 	client := &http.Client{Timeout: 2 * time.Second}
-	resp, err := client.Get(adminURL)
+	resp, err := client.Get(healthURL)
 	if err != nil {
 		return false
 	}
-	resp.Body.Close()
-	return true
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return false
+	}
+	var payload map[string]any
+	if err := json.NewDecoder(io.LimitReader(resp.Body, 1<<20)).Decode(&payload); err != nil {
+		return false
+	}
+	_, ok := payload["version"]
+	return ok
 }
 
 func buildAndStart(host string, port int) {

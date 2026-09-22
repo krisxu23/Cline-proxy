@@ -167,7 +167,8 @@ func renderAdminTokenPrompt(mismatch bool, retain string) string {
 
 func adminStaticHandler(w http.ResponseWriter, r *http.Request) {
 	if r.URL.Path == "/admin/" || r.URL.Path == "/admin" {
-		// 校验令牌: 支持 ?token= 或已种下的会话 Cookie。面板 HTML 本身不含任何
+		// 校验令牌: 支持 ?token= 的一次性 exchange(校验通过 → 种 Cookie → 302
+		// 到不含 query 的地址, 见下方 switch)或已种下的会话 Cookie。面板 HTML 本身不含任何
 		// 凭据, 但此前对**任何**本地进程都返回完整 121KB 外壳(含全部前端 JS),
 		// 同机多账号共享场景下等于把管理界面裸暴露。现在改为: 没令牌只回一个
 		// 几百字节的「请附带令牌」提示页, 带令牌才回完整外壳。
@@ -175,27 +176,36 @@ func adminStaticHandler(w http.ResponseWriter, r *http.Request) {
 		var provided string
 		var mismatch bool
 		if token := loadOrCreateAdminToken(); token != "" {
-			if provided = adminTokenFrom(r); provided != "" {
-				if tokenEqual(provided, token) {
-					ok = true
-					// 令牌来自查询参数时种下会话 Cookie, 后续同源请求自动携带。
-					// Max-Age 必设(见 adminCookieMaxAge 注释): 会话级 Cookie 随浏览器
-					// 关闭失效, 用户重开浏览器就会撞上提示页。
-					if strings.TrimSpace(r.URL.Query().Get("token")) != "" {
-						http.SetCookie(w, &http.Cookie{
-							Name:     adminTokenCookie,
-							Value:    token,
-							Path:     "/",
-							MaxAge:   adminCookieMaxAge,
-							HttpOnly: true,
-							SameSite: http.SameSiteStrictMode,
-						})
-					}
-				} else {
-					// 带了令牌但校验没过: 不是"没令牌", 要明确告诉用户令牌无效并回填输入,
-					// 别让他重新手抄一遍(见 renderAdminTokenPrompt)。
-					mismatch = true
+			// adminTokenFrom 只认头/Authorization/Cookie, 不再认 query(P1-6)。
+			provided = adminTokenFrom(r)
+			q := strings.TrimSpace(r.URL.Query().Get("token"))
+			switch {
+			case provided != "" && tokenEqual(provided, token):
+				// 已有有效会话: ?token= 一律不认(一次性 exchange 已经结束),
+				// 坏 query 也不会把已登录用户踢回提示页。
+				ok = true
+			case q != "" && tokenEqual(q, token):
+				// 一次性 exchange(P1-6): 校验通过 → 种会话 Cookie → 302 跳到
+				// 不含 query 的路径, 令牌不再留在地址栏/浏览器历史/Referer 里。
+				// Max-Age 必设(见 adminCookieMaxAge 注释): 会话级 Cookie 随浏览器
+				// 关闭失效, 用户重开浏览器就会撞上提示页。
+				http.SetCookie(w, &http.Cookie{
+					Name:     adminTokenCookie,
+					Value:    token,
+					Path:     "/",
+					MaxAge:   adminCookieMaxAge,
+					HttpOnly: true,
+					SameSite: http.SameSiteStrictMode,
+				})
+				http.Redirect(w, r, r.URL.Path, http.StatusFound)
+				return
+			case provided != "" || q != "":
+				// 带了令牌但校验没过: 不是"没令牌", 要明确告诉用户令牌无效并回填输入,
+				// 别让他重新手抄一遍(见 renderAdminTokenPrompt)。
+				if provided == "" {
+					provided = q
 				}
+				mismatch = true
 			}
 		}
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")

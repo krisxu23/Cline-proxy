@@ -133,13 +133,37 @@ func zenReasoningEffortOf(params map[string]any) string {
 	return ""
 }
 
+// zenEndpointUnsupported 回退失败是否表明「端点不支持该模型」。
+//
+// 只有两种证据算数: 404, 或正文里明确出现 not found / unsupported。其余状态
+// 都与端点支持无关 —— 401 是 key 问题、429 是额度问题、408 是超时、5xx 可能
+// 只是线路坏。负向 memo 是**进程内永久**的(zen_endpoints.go 每次查询都读),
+// 误记会让该模型整个进程生命周期不再回退, 正确的 zen-*-only.json 学习记录
+// 永远写不进去(P2-14)。
+func zenEndpointUnsupported(status int, body string) bool {
+	if status == http.StatusNotFound {
+		return true
+	}
+	lb := strings.ToLower(body)
+	return strings.Contains(lb, "not found") || strings.Contains(lb, "unsupported")
+}
+
 // tryZenResponsesFallback chat/completions 吃 500 时的自适应回退: 用同一出口、
 // 同一会话身份向 /responses 发一次等价请求。成功 -> 登记该模型为 Responses
 // 专用(持久化)并返回合成好的 chat 形态响应; 失败 -> 返回 nil, 调用方继续
 // 原有的换出口重试流程。
-func tryZenResponsesFallback(ctx context.Context, base string, respBody map[string]any, stream bool, client *http.Client, requestedBudget int) *http.Response {
+// key 为调用方按出口选好的那把(经 zenSelectKey: TrimSpace / 去重 / 跳过退役)。
+// 此前这里裸取 getZenConfig().Key: 主 key 退役时回退必然 401(连锁触发负向
+// memo), key 含空白还会拼出非法头 —— 回退静默失败且无线索(P2-15)。
+func tryZenResponsesFallback(ctx context.Context, base string, respBody map[string]any, stream bool, client *http.Client, key string, requestedBudget int) *http.Response {
 	modelID, _ := respBody["model"].(string)
 	if modelID == "" || zenChatOnlyKnown(modelID) {
+		return nil
+	}
+	// 一把可用 key 都没有: 不构造 "Bearer " 空头, 直接放弃回退(带着空头打过去
+	// 只会换回一个 401, 还可能被误记成端点不支持)。
+	if key == "" {
+		log.Printf("  zen: model %s 的 /responses 回退跳过(没有可用的 zen key)", modelID)
 		return nil
 	}
 	raw, err := json.Marshal(respBody)
@@ -153,7 +177,7 @@ func tryZenResponsesFallback(ctx context.Context, base string, respBody map[stri
 	outbound := map[string]string{}
 	// /responses 同样用官方 CLI 身份(ses_ 形态 session, 官方客户端无 UUID 分支)。
 	applyOpencodeHeaders(outbound, nil, defaultOpencodeIdentity(), bodyFingerprint(respBody))
-	req.Header.Set("Authorization", "Bearer "+getZenConfig().Key)
+	req.Header.Set("Authorization", "Bearer "+key)
 	req.Header.Set("Content-Type", "application/json")
 	for k, v := range outbound {
 		req.Header.Set(k, v)
@@ -167,9 +191,10 @@ func tryZenResponsesFallback(ctx context.Context, base string, respBody map[stri
 	if resp.StatusCode != http.StatusOK {
 		raw := kit.ReadBody(resp)
 		resp.Body.Close()
-		// 4xx 说明模型/端点层面明确不买账(而非出口线路问题), 进程内记住
-		// 不再对它回退; 5xx 可能只是这条线路坏, 不记。
-		if resp.StatusCode < 500 {
+		// 只对表明「端点不支持该模型」的失败记负向(404 / not found / unsupported);
+		// 401(key)、429(额度)、408 及其它 4xx 是瞬时/凭据问题, 与端点无关,
+		// 不落 memo 按正常错误返回; 5xx 可能只是这条线路坏, 同样不记(P2-14)。
+		if zenEndpointUnsupported(resp.StatusCode, raw) {
 			zenMemoChatOnly(modelID)
 		}
 		log.Printf("  zen: model %s 的 /responses 回退未命中(%d): %s", modelID, resp.StatusCode, kit.Truncate(raw, 200))

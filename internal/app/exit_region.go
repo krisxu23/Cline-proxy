@@ -331,6 +331,11 @@ func exitRegionSummary() []map[string]any {
 		stats[d.ID] = &stat{}
 	}
 	for _, item := range list {
+		// 健康/地区数据都按 nodeLocalKey(去 # 名称的规范化键)存储, 原始行
+		// (如 socks5://1.2.3.4:1080#我的节点)永远查不到 —— 手动代理会全落进
+		// other、ok 计数恒 0(P3-4)。入列前统一规范化; nodeExitRegion/healthOf
+		// 的匹配逻辑本就按规范化键工作, 对它同样成立。
+		item = nodeLocalKey(item)
 		st := stats[nodeExitRegion(item)]
 		if st == nil {
 			continue

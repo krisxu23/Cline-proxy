@@ -20,7 +20,13 @@ import (
 	"bufio"
 	"bytes"
 	"io"
+	"time"
 )
+
+// probeBufMaxBytes 探测阶段回放缓冲 buf 的字节上限(P1-1)。
+// 上游持续发 ping/heartbeat 但迟迟不发首个真实事件时, buf 会随心跳无限
+// 增长 → 内存无上界。超过上限即判探测失败(走空流换站)。
+const probeBufMaxBytes = 1 << 20
 
 // prefixedBody 把探测阶段已消费的前缀与续读句柄合回一个响应体;
 // Close 透传到最底层(避免上游连接泄漏)。
@@ -63,6 +69,10 @@ func probeStreamFirstEvent(body io.ReadCloser) (bool, io.ReadCloser, string) {
 
 	st := &streamReadinessState{}
 	var buf bytes.Buffer
+	// 整体 deadline(P1-1): 下面的 idle 只约束**单次** read, 上游每隔一小段
+	// 时间就发一个心跳(间隔 < idle 上限)但不发真实事件时, 循环会永远转下去
+	// → 客户端无限挂起。探测阶段另设总时限, 到点即判空流换下一站。
+	deadline := time.Now().Add(streamIdleTimeout())
 	for {
 		line, err := br.ReadString('\n')
 		buf.WriteString(line)
@@ -79,6 +89,19 @@ func probeStreamFirstEvent(body io.ReadCloser) (bool, io.ReadCloser, string) {
 		if err != nil {
 			// EOF(或空闲超时)前都没读到有效事件: 视作空流, 换下一站
 			// 先冲刷残留的 pendingLine，处理最后一个不完整帧
+			if finishStreamReadinessSignal(st) {
+				return false, &prefixedBody{
+					prefix: bytes.NewReader(buf.Bytes()),
+					rest:   br,
+					closer: idle,
+				}, st.upstreamDiagnostic
+			}
+			return true, nil, st.upstreamDiagnostic
+		}
+		// 总时限 / 缓冲上限(P1-1): 任一超限即判探测失败(走空流换站)。
+		// 超限时同样先冲刷 pendingLine —— 已经读到手的完整事件不能丢,
+		// 字节回放语义(routing_dispatch 依赖)与 EOF 路径保持一致。
+		if time.Now().After(deadline) || buf.Len() > probeBufMaxBytes {
 			if finishStreamReadinessSignal(st) {
 				return false, &prefixedBody{
 					prefix: bytes.NewReader(buf.Bytes()),

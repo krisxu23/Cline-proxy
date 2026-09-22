@@ -135,7 +135,8 @@ func adminAuth(next http.HandlerFunc) http.HandlerFunc {
 	}
 }
 
-// adminTokenFrom 从请求里取出待校验的令牌, 支持头/Authorization/Cookie/查询参数。
+// adminTokenFrom 从请求里取出待校验的令牌, 只支持头/Authorization/Cookie。
+// 查询参数不在这里认(见函数末尾注释, P1-6)。
 func adminTokenFrom(r *http.Request) string {
 	if v := strings.TrimSpace(r.Header.Get("X-Admin-Token")); v != "" {
 		return v
@@ -146,8 +147,10 @@ func adminTokenFrom(r *http.Request) string {
 	if c, err := r.Cookie(adminTokenCookie); err == nil && c.Value != "" {
 		return c.Value
 	}
-	// ?token= 只用于"首次打开面板"引导, 校验通过后即改走 Cookie。
-	return strings.TrimSpace(r.URL.Query().Get("token"))
+	// ?token= 不在这里认: 它只在 /admin/ 页面的一次性 exchange 里生效
+	// (见 adminStaticHandler: 校验通过 → 种 Cookie → 302 到不含 query 的地址),
+	// API 一律走头/Authorization/Cookie, 避免令牌经 query 进入历史/Referer(P1-6)。
+	return ""
 }
 
 // tokenEqual 定长比较, 避免按字节短路泄露令牌前缀。
@@ -158,7 +161,14 @@ func tokenEqual(a, b string) bool {
 // originAllowed 判断浏览器跨站来源是否可信。
 //
 // 没有 Origin 头 = 非浏览器客户端(curl / SDK / 面板同源的简单 GET), 放行;
-// 带 Origin 就必须是本机或私网 —— 公网页面来这里拿数据正是要挡的场景。
+// 带 Origin 分两层判:
+//  1. 同源: Origin 的 host[:port] 与本请求 Host 全等 —— 面板自身页面发出的
+//     请求都走这条, 后面的端口校验不会把面板自己打挂。
+//  2. 跨源: hostname 仍须是本机/私网(公网页面来这里拿数据是要挡的场景),
+//     且**端口必须等于面板监听端口**(P1-5)。旧实现只看 hostname 完全
+//     不比端口: 同机其它端口上的攻击页面与面板同 site, admin_token
+//     Cookie(SameSite=Strict)会被浏览器一并带上, no-cors POST 就能静默
+//     打穿 delete-all / refresh-all / generateKey 这类状态变更端点。
 func originAllowed(r *http.Request) bool {
 	origin := r.Header.Get("Origin")
 	if origin == "" {
@@ -168,16 +178,84 @@ func originAllowed(r *http.Request) bool {
 	if err != nil || u.Host == "" {
 		return false
 	}
-	host := u.Hostname()
-	if strings.EqualFold(host, "localhost") {
+	// 同源请求(host+port 全等, 大小写不敏感): 面板页面自身的 fetch。
+	if sameAuthority(u.Host, r.Host, u.Scheme) {
 		return true
 	}
-	ip := net.ParseIP(host)
-	if ip == nil {
-		// 形如 evil.com 的公网域名一律拒绝。
+	host := u.Hostname()
+	if !strings.EqualFold(host, "localhost") {
+		ip := net.ParseIP(host)
+		if ip == nil {
+			// 形如 evil.com 的公网域名一律拒绝。
+			return false
+		}
+		if !(ip.IsLoopback() || ip.IsPrivate()) {
+			return false
+		}
+	}
+	// 跨源放行还要求端口与面板一致。
+	return authorityPort(u.Host, u.Scheme) == panelPort(r)
+}
+
+// sameAuthority 判断 Origin 的 authority 与请求 Host 是否同源(host+port 全等)。
+// 任一侧省略端口按该 scheme 的默认端口(http 80 / https 443)补齐再比。
+func sameAuthority(originHost, reqHost, scheme string) bool {
+	oh, rh := strings.ToLower(strings.TrimSpace(originHost)), strings.ToLower(strings.TrimSpace(reqHost))
+	if oh == rh {
+		return true
+	}
+	ohn, op := splitAuthority(oh)
+	rhn, rp := splitAuthority(rh)
+	if ohn != rhn {
 		return false
 	}
-	return ip.IsLoopback() || ip.IsPrivate()
+	if op == "" {
+		op = defaultPort(scheme)
+	}
+	if rp == "" {
+		rp = defaultPort(scheme)
+	}
+	return op == rp
+}
+
+// splitAuthority 拆 host[:port]; 不含端口时 port 返回空串(不报错)。
+// 处理 [::1]:8000 带方括号的 IPv6 形式。
+func splitAuthority(hostport string) (host, port string) {
+	if h, p, err := net.SplitHostPort(hostport); err == nil {
+		return h, p
+	}
+	return strings.Trim(hostport, "[]"), ""
+}
+
+// defaultPort scheme 的默认端口; 不认识的 scheme 返回空串。
+func defaultPort(scheme string) string {
+	switch strings.ToLower(scheme) {
+	case "http":
+		return "80"
+	case "https":
+		return "443"
+	}
+	return ""
+}
+
+// authorityPort authority 的端口, 省略时按 scheme 补默认端口。
+func authorityPort(hostport, scheme string) string {
+	if _, p := splitAuthority(hostport); p != "" {
+		return p
+	}
+	return defaultPort(scheme)
+}
+
+// panelPort 面板实际监听端口: 优先取本请求 Host 里的端口(浏览器发来的
+// host:port), Host 没带端口(默认端口/测试桩)时退回全局监听地址。
+func panelPort(r *http.Request) string {
+	if _, p := splitAuthority(r.Host); p != "" {
+		return p
+	}
+	if _, p := splitAuthority(proxyListenAddress); p != "" {
+		return p
+	}
+	return ""
 }
 
 // wrapAdminTokenURL 把令牌拼进面板地址, 供启动横幅与托盘一键打开。

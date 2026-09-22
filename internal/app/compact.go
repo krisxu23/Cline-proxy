@@ -69,6 +69,49 @@ var (
 	compactStatesMu sync.Mutex
 )
 
+const (
+	// maxCompactStates 条目总数上限。key 来自客户端可控的 header/body, 无上限时
+	// 每请求换一个伪造 session id 即可让 map 在 24h 内线性膨胀(每条含 summary+
+	// recent 文本), 故必须封顶, 超限按 updated 淘汰最旧(LRU)。
+	maxCompactStates = 1024
+	// compactSessionIDMaxLen session key 长度上限(UUID 36 / ses_ 前缀均远小于此)。
+	compactSessionIDMaxLen = 128
+)
+
+// validCompactSessionID 校验 session key 格式: 只接受有限长度的
+// [A-Za-z0-9_-](UUID / ses_xxx / 客户端短 id 形态)。不合法一律当作
+// "无 session", 不建条目 —— key 直接来自客户端, 不校验则任意字符串都能成为 map 键。
+func validCompactSessionID(sid string) bool {
+	if sid == "" || len(sid) > compactSessionIDMaxLen {
+		return false
+	}
+	for i := 0; i < len(sid); i++ {
+		c := sid[i]
+		if !(c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c >= '0' && c <= '9' || c == '_' || c == '-') {
+			return false
+		}
+	}
+	return true
+}
+
+// evictCompactStatesLocked 把条目数压回上限内, 按 updated 淘汰最旧。
+// 调用方必须已持有 compactStatesMu(避免引入 map race)。
+func evictCompactStatesLocked() {
+	for len(compactStates) > maxCompactStates {
+		oldestKey := ""
+		var oldest time.Time
+		for k, v := range compactStates {
+			if oldestKey == "" || v.updated.Before(oldest) {
+				oldestKey, oldest = k, v.updated
+			}
+		}
+		if oldestKey == "" {
+			return
+		}
+		delete(compactStates, oldestKey)
+	}
+}
+
 // ============ 消息序列化(官方 serialize 移植) ============
 
 func strField(m map[string]any, key string) string {
@@ -278,7 +321,7 @@ func estimateJSON(v any) int {
 // ============ 会话状态 ============
 
 func loadCompactState(sessionID string) *compactState {
-	if sessionID == "" {
+	if !validCompactSessionID(sessionID) {
 		return nil
 	}
 	compactStatesMu.Lock()
@@ -289,11 +332,12 @@ func loadCompactState(sessionID string) *compactState {
 	}
 	st = &compactState{}
 	compactStates[sessionID] = st
+	evictCompactStatesLocked()
 	return st
 }
 
 func updateCompactState(sessionID string, summary, recent string) {
-	if sessionID == "" {
+	if !validCompactSessionID(sessionID) {
 		return
 	}
 	compactStatesMu.Lock()
@@ -303,6 +347,7 @@ func updateCompactState(sessionID string, summary, recent string) {
 		recent:  recent,
 		updated: time.Now(),
 	}
+	evictCompactStatesLocked()
 }
 
 func cleanupCompactStates() {
@@ -327,10 +372,11 @@ func cleanupCompactStates() {
 }
 
 func requestSessionID(r map[string]any, hdr http.Header) string {
-	if sid := hdr.Get("x-opencode-session"); sid != "" {
+	// key 直接来自客户端可控的 header/body: 格式不合法一律当作"无 session"。
+	if sid := hdr.Get("x-opencode-session"); validCompactSessionID(sid) {
 		return sid
 	}
-	if sid := strField(r, "session_id"); sid != "" {
+	if sid := strField(r, "session_id"); validCompactSessionID(sid) {
 		return sid
 	}
 	return ""

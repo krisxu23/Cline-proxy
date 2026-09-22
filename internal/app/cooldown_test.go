@@ -21,7 +21,11 @@ func TestClassifyCandidateFailure(t *testing.T) {
 		{"500 上游错误", 500, `{"error":{"message":"boom"}}`, classServerError},
 		{"503 上游不可用", 503, `{"error":{"message":"unavailable"}}`, classServerError},
 		{"连接层失败", 0, ``, classTimeout},
-		{"400 普通错误", 400, `{"error":{"message":"bad request"}}`, classServerError},
+		// 未匹配的 4xx 是客户端侧坏请求: 归 clientError 而非 serverError, 否则会被
+		// 模型可用性门当成上游硬失败, 健康模型被坏请求摘除约 30 分钟(P2-9)。
+		{"400 普通错误", 400, `{"error":{"message":"bad request"}}`, classClientError},
+		{"413 payload 过大", 413, `{"error":{"message":"too large"}}`, classClientError},
+		{"422 参数校验失败", 422, `{"error":{"message":"invalid params"}}`, classClientError},
 		{"400 非聊天模型", 400, `{"error":{"message":"This model only supports Interactions API"}}`, classPermanent},
 		// 无免费层必须是永久剔除, 否则会被反复选中并浪费候选位
 		{"无免费层", 429, `{"error":{"message":"Quota exceeded for metric: generativelanguage.googleapis.com/generate_content_free_tier_requests, limit: 0"}}`, classPermanent},

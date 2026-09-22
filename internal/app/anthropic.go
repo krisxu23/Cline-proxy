@@ -28,13 +28,17 @@ type toolAccumulator struct {
 }
 
 type anthropicReq struct {
-	Model       string          `json:"model"`
-	MaxTokens   int             `json:"max_tokens"`
-	Messages    []anthropicMsg  `json:"messages"`
-	System      json.RawMessage `json:"system,omitempty"`
-	Stream      bool            `json:"stream,omitempty"`
-	Temperature float64         `json:"temperature,omitempty"`
-	TopP        float64         `json:"top_p,omitempty"`
+	Model     string          `json:"model"`
+	MaxTokens int             `json:"max_tokens"`
+	Messages  []anthropicMsg  `json:"messages"`
+	System    json.RawMessage `json:"system,omitempty"`
+	Stream    bool            `json:"stream,omitempty"`
+	// P1-7: 温度字段用 any 判存在性 —— float64 上「未传」与「显式 0」同为零值,
+	// 旧写法 `!= 0` 会把客户端显式传的 temperature:0 / top_p:0(贪心解码, agent
+	// 工具常用)当缺省丢掉, 上游按默认温度跑。JSON 解出非 nil 即客户端传过(含 0),
+	// 原样透传; 未传为 nil, 维持旧行为不注入。
+	Temperature any             `json:"temperature,omitempty"`
+	TopP        any             `json:"top_p,omitempty"`
 	TopK        int             `json:"top_k,omitempty"`
 	Stop        json.RawMessage `json:"stop_sequences,omitempty"`
 	Tools       json.RawMessage `json:"tools,omitempty"`
@@ -153,11 +157,21 @@ func anthropicToOpenAI(req anthropicReq) map[string]any {
 		"stream":     req.Stream,
 		"messages":   []any{},
 	}
-	if req.Temperature != 0 {
+	// P1-7: 只有客户端显式传过 temperature/top_p 才透传 —— 显式 0(贪心解码)
+	// 必须原样下发, 不能再被 `!= 0` 判成缺省而丢弃。
+	if req.Temperature != nil {
 		openAI["temperature"] = req.Temperature
 	}
-	if req.TopP != 0 {
+	if req.TopP != nil {
 		openAI["top_p"] = req.TopP
+	}
+	// P1-8: stop_sequences 此前声明但从未转发, 停止词静默失效。
+	// 解析为字符串数组, 非空才写入 OpenAI 的 stop; 解析失败或空数组直接忽略, 不 panic。
+	if req.Stop != nil {
+		var stops []string
+		if json.Unmarshal(req.Stop, &stops) == nil && len(stops) > 0 {
+			openAI["stop"] = stops
+		}
 	}
 	// Convert Anthropic tools to OpenAI format
 	if req.Tools != nil {
@@ -291,9 +305,21 @@ func anthropicToOpenAI(req anthropicReq) map[string]any {
 					id, _ := tr["tool_call_id"].(string)
 					log.Printf("  anthropic req: tool_result id=%s content_len=%d prefix=%s", id, len(content), kit.Truncate(content, 400))
 				}
+				// P1-9: 工具结果之后的用户文字指示不能丢 —— 照 openai_anthropic.go
+				// anthropicUserToOpenAI 的正确做法, 在 tool 消息之后补一条 user 消息。
+				if text := strings.Join(textParts, "\n"); text != "" {
+					msgs = append(msgs, map[string]any{"role": "user", "content": text})
+				}
 			} else {
 				content := strings.Join(textParts, "\n")
 				msgs = append(msgs, map[string]any{"role": m.Role, "content": content})
+			}
+		default:
+			// P1-10: content 为 null / 非 string 非 []any 形态时不能整条静默丢弃 ——
+			// 对话历史缺轮次会破坏 tool_use/tool_result 配对, 上游直接 400。
+			// anthropicContentToString 对 nil 安全; 转出空字符串时才跳过该消息。
+			if text := anthropicContentToString(c); text != "" {
+				msgs = append(msgs, map[string]any{"role": m.Role, "content": text})
 			}
 		}
 	}

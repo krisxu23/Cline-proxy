@@ -65,7 +65,35 @@ func validateOutboundURL(raw string) error {
 	if reason := blockedOutboundReason(u.Hostname()); reason != "" {
 		return fmt.Errorf("目标地址被拒绝（%s）: %q", reason, raw)
 	}
+	if reason := resolvedLinkLocalReason(u.Hostname()); reason != "" {
+		return fmt.Errorf("目标地址被拒绝（%s）: %q", reason, raw)
+	}
 	return nil
+}
+
+// resolvedLinkLocalReason 主机名解析结果里是否有链路本地地址(169.254.0.0/16 /
+// fe80::/10)。返回拒绝原因; 允许或无法判定时返回空串。
+//
+// 主机名**字面量**检查拦不住"名字解析到云 metadata"的 DNS rebinding 面(P3-28):
+// 这里在拿到解析结果之后、建立任何连接之前把解析结果拦下。**只拦链路本地段**
+// (云 metadata 服务就在这一段); 私网(10/8、172.16/12、192.168/16、fc00::/7)
+// 与回环**绝不在此拦** —— 局域网/LAN 上游是正当用途, 它们的拦截策略由
+// blockedOutboundReason 按 CLINE_PROXY_ALLOW_PRIVATE_UPSTREAM 单独管理。
+// 解析失败(离线/NXDOMAIN)不拦: 配置期判定不了, 拨号时仍有字面 IP 规则兜底。
+func resolvedLinkLocalReason(host string) string {
+	if net.ParseIP(host) != nil {
+		return "" // IP 字面量已由 blockedOutboundReason 判过, 无需再解析
+	}
+	ips, err := net.LookupIP(host)
+	if err != nil {
+		return ""
+	}
+	for _, ip := range ips {
+		if ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() {
+			return "主机名解析到链路本地/云元数据地址 " + ip.String()
+		}
+	}
+	return ""
 }
 
 // blockedOutboundReason 返回该主机被拒的原因; 允许时返回空串。

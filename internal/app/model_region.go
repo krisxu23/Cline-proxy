@@ -270,6 +270,11 @@ func probeNodeModel(key, modelID string) (regionOK, known bool) {
 			TLSHandshakeTimeout: 10 * time.Second,
 		},
 	}
+	// 探测是一次性的: 每轮(30 分钟)多模型×出口并发都新建 Client+Transport,
+	// 不显式关掉空闲连接会攒下一批无人回收的 TCP/TLS 连接(对照
+	// rebuildZenTransport 的 old.CloseIdleConnections)。defer 放在 client.Do
+	// 之前, 出错早退路径(client.Do 返回 err)同样会被执行到。
+	defer client.CloseIdleConnections()
 	resp, err := client.Do(req)
 	if err != nil {
 		return false, false
