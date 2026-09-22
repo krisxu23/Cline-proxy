@@ -1,6 +1,7 @@
 package app
 
 import (
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -151,5 +152,59 @@ func TestConcurrentConfigReadWrite(t *testing.T) {
 	}
 	for i := 0; i < 12; i++ {
 		<-done
+	}
+}
+
+// 匿名开关的读写闭环: GET 暴露当前值, POST 更新生效, 且不动未提及的字段
+// (与 TestZenConfigUpdatePreservesUntouchedFields 同一纪律)。
+func TestZenConfigAnonymousRoundTrip(t *testing.T) {
+	withTestConfig(t, &zenConfigData{Enabled: true, Key: "sk-real", Anonymous: true, Retries: 3})
+
+	// GET 暴露 anonymous 与 key
+	req := httptest.NewRequest("GET", "/admin/api/zen/config", nil)
+	rec := httptest.NewRecorder()
+	handleZenConfig(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("GET status = %d, body = %s", rec.Code, rec.Body.String())
+	}
+	var out struct {
+		Success bool           `json:"success"`
+		Data    map[string]any `json:"data"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &out); err != nil {
+		t.Fatalf("GET body 不是 JSON: %v", err)
+	}
+	if out.Data["anonymous"] != true {
+		t.Fatalf("GET anonymous = %#v, 期望 true", out.Data["anonymous"])
+	}
+	if out.Data["key"] != "sk-real" {
+		t.Fatalf("GET key = %#v, 期望 sk-real", out.Data["key"])
+	}
+
+	// POST 关闭匿名 → 生效, 未提及的字段保持
+	req = httptest.NewRequest("POST", "/admin/api/zen/config/update", strings.NewReader(`{"anonymous": false}`))
+	rec = httptest.NewRecorder()
+	handleZenConfigUpdate(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("POST status = %d, body = %s", rec.Code, rec.Body.String())
+	}
+	after := getZenConfig()
+	if after.Anonymous {
+		t.Fatal("POST anonymous=false 未生效")
+	}
+	if after.Key != "sk-real" || after.Retries != 3 {
+		t.Fatalf("匿名开关之外的字段被改动: key=%q retries=%d", after.Key, after.Retries)
+	}
+}
+
+// 新装默认开匿名(免费模型走 public 不烧 key); 老配置缺该字段时零值 false,
+// 行为与升级前完全一致 —— 不存在静默换凭据。
+func TestZenAnonymousDefaults(t *testing.T) {
+	if !defaultZenConfig().Anonymous {
+		t.Fatal("defaultZenConfig().Anonymous 应为 true(新装默认匿名)")
+	}
+	var old zenConfigData
+	if old.Anonymous {
+		t.Fatal("零值应为 false(老配置无该字段时保持升级前行为)")
 	}
 }

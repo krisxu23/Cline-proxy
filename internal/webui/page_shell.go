@@ -432,6 +432,12 @@ body:not([data-theme="dark"]) .theme-toggle .dark-label{display:none}
         <select id="ocEnabled"><option value="true">开启</option><option value="false">关闭</option></select>
       </div>
       <div class="field"><label>API Key</label><input type="text" id="ocKey" placeholder="public"></div>
+      <div class="field"><label>匿名模式</label>
+        <select id="ocAnonymous">
+          <option value="true">开启（免费模型统一发 public，不消耗 API Key）</option>
+          <option value="false">关闭（免费模型也用上方 API Key）</option>
+        </select>
+      </div>
     </div>
     <div class="form-row">
       <div class="field"><label>API 端点（每行一个，第一个为主端点，其余为 CDN 镜像，重试自动轮换）</label>

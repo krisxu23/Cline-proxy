@@ -125,6 +125,13 @@ func zenFreeShapeRequired(endpoint zenEndpointKind, modelID string) bool {
 	if endpoint == zenEndpointGemini {
 		return false
 	}
+	return zenFreeModelEligible(modelID)
+}
+
+// zenFreeModelEligible 免费层判定的**唯一口径**: 形态整形(zenFreeShapeRequired)
+// 与匿名凭据选择(zenSelectKeyForModel)共用。两者必须同进同出 —— 否则会出现
+// "形态按免费层处理、凭据却烧 key" 或反过来的劈叉。
+func zenFreeModelEligible(modelID string) bool {
 	if strings.HasSuffix(modelID, "-free") {
 		return true
 	}

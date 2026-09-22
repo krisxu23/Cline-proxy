@@ -534,6 +534,8 @@ func (p *modelProvider) chatWithKey(ctx context.Context, cfg providerConfig, par
 	if needsSig {
 		attempts = 2
 	}
+	// Anthropic 形态过期 thinking 的一次性修复重放标志(见下方重试环内的守卫)。
+	staleThinkingReplayed := false
 
 	// 照抄 OmniRoute modelStrip.ts:19-55 —— 剥掉该模型不支持的
 	// 内容类型（image / audio）。不剥的话上游直接 400 拒绝
@@ -650,6 +652,27 @@ func (p *modelProvider) chatWithKey(ctx context.Context, cfg providerConfig, par
 		if needsSig && attempt < attempts && isMissingThoughtSignatureError(resp.StatusCode, string(body)) {
 			log.Printf("  providers: %s rejected a thought-signature, replaying with the skip sentinel", p.name)
 			markAllSignaturesSkipped(params)
+			continue
+		}
+		// Anthropic 形态 400 的被动修复重放(每请求最多一次): 过期/失效
+		// thinking 剥离后重放 —— 详见 stale_thinking.go 的成因与作用域说明。
+		// 主动防御(applyClaudeThinkingBlocks, 进环前一次)救不了: 最新
+		// assistant 的真签名块按协议不敢改写, 占位块上游也可能不认。
+		//
+		// 作用域限 Anthropic 形态: OpenAI 形态的 reasoning 契约是反向的
+		// (缺了要补空串), 剥字段会打出另一类 400, 绝不能碰。
+		//
+		// attempt >= attempts 时把预算顶开一格: 这是修复重放, 不是普通重试 ——
+		// 与 Gemini 哨兵重放不同, 它在首次(也可能是最后一次)尝试失败时才
+		// 知道需要发生, 必须显式给它留一发。staleThinkingReplayed 保证只有一发。
+		if !staleThinkingReplayed &&
+			(cfg.APIType == "anthropic" || cfg.APIFormat == apiFormatMessages) &&
+			isStaleThinkingError(resp.StatusCode, string(body)) && stripStaleThinking(params) {
+			staleThinkingReplayed = true
+			log.Printf("  providers: %s rejected stale thinking (400), stripping thinking config/blocks and replaying once", p.name)
+			if attempt >= attempts {
+				attempts++
+			}
 			continue
 		}
 		// Gemini 的 OpenAI 兼容层既接受裸模型名, 也接受带 models/ 前缀的名字。

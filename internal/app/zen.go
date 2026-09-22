@@ -312,7 +312,13 @@ type zenConfigData struct {
 	//   会从数百个 IP 打, 改善有限); **冗余性是确定的收益**。详见 zen_keys.go。
 	//
 	// 配对是确定性的(按出口标识哈希), 不需要额外配置出口分组。
-	Keys            []string                  `json:"keys,omitempty"`
+	Keys []string `json:"keys,omitempty"`
+	// Anonymous 匿名模式(opencode2api 同款): 免费模型统一发上游公开凭据
+	// "Bearer public", 不消耗配置的 key; 付费/未知模型仍按出口确定性选 key。
+	// 匿名失败按**出口**粒度故障转移(cooldownActualExit / 429 配额冷却),
+	// 对应 opencode2api 的"按代理独立冷却、换代理即故障转移"。
+	// 探针依据见 zen_keys.go 的 zenAnonymousCredential。
+	Anonymous       bool                      `json:"anonymous,omitempty"`
 	BaseURL         string                    `json:"baseURL"`                  // 主端点(兼容旧配置字段)
 	BaseURLs        []string                  `json:"baseURLs"`                 // 全部端点: 主端点 + CDN 镜像, 重试时轮换
 	Proxies         []string                  `json:"proxies"`                  // http(s)/socks5 代理与节点链接,轮询出口
@@ -398,6 +404,7 @@ func defaultZenConfig() *zenConfigData {
 	return &zenConfigData{
 		Enabled:         true,
 		Key:             "public",
+		Anonymous:       true, // 新装默认匿名: 免费模型走 public, 不烧 key
 		BaseURL:         zenAPIBase,
 		BaseURLs:        defaultZenBaseURLs(),
 		ProxyStrategy:   "round_robin",

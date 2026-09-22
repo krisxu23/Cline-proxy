@@ -22,6 +22,7 @@ func handleZenConfig(w http.ResponseWriter, r *http.Request) {
 	data := map[string]any{
 		"enabled":             cfg.Enabled,
 		"key":                 cfg.Key,
+		"anonymous":           cfg.Anonymous,
 		"baseURL":             cfg.BaseURL,
 		"baseURLs":            zenBaseURLList(cfg),
 		"proxies":             cfg.Proxies,
@@ -75,6 +76,7 @@ func handleZenConfigUpdate(w http.ResponseWriter, r *http.Request) {
 	var patch struct {
 		Enabled             *bool     `json:"enabled"`
 		Key                 *string   `json:"key"`
+		Anonymous           *bool     `json:"anonymous"`
 		BaseURL             *string   `json:"baseURL"`
 		BaseURLs            []string  `json:"baseURLs"`
 		Proxies             []string  `json:"proxies"`
@@ -128,6 +130,9 @@ func handleZenConfigUpdate(w http.ResponseWriter, r *http.Request) {
 		cur := next.clone()
 		if patch.Enabled != nil {
 			next.Enabled = *patch.Enabled
+		}
+		if patch.Anonymous != nil {
+			next.Anonymous = *patch.Anonymous
 		}
 		if patch.Key != nil {
 			// P3-17: 只认 TrimSpace 后的非空值 —— 旧判定 *patch.Key != "" 会

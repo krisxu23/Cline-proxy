@@ -181,6 +181,7 @@ async function loadOcConfig() {
     const c = d.data;
     _('ocEnabled').value = String(c.enabled);
     _('ocKey').value = c.key || 'public';
+    if (_('ocAnonymous')) _('ocAnonymous').value = c.anonymous ? 'true' : 'false';
     _('ocBaseURLs').value = (c.baseURLs && c.baseURLs.length ? c.baseURLs : (c.baseURL ? [c.baseURL] : [])).join('\n');
     _('ocProxies').value = (c.proxies || []).join('\n');
     ocSubsArr = (c.subs || []).slice();
@@ -405,6 +406,7 @@ async function saveOcConfig() {
   const body = {
     enabled: _('ocEnabled').value === 'true',
     key: _('ocKey').value.trim(),
+    anonymous: _('ocAnonymous') ? _('ocAnonymous').value === 'true' : true,
     baseURLs: _('ocBaseURLs').value.split('\n').map(s => s.trim()).filter(Boolean),
     proxies: proxies,
     subs: ocSubsArr,

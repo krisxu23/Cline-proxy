@@ -132,3 +132,44 @@ func TestMaskZenKey(t *testing.T) {
 		t.Fatalf("空 key 应返回 (empty), 实得 %q", got)
 	}
 }
+
+// 匿名模式凭据选择: 免费模型统一 public(与出口无关、不参与 key 哈希与退役),
+// 匿名关或非免费模型回退到按出口确定性选 key。
+func TestZenSelectKeyForModel_匿名与回退(t *testing.T) {
+	zenClearRetiredKeysForTest()
+	defer zenClearRetiredKeysForTest()
+
+	keys := []string{"k-main", "k2"}
+	cfg := &zenConfigData{Key: "k-main", Keys: []string{"k2"}, Anonymous: true}
+	exits := []string{"", "socks5://1.2.3.4:1080", "vmess://x"}
+
+	// 匿名开 + 免费模型(-free 后缀判定, 不依赖目录) → 任何出口都是 public
+	for _, exit := range exits {
+		if got := zenSelectKeyForModel(cfg, exit, "mimo-v2.5-free"); got != zenAnonymousCredential {
+			t.Fatalf("匿名+免费 exit=%q: 期望 %q, 实得 %q", exit, zenAnonymousCredential, got)
+		}
+	}
+
+	// 匿名关 → 免费模型也走 key 选择(按出口确定性)
+	cfg.Anonymous = false
+	for _, exit := range exits {
+		want := zenKeyForExit(keys, exit)
+		if got := zenSelectKeyForModel(cfg, exit, "mimo-v2.5-free"); got != want {
+			t.Fatalf("匿名关 exit=%q: 期望 %q, 实得 %q", exit, want, got)
+		}
+	}
+
+	// 匿名开 + 未知(非免费)模型 → 仍走 key, 付费路径不能被打成 public
+	cfg.Anonymous = true
+	for _, exit := range exits {
+		want := zenKeyForExit(keys, exit)
+		if got := zenSelectKeyForModel(cfg, exit, "totally-unknown-model"); got != want {
+			t.Fatalf("匿名+未知模型 exit=%q: 期望 %q, 实得 %q", exit, want, got)
+		}
+	}
+
+	// nil 配置安全: 退化为 zenSelectKey(nil) → 空
+	if got := zenSelectKeyForModel(nil, "x", "mimo-v2.5-free"); got != "" {
+		t.Fatalf("nil 配置应返回空, 实得 %q", got)
+	}
+}

@@ -187,9 +187,10 @@ func callZenAPI(ctx context.Context, params map[string]any, stream bool) (*http.
 		// 结构 ID。门禁按此判 "from within OpenCode", 形态不对即 403 FreeTierError。
 		outbound := map[string]string{}
 		applyOpencodeHeaders(outbound, nil, defaultOpencodeIdentity(), bodyFingerprint(body))
-		// 多 key: 按出口**确定性**选一把(同一出口永远用同一把 key, 见 zen_keys.go),
-		// 退役中的 key 自动跳过。
-		reqKey := zenSelectKey(cfg, reqExitKey(ctx))
+		// 凭据选择: 匿名模式开 && 免费模型 → 统一 "public"(opencode2api 同款
+		// 匿名档, 探针见 zen_keys.go); 否则多 key 按出口**确定性**选一把
+		// (同一出口永远用同一把 key, 见 zen_keys.go), 退役中的 key 自动跳过。
+		reqKey := zenSelectKeyForModel(cfg, reqExitKey(ctx), zenResolvedModel)
 		// 鉴权按端点形态分流: Anthropic Messages 用 x-api-key + 版本头, 其余用
 		// Bearer。漏掉这步会拿到 401, 而 401 很容易被误判成"key 不对"。
 		if zenEndpoint.usesAnthropicAuth() {

@@ -153,3 +153,30 @@ func zenClearRetiredKeysForTest() {
 	zenKeyRetired = map[string]time.Time{}
 	zenKeyStateMu.Unlock()
 }
+
+// zenAnonymousCredential opencode 匿名档的公开凭据。
+//
+// 2026-09-22 直连探针(同一 free-shape body, 只换 Authorization):
+//
+//	缺 Authorization / Bearer public → 403 FreeTierError(已进匿名通道, 只被出口 IP 门禁挡)
+//	伪造 key / 随机 UUID             → 401 AuthError: Invalid API key.
+//
+// 即 "public" 是上游公开的匿名凭据, 与 opencode2api README 一致
+// ("使用 OpenCode public 凭证的可选 Zen 匿名通道 / 匿名请求在上游认证头中使用 public 凭证")。
+const zenAnonymousCredential = "public"
+
+// zenSelectKeyForModel 本次请求发给上游的凭据。
+//
+// 匿名模式开 && 模型属免费层 → 统一 zenAnonymousCredential("public"),
+// 不消耗配置 key、不参与出口哈希与 401 退役 —— 这就是匿名档:
+// 所有出口共用一个公开凭据, 故障转移只按出口冷却(与 opencode2api 的
+// anonymousPool 同构: public 凭据按代理独立冷却、绝不换绑凭据)。
+//
+// 其余情况(匿名关 / 付费或未知模型)走 zenSelectKey 的按出口确定性选 key。
+// 免费层判定与形态整形共用 zenFreeModelEligible 一个口径。
+func zenSelectKeyForModel(cfg *zenConfigData, exitKey, modelID string) string {
+	if cfg != nil && cfg.Anonymous && zenFreeModelEligible(modelID) {
+		return zenAnonymousCredential
+	}
+	return zenSelectKey(cfg, exitKey)
+}
