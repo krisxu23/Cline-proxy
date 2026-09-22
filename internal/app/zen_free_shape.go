@@ -6,7 +6,6 @@ import (
 	"strings"
 )
 
-
 // opencode zen 免费层的形态要求(2026-09-22 直连实测, Bearer public + Bearer <key> 双通过):
 //
 //	free 模型(带 -free 后缀 / seed 白名单 / 手动启用)经 zen 上游时, 请求体必须
