@@ -266,6 +266,12 @@ func syncNodeBox() {
 
 	ctx := include.Context(context.Background())
 	instance, err := startNodeInstanceFn(ctx, inbounds, outbounds, rules)
+	// (nil,nil) 会绕过下面所有 err 分支直接走到 instance.Start() —— nil 接口
+	// 调方法即 panic 打挂进程。内置实现不返回 (nil,nil), 但钩子可被注入
+	// (2026-09-22 审查 P3 防御)。
+	if err == nil && instance == nil {
+		err = fmt.Errorf("startNodeInstance 返回 nil 实例")
+	}
 	if err != nil && hasMap {
 		// 订阅提供的原始出站可能有个别不合法: 退回仅手动节点链接重建,
 		// 避免单个坏节点拖垮全部出口
@@ -280,8 +286,10 @@ func syncNodeBox() {
 				})
 			}
 			outb2 = append(outb2, map[string]any{"type": "direct", "tag": "direct"})
-			if inst2, err2 := startNodeInstanceFn(ctx, inb2, outb2, rules2); err2 == nil {
+			if inst2, err2 := startNodeInstanceFn(ctx, inb2, outb2, rules2); err2 == nil && inst2 != nil {
 				instance, ports, err, endpoints = inst2, p2, nil, ep2
+			} else if err2 == nil {
+				err = fmt.Errorf("startNodeInstance(仅手动) 返回 nil 实例")
 			} else {
 				err = err2
 			}
@@ -294,10 +302,12 @@ func syncNodeBox() {
 	if err := instance.Start(); err != nil {
 		instance.Close()
 		// 自愈(P2 修复): Start 失败说明这批端口里有被占的(半启动实例/其它
-		// 进程), 把本次使用的稳定端口记录全部清除 —— 下次重建重新分配,
-		// 避免反复撞同一批坏端口(实测事故: 同一端口连续失败数小时)。
-		purgeStablePorts(ports)
-		failKeepOld(fmt.Errorf("启动失败(已清除本次稳定端口记录, 下次重建换端口): %v", err))
+		// 进程)。优先只清除错误里点名的监听地址 —— bind 失败通常只有一个端口
+		// 被抢, 清整批会让几百个健康节点的端口无谓漂移(2026-09-22 审查 P2);
+		// 错误串里解析不出端口时退回整批清除, 保留原自愈语义(实测事故:
+		// 同一端口连续失败数小时, 不允许复现)。
+		cleared := purgeStablePortsFromError(err, ports)
+		failKeepOld(fmt.Errorf("启动失败(已清除 %d 个端口记录, 下次重建换端口): %v", cleared, err))
 		// 当前没有可用实例时, 30 秒后自动重试一次(给订阅刷新/端口释放留时间)
 		if len(prevPorts) == 0 && len(entries) > 0 {
 			go func() {
@@ -329,6 +339,10 @@ func syncNodeBox() {
 		log.Printf("  nodes: %d 个高级节点出口已就绪", len(ports))
 	} else {
 		// 期间已被其它 sync 替换: 丢弃本次刚建好的新实例, 保留现有实例。
+		// 这里**刻意不** purgeStablePorts: 与 Start 失败(bind 被占)不同, 本分支
+		// 没有任何端口出错 —— 实例 Close 后端口即释放, 留着记录正是"订阅更新
+		// 端口不漂移"的目的; 端口日后真被外部抢占, stablePortOf 的 tcpPortFree
+		// 复查会兜住(2026-09-22 审查复核: 原指控的"不对称"是语义正确的设计)。
 		instance.Close()
 	}
 	nodeMu.Unlock()
@@ -431,7 +445,28 @@ func sanitizeOutboundShape(ob map[string]any) {
 	// 4) xtls 是 v2ray 的旧字段, sing-box 无此块(它用 flow + reality), 省略。
 	delete(ob, "xtls")
 
-	// 5) SS: method 字段里塞了 base64("<method>:<password>") 的畸形写法。
+	// 5) reality 协议强制要求 uTLS(sing-box common/tls/reality_client.go 是
+	//    **配置检查**: "uTLS is required by reality client", 与构建标签无关)。
+	//    上面第 3 步可能刚剥掉 fp=unsafe 的 utls 块 —— 普通 TLS 剥掉只是"不伪装",
+	//    reality 剥掉则整条被剔出出口池(实测 16 个 _xiaohe 节点)。reality 没有
+	//    "不校验指纹"档, 缺失/无效一律补 chrome 默认指纹, 让节点进检测池
+	//    (2026-09-22 审查: 修好 reality, 不走"直接剔除"的退路)。
+	if tls, ok := ob["tls"].(map[string]any); ok {
+		if reality, ok := tls["reality"].(map[string]any); ok {
+			if enabled, isBool := reality["enabled"].(bool); isBool && enabled {
+				fp := "chrome"
+				if u, ok := tls["utls"].(map[string]any); ok {
+					rawFP, _ := u["fingerprint"].(string)
+					if n := normalizeUTLSFingerprint(rawFP); n != "" {
+						fp = n
+					}
+				}
+				tls["utls"] = map[string]any{"enabled": true, "fingerprint": fp}
+			}
+		}
+	}
+
+	// 6) SS: method 字段里塞了 base64("<method>:<password>") 的畸形写法。
 	//
 	// 实测(2026-09-18) 19 条来自 **sing-box JSON 订阅**(该路径原样透传 outbound),
 	// 上游把整段 ss:// userinfo 放进了 method, 于是 sing-box 报

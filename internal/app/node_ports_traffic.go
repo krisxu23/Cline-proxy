@@ -15,10 +15,12 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
-	"math/rand"
+	"math/rand/v2"
 	"net"
 	"os"
+	"regexp"
 	"sort"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -94,6 +96,37 @@ func assignStablePort(key string) (int, bool, error) {
 	persistNodeStablePorts()
 	return p, false, nil
 }
+
+// purgeStablePortsFromError Start 失败时按错误信息做**最小范围**端口清除。
+// sing-box 的 bind 错误串携带监听地址(如 `listen tcp 127.0.0.1:34567: bind: ...`),
+// 只清这些端口对应的 key; 解析不出(错误格式变化/非 bind 失败)时退回整批清除,
+// 保持"不复现连续撞同一批坏端口"的原自愈语义。返回清除条数(日志用)。
+func purgeStablePortsFromError(err error, ports map[string]int) int {
+	if err == nil || len(ports) == 0 {
+		return 0
+	}
+	want := map[int]bool{}
+	for _, m := range listenAddrRe.FindAllStringSubmatch(err.Error(), -1) {
+		if p, convErr := strconv.Atoi(m[1]); convErr == nil {
+			want[p] = true
+		}
+	}
+	bad := make(map[string]int, len(want))
+	for k, p := range ports {
+		if want[p] {
+			bad[k] = p
+		}
+	}
+	if len(bad) == 0 {
+		purgeStablePorts(ports)
+		return len(ports)
+	}
+	purgeStablePorts(bad)
+	return len(bad)
+}
+
+// listenAddrRe 匹配错误串里的本机监听地址(端口 2~5 位数字)。
+var listenAddrRe = regexp.MustCompile(`127\.0\.0\.1:(\d{2,5})`)
 
 // purgeStablePorts 清除一批节点的稳定端口记录(Start 失败自愈: 这些端口
 // 可能被半启动实例或其它进程占用, 下次重建应重新分配而不是复用)。
@@ -219,7 +252,7 @@ func tcpPortFree(port int) bool {
 // freeNodePortInRange 在 [min,max] 里找一个当前空闲的端口。
 func freeNodePortInRange() (int, error) {
 	for attempt := 0; attempt < 64; attempt++ {
-		p := nodePortMin + rand.Intn(nodePortMax-nodePortMin+1)
+		p := nodePortMin + rand.IntN(nodePortMax-nodePortMin+1)
 		if portReservedByService(p) {
 			continue
 		}
@@ -348,7 +381,14 @@ func startTrafficSampler() {
 		go func() {
 			t := time.NewTicker(trafficSampleInterval)
 			defer t.Stop()
-			for range t.C {
+			for {
+				select {
+				case <-t.C:
+				case <-appRootCtx.Done():
+					// 与包内其余 14 处 ticker 同纪律: 退出信号后停采样,
+					// 否则 shutdown 后仍每分钟读写 traffic 状态(2026-09-22 审查 P2)。
+					return
+				}
 				var up, down int64
 				nodeTrafficMu.Lock()
 				for _, c := range nodeTraffic {

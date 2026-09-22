@@ -49,13 +49,31 @@ func healthCheckTargets() []string {
 }
 
 // checkNodeHealth 经单个节点出口跑增强测试(活性/出口IP/测速/MITM/分类)。
-// 增强测试的"健康"判定: 活且无 MITM 风险且未断流。
+// 增强测试的"健康"判定: 活且无 MITM 劫持且未**真断流**。
+// 2026-09-22 审查后 IsStalled 只在读空闲 >3s 时为真: 测速端点全挂
+// (SpeedTestFailed)与慢速(<nodeSpeedSlowBPS)都不再判死, 后者由选路降权兜底。
 // 上游可达性矩阵(probeUpstreamMatrixAsync)仍独立运行, 两者互补。
 func checkNodeHealth(key string) bool {
 	r := testNodeComprehensiveFn(key)
-	// 健康 = 节点存活 + 无 MITM 劫持 + 未断流
+	// 健康 = 节点存活 + 无 MITM 劫持 + 未真断流
 	ok := r.Alive && !r.MITMRisk && !r.IsStalled
 	return ok
+}
+
+// pruneStaleNodeHealth 删除健康表里不在当前出口池中的残留条目。
+// 订阅删除节点后, 旧 key 永远不会再被 record 覆写或清理 —— 见调用点注释。
+func pruneStaleNodeHealth(active []string) {
+	on := make(map[string]bool, len(active))
+	for _, k := range active {
+		on[k] = true
+	}
+	nodeHealthMu.Lock()
+	for k := range nodeHealth {
+		if !on[k] {
+			delete(nodeHealth, k)
+		}
+	}
+	nodeHealthMu.Unlock()
 }
 
 // checkAllNodeHealth 并发检测全部节点出口, 并发数随节点规模放大(上限 48)。
@@ -92,6 +110,10 @@ func checkAllNodeHealth() {
 		keys = append(keys, k)
 	}
 	nodeMu.Unlock()
+	// 清理已消失节点(订阅删除/重建剔除)的残留健康条目: 旧 key 不会被本轮任何
+	// record 覆写, 不删就永久驻留, 其旧 ExitIP 还会继续参与 exit-fold 折叠,
+	// 让存活的兄弟节点被误判为重复而跳过选路(2026-09-22 审查 P3)。
+	pruneStaleNodeHealth(keys)
 	if len(keys) == 0 {
 		// 出口池为空 = sing-box 实例没起来(构建失败)。必须显式告警: 静默 return
 		// 会让面板上一切节点永远停在"未检测", 而看不出是池子挂了。
@@ -109,6 +131,9 @@ func checkAllNodeHealth() {
 	}
 	var okCount int32
 	var mu sync.Mutex
+	// 四关失败分解(2026-09-22 审查: 汇总行只有 N/M, 逐关失败原因不落盘,
+	// "上千个节点只剩几十个"无法自查 —— 至少把分解计数写进这一行)。
+	var stageDead, stageMITM, stageStalled, stageSpeedFail, stageSlow int
 	sem := make(chan struct{}, workers)
 
 	// 按**上游服务器**分组(见 nodeRemoteEndpoints 注释)。取不到远端信息的节点
@@ -134,6 +159,21 @@ func checkAllNodeHealth() {
 		mu.Lock()
 		if ok {
 			okCount++
+		} else {
+			switch {
+			case !r.Alive:
+				stageDead++
+			case r.MITMRisk:
+				stageMITM++
+			case r.IsStalled:
+				stageStalled++
+			}
+		}
+		if r.Alive && r.SpeedTestFailed {
+			stageSpeedFail++ // 与判死无关, 独立统计(端点抽风量)
+		}
+		if r.Alive && r.SpeedBPS > 0 && r.SpeedBPS < nodeSpeedSlowBPS {
+			stageSlow++ // 降权池大小
 		}
 		mu.Unlock()
 		nodeHealthMu.Lock()
@@ -194,8 +234,8 @@ func checkAllNodeHealth() {
 		log.Printf("  nodes: %d 个变体与其服务器代表同判不可达, 已跳过探测(%d 台服务器分组)",
 			skipped, len(groups))
 	}
-	log.Printf("  nodes: 增强检测完成(%d 并发), %d/%d 个出口可达(去重服务器 %d 台)",
-		workers, okCount, len(keys), len(groups))
+	log.Printf("  nodes: 增强检测完成(%d 并发), %d/%d 个出口可达(去重服务器 %d 台); 失败分解: 活性挂 %d · MITM %d · 真断流 %d · 测速端点全挂 %d · 慢速降权 %d",
+		workers, okCount, len(keys), len(groups), stageDead, stageMITM, stageStalled, stageSpeedFail, stageSlow)
 	// 出口级去重(P2, freesub 语义): 按最新结果折叠同出口 IP 的重复节点,
 	// 选路只保留每组最快的 —— 之后 nodeUsable 对折叠副本返回 false。
 	recomputeExitFold()

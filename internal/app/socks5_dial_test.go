@@ -273,3 +273,28 @@ func TestDialSOCKS5ThroughRealSingBox(t *testing.T) {
 		t.Fatalf("body = %q, want ok", body)
 	}
 }
+
+// RFC 1929 认证应答的版本字节必须校验(2026-09-22 审查 P3):
+// 不校验会把代理侧协议错乱/具体状态压成一句 "authentication failed", 排查靠猜。
+func TestSocks5UserPassAuthValidatesReply(t *testing.T) {
+	run := func(reply []byte) error {
+		c1, c2 := net.Pipe()
+		t.Cleanup(func() { c1.Close(); c2.Close() })
+		go func() {
+			buf := make([]byte, 512)
+			_, _ = c2.Read(buf) // 读走认证请求
+			_, _ = c2.Write(reply)
+		}()
+		return socks5UserPassAuth(c1, "u", "p")
+	}
+
+	if err := run([]byte{0x02, 0x00}); err == nil || !strings.Contains(err.Error(), "bad auth reply version") {
+		t.Fatalf("版本字节非 0x01 应报版本错误, got %v", err)
+	}
+	if err := run([]byte{0x01, 0x02}); err == nil || !strings.Contains(err.Error(), "status 0x02") {
+		t.Fatalf("失败状态码应原样带出, got %v", err)
+	}
+	if err := run([]byte{0x01, 0x00}); err != nil {
+		t.Fatalf("合法应答不应报错: %v", err)
+	}
+}

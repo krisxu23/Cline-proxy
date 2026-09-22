@@ -5,6 +5,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"testing"
 	"time"
 )
@@ -100,6 +101,45 @@ func TestBuildNodePartsDropsBadStringLink(t *testing.T) {
 	}
 }
 
+// --- 解析健壮性(2026-09-22 审查) ---
+
+// 订阅里的无 @ 畸形行(vless://host:port?...)曾让 u.User.Username() nil panic
+// 打挂整个进程 —— 订阅是不可信输入, 必须报错而不是崩溃。
+func TestUserinfoNodeMissingUserNoPanic(t *testing.T) {
+	for _, rest := range []string{
+		"1.2.3.4:443?security=tls",
+		"1.2.3.4:443?security=reality&pbk=pk",
+		"1.2.3.4:443",
+	} {
+		for _, typ := range []string{"vless", "trojan"} {
+			if _, err := parseUserinfoNode(rest, "out-0", typ); err == nil {
+				t.Fatalf("%s:// 缺 @ 的畸形行必须报错: %q", typ, rest)
+			}
+		}
+	}
+	// 对照: 带 @ 的正常链接解析成功
+	if _, err := parseUserinfoNode("b831381d-6324-4d53-ad4f-8cda48b30811@1.2.3.4:443?security=tls", "out-0", "vless"); err != nil {
+		t.Fatalf("正常链接不应报错: %v", err)
+	}
+}
+
+// http/h2 transport 的 host 缺失时不得注入 host:[""] —— 空串会被 sing-box
+// 判为无效 HTTP transport 整条剔除, 而 type=http 不带 host 是常见写法。
+func TestTransportHTTPHostOmittedWhenEmpty(t *testing.T) {
+	tr, ok := transportBlock("http", url.Values{"path": {"/x"}})
+	if !ok {
+		t.Fatal("type=http 应产出 transport 块")
+	}
+	if _, has := tr["host"]; has {
+		t.Fatalf("host 缺失不得注入, got %v", tr["host"])
+	}
+	tr2, _ := transportBlock("h2", url.Values{"host": {"h.example.com"}})
+	got, _ := tr2["host"].([]string)
+	if len(got) != 1 || got[0] != "h.example.com" {
+		t.Fatalf("host 存在时应原样透传, got %v", tr2["host"])
+	}
+}
+
 // --- 测速取消时机回归(2026-09-15 审计) ---
 //
 // 旧实现 probeNodeSpeed 在 client.Do 返回后立刻 cancel(), 然后才读响应体。
@@ -137,12 +177,37 @@ func TestProbeNodeSpeedReadsBodyBeforeCancel(t *testing.T) {
 	t.Cleanup(func() { nodeSpeedTestURLs = prev })
 
 	client := &http.Client{Timeout: 30 * time.Second}
-	speed, stalled := probeNodeSpeed(client)
+	speed, stalled, failed := probeNodeSpeed(client)
 	if stalled {
 		t.Fatalf("健康链路被判为断流(stalled): speed=%d —— 取消时机回归失败", speed)
 	}
+	if failed {
+		t.Fatalf("有真实吞吐就不该标测速失败: speed=%d", speed)
+	}
 	if speed <= 0 {
 		t.Fatalf("吞吐应为正数, got %d(stalled=%v)", speed, stalled)
+	}
+}
+
+// 测速端点全挂(两个 URL 同为 speed.cloudflare.com, 同生同死)必须报
+// "测速失败"而不是"断流" —— 2026-09-22 审查 P1: 旧实现 return (0, true)
+// 无条件 IsStalled, 一次 CF 侧事故就把全部活节点踢出选路池。
+func TestProbeNodeSpeedAllEndpointsFailNotStalled(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	defer srv.Close()
+
+	prev := nodeSpeedTestURLs
+	nodeSpeedTestURLs = []string{srv.URL + "/down1", srv.URL + "/down2"}
+	t.Cleanup(func() { nodeSpeedTestURLs = prev })
+
+	speed, stalled, failed := probeNodeSpeed(&http.Client{Timeout: 10 * time.Second})
+	if speed != 0 || stalled {
+		t.Fatalf("端点全挂应得 (0,false,failed=true), 得到 speed=%d stalled=%v", speed, stalled)
+	}
+	if !failed {
+		t.Fatal("端点全挂必须报测速失败, 否则 0 字节会被误读成断流")
 	}
 }
 

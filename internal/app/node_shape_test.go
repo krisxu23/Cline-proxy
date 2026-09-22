@@ -385,3 +385,52 @@ func TestSanitizeOutboundShapeSSURLEncodedBase64Method(t *testing.T) {
 		t.Fatalf("垃圾值必须原样保留, got %v", ob2["method"])
 	}
 }
+
+// reality 出站必须永远带有效 utls —— sing-box 的 reality_client.go 是配置检查
+// ("uTLS is required by reality client"), 缺块/指纹无效整条被剔出出口池。
+// 2026-09-22 审查实锤 16 个 _xiaohe 节点死于此: fp=unsafe 被第 3 步剥掉后,
+// reality 没有 utls 可用。第 5 步负责补回 chrome。
+func TestSanitizeRealityEnsuresUTLS(t *testing.T) {
+	reality := func(utls any) map[string]any {
+		tls := map[string]any{
+			"enabled": true, "server_name": "x.com",
+			"reality": map[string]any{"enabled": true, "public_key": "pk", "short_id": "sid"},
+		}
+		if utls != nil {
+			tls["utls"] = utls
+		}
+		return map[string]any{"type": "vless", "server": "1.2.3.4", "server_port": 443, "uuid": "u", "tls": tls}
+	}
+	getUTLS := func(ob map[string]any) (map[string]any, bool) {
+		u, ok := ob["tls"].(map[string]any)["utls"].(map[string]any)
+		return u, ok
+	}
+
+	// 1) fp=unsafe 被剥后 → 补 chrome
+	ob := reality(map[string]any{"enabled": true, "fingerprint": "unsafe"})
+	sanitizeOutboundShape(ob)
+	if u, ok := getUTLS(ob); !ok || u["fingerprint"] != "chrome" || u["enabled"] != true {
+		t.Fatalf("unsafe 剥离后应补 chrome, got %v", u)
+	}
+	// 2) 完全缺 utls → 补 chrome
+	ob = reality(nil)
+	sanitizeOutboundShape(ob)
+	if u, ok := getUTLS(ob); !ok || u["fingerprint"] != "chrome" {
+		t.Fatalf("缺 utls 应补 chrome, got %v", u)
+	}
+	// 3) 有效指纹 → 原样保留, 不被覆盖
+	ob = reality(map[string]any{"enabled": true, "fingerprint": "firefox"})
+	sanitizeOutboundShape(ob)
+	if u, ok := getUTLS(ob); !ok || u["fingerprint"] != "firefox" {
+		t.Fatalf("有效指纹应保留, got %v", u)
+	}
+	// 4) 非 reality 的 unsafe → 仍按既有语义整块省略(不误补)
+	obNoRe := map[string]any{"type": "vless", "tls": map[string]any{
+		"enabled": true, "server_name": "x.com",
+		"utls": map[string]any{"enabled": true, "fingerprint": "unsafe"},
+	}}
+	sanitizeOutboundShape(obNoRe)
+	if _, ok := getUTLS(obNoRe); ok {
+		t.Fatal("非 reality 的无效指纹仍应省略 utls")
+	}
+}

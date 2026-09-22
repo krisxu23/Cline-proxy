@@ -48,6 +48,36 @@ func TestNodeRemoteEndpointsSnapshot(t *testing.T) {
 	}
 }
 
+// 出口池里已消失的节点必须从健康表清掉: 残留条目永不覆写, 其旧 ExitIP 还会
+// 参与 exit-fold 折叠, 让存活的兄弟节点被误判重复而跳过选路(2026-09-22 审查 P3)。
+func TestPruneStaleNodeHealth(t *testing.T) {
+	nodeHealthMu.Lock()
+	prev := nodeHealth
+	nodeHealth = map[string]nodeHealthState{
+		"gone":  {Ok: true, Result: nodeTestResult{Alive: true, ExitIP: "9.9.9.9"}},
+		"alive": {Ok: true},
+	}
+	nodeHealthMu.Unlock()
+	t.Cleanup(func() {
+		nodeHealthMu.Lock()
+		nodeHealth = prev
+		nodeHealthMu.Unlock()
+	})
+
+	pruneStaleNodeHealth([]string{"alive"})
+
+	nodeHealthMu.RLock()
+	_, hasGone := nodeHealth["gone"]
+	_, hasAlive := nodeHealth["alive"]
+	nodeHealthMu.RUnlock()
+	if hasGone {
+		t.Fatal("已消失节点的健康条目应被清除")
+	}
+	if !hasAlive {
+		t.Fatal("在池节点的健康条目必须保留")
+	}
+}
+
 // ★ 核心回归: 同一台服务器的变体**不重复探测**。
 //
 // 实测背景: 订阅源为同一台服务器生成多个 SNI 变体(13,841 实例 / 3,722 个

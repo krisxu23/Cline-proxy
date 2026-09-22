@@ -377,6 +377,21 @@ func pickZenProxyWhere(extra func(p string) bool) (string, int) {
 			avail = append(avail, i)
 		}
 	}
+	// 慢节点降权(2026-09-22 审查): 实测吞吐低于 nodeSpeedSlowBPS 的出口不再判死,
+	// 但只在没有正常出口时兜底 —— 低于阈值的节点跑 LLM 流式会拖慢每一轮, 有
+	// 快节点时不该轮到它; 全池都慢时降级为"能用就行"。
+	fast := make([]int, 0, len(avail))
+	slow := 0
+	for _, i := range avail {
+		if nodeSlow(list[i]) {
+			slow++
+		} else {
+			fast = append(fast, i)
+		}
+	}
+	if slow > 0 && len(fast) > 0 {
+		avail = fast
+	}
 	if len(avail) == 0 {
 		// 整池都不满足条件时返回直连决策(交给上层), 不退而求其次。
 		return "", -1
@@ -455,6 +470,23 @@ func nodeUsable(p string) bool {
 		return false
 	}
 	return true
+}
+
+// nodeSlow 该出口最近一次实测吞吐低于降权阈值(见 pickZenProxyWhere 的降权段)。
+// 未测(无记录)与测速失败(speedBPS==0, 端点全挂)不算慢 —— 那是测速端点的问题,
+// 不是节点的(2026-09-22 审查 P1: 曾被无差别判死)。
+func nodeSlow(p string) bool {
+	if !isNodeLink(p) {
+		return false
+	}
+	nodeHealthMu.RLock()
+	st, ok := nodeHealth[nodeLocalKey(p)]
+	nodeHealthMu.RUnlock()
+	if !ok {
+		return false
+	}
+	sp := st.Result.SpeedBPS
+	return sp > 0 && sp < nodeSpeedSlowBPS
 }
 
 // lastZenProxyIdx 最近一次选择的代理索引(日志用)
@@ -659,7 +691,16 @@ func zenDialContext(ctx context.Context, network, addr string) (net.Conn, error)
 		// 显式直连模式不需要这条日志(那是正当配置); 只有"代理模式节点全挂、
 		// 悄悄走直连"才要大声打出来, 否则用户看到行为异常却无从排查
 		// (2026-09-17 审查 R2-9)。
-		log.Printf("  exit: 节点池无可用出口, 触发直连兜底(rescueDirect=%v, 可在 zen 设置里关闭)", rescueDirectEnabled())
+		//
+		// 地区过滤激活时必须点名"绕过了地区限制": catch-all/Go 直连都打本机 IP,
+		// 不在所选地区内, 兜底窗口里地区受限模型必然失败, 而面板仍显示"已选某地区"
+		// —— 不说出来用户只能看到莫名其妙的 403(2026-09-22 审查 P2)。
+		if exitRegionFilterActive() {
+			log.Printf("  exit: ⚠️ 节点池无可用出口, 触发直连兜底 — 当前限定出口地区 %v, 兜底期间将绕过地区限制(地区受限模型会失败, rescueDirect=%v 可在 zen 设置里关闭)",
+				enabledExitRegions(), rescueDirectEnabled())
+		} else {
+			log.Printf("  exit: 节点池无可用出口, 触发直连兜底(rescueDirect=%v, 可在 zen 设置里关闭)", rescueDirectEnabled())
+		}
 	}
 	if local := catchAllLocalAddr(); local != "" {
 		u := &url.URL{Scheme: "socks5", Host: local}
@@ -749,6 +790,14 @@ func dialHTTPProxy(ctx context.Context, u *url.URL, network, addr string) (net.C
 	if err != nil {
 		return nil, err
 	}
+	// CONNECT 握手硬超时: Go 1.15+ 起 DialContext 成功即清除 deadline, 之后
+	// req.Write / ReadResponse 阶段对静默代理没有任何硬约束, 只能等上层 ctx
+	// 放弃 —— 与 SOCKS5 路径的 SetDeadline 对齐(2026-09-22 审查 P3)。
+	handshakeDL := time.Now().Add(30 * time.Second)
+	if dl, ok := ctx.Deadline(); ok && dl.Before(handshakeDL) {
+		handshakeDL = dl
+	}
+	_ = rawConn.SetDeadline(handshakeDL)
 	if u.Scheme == "https" {
 		tlsConn := tls.Client(rawConn, &tls.Config{MinVersion: tls.VersionTLS12, ServerName: u.Hostname()})
 		if err := tlsConn.HandshakeContext(ctx); err != nil {
@@ -785,5 +834,7 @@ func dialHTTPProxy(ctx context.Context, u *url.URL, network, addr string) (net.C
 		b, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
 		return nil, fmt.Errorf("proxy CONNECT %s: %s %s", u.Host, resp.Status, strings.TrimSpace(string(b)))
 	}
+	// 隧道已建立: 清掉握手 deadline, 否则后续透传流量会在 30s 处被截断。
+	_ = rawConn.SetDeadline(time.Time{})
 	return rawConn, nil
 }

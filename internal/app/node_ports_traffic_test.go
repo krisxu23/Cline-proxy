@@ -3,6 +3,7 @@ package app
 // 稳定端口 / 每节点流量 / 构建去重 的测试。
 
 import (
+	"fmt"
 	"net"
 	"testing"
 )
@@ -138,4 +139,54 @@ func TestPurgeStablePortsRemovesFailedRecords(t *testing.T) {
 	nodeStableMu.Lock()
 	delete(nodeStablePorts, k2)
 	nodeStableMu.Unlock()
+}
+
+// Start 失败的端口清除必须是**最小范围**: bind 错误点名哪个端口清哪个,
+// 清整批会让几百个健康节点的端口无谓漂移(2026-09-22 审查 P2)。
+// 错误串解析不出端口时才退回整批清除(保留原自愈语义)。
+func TestPurgeStablePortsFromError(t *testing.T) {
+	k1, k2, k3 := "socks5://127.0.0.1:9601#e1", "socks5://127.0.0.1:9602#e2", "socks5://127.0.0.1:9603#e3"
+	all := map[string]int{k1: 17101, k2: 17102, k3: 17103}
+	reset := func() {
+		nodeStableMu.Lock()
+		// loaded 必须置真: purgeStablePorts 内部的惰性加载一旦触发, 会用磁盘
+		// 文件覆盖这里注入的 map, 断言就会看到空表(实际踩过)。
+		nodeStablePorts = map[string]int{k1: 17101, k2: 17102, k3: 17103}
+		nodeStableLoaded = true
+		nodeStableMu.Unlock()
+	}
+	reset()
+	t.Cleanup(func() {
+		nodeStableMu.Lock()
+		nodeStablePorts = map[string]int{}
+		nodeStableLoaded = false
+		nodeStableMu.Unlock()
+	})
+
+	// 1) 错误点名 17102: 只清 k2, k1/k3 保留
+	n := purgeStablePortsFromError(
+		fmt.Errorf("listen tcp 127.0.0.1:17102: bind: Only one usage of each socket address"), all)
+	if n != 1 {
+		t.Fatalf("应只清 1 个, got %d", n)
+	}
+	nodeStableMu.Lock()
+	_, k1in := nodeStablePorts[k1]
+	_, k2in := nodeStablePorts[k2]
+	_, k3in := nodeStablePorts[k3]
+	nodeStableMu.Unlock()
+	if !k1in || k2in || !k3in {
+		t.Fatalf("应只清 k2(k1=%v k2=%v k3=%v): %v", k1in, k2in, k3in, nodeStablePorts)
+	}
+
+	// 2) 错误串无监听地址: 退回整批清除
+	reset()
+	if n := purgeStablePortsFromError(fmt.Errorf("some non-bind failure"), all); n != 3 {
+		t.Fatalf("解析不出端口应整批清除(3), got %d", n)
+	}
+	nodeStableMu.Lock()
+	remaining := len(nodeStablePorts)
+	nodeStableMu.Unlock()
+	if remaining != 0 {
+		t.Fatalf("整批清除后应无记录, got %d", remaining)
+	}
 }

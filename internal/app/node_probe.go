@@ -36,11 +36,12 @@ const (
 	nodeProbeTimeout      = 12 * time.Second // 单源宽超时, 容纳慢启动节点
 	nodeProbeRetryTimeout = 4 * time.Second  // MITM/WARP 复核窄超时, 死节点快速放弃
 
-	// 测速
+	// 测速(2026-09-22 审查: 原 nodeSpeedMinBPS=70000 直接判死, 实测误杀
+	// 12~62KB/s 的可用节点。按用户决定降到 50KB/s 并改判**降权**, 不判死)
 	nodeSpeedBudget      = 5.0   // 测速时间预算(秒)
-	nodeSpeedMinBPS      = 70000 // 吞吐 < 70KB/s 判定断流
+	nodeSpeedSlowBPS     = 50000 // < 50KB/s 只在选路里降权兜底, 不判死
 	nodeSpeedChunkSize   = 65536 // 读块大小
-	nodeSpeedIdleTimeout = 3.0   // 空闲 > 3s = 断流签名
+	nodeSpeedIdleTimeout = 3.0   // 读空闲 > 3s = 真断流签名(唯一判死条件)
 
 	// 出口 IP 查询超时
 	nodeIPEchoTimeout = 8 * time.Second
@@ -122,8 +123,11 @@ type nodeTestResult struct {
 	// 质量
 	SpeedBPS  int64 `json:"speedBps"`
 	IsStalled bool  `json:"isStalled"`
-	MITMRisk  bool  `json:"mitmRisk"`
-	IsWarp    bool  `json:"isWarp"`
+	// SpeedTestFailed 测速端点全挂/0 字节 —— **不是**节点的错, 不参与健康判定,
+	// 也不算慢(2026-09-22 审查 P1: 曾被无差别并入 IsStalled 判死)。
+	SpeedTestFailed bool `json:"speedTestFailed,omitempty"`
+	MITMRisk        bool `json:"mitmRisk"`
+	IsWarp          bool `json:"isWarp"`
 
 	// 分类(测试后填充)
 	NetworkType   string `json:"networkType,omitempty"`   // datacenter/residential/mobile/cdn/unknown
@@ -181,7 +185,7 @@ func testNodeComprehensive(key string) nodeTestResult {
 	probeNodeExitInfo(client, &result)
 
 	// === 3) 测速 + 断流检测 ===
-	result.SpeedBPS, result.IsStalled = probeNodeSpeed(client)
+	result.SpeedBPS, result.IsStalled, result.SpeedTestFailed = probeNodeSpeed(client)
 
 	// === 4) MITM + WARP 检测 ===
 	result.MITMRisk = probeMITM(client)
@@ -442,8 +446,16 @@ func truncateStr(s string, maxLen int) string {
 
 // --- 测速 + 断流检测 ---
 
-// probeNodeSpeed 经代理做限时下载测速, 返回 (吞吐字节/s, 是否断流)
-func probeNodeSpeed(client *http.Client) (int64, bool) {
+// probeNodeSpeed 经代理做限时下载测速, 返回 (吞吐字节/s, 是否断流, 测速是否失败)。
+//
+// 三态语义(2026-09-22 审查 P1 修复):
+//   - 断流(IsStalled): 下载中途出现 >3s 读空闲 —— 这才是节点自身的"断流签名",
+//     唯一足以判死的信号;
+//   - 测速失败(SpeedTestFailed): 所有端点都连不上/非 200/0 字节 —— 端点抽风
+//     (两个 URL 同为 speed.cloudflare.com, 同生同死)不是节点的错, 不判死;
+//   - 慢(仅记 SpeedBPS): 持续有数据但吞吐 < nodeSpeedSlowBPS —— 由选路降权兜底,
+//     不判死(实测 p50=36KB/s 的节点跑 LLM 流式完全可用)。
+func probeNodeSpeed(client *http.Client) (int64, bool, bool) {
 	for _, url := range nodeSpeedTestURLs {
 		ctx, cancel := context.WithTimeout(context.Background(), time.Duration(nodeSpeedBudget*float64(time.Second)))
 		req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
@@ -464,6 +476,7 @@ func probeNodeSpeed(client *http.Client) (int64, bool) {
 		var downloaded int64
 		t0 := time.Now()
 		lastChunk := t0
+		stalled := false
 		chunk := make([]byte, nodeSpeedChunkSize)
 		for {
 			n, err := resp.Body.Read(chunk)
@@ -479,7 +492,8 @@ func probeNodeSpeed(client *http.Client) (int64, bool) {
 				break
 			}
 			if now.Sub(lastChunk).Seconds() > nodeSpeedIdleTimeout {
-				break // 空闲断流
+				stalled = true // 空闲断流: 节点自身的签名
+				break
 			}
 		}
 		resp.Body.Close()
@@ -488,14 +502,13 @@ func probeNodeSpeed(client *http.Client) (int64, bool) {
 		if elapsed < 0.001 {
 			elapsed = 0.001
 		}
-		speed := int64(float64(downloaded) / elapsed)
 		if downloaded > 0 {
-			stalled := speed < nodeSpeedMinBPS
-			return speed, stalled
+			return int64(float64(downloaded) / elapsed), stalled, false
 		}
+		// 200 但 0 字节: 视作该端点失败, 换下一个端点再试
 	}
-	// 全部端点都失败 = 断流
-	return 0, true
+	// 全部端点都失败 = 测速未测(不是断流)
+	return 0, false, true
 }
 
 // --- MITM + WARP 检测 ---

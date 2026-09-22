@@ -189,8 +189,13 @@ func socks5UserPassAuth(conn net.Conn, user, pass string) error {
 	if _, err := io.ReadFull(conn, reply[:]); err != nil {
 		return fmt.Errorf("socks5: read auth reply: %w", err)
 	}
+	// RFC 1929: 应答版本恒为 0x01。不校验会把代理侧的协议错乱压成"认证失败",
+	// 排查时分不清凭据错与代理本身报错(2026-09-22 审查 P3)。
+	if reply[0] != 0x01 {
+		return fmt.Errorf("socks5: bad auth reply version 0x%02x", reply[0])
+	}
 	if reply[1] != 0x00 {
-		return fmt.Errorf("socks5: authentication failed")
+		return fmt.Errorf("socks5: authentication failed (RFC1929 status 0x%02x)", reply[1])
 	}
 	return nil
 }

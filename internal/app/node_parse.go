@@ -144,7 +144,14 @@ func transportBlock(net string, q url.Values) (map[string]any, bool) {
 		}
 		return map[string]any{"type": "grpc", "service_name": sn}, true
 	case "http", "h2":
-		return map[string]any{"type": "http", "path": q.Get("path"), "host": []string{q.Get("host")}}, true
+		t := map[string]any{"type": "http", "path": q.Get("path")}
+		// 与 ws 分支同纪律: host 缺失时不注入。无条件塞 host:[""] 会被 sing-box
+		// 判为无效 HTTP transport 整条剔除 —— 而 type=http 不带 host 是分享链接
+		// 的常见最简写法(2026-09-22 审查 P2)。
+		if h := q.Get("host"); h != "" {
+			t["host"] = []string{h}
+		}
+		return t, true
 	}
 	return nil, false
 }
@@ -230,6 +237,11 @@ func parseUserinfoNode(rest, tag, typ string) (map[string]any, error) {
 		return nil, fmt.Errorf("%s: bad host/port", typ)
 	}
 	q := u.Query()
+	// 订阅源可给出无 @ 的畸形行(vless://1.2.3.4:443?security=tls): u.User 为 nil,
+	// 直接 .Username() 会 nil pointer 打挂整个进程(2026-09-22 审查 P1)。
+	if u.User == nil {
+		return nil, fmt.Errorf("%s: missing credential", typ)
+	}
 	secret := u.User.Username()
 	if secret == "" {
 		return nil, fmt.Errorf("%s: missing credential", typ)
