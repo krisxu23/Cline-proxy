@@ -103,11 +103,6 @@ func callZenAPI(ctx context.Context, params map[string]any, stream bool) (*http.
 	case zenEndpointResponses:
 		body = translate_registry.TranslateRequest(translate_registry.Chat, translate_registry.Responses, body)
 		applyResponsesReasoning(body, reasoningEffort)
-		// 出站体形态不变量(P1-9): 违例说明转换层有 bug(如重复转换把 input
-		// 转空), 宁可网关 500 也不把畸形请求发给上游换回难以理解的 400。
-		if problems := translate_registry.ValidateOutbound(translate_registry.Responses, body); len(problems) > 0 {
-			return nil, 0, fmt.Errorf("responses outbound shape invalid: %s", strings.Join(problems, "; "))
-		}
 	case zenEndpointMessages:
 		// Anthropic Messages 形态: 用 internal/translate 的 openai→claude 方向。
 		// 失败即返回, 不把畸形请求发给上游。
@@ -117,8 +112,23 @@ func callZenAPI(ctx context.Context, params map[string]any, stream bool) (*http.
 		}
 		body = converted
 	}
-	// 保留给下方"Responses 端点自适应回退"分支的既有判据。
-	// (已被 zenEndpoint 取代, 保留注释说明来源)
+
+	// 免费层形态整形: chat/responses/messages 三个端点都要 agent 工具 + stream,
+	// 缺一个即 403 FreeTierError。放在协议翻译之后, 因为翻译会丢失 chat
+	// 形状的 tools(OpenAIChatToClaudeRequest 只保留 {function:{...}} 嵌套)。
+	forcedStream := false
+	if isFreeModelForShape := zenFreeShapeRequired(zenEndpoint, zenResolvedModel); isFreeModelForShape {
+		body, forcedStream = zenApplyFreeShape(zenEndpoint, body)
+	}
+
+	switch zenEndpoint {
+	case zenEndpointResponses:
+		// 出站体形态不变量(P1-9): 违例说明转换层或整形层有 bug,
+		// 宁可网关 500 也不把畸形请求发给上游换回难以理解的 400。
+		if problems := translate_registry.ValidateOutbound(translate_registry.Responses, body); len(problems) > 0 {
+			return nil, 0, fmt.Errorf("responses outbound shape invalid: %s", strings.Join(problems, "; "))
+		}
+	}
 
 	bodyJSON, err := json.Marshal(body)
 	if err != nil {
@@ -260,7 +270,7 @@ func callZenAPI(ctx context.Context, params map[string]any, stream bool) (*http.
 			}
 			switch zenEndpoint {
 			case zenEndpointResponses:
-				if stream {
+				if stream || forcedStream {
 					resp = wrapResponsesStreamToChat(resp, zenResolvedModel, zenBudget)
 				} else {
 					converted, cerr := convertResponsesResponseToChat(resp, zenResolvedModel, zenBudget)
@@ -275,7 +285,7 @@ func callZenAPI(ctx context.Context, params map[string]any, stream bool) (*http.
 			case zenEndpointMessages:
 				// Anthropic 响应 / SSE → chat 形态。流式走 io.Pipe 实时转换, 因此
 				// 下游的空流守卫、坏帧清洗、心跳全部照常生效, 无需单独实现一套。
-				if stream {
+				if stream || forcedStream {
 					resp = wrapClaudeStreamToChat(resp, zenResolvedModel)
 				} else {
 					converted, cerr := convertClaudeResponseToChat(resp, zenResolvedModel)
@@ -289,11 +299,20 @@ func callZenAPI(ctx context.Context, params map[string]any, stream bool) (*http.
 				// 实测调通 → 持久化登记, 之后直接走 /messages(负向结论不落盘)。
 				zenLearnMessagesOnly(zenResolvedModel)
 			}
+			// 免费层强制了 stream, 但客户端原始请求是非流式 —— 上游返回 chat SSE,
+			// 需要汇总成 JSON 再交回, 保持与非免费层调用形态一致。
+			if forcedStream && !stream {
+				collapsed, cerr := zenCollapseFreeStreamToJSON(resp)
+				if cerr != nil {
+					recordZenModelResult(zenModelIDOf(params), true)
+					return nil, rateLimited, fmt.Errorf("zen free-tier collapse: %w", cerr)
+				}
+				resp = collapsed
+			}
 			// 端点转换与空回合判定全部通过 —— 到这里才是真的"模型这一轮可用"。
 			recordZenModelResult(zenModelIDOf(params), false)
 			return resp, rateLimited, nil
 		}
-
 		bodyBytes := kit.ReadBody(resp)
 		resp.Body.Close()
 		// 401: 这把 key 失效(被吊销 / 冻结) → 临时退役, 受影响出口自动落到下一把
