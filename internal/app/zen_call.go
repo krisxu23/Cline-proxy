@@ -118,6 +118,30 @@ func callZenAPI(ctx context.Context, params map[string]any, stream bool) (*http.
 	// 判据与端点矩阵见 zen_endpoints.go 与 docs/opencode-zen-facts.md。
 	zenResolvedModel, _ := body["model"].(string)
 	zenEndpoint := zenEndpointFor(zenResolvedModel)
+	// 直连 zen 路径的决策轨迹。此前只有候选链(handleChainedChat)会建轨迹, 于是所有
+	// 非链式 zen 请求在面板详情里同时出现两个假象: "决策轨迹不可用 HTTP 404"(轨迹
+	// 从未登记)与"0 次尝试, 跳过 0 站"(计数从未写入)—— 两条假象同源于此: 轨迹从未创建。
+	//
+	// ★ 创建点必须留在所有 return 之前: 它曾位于信号量之后, 于是 4 条提前 return
+	// (消息端点转换失败 / 出站形态校验失败 / marshal 失败 / 排队中客户端取消)
+	// 从未登记轨迹, 面板对这些请求回 404。上移到模型解析之后, 全部 18 条 return
+	// 路径都被覆盖 —— 修法是"创建覆盖所有 return", 而非在各 return 前逐个补记。
+	//
+	// owns 是记账开关, 不是判重: callZenAPI 同时被 callChainUpstream 调用(routing_chain.go),
+	// 而链式调度自己已经做了完整的逐候选记账(handleChainedChat: tr.AddAttempt + dec.addCandidate)。
+	// 此处若再来一遍, 每次上游调用会把尝试数与候选数**翻倍**。因此只有"本次新建"轨迹时
+	// (直连路径)才记账; 已存在(链式已登记)一律跳过。
+	trace := traceFrom(ctx)
+	dec := decisionTraceFrom(reqIDFrom(ctx))
+	owns := false
+	if dec == nil {
+		dec = decisionTraceStart(reqIDFrom(ctx), zenResolvedModel)
+		owns = true
+	}
+	// 终局收口: 面板的 finish 状态依赖它。finish 幂等且持锁, 与链式入口的 defer 并存也安全。
+	if owns {
+		defer dec.finish()
+	}
 	// reasoning_effort 会被 buildZenBody 删除(chat 端点上上游不接受), 这里
 	// 先留存, 供 Responses 形态使用。
 	reasoningEffort := zenReasoningEffortOf(params)
@@ -205,26 +229,6 @@ func callZenAPI(ctx context.Context, params map[string]any, stream bool) (*http.
 	rateLimited = 0
 	respTried := false // Responses 端点自适应回退每次请求只试一次
 	msgTried := false  // Messages 端点自适应回退每次请求只试一次
-
-	// 直连 zen 路径的决策轨迹。此前只有候选链(handleChainedChat)会建轨迹, 于是所有
-	// 非链式 zen 请求在面板详情里同时出现两个假象: "决策轨迹不可用 HTTP 404"(轨迹
-	// 从未登记)与"0 次尝试, 跳过 0 站"(计数从未写入)—— 两条假象同源于此: 轨迹从未创建。
-	//
-	// owns 是记账开关, 不是判重: callZenAPI 同时被 callChainUpstream 调用(routing_chain.go),
-	// 而链式调度自己已经做了完整的逐候选记账(handleChainedChat: tr.AddAttempt + dec.addCandidate)。
-	// 此处若再来一遍, 每次上游调用会把尝试数与候选数**翻倍**。因此只有"本次新建"轨迹时
-	// (直连路径)才记账; 已存在(链式已登记)一律跳过。
-	trace := traceFrom(ctx)
-	dec := decisionTraceFrom(reqIDFrom(ctx))
-	owns := false
-	if dec == nil {
-		dec = decisionTraceStart(reqIDFrom(ctx), zenResolvedModel)
-		owns = true
-	}
-	// 终局收口: 面板的 finish 状态依赖它。finish 幂等且持锁, 与链式入口的 defer 并存也安全。
-	if owns {
-		defer dec.finish()
-	}
 
 	for attempt := 0; ; attempt++ {
 		// 直连路径: 每次尝试记一条候选 + 一次真实尝试。请求日志的"尝试/跳过"与
