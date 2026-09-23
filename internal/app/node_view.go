@@ -45,6 +45,9 @@ type nodeView struct {
 
 // healthOf 节点最近一次连通检测结果
 func healthOf(key string) string {
+	// 惰性恢复落盘的健康结论: 选路判定第一读就走这里, 是"重启后立刻有健康视图"
+	// 的关键路径(见 ensureNodeHealthLoaded)。
+	ensureNodeHealthLoaded()
 	nodeHealthMu.RLock()
 	defer nodeHealthMu.RUnlock()
 	st, ok := nodeHealth[key]

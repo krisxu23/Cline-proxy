@@ -1,9 +1,12 @@
 package app
 
 import (
+	"encoding/json"
 	"free-router/internal/cline"
+	"free-router/internal/kit"
 	"log"
 	"net/url"
+	"os"
 	"sort"
 	"sync"
 	"time"
@@ -30,9 +33,102 @@ var (
 const nodeStartupHealthDelay = 12 * time.Second
 
 type nodeHealthState struct {
-	Ok     bool
-	At     time.Time
-	Result nodeTestResult // 增强测试引擎的完整结果(活性/出口IP/测速/MITM/分类)
+	Ok     bool           `json:"ok"`
+	At     time.Time      `json:"at"`
+	Result nodeTestResult `json:"result"` // 增强测试引擎的完整结果(活性/出口IP/测速/MITM/分类)
+}
+
+// ===== 健康表落盘: 让重启后立刻拥有上次的健康视图 =====
+//
+// 为什么必须落盘(2026-09-23 实证): 健康表此前只存在于内存, 重启/订阅重建后
+// `healthOf` 对每个节点返回 "unknown", 而 nodeUsable 的口径是"未检测 ≠ 不可用"
+// (见 nodes.go 的启动探测注释)—— 于是**全部节点在首轮探测完成前都参与选路**。
+// 实测每次重建后有约 2 分半的窗口(12s 启动延迟 + 约 2.5min 全量探测):
+//
+//	19:03:55  1263 个高级节点出口已就绪
+//	19:06:24  增强检测完成 ... 92/1263 个出口可达   ← 2 分 29 秒
+//
+// 池子里约 85% 是死节点(1131/1327), 这个窗口里它们全都在候选集里 —— 表现就是
+// "节点明明一堆, 就是连不上"。用户侧的正确预期是: 非首次启动时本地**存着上一次
+// 的节点信息与健康结论**, 可以直接用; 后台再全量复检覆盖。
+//
+// 与订阅节点缓存(subs_cache.json)同一套思路, 只是缓存的对象是"健康结论"。
+const nodeHealthFile = "node-health.json"
+
+// nodeHealthCacheTTL 落盘健康结论的最大可信年龄。
+//
+// 超过它的一律丢弃、回到"未检测"由首轮探测重新判定。存在的意义是挡住"网关停了
+// 一周再开"这种场景 —— 那时的结论已经没有参考价值, 但也不该因此把全部节点当成
+// 可用(那正是本机制要修的问题), 所以宁可让它们等首轮探测。
+const nodeHealthCacheTTL = 7 * 24 * time.Hour
+
+var nodeHealthLoadOnce sync.Once
+
+// nodeHealthFileOverride 落盘路径覆盖(仅测试用; 空 = data/node-health.json)。
+var nodeHealthFileOverride string
+
+func nodeHealthPath() string {
+	if nodeHealthFileOverride != "" {
+		return nodeHealthFileOverride
+	}
+	return kit.ResolveDataPath(nodeHealthFile)
+}
+
+// ensureNodeHealthLoaded 惰性恢复落盘的健康结论(仅一次)。
+//
+// 用 sync.Once 而不是"在某个启动点调用一次": 读取点分散在 healthOf /
+// checkAllNodeHealth / recomputeExitFold 三处, 漏掉任一处就会出现"部分路径看不到
+// 缓存"的诡异行为; Once 让"第一次读"本身就完成加载, 无遗漏。
+func ensureNodeHealthLoaded() {
+	nodeHealthLoadOnce.Do(loadNodeHealthCache)
+}
+
+// loadNodeHealthCache 加载体(单独抽出便于测试反复调用 —— Once 只能跑一次)。
+//
+// 合并语义是**只补空缺**: 已经存在的键(本进程已探测出的新结论)一律保留 ——
+// 万一加载发生在首轮探测之后, 也不能用旧结论覆盖新结论。
+func loadNodeHealthCache() {
+	data, err := os.ReadFile(nodeHealthPath())
+	if err != nil {
+		return // 首次运行/文件被删: 正常路径, 静默
+	}
+	var snap map[string]nodeHealthState
+	if err := json.Unmarshal(data, &snap); err != nil {
+		log.Printf("  nodes: 健康表缓存解析失败已忽略(将走全量探测): %v", err)
+		return
+	}
+	cutoff := time.Now().Add(-nodeHealthCacheTTL)
+	restored, stale := 0, 0
+	nodeHealthMu.Lock()
+	for k, v := range snap {
+		if v.At.Before(cutoff) {
+			stale++
+			continue
+		}
+		if _, ok := nodeHealth[k]; !ok {
+			nodeHealth[k] = v
+			restored++
+		}
+	}
+	nodeHealthMu.Unlock()
+	log.Printf("  nodes: 已从本地缓存恢复 %d 条出口健康结论(重启后立即可用, 后台会全量复检覆盖); 过期丢弃 %d 条",
+		restored, stale)
+}
+
+// persistNodeHealth 落盘当前健康表(失败仅告警, 下一轮探测会重试)。
+// 持锁拷贝快照、放锁后再做文件 I/O —— 与 persistNodeStablePorts 同一约定。
+func persistNodeHealth() {
+	nodeHealthMu.RLock()
+	snap := make(map[string]nodeHealthState, len(nodeHealth))
+	for k, v := range nodeHealth {
+		snap[k] = v
+	}
+	nodeHealthMu.RUnlock()
+	if b := mustJSONIndent(snap); b != nil {
+		if err := kit.WriteFileAtomicDefault(nodeHealthPath(), b); err != nil {
+			log.Printf("node health persist failed: %v", err)
+		}
+	}
 }
 
 // healthCheckTargets 连通检测目标: zen 主端点与 cline 上游的 host
@@ -73,6 +169,9 @@ func pruneStaleNodeHealth(active []string) {
 // 但"重入即丢弃"必须补偿: 置 healthRunAgain 让上一轮结束后立刻补跑, 否则订阅
 // 新刷进来的节点要等到下一个 30 分钟周期才被测。
 func checkAllNodeHealth() {
+	// 先把落盘的健康结论并进来: 首轮探测要跑约 2.5 分钟, 这期间选路读的就是
+	// 这张表 —— 不先恢复的话, 全部节点都是 "unknown", nodeUsable 一律放行。
+	ensureNodeHealthLoaded()
 	nodeHealthRunMu.Lock()
 	if nodeHealthRunning {
 		healthRunAgain = true
@@ -269,6 +368,9 @@ func checkAllNodeHealth() {
 	}
 	wg.Wait()
 	persistNodeCountries()
+	// 健康结论一并落盘: 下次启动/重建就能立刻拿到"哪些出口真的可用", 不必让
+	// 全部节点(实测约 85% 是死的)在首轮探测的 ~2.5 分钟窗口里当可用参与选路。
+	persistNodeHealth()
 	// 整批检测完再失效一次出口列表缓存(逐节点失效会把缓存打穿)
 	invalidateExitListCache()
 	if skipped > 0 {

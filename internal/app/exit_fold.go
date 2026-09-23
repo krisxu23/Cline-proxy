@@ -25,6 +25,9 @@ var (
 // recomputeExitFold 按最新一轮检测结果重算出口折叠。
 // 约束: 只折叠"有实测出口 IP 且健康"的节点; 同组内 latency 最小者为主力。
 func recomputeExitFold() {
+	// 折叠依赖 Result.ExitIP, 而它随健康表一起落盘 —— 不先恢复的话重启后折叠表
+	// 是空的, 同出口 IP 的副本会全部参与选路(见 ensureNodeHealthLoaded)。
+	ensureNodeHealthLoaded()
 	type group struct {
 		bestKey string
 		bestLat int64
