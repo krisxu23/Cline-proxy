@@ -642,8 +642,10 @@ func buildZenTransport() *http.Transport {
 // newZenTransport 构建 zen transport 本体, 同时返回注册进 https 侧路的 h2
 // 引用。共享给两处调用方, 避免构造参数分叉:
 //   - buildZenTransport: 进程唯一共享实例(连接池复用, 配置变更时关闭并重建)。
-//   - zen call 每次重试的 fresh transport: 不复用连接, 让 zenDialContext
-//     现场选出口 —— 见 zen_call.go 的重试分支。
+//   - zen call 每次 attempt 的 fresh transport: 不复用连接, 让 zenDialContext
+//     现场选出口 —— 见 zen_call.go 的调用点。**每次尝试**都新建(不再只给
+//     重试), 因为共享池的连接按上游 host 复用, 会绕过出口选择, 并把"该冷却
+//     哪个出口"这条信息一并丢掉。
 //
 // http 走 http.Transport 主路(DialContext = zenDialGuarded, 明文), https
 // 走 RegisterProtocol 登记的 h2 + uTLS Chrome 指纹(完整浏览器指纹含 h2,
