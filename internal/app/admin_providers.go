@@ -8,7 +8,7 @@ import (
 	"net/http"
 	"time"
 
-	"cline-go-proxy/internal/kit"
+	"free-router/internal/kit"
 )
 
 // GET /admin/api/providers

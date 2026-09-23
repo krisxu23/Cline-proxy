@@ -8,7 +8,7 @@ import (
 	"sync"
 	"time"
 
-	"cline-go-proxy/internal/kit"
+	"free-router/internal/kit"
 )
 
 // 每日配额账本(spec §4.4)。

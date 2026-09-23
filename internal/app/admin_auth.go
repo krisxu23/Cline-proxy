@@ -13,7 +13,7 @@ import (
 	"strings"
 	"sync"
 
-	"cline-go-proxy/internal/kit"
+	"free-router/internal/kit"
 )
 
 // ============================================================================

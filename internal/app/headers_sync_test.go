@@ -94,11 +94,11 @@ func TestFetchVersionFromCorePackage(t *testing.T) {
 	}
 }
 
-// 真实网络校验: 默认跳过, 用 CLINE_PROXY_NET_TESTS=1 打开。
+// 真实网络校验: 默认跳过, 用 FREE_ROUTER_NET_TESTS=1 打开。
 // 官方版本号是外部事实, 只有真跑一次才知道上游换了包名或字段。
 func TestFetchClineVersionsLive(t *testing.T) {
-	if os.Getenv("CLINE_PROXY_NET_TESTS") != "1" {
-		t.Skip("set CLINE_PROXY_NET_TESTS=1 to query the official registries")
+	if os.Getenv("FREE_ROUTER_NET_TESTS") != "1" {
+		t.Skip("set FREE_ROUTER_NET_TESTS=1 to query the official registries")
 	}
 	info, err := fetchClineVersions(context.Background())
 	if err != nil {

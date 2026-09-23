@@ -1,7 +1,7 @@
 package app
 
 import (
-	"cline-go-proxy/internal/cline"
+	"free-router/internal/cline"
 	"log"
 	"net/url"
 	"sync"

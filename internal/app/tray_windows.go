@@ -18,7 +18,7 @@ import (
 	"runtime"
 	"time"
 
-	"cline-go-proxy/internal/kit"
+	"free-router/internal/kit"
 	"fyne.io/systray"
 )
 
@@ -73,8 +73,8 @@ func OpenAdminWindow(adminURL string) {
 func RunTray(adminURL string) {
 	systray.Run(func() {
 		systray.SetIcon(trayIconIco)
-		systray.SetTitle("Cline Proxy")
-		systray.SetTooltip("Cline Go Proxy 综合网关 - 运行中")
+		systray.SetTitle("Free Router")
+		systray.SetTooltip("Free Router 综合网关 - 运行中")
 		mOpen := systray.AddMenuItem("打开管理界面", "在应用窗口中打开 Web 后台")
 		mData := systray.AddMenuItem("打开数据目录", "在资源管理器中打开 data/ 目录(日志与配置所在)")
 		mDiag := systray.AddMenuItem("导出诊断包", "打包 health/日志尾部/节点概览为 zip, 便于排障")
@@ -103,7 +103,7 @@ func RunTray(adminURL string) {
 
 // openDataDir 在资源管理器中打开 data/ 目录(日志、配置、令牌都在这里)。
 func openDataDir() {
-	dir := filepath.Dir(kit.ResolveDataPath("cline-proxy.log"))
+	dir := filepath.Dir(kit.ResolveDataPath("free-router.log"))
 	exec.Command("explorer", dir).Start()
 }
 
@@ -117,7 +117,7 @@ func openDataDir() {
 //
 // 默认导出到 data/diag-<时间戳>.zip, 完成后用资源管理器定位到该文件方便取走。
 func exportDiagnostics(adminURL string) {
-	dir := filepath.Dir(kit.ResolveDataPath("cline-proxy.log"))
+	dir := filepath.Dir(kit.ResolveDataPath("free-router.log"))
 	ts := time.Now().Format("20060102-150405")
 	zipPath := filepath.Join(dir, "diag-"+ts+".zip")
 	if err := writeDiagnosticsZip(zipPath, adminURL); err != nil {
@@ -129,7 +129,7 @@ func exportDiagnostics(adminURL string) {
 }
 
 func writeDiagnosticsZip(zipPath, adminURL string) error {
-	dir := filepath.Dir(kit.ResolveDataPath("cline-proxy.log"))
+	dir := filepath.Dir(kit.ResolveDataPath("free-router.log"))
 	f, err := os.Create(zipPath)
 	if err != nil {
 		return err
@@ -168,8 +168,8 @@ func writeDiagnosticsZip(zipPath, adminURL string) error {
 	}
 
 	// 2) 主日志与流式日志的尾部(各 64KB, 控制体积)。
-	writeZipFile("logs/cline-proxy.log.tail", readTailFile(kit.ResolveDataPath("cline-proxy.log"), 64<<10))
-	writeZipFile("logs/cline-proxy-stream.log.tail", readTailFile(kit.ResolveDataPath("cline-proxy-stream.log"), 64<<10))
+	writeZipFile("logs/free-router.log.tail", readTailFile(kit.ResolveDataPath("free-router.log"), 64<<10))
+	writeZipFile("logs/free-router-stream.log.tail", readTailFile(kit.ResolveDataPath("free-router-stream.log"), 64<<10))
 
 	// 3) 节点与订阅概览。nodePorts 由 nodeMu 保护, 短暂加锁读长度。
 	nodeMu.Lock()

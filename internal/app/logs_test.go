@@ -9,7 +9,7 @@ import (
 	"testing"
 	"time"
 
-	"cline-go-proxy/internal/kit"
+	"free-router/internal/kit"
 )
 
 // TestAppendReqLogConcurrent 验证并发写入的正确性:

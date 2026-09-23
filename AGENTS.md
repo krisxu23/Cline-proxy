@@ -91,11 +91,11 @@ ssh -T -p 443 git@ssh.github.com
 ```bash
 export PATH="/c/Go/bin:$PATH" GOROOT="C:\\Go"     # 本机 Go 不在 PATH
 go build -tags "with_quic,with_grpc,with_utls" ./...            # 编译全部包(校验用)
-go build -tags "with_quic,with_grpc,with_utls" -o cline-proxy.exe ./cmd/cline-proxy
+go build -tags "with_quic,with_grpc,with_utls" -o free-router.exe ./cmd/free-router
 go test  -count=1 -tags "with_quic,with_grpc,with_utls" ./internal/...
 ```
 
-入口包在 `cmd/cline-proxy/`（标准布局）；`internal/` 下全部为库包，
+入口包在 `cmd/free-router/`（标准布局）；`internal/` 下全部为库包，
 业务代码只在 `internal/` 内演进。
 
 构建标签是硬要求：不带标签时 reality/QUIC 类节点会被剔除，相关用例会失败。
@@ -107,7 +107,7 @@ go test  -count=1 -tags "with_quic,with_grpc,with_utls" ./internal/...
 
 ```bash
 CGO_ENABLED=0 go build -tags with_quic,with_grpc,with_utls \
-  -ldflags="-s -w -H=windowsgui" -o "D:/目标/cline-proxy.exe" ./cmd/cline-proxy
+  -ldflags="-s -w -H=windowsgui" -o "D:/目标/free-router.exe" ./cmd/free-router
 ```
 
-windowsgui 下没有控制台，运行日志看 `data/cline-proxy.log` 或管理面板。
+windowsgui 下没有控制台，运行日志看 `data/free-router.log` 或管理面板。

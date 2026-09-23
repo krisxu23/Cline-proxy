@@ -1,25 +1,25 @@
 package app
 
 import (
-	"cline-go-proxy/internal/kit"
 	"fmt"
+	"free-router/internal/kit"
 	"io"
 	"log"
 	"os"
 	"sync"
 )
 
-// maxLogBytes cline-proxy.log 的上限(10 MiB)。
+// maxLogBytes free-router.log 的上限(10 MiB)。
 //
 // GUI 构建下没有控制台, 这个文件是唯一的诊断通道; 无限追加会在长期运行后
 // 撑爆磁盘, 也让翻日志越来越难。超限时截断成空而不是滚动保留历史 ——
 // 诊断日志要的是最近一段, 不值得为历史轮转引入额外复杂度。
 const maxLogBytes = 10 << 20
 
-// initLogFile 将日志同时输出到控制台与 cline-proxy.log（追加模式），
+// initLogFile 将日志同时输出到控制台与 free-router.log（追加模式），
 // 控制台窗口滚动内容有限，文件可完整保留最近 maxLogBytes 的日志。
 func initLogFile() {
-	path := kit.ResolveDataPath("cline-proxy.log")
+	path := kit.ResolveDataPath("free-router.log")
 	// 0600 是「不写敏感信息」之外的第二道防线: 日志会记录订阅节点、上游返回文本等
 	// 可能带凭据的内容。注意 Windows 不实现数字权限位(实测文件仍是 644), 真正生效的
 	// 是把令牌本身挡在日志外 —— 见下方「访问令牌已省略」那条 Printf。
@@ -121,7 +121,7 @@ var (
 
 // streamLogFileName 流式诊断日志文件名。截断需要按路径重新开句柄(见 writeStreamLog),
 // 所以抽成常量而不是内联字面量, 避免两处写法漂移。
-const streamLogFileName = "cline-proxy-stream.log"
+const streamLogFileName = "free-router-stream.log"
 
 func writeStreamLog(line string) {
 	streamLogMu.Lock()
@@ -139,7 +139,7 @@ func writeStreamLog(line string) {
 			streamLogSize = 0
 		}
 	}
-	// 超过上限则截断成空, 只保留最近内容(与 cline-proxy.log 的轮转思路一致)。
+	// 超过上限则截断成空, 只保留最近内容(与 free-router.log 的轮转思路一致)。
 	// 终审 P3: 用内存计数代替此前**每次写**前的 Stat —— 该调用点在每个 SSE 事件上,
 	// 每帧一次内核调用纯属浪费。
 	if streamLogSize > maxLogBytes {

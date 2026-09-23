@@ -1,11 +1,11 @@
 package app
 
 import (
-	"cline-go-proxy/internal/kit"
-	"cline-go-proxy/internal/providers"
 	"context"
 	"encoding/json"
 	"fmt"
+	"free-router/internal/kit"
+	"free-router/internal/providers"
 	"io"
 	"log"
 	"net/http"
@@ -27,7 +27,7 @@ const (
 	defaultReasoningEffort = "high"
 )
 
-// buildVersion 由构建时注入: `-ldflags "-X cline-go-proxy/internal/app.buildVersion=$(git describe)"`。
+// buildVersion 由构建时注入: `-ldflags "-X free-router/internal/app.buildVersion=$(git describe)"`。
 // 未注入时回退到本硬编码默认值, 这样手工 `go build`(不带 -X)也不会得到空串。
 var buildVersion = "go-1.1"
 
@@ -497,7 +497,7 @@ func StartProxy(host string, port int) error {
 	panelURL := wrapAdminTokenURL(fmt.Sprintf("http://127.0.0.1:%d/admin/", port))
 	fmt.Println("")
 	fmt.Println(strings.Repeat("=", 58))
-	fmt.Println("  Cline Go Proxy v1.0 - No CLI Required")
+	fmt.Println("  Free Router v1.0 - No CLI Required")
 	fmt.Println(strings.Repeat("=", 58))
 	fmt.Printf("  http://%s\n", addr)
 	fmt.Printf("  http://%s/v1\n", addr)
@@ -600,7 +600,7 @@ func healthInfo() map[string]any {
 	}
 
 	// logBytes: 主日志文件当前大小(诊断磁盘占用)。
-	if st, err := os.Stat(kit.ResolveDataPath("cline-proxy.log")); err == nil {
+	if st, err := os.Stat(kit.ResolveDataPath("free-router.log")); err == nil {
 		info["logBytes"] = st.Size()
 	} else {
 		info["logBytes"] = int64(0)

@@ -5,7 +5,7 @@
 FROM golang:1.26-alpine AS builder
 
 # 构建版本号(P3-29): 与 .github/workflows/build.yml 用同一注入点
-# -X cline-go-proxy/internal/app.buildVersion, 未传时回退 dev ——
+# -X free-router/internal/app.buildVersion, 未传时回退 dev ——
 # 否则容器 /health 恒报硬编码默认值 go-1.1, 无法区分线上构建版本。
 ARG VERSION=dev
 
@@ -13,13 +13,13 @@ WORKDIR /build
 COPY go.mod ./
 RUN go mod download
 COPY . .
-RUN CGO_ENABLED=0 go build -tags with_quic,with_grpc,with_utls -buildvcs=false -ldflags="-s -w -X cline-go-proxy/internal/app.buildVersion=${VERSION}" -o cline-proxy ./cmd/cline-proxy
+RUN CGO_ENABLED=0 go build -tags with_quic,with_grpc,with_utls -buildvcs=false -ldflags="-s -w -X free-router/internal/app.buildVersion=${VERSION}" -o free-router ./cmd/free-router
 
 FROM alpine:3.21
 
 RUN apk add --no-cache ca-certificates tzdata
 WORKDIR /app
-COPY --from=builder /build/cline-proxy .
+COPY --from=builder /build/free-router .
 
 # 以非 root 用户运行(安全加固): 固定 uid/gid=10001, 并把 /app(含数据目录)
 # 的所有权交还给该用户。容器仍监听 0.0.0.0(见下方 CMD), 与 USER 切换无关。
@@ -40,7 +40,7 @@ VOLUME ["/app/data"]
 # 这里刻意不设 PORT 环境变量(P3-30): 程序只认 -port flag, 全仓无任何
 # Getenv("PORT"), 设了也是假旋钮。端口由下方 CMD 的 -port(及 HEALTHCHECK)决定。
 
-ENTRYPOINT ["/app/cline-proxy"]
+ENTRYPOINT ["/app/free-router"]
 # 容器内必须显式 0.0.0.0, 否则端口映射不可达; 这与「镜像内绑定 0.0.0.0」是两回事 ——
 # 真正对宿主机暴露哪些端口由 `docker run -p` / compose 的 ports 字段决定(例如
 # `ports: "3457:3457"` 会把容器 3457 映射到宿主机 3457, 即绑宿主 0.0.0.0)。无论怎么

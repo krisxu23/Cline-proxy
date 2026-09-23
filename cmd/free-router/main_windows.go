@@ -52,7 +52,7 @@ func attachParentConsole() {
 func msgboxFail(err error) {
 	u32 := syscall.NewLazyDLL("user32.dll")
 	mb := u32.NewProc("MessageBoxW")
-	title, _ := syscall.UTF16PtrFromString("Cline Proxy")
+	title, _ := syscall.UTF16PtrFromString("Free Router")
 	text, _ := syscall.UTF16PtrFromString("代理启动失败:\n" + err.Error() + "\n\n常见原因: 端口被占用, 可用 -port 换端口。")
 	const mbIconError = 0x10
 	mb.Call(0, uintptr(unsafe.Pointer(text)), uintptr(unsafe.Pointer(title)), mbIconError)

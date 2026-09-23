@@ -175,7 +175,7 @@ func TestHTTPPostJSONSendsJSON(t *testing.T) {
 }
 
 func TestRunCommandMissingBinaryReturnsError(t *testing.T) {
-	if err := RunCommand("cline-proxy-nonexistent-binary-xyz"); err == nil {
+	if err := RunCommand("free-router-nonexistent-binary-xyz"); err == nil {
 		t.Fatal("不存在的可执行文件必须返回错误(调用方据此提示)")
 	}
 }

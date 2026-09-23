@@ -9,7 +9,7 @@ import (
 	"testing"
 	"time"
 
-	"cline-go-proxy/internal/kit"
+	"free-router/internal/kit"
 )
 
 // TestInitStatsRetry 验证 stats 文件打开失败后不会永久降级:

@@ -1,12 +1,12 @@
 package app
 
 import (
-	"cline-go-proxy/internal/kit"
 	"context"
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"free-router/internal/kit"
 	"io"
 	"log"
 	"net/http"
@@ -403,7 +403,7 @@ func handleConfigExport(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	writeAPI(w, http.StatusOK, apiResponse{Success: true, Data: map[string]any{
-		"kind":       "cline-proxy-config-backup",
+		"kind":       "free-router-config-backup",
 		"version":    1,
 		"exportedAt": time.Now().Format(time.RFC3339),
 		"files":      files,

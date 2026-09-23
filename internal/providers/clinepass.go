@@ -12,9 +12,9 @@ import (
 	"sync"
 	"time"
 
-	"cline-go-proxy/internal/cline"
-	"cline-go-proxy/internal/kit"
-	"cline-go-proxy/internal/protocol"
+	"free-router/internal/cline"
+	"free-router/internal/kit"
+	"free-router/internal/protocol"
 )
 
 // proxyDoer is set by the host app to route upstream calls through the proxy pool.

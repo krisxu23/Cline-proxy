@@ -21,8 +21,8 @@ import (
 	"fmt"
 	"net/http"
 
-	"cline-go-proxy/internal/app/translate_registry"
-	"cline-go-proxy/internal/translate"
+	"free-router/internal/app/translate_registry"
+	"free-router/internal/translate"
 )
 
 const (

@@ -9,7 +9,7 @@ import (
 	"strings"
 	"sync"
 
-	"cline-go-proxy/internal/providers"
+	"free-router/internal/providers"
 )
 
 // gateway assembles the provider layer: the Router seam plus concrete

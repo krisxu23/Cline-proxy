@@ -1,8 +1,8 @@
 package app
 
 import (
-	"cline-go-proxy/internal/webui"
 	"encoding/json"
+	"free-router/internal/webui"
 	"html/template"
 	"net/http"
 	"strings"
@@ -146,7 +146,7 @@ func renderAdminTokenPrompt(mismatch bool, retain string) string {
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Cline Proxy · 需要访问令牌</title>
+<title>Free Router · 需要访问令牌</title>
 <style>body{font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif;background:#0f172a;color:#e2e8f0;display:flex;min-height:100vh;align-items:center;justify-content:center;margin:0}main{max-width:560px;padding:32px;background:#1e293b;border-radius:12px;line-height:1.7}h1{font-size:20px;margin:0 0 12px}code{background:#0f172a;padding:2px 6px;border-radius:4px;word-break:break-all}a{color:#60a5fa}p{margin:10px 0}form{display:flex;gap:8px;margin:14px 0 4px}input{flex:1;background:#0f172a;border:1px solid #334155;border-radius:6px;color:#e2e8f0;padding:8px 10px;font-size:14px}button{background:#2563eb;border:0;border-radius:6px;color:#fff;padding:8px 16px;font-size:14px;cursor:pointer}button:hover{background:#1d4ed8}</style>
 </head>
 <body><main>

@@ -8,7 +8,7 @@ import (
 	"sync"
 	"time"
 
-	"cline-go-proxy/internal/kit"
+	"free-router/internal/kit"
 )
 
 // 候选层冷却 —— 四层冷却中的第四层。

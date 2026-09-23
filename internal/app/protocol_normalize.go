@@ -1,8 +1,8 @@
 package app
 
 import (
-	"cline-go-proxy/internal/kit"
 	"encoding/json"
+	"free-router/internal/kit"
 	"strings"
 )
 

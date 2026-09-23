@@ -1,4 +1,4 @@
-module cline-go-proxy
+module free-router
 
 go 1.26.0
 

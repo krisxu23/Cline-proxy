@@ -9,7 +9,7 @@ import (
 	"strings"
 	"testing"
 
-	"cline-go-proxy/internal/providers"
+	"free-router/internal/providers"
 )
 
 // P2-9: 接口写的是 io.Writer, 就必须真的支持任意 io.Writer。

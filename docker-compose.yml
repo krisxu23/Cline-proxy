@@ -3,9 +3,9 @@ version: "3.9"
 # 管理后台需要 token 才能访问；token 首次启动自动生成并落盘到 data/admin-token，
 # 启动横幅会打印该 token。请妥善保管，不要随镜像或日志外泄。
 services:
-  cline-proxy:
+  free-router:
     build: .
-    container_name: cline-proxy
+    container_name: free-router
     restart: unless-stopped
     ports:
       # 只监听本机回环, 不暴露到全网段。容器内仍由 CMD 的 -host 0.0.0.0 监听,

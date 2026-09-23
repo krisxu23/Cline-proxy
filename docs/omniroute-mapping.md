@@ -1,4 +1,4 @@
-# Cline-proxy ↔ OmniRoute 功能模块映射表
+# Free-Router ↔ OmniRoute 功能模块映射表
 
 > 用途：逐字逐句照抄工作的地基。每个我方文件都必须在本表中找到定位——
 > 要么指向 OmniRoute 的参考实现（照抄），要么明确标注「OmniRoute 无对应」（自研）。

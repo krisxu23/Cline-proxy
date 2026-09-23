@@ -118,7 +118,7 @@ async function api(method, path, body, timeoutMs) {
   } catch (e) {
     if (e.name === 'AbortError') throw new Error('请求超时：后端正忙（目录刷新/节点探测占用出口），稍后重试');
     if (/Failed to fetch|NetworkError|load failed/i.test(e.message || '')) {
-      throw new Error('无法连接后端：网关进程可能已退出，检查 data/cline-proxy.log');
+      throw new Error('无法连接后端：网关进程可能已退出，检查 data/free-router.log');
     }
     throw e;
   } finally {

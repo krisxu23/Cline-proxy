@@ -2,8 +2,8 @@ package app
 
 import (
 	"bytes"
-	"cline-go-proxy/internal/kit"
 	"fmt"
+	"free-router/internal/kit"
 	"log"
 	"net"
 	"net/http"
@@ -42,7 +42,7 @@ func getNested(obj map[string]any, keys ...any) any {
 //
 // 此前这里是无条件的 Stop-Process: 只要端口被占, 就把占用者的进程强杀, 既没有
 // 任何身份校验也没有提示 —— 用户机器上恰好用该端口的无关程序会被静默干掉。
-// 现在只清理与当前可执行文件同名的进程(即另一个 cline-proxy), 遇到陌生进程
+// 现在只清理与当前可执行文件同名的进程(即另一个 free-router), 遇到陌生进程
 // 如实记录后放手, 让 ListenAndServe 用 "address already in use" 明确报错。
 func freePort(port int) {
 	addr := fmt.Sprintf("127.0.0.1:%d", port)

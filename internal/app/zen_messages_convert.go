@@ -27,8 +27,8 @@ import (
 	"log"
 	"net/http"
 
-	"cline-go-proxy/internal/kit"
-	"cline-go-proxy/internal/translate"
+	"free-router/internal/kit"
+	"free-router/internal/translate"
 )
 
 // translateZenMessagesRequest OpenAI chat 请求体 → Anthropic Messages 请求体。

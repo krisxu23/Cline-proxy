@@ -90,7 +90,7 @@ func TestProviderChatCustomHeaders(t *testing.T) {
 		BaseURL: srv.URL, APIKey: "k",
 		Headers: map[string]providerHeaderSpec{
 			"HTTP-Referer": {Default: "${origin}"},
-			"X-Title":      {Default: "Cline Proxy"},
+			"X-Title":      {Default: "Free Router"},
 		},
 	})
 	p := providerByName("or")
@@ -99,7 +99,7 @@ func TestProviderChatCustomHeaders(t *testing.T) {
 		t.Fatal(err)
 	}
 	resp.Body.Close()
-	if gotTitle != "Cline Proxy" {
+	if gotTitle != "Free Router" {
 		t.Fatalf("static header: %q", gotTitle)
 	}
 	if gotReferer == "" {

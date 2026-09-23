@@ -17,7 +17,7 @@ import (
 // 现在 logFanout.Write 在写入路径上自己维护上限, 与 writeStreamLog 语义对齐。
 func TestLogFanoutTruncatesOnWrite(t *testing.T) {
 	dir := t.TempDir()
-	path := filepath.Join(dir, "cline-proxy.log")
+	path := filepath.Join(dir, "free-router.log")
 	f, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR|os.O_APPEND, 0600)
 	if err != nil {
 		t.Fatalf("创建日志文件失败: %v", err)
@@ -53,7 +53,7 @@ func TestLogFanoutTruncatesOnWrite(t *testing.T) {
 // TestLogFanoutKeepsContentBelowLimit 确认没超限时正常追加、不误截断。
 func TestLogFanoutKeepsContentBelowLimit(t *testing.T) {
 	dir := t.TempDir()
-	path := filepath.Join(dir, "cline-proxy.log")
+	path := filepath.Join(dir, "free-router.log")
 	f, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR|os.O_APPEND, 0600)
 	if err != nil {
 		t.Fatalf("创建日志文件失败: %v", err)

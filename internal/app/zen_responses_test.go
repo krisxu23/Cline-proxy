@@ -10,7 +10,7 @@ import (
 	"strings"
 	"testing"
 
-	"cline-go-proxy/internal/kit"
+	"free-router/internal/kit"
 )
 
 func TestNormalizeMuseSparkFinish(t *testing.T) {

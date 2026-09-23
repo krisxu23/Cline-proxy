@@ -11,7 +11,7 @@ import (
 	"sync"
 	"time"
 
-	"cline-go-proxy/internal/cline"
+	"free-router/internal/cline"
 )
 
 // 节点 × 上游 可达性矩阵。

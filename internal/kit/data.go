@@ -11,7 +11,7 @@ import (
 //
 // 创建目录时若首选位置(exe 目录 / 工作目录)不可写(例如 exe 放在 C:\Program Files\)，
 // 回退到用户配置目录(os.UserConfigDir: Windows %LOCALAPPDATA%, 其他平台 ~/.config)
-// 下的 cline-proxy/data；三候选均失败则按惯例返回 exeDir/data 路径，
+// 下的 free-router/data；三候选均失败则按惯例返回 exeDir/data 路径，
 // 后续各落盘点自行报错。
 func ResolveDataPath(filename string) string {
 	exeDir, pwd := "", ""
@@ -52,7 +52,7 @@ func ResolveDataPath(filename string) string {
 		}
 	}
 	if cfgDir, err := os.UserConfigDir(); err == nil {
-		p := filepath.Join(cfgDir, "cline-proxy", "data")
+		p := filepath.Join(cfgDir, "free-router", "data")
 		if err := os.MkdirAll(p, 0755); err == nil {
 			return filepath.Join(p, filename)
 		}

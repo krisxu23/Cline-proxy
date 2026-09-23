@@ -1,4 +1,4 @@
-# Cline-proxy
+# Free-Router
 
 把 Cline 账号池、opencode zen 免费模型、ClinePass 订阅与任意 OpenAI 兼容站点合流为一个本地网关：三协议对外、按 model 前缀直选上游；单二进制，Windows 桌面形态开箱即用。
 
@@ -30,17 +30,17 @@
 
 ### 桌面应用（Windows）
 
-从 [Release](https://github.com/krisxu23/Cline-proxy/releases) 下载 `cline-proxy-windows-amd64.exe`，双击即用：
+从 [Release](https://github.com/krisxu23/Free-Router/releases) 下载 `free-router-windows-amd64.exe`，双击即用：
 
 - **无控制台黑窗口**：GUI 子系统构建，启动即进桌面形态
 - **管理窗口**：自动弹出独立应用窗口渲染 Web 后台（无地址栏、独立任务栏图标）
 - **系统托盘**：右键菜单含 4 项——「打开管理界面」「打开数据目录」（资源管理器打开 `data/`）「导出诊断包」（打包日志与运行状态到 `data/diag-<时间戳>.zip`）「退出」
 - **重复双击**：端口被占时自动并入已在运行的实例，直接弹出管理窗口
 - **启动失败**：弹窗提示原因（如端口占用，可换端口）
-- **完整性校验**：发布包未签名，Windows SmartScreen 可能拦截。下载后比对 Release 页的 `cline-proxy-windows-amd64.exe.sha256`：
+- **完整性校验**：发布包未签名，Windows SmartScreen 可能拦截。下载后比对 Release 页的 `free-router-windows-amd64.exe.sha256`：
 
   ```powershell
-  certutil -hashfile cline-proxy-windows-amd64.exe SHA256
+  certutil -hashfile free-router-windows-amd64.exe SHA256
   ```
 
   输出与 `.sha256` 文件内容一致再运行。
@@ -48,9 +48,9 @@
 命令行功能照常可用（终端直跑会回挂控制台）：
 
 ```powershell
-.\cline-proxy.exe -list                 # 查看账号池
-.\cline-proxy.exe -add-account          # OAuth 添加账号
-.\cline-proxy.exe -desktop -port 3457   # 显式桌面模式
+.\free-router.exe -list                 # 查看账号池
+.\free-router.exe -add-account          # OAuth 添加账号
+.\free-router.exe -desktop -port 3457   # 显式桌面模式
 ```
 
 带任意参数从终端启动则进入常规服务器模式，日志实时打印，Ctrl+C 停止。
@@ -59,22 +59,22 @@
 
 ```bash
 # Windows GUI 构建（无控制台窗口）
-go build -tags "with_quic,with_grpc,with_utls" -ldflags "-s -w -H=windowsgui" -o cline-proxy.exe ./cmd/cline-proxy
+go build -tags "with_quic,with_grpc,with_utls" -ldflags "-s -w -H=windowsgui" -o free-router.exe ./cmd/free-router
 
 # 控制台构建（调试用，或 Linux/macOS）
-go build -tags "with_quic,with_grpc,with_utls" -o cline-proxy.exe ./cmd/cline-proxy
+go build -tags "with_quic,with_grpc,with_utls" -o free-router.exe ./cmd/free-router
 
 # 构建 + 启动 + 打开浏览器
-go run -tags "with_quic,with_grpc,with_utls" ./cmd/cline-proxy -start
+go run -tags "with_quic,with_grpc,with_utls" ./cmd/free-router -start
 ```
 
 > 构建标签 `with_quic,with_grpc,with_utls` **不可省略**：缺少时 reality/uTLS 与 QUIC（hysteria2/tuic）类节点会被 sing-box 判为无效出站并从出口池剔除，可用节点数会大幅减少。
 
 ```bash
-./cline-proxy.exe                      # 默认只监听 127.0.0.1，仅本机可访问
-./cline-proxy.exe -host 0.0.0.0        # 允许局域网访问（自行承担同网段风险）
-./cline-proxy.exe -port 3457           # 指定端口
-./cline-proxy.exe -cli                 # Windows: 留在前台控制台模式（调试用），不进托盘
+./free-router.exe                      # 默认只监听 127.0.0.1，仅本机可访问
+./free-router.exe -host 0.0.0.0        # 允许局域网访问（自行承担同网段风险）
+./free-router.exe -port 3457           # 指定端口
+./free-router.exe -cli                 # Windows: 留在前台控制台模式（调试用），不进托盘
 
 # 局域网访问地址：http://<本机局域网IP>:3457/admin/
 ```
@@ -299,8 +299,8 @@ Model:    同上
 - **自定义请求头**：后台 **📨 请求头配置（模拟 Cline CLI 发出）**，编辑转发给上游的头
 - **路由决策头**：每个响应带 `X-Proxy-Route`，标注 `upstream` / `model` / `failover`，排查路由一目了然
 - **token 统计**：每请求 JSONL 落盘（`data/zen-stats.jsonl`），按账号/上游/模型聚合，后台实时展示
-- **请求日志**：`data/requests.jsonl` 记录每次请求；运行日志写在 `data/cline-proxy.log`（追加模式，桌面形态同样落盘）
-- **日志自轮转**：`cline-proxy.log` / `cline-proxy-stream.log` / `zen-stats.jsonl` / `requests.jsonl` 按大小自动轮转（主日志 10 MiB，超限截断只保留最近内容）。
+- **请求日志**：`data/requests.jsonl` 记录每次请求；运行日志写在 `data/free-router.log`（追加模式，桌面形态同样落盘）
+- **日志自轮转**：`free-router.log` / `free-router-stream.log` / `zen-stats.jsonl` / `requests.jsonl` 按大小自动轮转（主日志 10 MiB，超限截断只保留最近内容）。
 - **出口治理**：后台 **🌐 出口代理与节点** —— 代理策略、代理列表、订阅、节点列表与连通检测、限流防御、上下文压缩都在此页
 - **thinking 透传**：Anthropic 协议下上游 `reasoning_content` 自动转为 `thinking` 内容块（流式 + 非流式）
 - **SSE 稳健性**：上游流无任何 choices 时自动补一个空 chunk 收尾，避免客户端报 "Provider returned no completion choices"
@@ -335,7 +335,7 @@ curl -s http://127.0.0.1:3457/health
 
 ```
 ├── cmd/
-│   └── cline-proxy/            入口包：CLI 参数、桌面/托盘模式、平台差异
+│   └── free-router/            入口包：CLI 参数、桌面/托盘模式、平台差异
 │       ├── main.go             main()、runDesktop、buildAndStart
 │       ├── main_windows.go     Windows 专用：回挂父控制台、失败弹窗
 │       ├── main_other.go       其它平台占位实现
@@ -419,8 +419,8 @@ curl -s http://127.0.0.1:3457/health
 
 | 变量 | 作用 |
 |---|---|
-| `CLINE_PROXY_ALLOW_PRIVATE_UPSTREAM=1` | 允许把**私网/回环地址**配为上游（本机或内网跑 Ollama / LM Studio / vLLM 等）。默认拦截以防 SSRF；链路本地与云元数据地址（`169.254.169.254` 等）即使设了该变量也仍然拦截 |
-| `CLINE_PROXY_SKIP_NODEBOX=1` | 测试专用：不实例化真实 sing-box（避开其内部竞态） |
+| `FREE_ROUTER_ALLOW_PRIVATE_UPSTREAM=1` | 允许把**私网/回环地址**配为上游（本机或内网跑 Ollama / LM Studio / vLLM 等）。默认拦截以防 SSRF；链路本地与云元数据地址（`169.254.169.254` 等）即使设了该变量也仍然拦截 |
+| `FREE_ROUTER_SKIP_NODEBOX=1` | 测试专用：不实例化真实 sing-box（避开其内部竞态） |
 
 运行时数据在 `data/`（首次使用时生成）：
 
@@ -432,7 +432,7 @@ curl -s http://127.0.0.1:3457/health
 | `subs_cache.json` | 订阅解析缓存 |
 | `requests.jsonl` | 请求日志 |
 | `zen-stats.jsonl` | token 统计 |
-| `cline-proxy.log` | 运行日志 |
+| `free-router.log` | 运行日志 |
 | `override.md` | 可选的系统提示词覆盖 |
 
 ## 开发与构建

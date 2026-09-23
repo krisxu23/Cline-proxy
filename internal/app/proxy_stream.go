@@ -2,10 +2,10 @@ package app
 
 import (
 	"bufio"
-	"cline-go-proxy/internal/kit"
-	"cline-go-proxy/internal/protocol"
 	"encoding/json"
 	"fmt"
+	"free-router/internal/kit"
+	"free-router/internal/protocol"
 	"io"
 	"log"
 	"net/http"

@@ -18,7 +18,7 @@ import (
 	"time"
 	"unicode"
 
-	"cline-go-proxy/internal/kit"
+	"free-router/internal/kit"
 	"gopkg.in/yaml.v3"
 )
 

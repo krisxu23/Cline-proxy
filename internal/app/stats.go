@@ -2,9 +2,9 @@ package app
 
 import (
 	"bytes"
-	"cline-go-proxy/internal/kit"
 	"context"
 	"encoding/json"
+	"free-router/internal/kit"
 	"io"
 	"log"
 	"os"
@@ -416,7 +416,7 @@ func recordZenStats(rec zenStatsRecord) {
 				statsBytesWritten += int64(n)
 			}
 		}
-		// 轮转: 超过上限则截断成空, 只保留最近记录(与 cline-proxy.log / requests.jsonl 同思路)。
+		// 轮转: 超过上限则截断成空, 只保留最近记录(与 free-router.log / requests.jsonl 同思路)。
 		// 必须用 os.Truncate 而不是句柄级 Truncate: statsFile 是 O_APPEND 打开的,
 		// Windows 下该句柄没有 GENERIC_WRITE, 句柄级截断会 "Access is denied"。
 		if statsBytesWritten > maxZenStatsBytes {

@@ -7,7 +7,7 @@ import (
 	"io"
 	"strings"
 
-	"cline-go-proxy/internal/kit"
+	"free-router/internal/kit"
 )
 
 // SSEEvent is a single Server-Sent Event payload normalized for downstream

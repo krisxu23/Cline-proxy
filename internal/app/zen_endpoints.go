@@ -28,7 +28,7 @@ import (
 	"sync"
 	"time"
 
-	"cline-go-proxy/internal/kit"
+	"free-router/internal/kit"
 )
 
 // zenEndpointKind zen 出站端点形态。

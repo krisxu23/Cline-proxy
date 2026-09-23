@@ -54,7 +54,7 @@ jobs:
         # 开发者本机多为 Windows 且无 gcc，-race 在本地跑不了；
         # ubuntu runner 自带 gcc，CGO 可用，竞态检测只能靠 CI 兜。
         #
-        # CLINE_PROXY_SKIP_NODEBOX: 让测试不实例化真实 sing-box。sing-box 的 Box
+        # FREE_ROUTER_SKIP_NODEBOX: 让测试不实例化真实 sing-box。sing-box 的 Box
         # 起来后会拉起自己的后台 goroutine(网络接口监听 / systemd-resolved DBus),
         # 这些第三方内部实现之间存在数据竞争 —— 实测报了 15 处, 全部在
         # route.NetworkManager.Start 与 updateInterface 之间, 没有一处涉及本仓库
@@ -63,7 +63,7 @@ jobs:
         # 「go test」步骤覆盖(不设该变量)。
         env:
           CGO_ENABLED: '1'
-          CLINE_PROXY_SKIP_NODEBOX: '1'
+          FREE_ROUTER_SKIP_NODEBOX: '1'
         run: go test -race -count=1 -tags with_quic,with_grpc,with_utls ./internal/...
 
       - name: Setup Node
@@ -158,14 +158,14 @@ jobs:
           else
             LDFLAGS="-s -w"
           fi
-          LDFLAGS="$LDFLAGS -X cline-go-proxy/internal/app.buildVersion=${{ steps.ver.outputs.version }}"
-          go build -tags with_quic,with_grpc,with_utls -ldflags="$LDFLAGS" -o cline-proxy-${{ matrix.target }}${{ matrix.ext }} ./cmd/cline-proxy
+          LDFLAGS="$LDFLAGS -X free-router/internal/app.buildVersion=${{ steps.ver.outputs.version }}"
+          go build -tags with_quic,with_grpc,with_utls -ldflags="$LDFLAGS" -o free-router-${{ matrix.target }}${{ matrix.ext }} ./cmd/free-router
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: cline-proxy-${{ matrix.target }}
-          path: cline-proxy-${{ matrix.target }}${{ matrix.ext }}
+          name: free-router-${{ matrix.target }}
+          path: free-router-${{ matrix.target }}${{ matrix.ext }}
 
   release:
     name: Create Release
@@ -185,7 +185,7 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           path: artifacts
-          pattern: cline-proxy-*
+          pattern: free-router-*
 
       - name: Generate sha256 checksums
         shell: bash
@@ -195,7 +195,7 @@ jobs:
           set -euo pipefail
           cd artifacts
           : > ../checksums.txt
-          find . -type f -name 'cline-proxy-*' | sort | while read -r f; do
+          find . -type f -name 'free-router-*' | sort | while read -r f; do
             h=$(sha256sum "$f" | cut -d' ' -f1)
             echo "$h  ${f#./}" >> ../checksums.txt
             echo "$h" > "$f.sha256"
@@ -224,7 +224,7 @@ jobs:
           tag_name: ${{ steps.tag.outputs.tag }}
           name: ${{ steps.tag.outputs.tag }}
           files: |
-            artifacts/cline-proxy-*/*
+            artifacts/free-router-*/*
             checksums.txt
           generate_release_notes: true
         env:

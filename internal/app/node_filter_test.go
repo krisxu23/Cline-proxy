@@ -9,7 +9,7 @@ import (
 	"testing"
 	"time"
 
-	"cline-go-proxy/internal/translate"
+	"free-router/internal/translate"
 )
 
 func TestNodeExcludedByFilter(t *testing.T) {

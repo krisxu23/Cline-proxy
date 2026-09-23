@@ -42,7 +42,7 @@ var (
 )
 
 // startNodeInstanceFn 是可替换的实例构建入口: 测试可注入错误以验证 failKeepOld(§2.6 第 22 项),
-// 或注入替身以避开真实 sing-box 实例化(配合 CLINE_PROXY_SKIP_NODEBOX)。默认指向 startNodeInstance。
+// 或注入替身以避开真实 sing-box 实例化(配合 FREE_ROUTER_SKIP_NODEBOX)。默认指向 startNodeInstance。
 //
 // 配套的 startNodeInstanceInjected 记录「钩子是否被测试替换过」。这里不能用函数值做相等
 // 比较 —— Go 里 func 只能和 nil 比, `startNodeInstanceFn == startNodeInstance` 编译不过。
@@ -136,7 +136,7 @@ func nodePortOf(key string) (int, bool) {
 //
 // 所以 -race 任务带上这个变量, 让测试不建实例; 确实需要真实实例的用例通过
 // requireNodeBox(t) 显式跳过, 它们继续在普通构建下运行。
-const nodeBoxSkipEnv = "CLINE_PROXY_SKIP_NODEBOX"
+const nodeBoxSkipEnv = "FREE_ROUTER_SKIP_NODEBOX"
 
 // nodeBoxSkipRequested 是否应跳过实例化 sing-box。
 //

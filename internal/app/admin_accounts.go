@@ -2,11 +2,11 @@ package app
 
 import (
 	"bytes"
-	"cline-go-proxy/internal/cline"
-	"cline-go-proxy/internal/kit"
 	"context"
 	"encoding/json"
 	"fmt"
+	"free-router/internal/cline"
+	"free-router/internal/kit"
 	"io"
 	"log"
 	"net/http"

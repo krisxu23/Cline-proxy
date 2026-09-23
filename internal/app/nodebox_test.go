@@ -14,6 +14,6 @@ import "testing"
 func requireNodeBox(t *testing.T) {
 	t.Helper()
 	if nodeBoxSkipRequested() {
-		t.Skip("需要真实 sing-box 实例; 当前测试进程要求跳过实例化(见 CLINE_PROXY_SKIP_NODEBOX), 该用例只在普通构建下运行")
+		t.Skip("需要真实 sing-box 实例; 当前测试进程要求跳过实例化(见 FREE_ROUTER_SKIP_NODEBOX), 该用例只在普通构建下运行")
 	}
 }

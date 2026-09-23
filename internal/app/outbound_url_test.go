@@ -6,7 +6,7 @@ import (
 )
 
 // SSRF 面(审计 P3-10): 链路本地/元数据/未指定地址**永远**拦截;
-// 私网与回环默认拦截, 但可用 CLINE_PROXY_ALLOW_PRIVATE_UPSTREAM=1 放开
+// 私网与回环默认拦截, 但可用 FREE_ROUTER_ALLOW_PRIVATE_UPSTREAM=1 放开
 // (本机/内网自建上游是真实用法, 需要逃生口)。
 
 func TestValidateOutboundURLRejectsBadSchemeAndEmptyHost(t *testing.T) {

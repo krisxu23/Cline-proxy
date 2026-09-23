@@ -27,7 +27,7 @@ func (f *fakeNodeBox) Close() error {
 // nodeBox / nodePorts / catchAllPort 三项全局状态完全不变(保留上一个可用实例继续服务)。
 //
 // 通过注入 startNodeInstanceFn 返回错误来触发失败路径, 因此不需要真实 sing-box 实例化,
-// 在 CLINE_PROXY_SKIP_NODEBOX=1 下也能跑(走注入的错误路径, 不碰真实 sing-box)。
+// 在 FREE_ROUTER_SKIP_NODEBOX=1 下也能跑(走注入的错误路径, 不碰真实 sing-box)。
 func TestSyncNodeBoxKeepsOldInstanceOnBuildFailure(t *testing.T) {
 	// 先建好"旧状态": 一个非 nil 的旧实例 + 一组出口端口 + 一个 catch-all 端口。
 	oldBox := &fakeNodeBox{}
@@ -50,7 +50,7 @@ func TestSyncNodeBoxKeepsOldInstanceOnBuildFailure(t *testing.T) {
 
 	// 注入: 构建实例直接失败。这是触发 failKeepOld 的路径, 不需要真实 sing-box。
 	// 走 setter 而不是直接给 var 赋值 —— setter 同时记下「已被注入」,
-	// syncNodeBox 靠这个标记决定在 CLINE_PROXY_SKIP_NODEBOX 下是否放行注入路径。
+	// syncNodeBox 靠这个标记决定在 FREE_ROUTER_SKIP_NODEBOX 下是否放行注入路径。
 	setStartNodeInstanceFn(func(ctx context.Context, inbounds, outbounds, rules []map[string]any) (nodeBoxInstance, error) {
 		return nil, errors.New("injected build failure")
 	})

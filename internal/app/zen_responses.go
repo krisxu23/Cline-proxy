@@ -18,10 +18,10 @@ package app
 // (/responses 也失败)只在进程内记住, 不落盘 —— 上游随时可能修复, 不能写死。
 
 import (
-	"cline-go-proxy/internal/app/translate_registry"
-	"cline-go-proxy/internal/kit"
 	"encoding/json"
 	"fmt"
+	"free-router/internal/app/translate_registry"
+	"free-router/internal/kit"
 	"os"
 	"strings"
 	"sync"

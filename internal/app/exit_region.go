@@ -20,7 +20,7 @@ import (
 	"sync"
 	"time"
 
-	"cline-go-proxy/internal/kit"
+	"free-router/internal/kit"
 )
 
 // exitRegionDef 地区定义

@@ -1,15 +1,15 @@
 # Build output
 # 注意: 这些"产物名"必须锚定到仓库根(前导斜杠)。
-# 曾经写成不带斜杠的 `cline-proxy`, 它同时匹配了**目录** cmd/cline-proxy/ ——
+# 曾经写成不带斜杠的 `free-router`, 它同时匹配了**目录** cmd/free-router/ ——
 # 于是 `git add -A` 静默吞掉整个入口包, CI 构建报"找不到目录"才发现
 # (2026-09-16 实撞)。目录名与产物名重合时一律用 /name 锚定。
 /dist/
 
 # Compiled binary
-/cline-proxy
-/cline-proxy.exe
-/cline-proxy-*
-/cline-proxy-test.exe*
+/free-router
+/free-router.exe
+/free-router-*
+/free-router-test.exe*
 
 # Go workspace
 *.test
@@ -29,8 +29,8 @@
 /admin-token
 /requests*.jsonl
 /zen-stats.jsonl
-/cline-proxy.log
-/cline-proxy-stream.log
+/free-router.log
+/free-router-stream.log
 /override.md
 
 # Local debug tool (kept locally, not uploaded)

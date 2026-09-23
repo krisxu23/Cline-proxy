@@ -22,12 +22,12 @@ import (
 // 这里对**链路本地/未指定/元数据主机名**永远拦截(不存在合法上游用途);
 // 对**私网与回环**默认也拦截(审计 P3-10: 否则网关等于一台内网探测器),
 // 但在本机或局域网跑 Ollama / LM Studio / vLLM 的用户可以用
-// CLINE_PROXY_ALLOW_PRIVATE_UPSTREAM=1 显式放开 —— 一刀切会误伤真实需求,
+// FREE_ROUTER_ALLOW_PRIVATE_UPSTREAM=1 显式放开 —— 一刀切会误伤真实需求,
 // 但"默认放开"又不该是安全默认值。
 // ============================================================================
 
 // AllowPrivateUpstreamEnv 放开私网/回环上游的环境变量(取值 1/true/yes)。
-const AllowPrivateUpstreamEnv = "CLINE_PROXY_ALLOW_PRIVATE_UPSTREAM"
+const AllowPrivateUpstreamEnv = "FREE_ROUTER_ALLOW_PRIVATE_UPSTREAM"
 
 // privateUpstreamAllowed 是否允许把私网/回环地址当作上游。
 func privateUpstreamAllowed() bool {
@@ -79,7 +79,7 @@ func validateOutboundURL(raw string) error {
 // 这里在拿到解析结果之后、建立任何连接之前把解析结果拦下。**只拦链路本地段**
 // (云 metadata 服务就在这一段); 私网(10/8、172.16/12、192.168/16、fc00::/7)
 // 与回环**绝不在此拦** —— 局域网/LAN 上游是正当用途, 它们的拦截策略由
-// blockedOutboundReason 按 CLINE_PROXY_ALLOW_PRIVATE_UPSTREAM 单独管理。
+// blockedOutboundReason 按 FREE_ROUTER_ALLOW_PRIVATE_UPSTREAM 单独管理。
 // 解析失败(离线/NXDOMAIN)在配置期判定不了, 不拦。
 func resolvedLinkLocalReason(host string) string {
 	if net.ParseIP(host) != nil {
@@ -155,7 +155,7 @@ func filterOutboundURLs(raw []string, what string) ([]string, error) {
 // 刻意只拦两类: 链路本地(169.254.0.0/16 / fe80::/10, 云 metadata 服务就在
 // 这一段)与 blockedOutboundHosts 里的云元数据主机名字面量。回环/私网**绝不在
 // 此拦** —— 本地 sing-box 与 LAN 上游是正当用途, 它们的策略由
-// blockedOutboundReason 按 CLINE_PROXY_ALLOW_PRIVATE_UPSTREAM 管理。
+// blockedOutboundReason 按 FREE_ROUTER_ALLOW_PRIVATE_UPSTREAM 管理。
 // 拦下时关闭已建连接并返回错误, 口径与 blockedOutboundReason /
 // resolvedLinkLocalReason 一致。
 func dialWithSSRFGuard(dial func(ctx context.Context, network, addr string) (net.Conn, error)) func(ctx context.Context, network, addr string) (net.Conn, error) {

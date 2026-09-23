@@ -12,9 +12,9 @@ import (
 	"strings"
 	"time"
 
-	"cline-go-proxy/internal/kit"
-	"cline-go-proxy/internal/protocol"
-	"cline-go-proxy/internal/providers"
+	"free-router/internal/kit"
+	"free-router/internal/protocol"
+	"free-router/internal/providers"
 )
 
 // init 把共享 HTTP 传输(HTTPClient/HTTPClientTimeout 共用同一指针)的基础拨号

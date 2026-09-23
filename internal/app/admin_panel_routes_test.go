@@ -1,7 +1,7 @@
 package app
 
 import (
-	"cline-go-proxy/internal/webui"
+	"free-router/internal/webui"
 	"net/http"
 	"net/http/httptest"
 	"regexp"

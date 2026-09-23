@@ -2,11 +2,11 @@ package app
 
 import (
 	"bytes"
-	"cline-go-proxy/internal/app/translate_registry"
-	"cline-go-proxy/internal/kit"
 	"context"
 	"encoding/json"
 	"fmt"
+	"free-router/internal/app/translate_registry"
+	"free-router/internal/kit"
 	"golang.org/x/net/http2"
 	"io"
 	"log"

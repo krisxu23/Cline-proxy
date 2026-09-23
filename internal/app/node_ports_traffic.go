@@ -24,7 +24,7 @@ import (
 	"sync/atomic"
 	"time"
 
-	"cline-go-proxy/internal/kit"
+	"free-router/internal/kit"
 )
 
 // ============ 稳定端口 ============

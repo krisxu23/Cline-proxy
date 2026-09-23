@@ -1,10 +1,10 @@
 package main
 
 import (
-	"cline-go-proxy/internal/app"
 	"encoding/json"
 	"flag"
 	"fmt"
+	"free-router/internal/app"
 	"io"
 	"log"
 	"net/http"
@@ -151,10 +151,10 @@ func isServiceAlive(healthURL string) bool {
 }
 
 func buildAndStart(host string, port int) {
-	exe := "cline-proxy.exe"
+	exe := "free-router.exe"
 	isWindows := runtime.GOOS == "windows"
 	if !isWindows {
-		exe = "./cline-proxy"
+		exe = "./free-router"
 	}
 
 	fmt.Println("Building proxy...")
@@ -164,8 +164,8 @@ func buildAndStart(host string, port int) {
 		// windowsgui 子系统: 双击启动不弹控制台窗口,托盘 + 管理窗口接管交互
 		args = []string{"build", "-tags", "with_quic,with_grpc,with_utls", "-ldflags", "-s -w -H=windowsgui"}
 	}
-	// 入口包已迁到 cmd/cline-proxy(标准布局), 构建目标随之。
-	args = append(args, "-o", exe, "./cmd/cline-proxy")
+	// 入口包已迁到 cmd/free-router(标准布局), 构建目标随之。
+	args = append(args, "-o", exe, "./cmd/free-router")
 	cmd := exec.Command("go", args...)
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
@@ -178,7 +178,7 @@ func buildAndStart(host string, port int) {
 	running := false
 	if isWindows {
 		out, _ := exec.Command("powershell", "-Command",
-			"Get-Process cline-proxy -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Id").Output()
+			"Get-Process free-router -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Id").Output()
 		if len(out) > 0 {
 			running = true
 		}

@@ -5,7 +5,7 @@ import (
 	"os"
 	"testing"
 
-	"cline-go-proxy/internal/kit"
+	"free-router/internal/kit"
 )
 
 // TestSaveZenConfigAtomic 验证 saveZenConfig 走原子写, 落盘后是完整可解析的 JSON。

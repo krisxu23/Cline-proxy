@@ -15,7 +15,7 @@ import (
 	"strings"
 	"time"
 
-	"cline-go-proxy/internal/kit"
+	"free-router/internal/kit"
 )
 
 // 注: catalogModel 结构体声明在 providers_config.go, 此处不要重复声明。

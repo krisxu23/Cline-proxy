@@ -6,7 +6,7 @@ import (
 	"os"
 	"time"
 
-	"cline-go-proxy/internal/kit"
+	"free-router/internal/kit"
 )
 
 // zen 模型目录持久化。
