@@ -19,9 +19,21 @@ import (
 //
 // 上游 Retry-After 头对纯数字秒数没有上限(proxy_util parseRetryAfter,
 // "999999999"≈31 年), 无上限 time.Sleep 会全程占着并发信号量(默认仅 8 槽)
-// 且循环顶的 ctx 检查打不断它。超过上限就不再占槽干等, 直接把 429 交还
-// 客户端自重试(与冷却表侧 zenQuotaRetryAfterCap 同口径, P1-4)。
+// 且循环顶的 ctx 检查打不断它。超过上限就不再占槽干等, 而是**冷却该出口后
+// 立即换出口重试**(见 429 分支)。
 const zenRetryAfterMaxWait = 60 * time.Second
+
+// zenQuotaRotateBudget 429 换出口的独立预算。
+//
+// 429 的语义是"**这个出口**的额度没了"(opencode 免费层按出口 IP 计), 不是
+// "这个请求有问题" —— 换一个出口就是全新的机会, 所以它值得比通用重试
+// (retries, 默认 3)更宽的预算。
+//
+// 为什么不照搬参考实现(opencode2api)的"上限 = 出口池大小": 它的池是用户手填的
+// 几十个代理, 所以那个上限合理; 我们的出口池是订阅聚合出来的(实测 1327 个出口、
+// 其中可达 136 个), 而每次 429 轮换都要真发一次请求 —— 上百次必然拖爆客户端的
+// 30s 超时(实测客户端 59~150s 就断)。所以取一个有界预算, 而不是池大小。
+const zenQuotaRotateBudget = 8
 
 // zenAttemptHeaderTimeout 单次 attempt 等待响应头的上限 —— 对齐主 transport
 // 的 ResponseHeaderTimeout(120s, proxy_pool.go)。https 被 RegisterProtocol
@@ -29,12 +41,12 @@ const zenRetryAfterMaxWait = 60 * time.Second
 // 上游 accept 后不回响应头会把请求连同并发信号量槽(默认 8)一起挂死。
 const zenAttemptHeaderTimeout = 120 * time.Second
 
-// zenAttemptBody 把 attempt 级回收绑到响应体关闭上, 流读取期间二者都不能动:
+// zenAttemptBody 把 attempt 级回收绑到响应体关闭上, 流读取期间不能动:
 //   - cancel: 响应头超时的 cancel; 拿到响应头后已停表, body 关闭即归还资源;
-//   - h2: 地区受限模型每次 attempt 新建的专用 transport(裸 transport 的
-//     IdleConnTimeout 为 0, 客户端侧永不闲置关闭)。挂着流的连接不受
-//     CloseIdleConnections 影响, 流结束归还为闲置后立刻回收 —— 不改变
-//     "每次真实拨号选出口"的语义(transport 依旧每次 attempt 新建)。
+//   - h2: attempt 级专用 transport 的侧路引用。**当前恒为 nil** —— 出口
+//     transport 现在是按出口长期缓存复用的(zenClientForExit), 它的空闲连接
+//     由 IdleConnTimeout(90s) 自行回收, 不能在响应体关闭时关掉, 否则就把
+//     同出口复用的收益抹掉了。字段保留给"确实需要 attempt 级回收"的场景。
 type zenAttemptBody struct {
 	io.ReadCloser
 	cancel context.CancelFunc
@@ -222,6 +234,13 @@ func callZenAPI(ctx context.Context, params map[string]any, stream bool) (*http.
 	if isRegionRestrictedModel(zenModelIDOf(params)) && retries < 6 {
 		retries = 6
 	}
+	// 429 换出口用**独立预算**(见 zenQuotaRotateBudget): 429 是对"出口"的判定,
+	// 不是对"请求"的判定 —— 换一个出口就是全新的机会, 值得比通用重试更宽的预算。
+	// 循环里只有 429 分支用得上这个上限, 其余分支仍按 retries 收口。
+	maxAttempts := retries
+	if maxAttempts < zenQuotaRotateBudget {
+		maxAttempts = zenQuotaRotateBudget
+	}
 	// 轮换重试不退避: 节点级失败换一个出口就是全新的机会, 睡眠只会把请求
 	// 拖过客户端超时(实测 59~150s, 客户端 30s 就断开了)。退避只保留给
 	// 429 —— 那种才需要等限流窗口过去。
@@ -290,32 +309,30 @@ func callZenAPI(ctx context.Context, params map[string]any, stream bool) (*http.
 		log.Printf("  zen upstream: model=%s stream=%v msgs=%d via=%s endpoint=%s attempt=%d session=%s",
 			body["model"], stream, getMsgCount(params), describeZenProxy(), base, attempt+1, kit.Truncate(outbound["x-opencode-session"], 24))
 
-		// ★ 每次 attempt 都强制真实拨号, 一次都不吃共享连接池。
+		// ★ 出口在这里**先定**, 再取它专属的 client —— 出口是"编译进 transport"
+		// 的(zenClientForExit / newZenTransportPinned), 不再由拨号层现场决定。
 		//
-		// 共享池里的连接按**上游 host** 复用, 而出口选择发生在拨号那一刻 ——
-		// 复用直接绕过了出口选择。一旦某条长连接是在出口 X 上建起来的, 后续
-		// 所有请求都从 X 出去, 哪怕 X 已被判定额度耗尽: 上游按出口 IP 计额度,
-		// "一个 IP 用完就 429、换一个 IP 就能继续"正是本网关的立足点, 连接复用
-		// 把这个立足点废掉了。
+		// 为什么必须"先定出口再取 client": 共享 transport 的连接按**上游 host**
+		// 复用, 复用直接绕过出口选择 —— 一条建立在出口 X 上的长连接会被后续请求
+		// 继续用, 哪怕 X 已被判定额度耗尽(上游按出口 IP 计额度, "一个 IP 用完就
+		// 429、换一个 IP 就能继续"正是本网关的立足点); 而且复用不触发拨号,
+		// setReqExit 不写, 429 时连"该冷却哪个出口"都不知道 —— 2026-09-23 实证:
+		// 95 次 429 里只有 4 次冷却到了出口, 同一个节点被连打 32 次、37 次。
 		//
-		// 更隐蔽的是: 复用不触发拨号 → setReqExit 不会被调用 → reqExit 为空 →
-		// 429 时连"该冷却哪个出口"都无从得知, 冷却表写不进去, 出口轮换与冷却
-		// 双双失效。2026-09-23 实证: 95 次 429 里只有 4 次真正冷却到了出口,
-		// 其余 91 次 reqExit 为空; 同一个节点被连续打了 32 次、37 次(跨度
-		// 12.5 分钟)。地区受限模型的出口选择同理被绕过(RegionError 403 就是
-		// 这么一路复现的)。
+		// 每个出口一份 client 之后, 连接池天然按出口隔离: 复用永远发生在同出口
+		// 内部, 跨出口复用从结构上不可能(与 opencode2api 的 proxyTransport 同构)。
+		// 粘性会话开启时同一来源反复走同一出口, 这条复用是稳态收益。
 		//
-		// 此前这里给"首次 attempt"开了豁免(attempt > 0 才新建 transport), 而
-		// 客户端每次重发都是 attempt == 0 —— 豁免恰好落在最容易中毒的那条路径
-		// 上, 这正是本 bug 的成因。代价是一次握手, 相对 LLM 流式响应的秒级时长
-		// 可以忽略; 换来的是"每次尝试 = 重新选出口"这条不变量真正成立。
-		//
-		// 连接回收: transport 每次 attempt 新建, 空闲连接由 zenAttemptBody 在
-		// 响应体关闭时回收(流读取期间不能动)。
-		fresh := *getZenHTTPClient()
-		var freshH2 *http2.Transport
-		fresh.Transport, freshH2 = newZenTransport()
-		client := &fresh
+		// exit 为空(直连模式 / 池里无可用节点)时 zenClientForExit 回落到共享
+		// client —— 那条路径自带多候选重试与 catch-all / Go 原生直连兜底链。
+		exit, _ := pickUnifiedExit(ctx, zenModelIDOf(params))
+		// ★ 出口已知, 就在这里写回 ctx —— **不能只靠拨号层写**: 出口 client 是
+		// 复用的, 连接被复用时拨号根本不会发生, setReqExit 就不会被调用, reqExit
+		// 留空, 429 时 cooldownActualExitQuota 直接早退返回 0 —— 冷却表写不进去,
+		// "同一个 IP 打到底"的 bug 就原样回来了。拨号层那份写入保留(同值), 两条
+		// 路径合起来才覆盖"新建连接"与"复用连接"两种情况。
+		setReqExit(ctx, exit)
+		client := zenClientForExit(exit)
 		resp, err := client.Do(req)
 		// 响应头已到(或本次拨号已终局), 停掉响应头超时计时任务。
 		headerTimer.Stop()
@@ -350,10 +367,11 @@ func callZenAPI(ctx context.Context, params map[string]any, stream bool) (*http.
 			markZenFail()
 			return nil, rateLimited, fmt.Errorf("zen request: %w", err)
 		}
-		// 回收钩子(zenAttemptBody): attempt 的 cancel 与地区受限模型专用 h2
-		// transport 都绑到响应体关闭上 —— body 关闭(流结束、连接归还)后立即回收,
-		// 不改变"每次真实拨号选出口"的语义。
-		resp.Body = &zenAttemptBody{ReadCloser: resp.Body, cancel: cancelAttempt, h2: freshH2}
+		// 回收钩子(zenAttemptBody): attempt 级的 cancel 绑到响应体关闭上 ——
+		// body 关闭(流结束、连接归还)后立即归还资源。**不再挂 h2 回收**:
+		// 出口 transport 现在按出口长期缓存复用, 在响应体关闭时关它的空闲连接
+		// 等于把同出口复用的收益抹掉; 那些连接由 IdleConnTimeout(90s) 自行回收。
+		resp.Body = &zenAttemptBody{ReadCloser: resp.Body, cancel: cancelAttempt}
 		if resp.StatusCode == http.StatusOK {
 			markZenSuccess()
 			// 重试成功时点名**真实出口**: 上面的 via= 打印的是全局轮询位置,
@@ -519,43 +537,47 @@ func callZenAPI(ctx context.Context, params map[string]any, stream bool) (*http.
 				// 一连串 429, 看不出冷却表根本没写进去。
 				log.Printf("  zen: 429 但本次未记录到真实出口(reqExit 为空) — 无出口可冷却/轮换(直连或兜底路径)")
 			}
-			if attempt < retries {
-				wait := delay
-				if retryAfter > wait {
-					wait = retryAfter
+			wait := delay
+			if retryAfter > wait {
+				wait = retryAfter
+			}
+			if wait <= zenRetryAfterMaxWait && attempt < retries {
+				log.Printf("  zen rate limited (%d), retry %d/%d after %v (next endpoint: %s)",
+					resp.StatusCode, attempt+1, retries, wait, baseURLs[(attempt+1)%len(baseURLs)])
+				// 睡眠必须可被客户端取消: ctx 已死还继续占槽睡, 只会拖住
+				// 整个并发窗口(信号量容量默认仅 8)。取消时立即返回 ——
+				// 半开探测已收到 429 但终局未到, 客户端取消视为无判定。
+				select {
+				case <-time.After(kit.WithRetryJitter(wait)):
+				case <-ctx.Done():
+					clearZenProbing()
+					return nil, rateLimited, fmt.Errorf("zen request aborted: %v", ctx.Err())
 				}
-				if wait <= zenRetryAfterMaxWait {
-					log.Printf("  zen rate limited (%d), retry %d/%d after %v (next endpoint: %s)",
-						resp.StatusCode, attempt+1, retries, wait, baseURLs[(attempt+1)%len(baseURLs)])
-					// 睡眠必须可被客户端取消: ctx 已死还继续占槽睡, 只会拖住
-					// 整个并发窗口(信号量容量默认仅 8)。取消时立即返回 ——
-					// 半开探测已收到 429 但终局未到, 客户端取消视为无判定。
-					select {
-					case <-time.After(kit.WithRetryJitter(wait)):
-					case <-ctx.Done():
-						clearZenProbing()
-						return nil, rateLimited, fmt.Errorf("zen request aborted: %v", ctx.Err())
-					}
-					delay *= 2
-					continue
-				}
-				// Retry-After 远超上限。它的语义是"**这个出口**多久之后恢复",
-				// 不是"整个网关要睡多久" —— opencode 免费层按出口 IP 计额度,
-				// Retry-After 实测 ≈ 到次日 08:00 重置(15h+), 永远超过 1 分钟上限。
-				//
-				// 所以两件事必须分开做: **不占槽睡眠**(睡 15h 等于把并发窗口
-				// 锁死, P1-4), 但**立刻换一个出口重试** —— 出口已经写进冷却表,
-				// 下一次尝试必然选到别的出口, 这才是"冷却"的意义。
-				//
-				// 此前这里直接 return 429, 于是"冷却了出口却不换出口": 客户端
-				// 收到 429 只好自己重发, 重发又落到同一个已耗尽的出口上 ——
-				// 同一个 IP 一路 429 到底(2026-09-23 实证: 172 号连吃 32 次、
-				// 175 号连吃 37 次, 95 次 429 里只有 4 次真的换到了出口)。
-				if cooled > 0 {
-					log.Printf("  zen rate limited (%d), Retry-After %v 超过 %v 上限 — 不占槽等待, 该出口已冷却, 立即换出口重试 %d/%d (next endpoint: %s)",
-						resp.StatusCode, wait, zenRetryAfterMaxWait, attempt+1, retries, baseURLs[(attempt+1)%len(baseURLs)])
-					continue
-				}
+				delay *= 2
+				continue
+			}
+			// 走到这里 = Retry-After 远超上限(或短等待但通用预算已用尽)。
+			//
+			// Retry-After 的语义是"**这个出口**多久之后恢复", 不是"整个网关要睡
+			// 多久" —— opencode 免费层按出口 IP 计额度, Retry-After 实测 ≈ 到
+			// 次日 08:00 重置(15h+), 永远超过 1 分钟上限。
+			//
+			// 所以两件事必须分开做: **不占槽睡眠**(睡 15h 等于把并发窗口锁死,
+			// P1-4), 但**立刻换一个出口重试** —— 出口已经写进冷却表, 下一次尝试
+			// 必然选到别的出口, 这才是"冷却"的意义。
+			//
+			// 此前这里直接 return 429, 于是"冷却了出口却不换出口": 客户端收到 429
+			// 只好自己重发, 重发又落到同一个已耗尽的出口上 —— 同一个 IP 一路 429
+			// 到底(2026-09-23 实证: 172 号连吃 32 次、175 号连吃 37 次, 95 次 429
+			// 里只有 4 次真的换到了出口)。
+			if attempt+1 < maxAttempts && cooled > 0 {
+				log.Printf("  zen rate limited (%d), 该出口已冷却 — 不占槽等待(Retry-After %v), 立即换出口重试 %d/%d (next endpoint: %s)",
+					resp.StatusCode, wait, attempt+1, maxAttempts, baseURLs[(attempt+1)%len(baseURLs)])
+				continue
+			}
+			if cooled > 0 {
+				log.Printf("  zen rate limited (%d): 换出口预算 %d 次已用尽, 返回 429", resp.StatusCode, maxAttempts)
+			} else {
 				// 没有真实出口可轮换(直连/兜底): "换出口"是空操作, 交还 429
 				// 让客户端按自己的节奏重试(P1-4)。
 				log.Printf("  zen rate limited (%d), Retry-After %v 超过 %v 上限 — 且无真实出口可轮换, 直接返回 429 让客户端自重试",
@@ -583,11 +605,10 @@ func callZenAPI(ctx context.Context, params map[string]any, stream bool) (*http.
 					if problems := translate_registry.ValidateOutbound(translate_registry.Responses, altBody); len(problems) == 0 {
 						if alt := tryZenResponsesFallback(ctx, base, altBody, stream, client, reqKey, zenBudget); alt != nil {
 							markZenSuccess()
-							// 回退响应同样跑在地区专用 transport 上(若本次是
-							// fresh): 挂同样的连接回收钩子, 否则该连接无人关闭。
-							if freshH2 != nil {
-								alt.Body = &zenAttemptBody{ReadCloser: alt.Body, h2: freshH2}
-							}
+							// 回退响应同样挂在本次 attempt 的 cancel 上: 不挂的话
+							// attemptCtx 要等父 ctx 结束才释放(此前只在 freshH2
+							// 非空时才挂, 属于漏挂)。
+							alt.Body = &zenAttemptBody{ReadCloser: alt.Body, cancel: cancelAttempt}
 							recordZenModelResult(zenModelIDOf(params), false)
 							return alt, rateLimited, nil
 						}
@@ -597,9 +618,7 @@ func callZenAPI(ctx context.Context, params map[string]any, stream bool) (*http.
 					msgTried = true
 					if alt := tryZenMessagesFallback(ctx, base, body, stream, client, reqKey); alt != nil {
 						markZenSuccess()
-						if freshH2 != nil {
-							alt.Body = &zenAttemptBody{ReadCloser: alt.Body, h2: freshH2}
-						}
+						alt.Body = &zenAttemptBody{ReadCloser: alt.Body, cancel: cancelAttempt}
 						recordZenModelResult(zenModelIDOf(params), false)
 						return alt, rateLimited, nil
 					}

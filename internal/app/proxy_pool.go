@@ -312,6 +312,9 @@ func rebuildZenTransport() {
 	}
 	zenHTTPClient = &http.Client{Transport: buildZenTransport()} // 内部会刷新 zenH2Transport
 	zenTransportMu.Unlock()
+	// 每出口一份的 client 一并回收: 出口池变化后旧出口可能已不存在。
+	// 放在锁外调用 —— 它自己持 zenExitClientsMu, 与 zenTransportMu 无嵌套关系。
+	closeAllZenExitClients()
 }
 
 func getZenHTTPClient() *http.Client {
@@ -639,22 +642,59 @@ func buildZenTransport() *http.Transport {
 	return t
 }
 
-// newZenTransport 构建 zen transport 本体, 同时返回注册进 https 侧路的 h2
-// 引用。共享给两处调用方, 避免构造参数分叉:
-//   - buildZenTransport: 进程唯一共享实例(连接池复用, 配置变更时关闭并重建)。
-//   - zen call 每次 attempt 的 fresh transport: 不复用连接, 让 zenDialContext
-//     现场选出口 —— 见 zen_call.go 的调用点。**每次尝试**都新建(不再只给
-//     重试), 因为共享池的连接按上游 host 复用, 会绕过出口选择, 并把"该冷却
-//     哪个出口"这条信息一并丢掉。
+// newZenTransport 构建 zen 共享 transport 本体, 同时返回注册进 https 侧路的 h2
+// 引用。共享实例(连接池复用, 配置变更时关闭并重建)。
 //
 // http 走 http.Transport 主路(DialContext = zenDialGuarded, 明文), https
 // 走 RegisterProtocol 登记的 h2 + uTLS Chrome 指纹(完整浏览器指纹含 h2,
 // 避免 Go 原生指纹被 CF 风控)。h2 侧路自带握手超时与空闲探活, 主
 // transport 的 TLSHandshakeTimeout/IdleConnTimeout 对它不生效。
 func newZenTransport() (*http.Transport, *http2.Transport) {
+	return newZenTransportWithDial(zenDialGuarded, 100, 10)
+}
+
+// newZenTransportPinned 构建**钉死在某个出口上**的 transport。
+//
+// 出口不是"拨号时选", 而是编译进 transport —— 连接池因此天然按出口隔离,
+// 跨出口复用从结构上不可能(与 opencode2api 的 proxyTransport 同构)。
+//
+// 为什么必须这样: 共享 transport 的连接按**上游 host** 复用, 复用直接绕过出口
+// 选择 —— 一条建立在出口 X 上的长连接会被后续请求继续用, 哪怕 X 已被判定额度
+// 耗尽; 而且复用不触发拨号, setReqExit 不写, 429 时连"该冷却哪个出口"都不知道
+// (2026-09-23 实证: 95 次 429 里只有 4 次冷却到了出口, 同一个节点被连打 32 次)。
+//
+// 空闲连接上限压到 1: 池子规模由订阅决定(实测可能上千个出口), 每个都留几条
+// 空闲长连接会堆出成千上万条 TLS 连接挂在客户端侧。同一出口复用一条就够。
+func newZenTransportPinned(exit string) (*http.Transport, *http2.Transport) {
+	return newZenTransportWithDial(zenDialGuardedPinned(exit), 1, 1)
+}
+
+// zenDialGuardedPinned 把拨号钉死在指定出口上, 不再现场选路。
+//
+// 与 zenDialContext 的分工: 那条是"选路 + 多候选重试 + 直连兜底"的完整链路,
+// 只在出口未定时用(见 zenClientForExit 的 exit=="" 分支); 这条只负责"把这个
+// 出口拨通", 失败即冷却并交还错误, 由外层换下一个出口 —— 选路的职责上移到
+// 调用方, 这样"一次尝试 = 一个出口"才成立。
+func zenDialGuardedPinned(exit string) func(context.Context, string, string) (net.Conn, error) {
+	return dialWithSSRFGuard(func(ctx context.Context, network, addr string) (net.Conn, error) {
+		setReqExit(ctx, exit)
+		conn, err := dialViaProxy(ctx, exit, network, addr)
+		if err != nil {
+			// 与 zenDialContext 同一口径: 这个出口拨不通就冷却它, 外层换下一个。
+			cooldownZenProxy(exit, 2*time.Minute)
+			return nil, err
+		}
+		setLastZenExit(exit)
+		return conn, nil
+	})
+}
+
+// newZenTransportWithDial transport 构造的唯一出口: 调用方只差"拨号函数"与
+// "空闲连接预算"两个参数, 其余字段必须一致 —— 分开写迟早分叉。
+func newZenTransportWithDial(dial func(ctx context.Context, network, addr string) (net.Conn, error), maxIdleConns, maxIdlePerHost int) (*http.Transport, *http2.Transport) {
 	t := &http.Transport{
-		MaxIdleConns:        100,
-		MaxIdleConnsPerHost: 10,
+		MaxIdleConns:        maxIdleConns,
+		MaxIdleConnsPerHost: maxIdlePerHost,
 		IdleConnTimeout:     90 * time.Second,
 		// 分层超时(P1-11): TLS 握手与响应头阶段单独设限, 不再依赖客户端
 		// 自己的超时兜底 -- 上游卡死握手/卡死响应头时, 网关能主动断开并
@@ -663,13 +703,13 @@ func newZenTransport() (*http.Transport, *http2.Transport) {
 		ResponseHeaderTimeout: 120 * time.Second,
 		DisableCompression:    false,
 	}
-	t.DialContext = zenDialGuarded
-	h2 := zenHTTP2Transport()
+	t.DialContext = dial
+	h2 := zenHTTP2Transport(dial)
 	t.RegisterProtocol("https", h2)
 	return t, h2
 }
 
-func zenHTTP2Transport() *http2.Transport {
+func zenHTTP2Transport(dial func(ctx context.Context, network, addr string) (net.Conn, error)) *http2.Transport {
 	return &http2.Transport{
 		// 侧路被 RegisterProtocol 旁路, 主 transport 的 IdleConnTimeout/
 		// TLSHandshakeTimeout 对它全部不生效(2026-09-23 审查 P2: 裸 h2
@@ -679,7 +719,7 @@ func zenHTTP2Transport() *http2.Transport {
 		// 兜住"accept 后对端静默挂死"这类占满 8 槽并发的僵持连接。
 		ReadIdleTimeout: 30 * time.Second,
 		DialTLSContext: func(ctx context.Context, network, addr string, _ *tls.Config) (net.Conn, error) {
-			raw, err := zenDialGuarded(ctx, network, addr)
+			raw, err := dial(ctx, network, addr)
 			if err != nil {
 				return nil, err
 			}
@@ -702,6 +742,119 @@ func zenHTTP2Transport() *http2.Transport {
 			}
 			return uconn, nil
 		},
+	}
+}
+
+// ============ 每出口一份 client(出口级连接隔离) ============
+
+// zenExitClientTrimAt 缓存规模超过它时, 做一次"冷 client 空闲连接回收"。
+//
+// ★ 这**不是**缓存上限: 出口 client **永不淘汰**。
+//
+//	淘汰是有害的 —— 被淘汰的出口下次被选中时要重新握手, 而且出口池会随订阅
+//	增长, 任何固定上限迟早会挡住本该复用的出口, 从"资源保护"退化成功能缺陷。
+//
+//	那为什么不需要上限: 空闲连接由 IdleConnTimeout(90s) 自行回收, 所以同时在手
+//	的空闲连接数由**最近 90s 用过的出口数**决定, 与池规模无关; 缓存里没在用的
+//	client 只是几个空结构体(约 1~2KB), 几千个也就几 MB。
+//
+// 这个阈值只挡一种瞬时峰: 池子很大时一轮轮询可能在 90s 内碰过上千个出口, 于是
+// 瞬间堆出上千条 TLS 长连接。超过阈值就把**很久没用**的 client 的空闲连接关掉,
+// client 本身留着 —— 下次用到它照常复用(那一次要重新拨号)。
+const zenExitClientTrimAt = 512
+
+// zenExitClientColdAfter 多久没用算"冷", 冷 client 的空闲连接可回收。
+const zenExitClientColdAfter = 2 * time.Minute
+
+type zenExitClient struct {
+	client *http.Client
+	h2     *http2.Transport
+	last   int64 // 最近使用时刻(UnixNano)
+}
+
+var (
+	zenExitClientsMu sync.Mutex
+	zenExitClients   = map[string]*zenExitClient{}
+)
+
+// zenClientForExit 取(或惰性建)某出口专属的 client。**永不淘汰**。
+//
+// exit 为空(直连模式 / 池里无可用节点)时回落到共享 client —— 那条路径里的
+// zenDialContext 自带多候选重试与 catch-all / Go 原生直连兜底链, 不能丢。
+//
+// 键用 zenProxyCooldownKey(出口稳定标识)而不是下标: 列表每次现场拼装, 下标会
+// 随订阅刷新/地区过滤漂移(与冷却表同一理由)。
+func zenClientForExit(exit string) *http.Client {
+	if exit == "" {
+		return getZenHTTPClient()
+	}
+	key := zenProxyCooldownKey(exit)
+	now := time.Now().UnixNano()
+
+	zenExitClientsMu.Lock()
+	if c, ok := zenExitClients[key]; ok {
+		c.last = now
+		zenExitClientsMu.Unlock()
+		return c.client
+	}
+	zenExitClientsMu.Unlock()
+
+	// 构造放锁外: 只做结构体装配、不拨号, 但没必要占着锁。
+	t, h2 := newZenTransportPinned(exit)
+	client := *getZenHTTPClient() // 沿用共享 client 的 Timeout / CheckRedirect 等字段
+	client.Transport = t
+	fresh := &zenExitClient{client: &client, h2: h2, last: now}
+
+	zenExitClientsMu.Lock()
+	if old, ok := zenExitClients[key]; ok { // 双检: 并发下已被别的请求建好
+		zenExitClientsMu.Unlock()
+		closeZenExitTransport(t, h2)
+		return old.client
+	}
+	zenExitClients[key] = fresh
+	var cold []*zenExitClient
+	if len(zenExitClients) > zenExitClientTrimAt {
+		cutoff := time.Now().Add(-zenExitClientColdAfter).UnixNano()
+		for k, c := range zenExitClients {
+			if k != key && c.last < cutoff {
+				cold = append(cold, c)
+			}
+		}
+	}
+	zenExitClientsMu.Unlock()
+
+	// 锁外回收: 冷 client 的空闲连接显式关掉, 否则要挂到 IdleConnTimeout(90s)
+	// 才自行释放。**只关连接, 不删 client** —— 缓存条目全部保留。
+	for _, c := range cold {
+		closeZenExitTransport(c.client.Transport, c.h2)
+	}
+	return fresh.client
+}
+
+// closeZenExitTransport 关掉一份出口 transport 的空闲连接。
+// 主路与 h2 侧路必须各关一次: stdlib 的 CloseIdleConnections 对指针注册的
+// RegisterProtocol 侧路恒判非结构体, 关不到 h2 那边的连接(见 zenH2Transport 注释)。
+func closeZenExitTransport(transport http.RoundTripper, h2 *http2.Transport) {
+	if tr, ok := transport.(*http.Transport); ok {
+		tr.CloseIdleConnections()
+	}
+	if h2 != nil {
+		h2.CloseIdleConnections()
+	}
+}
+
+// closeAllZenExitClients 整体回收全部出口 client。
+//
+// 出口池/配置变化时调用: 订阅刷新会重建节点快照、本地入站端口随之变化, 旧
+// client 钉的出口已经不存在, 留着只占连接(它们不会误路由 —— 旧出口的本地入站
+// 已消失, dialNodeProxy 会直接失败 —— 但没必要留着)。
+func closeAllZenExitClients() {
+	zenExitClientsMu.Lock()
+	old := zenExitClients
+	zenExitClients = map[string]*zenExitClient{}
+	zenExitClientsMu.Unlock()
+	for _, c := range old {
+		closeZenExitTransport(c.client.Transport, c.h2)
 	}
 }
 

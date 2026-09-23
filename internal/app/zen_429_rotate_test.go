@@ -177,6 +177,47 @@ func TestRateLimitedExitRotatesInsteadOfReturning429(t *testing.T) {
 	}
 }
 
+// TestSameExitReusesConnection 同一出口的 client 会被缓存复用。
+//
+// 出口级连接隔离之后, 反复走同一出口的请求不该每次都重新握手 —— 粘性会话
+// (stickySessions) 下同一来源固定走同一出口, 这条复用是稳态路径上的收益。
+// 断言的是**拨号次数**(假代理收到的 CONNECT 数)而不是请求数。
+func TestSameExitReusesConnection(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.Write([]byte("data: {\"id\":\"c1\",\"object\":\"chat.completion.chunk\",\"model\":\"m\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"ok\"},\"finish_reason\":null}]}\n\ndata: [DONE]\n\n"))
+	}))
+	defer upstream.Close()
+
+	var dials atomic.Int32
+	proxy := fakeConnectProxy(t, upstream.Listener.Addr().String(), &dials)
+
+	// 池里只有一个出口 → 两次请求必然选到同一个, 正好用来验证复用。
+	withTestExitPool(t, []string{proxy.URL}, upstream.URL, 3)
+	closeAllZenExitClients()
+	t.Cleanup(closeAllZenExitClients)
+
+	params := map[string]any{
+		"model":      "mimo-v2.6-flash-free",
+		"messages":   []any{map[string]any{"role": "user", "content": "hi"}},
+		"max_tokens": 16,
+	}
+	for i := 1; i <= 2; i++ {
+		ctx := context.WithValue(context.Background(), ctxKeyReqExit, &reqExit{})
+		resp, _, err := callZenAPI(ctx, params, true)
+		if err != nil {
+			t.Fatalf("第 %d 次请求失败: %v", i, err)
+		}
+		// 必须把 body 读干净再关, 连接才会归还连接池 —— 没读完就关, stdlib
+		// 会直接弃掉这条连接, 那样测到的就不是复用了。
+		_, _ = io.Copy(io.Discard, resp.Body)
+		resp.Body.Close()
+	}
+	if dials.Load() != 1 {
+		t.Fatalf("同一出口的两次请求应复用同一条连接(只拨号 1 次), got %d 次拨号", dials.Load())
+	}
+}
+
 // TestRateLimitedExitWithoutPoolReturns429 兜底路径不能退化成死循环:
 // 直连(无出口可冷却)时换出口是空操作, 必须原样交还 429 而不是反复重试。
 func TestRateLimitedExitWithoutPoolReturns429(t *testing.T) {

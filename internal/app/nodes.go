@@ -378,6 +378,11 @@ func syncNodeBox() {
 	}
 	nodeMu.Unlock()
 
+	// 每出口一份的 client 全部回收: 本次替换让旧出口的本地入站端口作废, 钉在
+	// 旧端口上的 client 已经用不上了。放在 nodeMu 之外调用 —— 它自己持
+	// zenExitClientsMu, 不引入新的锁序。
+	closeAllZenExitClients()
+
 	// 稍后再做连通检测: 上百个节点同时拨号会占满出口与 CPU, 让面板先可用。
 	// 在此之前 healthOf 返回 unknown, 出口照常参与轮询(未探测≠不可用)。
 	go func() {
