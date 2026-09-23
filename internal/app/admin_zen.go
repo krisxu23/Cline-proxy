@@ -366,13 +366,19 @@ func handleZenNodesCheck(w http.ResponseWriter, r *http.Request) {
 	writeAPI(w, http.StatusOK, apiResponse{Success: true, Message: "连通检测已启动"})
 }
 
-// GET /admin/api/zen/models — 返回**全部**已同步的 zen 模型, 并逐个标注:
-//   - free:    自动免费(seed 白名单 / -free 后缀), 面板上锁定勾选
-//   - enabled: 当前对网关可用(自动免费或用户手动启用), 未启用的可在面板勾选启用
+// GET /admin/api/zen/models — 返回**免费**的 zen 模型, 并逐个标注:
+//   - free:     自动免费(seed 白名单 / -free 后缀), 面板上锁定勾选
+//   - enabled:  当前对网关可用(自动免费或用户手动启用)
 //   - manually: 用户手动启用的非自动免费模型(可随时取消勾选)
+//   - hiddenPaid: 被过滤掉的纯付费模型条数(仅供自查"怎么少了这么多")
 //
-// 之前只返回免费模型, opencode 不定期放进的免费测试模型(如 union-alpha,
-// 不带 -free 后缀)在目录里拉得到、却永远不显示, 用户无从启用。
+// 曾有一版返回**全量**目录, 理由是"opencode 会不定期放进免费但未标注 -free 的
+// 测试模型(如 union-alpha), 只列免费时它们不显示、用户无从启用"。那个需求现在由
+// **seed 白名单**(zenSeedModels)承接 —— big-pickle 这类没有 -free 后缀的免费模型
+// 就在白名单里 —— 而全量返回在上游开始提供商业目录后变成了反效果: 实测 84 条里
+// 只有 15 条免费, 面板被 69 个付费模型淹没(2026-09-24 用户要求改回只列免费)。
+//
+// 手动启用过的必须保留: 曾启用过的付费模型若从面板消失, 用户再也无法取消它。
 func handleZenModels(w http.ResponseWriter, r *http.Request) {
 	if r.Method != "GET" {
 		writeAPI(w, http.StatusMethodNotAllowed, apiResponse{Error: "method not allowed"})
@@ -381,12 +387,21 @@ func handleZenModels(w http.ResponseWriter, r *http.Request) {
 	initZenModels()
 	zenModelsMu.RLock()
 	models := make([]map[string]any, 0, len(zenModels))
+	hiddenPaid := 0
 	for _, m := range zenModels {
 		// 展示层必须用"自动免费"口径: isZenFreeModel 会把手动启用也算作免费,
 		// 那样面板会把一个手动启用的测试模型渲染成自动免费、勾选框锁死,
 		// 用户再也无法取消(2026-09-17 审查 C1)。
 		autoFree := isAutoFreeZenModel(m)
-		enabled := (autoFree || zenModelEnabled(m.ID)) && !zenModelUnavailable(m.ID)
+		manually := !autoFree && zenModelEnabled(m.ID)
+		// 只列免费模型(2026-09-24 用户要求): 上游 zen /v1/models 现在返回整个商业
+		// 目录(实测 84 条里只有 15 条免费), 全量返回等于把付费模型也推给面板。
+		// 手动启用过的保留 —— 否则用户再也无法取消它(同上 C1)。
+		if !autoFree && !manually {
+			hiddenPaid++
+			continue
+		}
+		enabled := (autoFree || manually) && !zenModelUnavailable(m.ID)
 		models = append(models, map[string]any{
 			"id":       m.ID,
 			"aliases":  m.Aliases,
@@ -395,7 +410,7 @@ func handleZenModels(w http.ResponseWriter, r *http.Request) {
 			"source":   m.Source,
 			"free":     autoFree,
 			"enabled":  enabled,
-			"manually": !autoFree && zenModelEnabled(m.ID), // 用户手动启用的非免费模型
+			"manually": manually, // 用户手动启用的非免费模型
 		})
 	}
 	zenModelsMu.RUnlock()
@@ -403,7 +418,10 @@ func handleZenModels(w http.ResponseWriter, r *http.Request) {
 	sort.Slice(models, func(i, j int) bool {
 		return models[i]["id"].(string) < models[j]["id"].(string)
 	})
-	writeAPI(w, http.StatusOK, apiResponse{Success: true, Data: map[string]any{"models": models, "count": len(models)}})
+	// hiddenPaid 一并返回: 面板上"怎么少了这么多"要能自查, 否则看起来像目录同步坏了。
+	writeAPI(w, http.StatusOK, apiResponse{Success: true, Data: map[string]any{
+		"models": models, "count": len(models), "hiddenPaid": hiddenPaid,
+	}})
 }
 
 // POST /admin/api/zen/models/toggle — 启用/禁用一个非自动免费的 zen 模型。

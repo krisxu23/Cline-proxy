@@ -215,9 +215,10 @@ function providerCardBody(n, p, stat) {
     }
     if (n === 'opencode') {
       const disp = 'zen/' + m.id;
-      // 自动免费的模型(seed / -free 后缀)锁定勾选: 它们本来就免费, 关掉只会误导。
-      // 其余的是 opencode 不定期放进、未标注 -free 的(免费)测试模型 —— 开关写入
-      // cfg.EnabledModels, 后端 isZenFreeModel 放行后才对网关可用。
+      // 后端已只下发免费模型(2026-09-24): 自动免费(seed 白名单 / -free 后缀)与
+      // 用户手动启用过的两种。纯付费模型不下发 —— 上游 zen /v1/models 现在返回
+      // 整个商业目录, 全量渲染会让面板变成一堵付费模型墙。
+      // 自动免费的锁定勾选(它们本来就免费, 关掉只会误导); 手动启用的可取消。
       // ★ 必须严格判 === true: providerModels 之外直接拼的对象可能没有 free 字段,
       //   undefined !== false 会误判成"免费"导致灰框。
       const free = m.free === true;
@@ -225,7 +226,7 @@ function providerCardBody(n, p, stat) {
       const box = free
         ? '<input type="checkbox" checked disabled title="自动免费模型, 无需手动启用">'
         : '<input type="checkbox" data-ocmodel="' + escAttr(m.id) + '"' + (on ? ' checked' : '') + ' onchange="toggleOcModel(this)">';
-      const tag = free ? '' : '<span class="model-tag" title="opencode 免费但未标注 -free 的测试模型, 手动启用后才会对网关发布">测试</span>';
+      const tag = free ? '' : '<span class="model-tag" title="你手动启用的模型(非自动免费), 取消勾选即从网关撤下">手动</span>';
       return '<tr data-mrow data-row-search="' + escAttr(disp) + '"><td>' + box + '</td>' +
         '<td class="mrow-label" style="text-align:left;font-family:var(--font-mono)">' + esc(disp) + ' ' + tag + '</td>' +
         '<td style="font-size:var(--fs-sm)">' + fmtNum(m.context || 0) + '</td>' +
@@ -245,7 +246,7 @@ function providerCardBody(n, p, stat) {
     note = '池内自动选账号与模型, 无需逐个启用。状态来自官方推荐清单(上次同步 ' + ls + ')。';
   } else if (n === 'opencode') {
     head = '<tr><th style="width:44px">启用</th><th style="text-align:left">模型 ID</th><th>上下文</th><th>最大输出</th><th style="width:44px"></th></tr>';
-    note = 'zen 目录全量(每 10 分钟自动同步); 自动免费的模型锁定勾选, 标「测试」的是上游放进但未标注 -free 的模型, 手动勾选即启用。';
+    note = '只列免费模型(每 10 分钟自动同步): 自动免费的锁定勾选; 标「手动」的是你手动启用过的, 取消勾选即撤下。上游商业目录里的付费模型已隐藏。';
   } else {
     head = '<tr><th style="width:44px">启用</th><th style="text-align:left">模型 ID' +
       '<button type="button" class="btn btn-sm" style="margin-left:10px;padding:2px 10px;font-size:var(--fs-xs)" onclick="toggleAllProviderModels(\'' + escJs(n) + '\',true)">全选</button>' +

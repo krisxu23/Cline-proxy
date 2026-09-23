@@ -74,10 +74,18 @@ func handleProvidersConfig(w http.ResponseWriter, r *http.Request) {
 // 通用 Provider 做目录刷新/连通测试。与 routerSnapshot 同源
 // (opencode = zenFreeCatalog 含健康门, cline = 官方推荐清单全量)。
 //
-// opencode 行**带出目录里的全部模型**(不只是免费的那部分): opencode 会不定期
-// 放进免费但未标注 -free 的测试模型(如 union-alpha), 只列免费模型时它们在
-// 面板上根本看不到, 用户无从启用。每项带 on(当前是否对网关可用) 与
-// free(是否自动免费 —— 自动免费的锁定勾选, 其余的可手动开关)。
+// opencode 行**只带出免费模型**(2026-09-24 用户要求): 上游 zen /v1/models 现在返回
+// **整个商业目录**(实测 84 条里只有 15 条免费), 全量渲染会让面板变成一堵付费模型墙。
+// 每项带 on(当前是否对网关可用) 与 free(是否自动免费 —— 自动免费的锁定勾选,
+// 其余的可手动开关)。
+//
+// 此前"带出全部"的理由是"opencode 会不定期放进免费但未标注 -free 的测试模型
+// (如 union-alpha), 只列免费模型时它们在面板上根本看不到, 用户无从启用"。那个需求
+// 由 **seed 白名单**(zenSeedModels)承接 —— big-pickle 这类没有 -free 后缀的免费模型
+// 就在里面, 所以不再需要靠"全量"兜底。
+//
+// 手动启用过的模型必须保留: 曾启用过的付费模型若从面板消失, 用户再也无法取消它
+// (与 2026-09-17 审查 C1 同一类问题)。
 func builtinProviderEntries() map[string]map[string]any {
 	zenKey := ""
 	if cfg := getZenConfig(); cfg != nil {
@@ -89,10 +97,14 @@ func builtinProviderEntries() map[string]map[string]any {
 		// 展示口径与 handleZenModels 一致: free 只代表"自动免费锁定勾选",
 		// 手动启用的模型必须可取消(2026-09-17 审查 C1)。
 		free := isAutoFreeZenModel(&m)
-		on := (free || zenModelEnabled(m.ID)) && !zenModelUnavailable(m.ID)
+		manually := !free && zenModelEnabled(m.ID)
+		if !free && !manually {
+			continue // 纯付费: 不列
+		}
+		on := (free || manually) && !zenModelUnavailable(m.ID)
 		zenModels = append(zenModels, map[string]any{
 			"id": "opencode:" + m.ID, "model": m.ID, "context": m.Context, "output": m.Output,
-			"free": free, "on": on,
+			"free": free, "on": on, "manually": manually,
 		})
 		zenCatalog = append(zenCatalog, map[string]any{"id": m.ID, "disabled": !on, "free": free})
 	}
