@@ -247,6 +247,51 @@ func TestRequestLogMiddlewareFillsTraceFields(t *testing.T) {
 	}
 }
 
+// TestDecisionTraceMarksLastCandidateResult 固化"候选必须带上真实结局"的契约。
+//
+// 面板按 c.status 判红绿(>=400 红, 否则绿): addCandidate 在请求发出时记
+// decision="tried"、status=0 —— 若不补结局, 一次 429 限流会被画成成功。
+// 该测试守护的就是这个方向, 而不是实现细节。
+func TestDecisionTraceMarksLastCandidateResult(t *testing.T) {
+	decisionTraceReset()
+	defer decisionTraceReset()
+
+	d := decisionTraceStart("req_mark", "muse-spark-1.3-contributor-free")
+	d.addCandidate("zen/a", "tried", "", 0, "")
+	d.markCandidateResult(http.StatusTooManyRequests, errClassForStatus(http.StatusTooManyRequests))
+
+	got := decisionTraceFor("req_mark")
+	if got == nil || len(got.Candidates) != 1 {
+		t.Fatalf("应能取回一条候选, got %+v", got)
+	}
+	c := got.Candidates[0]
+	if c.Status != http.StatusTooManyRequests {
+		t.Fatalf("429 必须落到候选上, 否则面板按 status 判绿(把限流画成成功), got %d", c.Status)
+	}
+	if c.ErrClass != classRateLimit {
+		t.Fatalf("错误类别应同步为 %s, got %q", classRateLimit, c.ErrClass)
+	}
+
+	// 装饰只动最后一条: 先前的候选(已判定的结局)不能被覆盖。
+	d.addCandidate("zen/b", "skipped", "冷却中(rateLimit)", 0, "")
+	d.markCandidateResult(http.StatusInternalServerError, errClassForStatus(http.StatusInternalServerError))
+	got = decisionTraceFor("req_mark")
+	if got.Candidates[0].Status != http.StatusTooManyRequests || got.Candidates[0].ErrClass != classRateLimit {
+		t.Fatalf("只应装饰最后一条候选, 首条被改写: %+v", got.Candidates[0])
+	}
+	if got.Candidates[1].Status != http.StatusInternalServerError {
+		t.Fatalf("最后一条应被标记, got %+v", got.Candidates[1])
+	}
+
+	// status=0(网络错误、客户端中断)没有 HTTP 结局可记, 必须 no-op,
+	// 否则会把上一条候选的真实结局改写成"无状态"。
+	d.markCandidateResult(0, "")
+	got = decisionTraceFor("req_mark")
+	if got.Candidates[1].Status != http.StatusInternalServerError || got.Candidates[1].ErrClass != classServerError {
+		t.Fatalf("status=0 不应改写候选, got %+v", got.Candidates[1])
+	}
+}
+
 func TestProtocolFromPath(t *testing.T) {
 	cases := map[string]string{
 		"/v1/chat/completions": "openai",

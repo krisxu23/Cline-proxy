@@ -143,6 +143,39 @@ func chatBodyToResponsesBody(chat map[string]any) map[string]any {
 	return out
 }
 
+// zenAutoToolChoiceOnly zen 的 /responses 端点只接受 tool_choice:"auto"。
+//
+// 实测 2026-09-23(muse-spark-1.3-contributor-free, 上游原样回包):
+//
+//	only "auto" is supported for tool_choice. "none", "required", and
+//	named functions are not supported.
+//
+// 客户端(opencode / 各家 SDK)会发 "none"、"required" 或指定函数的对象形态,
+// 直连上游就 400 整个请求。
+const zenAutoToolChoiceOnly = "muse-spark"
+
+// zenCoerceResponsesToolChoice 把 zen 不支持的 tool_choice 降级成 "auto"。
+//
+// 只动 tool_choice, **绝不删 tools**: 去掉 tools 会让 agent 客户端失去工具
+// 调用能力(退化成纯文本问答), 降级 tool_choice 只是让它"不再强制调用",
+// 语义弱得可控。降级后仍发 tools, 上游可用则调用、不用则不强制。
+//
+// 作用域按模型前缀限定(muse-spark 家族), 因为这是**实测到的上游限制**而不是
+// 猜测: 同端点上的其它模型(如 union-alpha 家族)未复现该限制, 无差别放宽
+// 会掩盖上游的真实能力, 也会让日后新增的支持模型白丢一次工具强制。
+//
+// 与转换层 chatBodyToResponsesBody 的分工: 那里只做 chat→Responses 的**形态**
+// 归一(扁平化 {function:{name}} → {name}), 不理解具体上游的接受范围; 接受范围
+// 的判定放在这里, 由 zen_call.go 按端点能力调用。
+func zenCoerceResponsesToolChoice(body map[string]any, modelID string) {
+	if body == nil || !strings.HasPrefix(strings.TrimSpace(modelID), zenAutoToolChoiceOnly) {
+		return
+	}
+	if tc, ok := body["tool_choice"]; ok && tc != "auto" {
+		body["tool_choice"] = "auto"
+	}
+}
+
 // ============ 响应转换: Responses -> OpenAI chat ============
 
 // usageFieldInt 从响应体的 usage 对象里取整数字段(兼容 float64 / int 两种解码形态)。

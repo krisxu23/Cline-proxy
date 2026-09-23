@@ -153,9 +153,11 @@ func callZenAPI(ctx context.Context, params map[string]any, stream bool) (*http.
 	if isFreeModelForShape := zenFreeShapeRequired(zenEndpoint, zenResolvedModel); isFreeModelForShape {
 		body, forcedStream = zenApplyFreeShape(zenEndpoint, body)
 	}
-
 	switch zenEndpoint {
 	case zenEndpointResponses:
+		// zen 的 /responses 只接受 tool_choice:"auto"(见 zenCoerceResponsesToolChoice),
+		// 降级必须在**转换后的形态**上做 —— 降级掉的是 tool_choice,不是 tools。
+		zenCoerceResponsesToolChoice(body, zenResolvedModel)
 		// 出站体形态不变量(P1-9): 违例说明转换层或整形层有 bug,
 		// 宁可网关 500 也不把畸形请求发给上游换回难以理解的 400。
 		if problems := translate_registry.ValidateOutbound(translate_registry.Responses, body); len(problems) > 0 {
@@ -204,7 +206,35 @@ func callZenAPI(ctx context.Context, params map[string]any, stream bool) (*http.
 	respTried := false // Responses 端点自适应回退每次请求只试一次
 	msgTried := false  // Messages 端点自适应回退每次请求只试一次
 
+	// 直连 zen 路径的决策轨迹。此前只有候选链(handleChainedChat)会建轨迹, 于是所有
+	// 非链式 zen 请求在面板详情里同时出现两个假象: "决策轨迹不可用 HTTP 404"(轨迹
+	// 从未登记)与"0 次尝试, 跳过 0 站"(计数从未写入)—— 两条假象同源于此: 轨迹从未创建。
+	//
+	// owns 是记账开关, 不是判重: callZenAPI 同时被 callChainUpstream 调用(routing_chain.go),
+	// 而链式调度自己已经做了完整的逐候选记账(handleChainedChat: tr.AddAttempt + dec.addCandidate)。
+	// 此处若再来一遍, 每次上游调用会把尝试数与候选数**翻倍**。因此只有"本次新建"轨迹时
+	// (直连路径)才记账; 已存在(链式已登记)一律跳过。
+	trace := traceFrom(ctx)
+	dec := decisionTraceFrom(reqIDFrom(ctx))
+	owns := false
+	if dec == nil {
+		dec = decisionTraceStart(reqIDFrom(ctx), zenResolvedModel)
+		owns = true
+	}
+	// 终局收口: 面板的 finish 状态依赖它。finish 幂等且持锁, 与链式入口的 defer 并存也安全。
+	if owns {
+		defer dec.finish()
+	}
+
 	for attempt := 0; ; attempt++ {
+		// 直连路径: 每次尝试记一条候选 + 一次真实尝试。请求日志的"尝试/跳过"与
+		// 面板的候选链同源(reqTrace), 此前直连路径两处都为 0, 面板无从判断重试是否发生。
+		// 链式路径不在此记账 —— handleChainedChat 已经自己记过(tr.AddAttempt + dec.addCandidate),
+		// 再来一遍会把尝试数与候选数翻倍。
+		if owns {
+			trace.AddAttempt()
+			dec.addCandidate(decZenCandidate(zenResolvedModel), "tried", "", 0, "")
+		}
 		// 客户端已断开(超时/取消): 立即停止, 再重试也没有人接收结果。
 		// 请求未获判定 → 释放半开探测标志(见 clearZenProbing)。
 		if ctx.Err() != nil {
@@ -257,17 +287,19 @@ func callZenAPI(ctx context.Context, params map[string]any, stream bool) (*http.
 			body["model"], stream, getMsgCount(params), describeZenProxy(), base, attempt+1, kit.Truncate(outbound["x-opencode-session"], 24))
 
 		client := getZenHTTPClient()
-		// 地区受限模型绝不能吃共享连接池: 池里的 h2 连接是启动早期建立的
-		// (model sync 等任务在节点就绪前就发起了第一批请求, 当时走的是直连
-		// 的大陆 IP), 此后所有 zen 请求都复用这条连接, DialTLSContext 不会再
-		// 被调用 —— 按模型的出口选择被整个绕过, RegionError 403 就是这么来的
-		// (其他 zen 模型不限地区所以正常, 只有受限模型暴露)。
-		// 每次用全新传输真实拨号, 让 zenDialContext 现场选出口。
+		// 重试绝不能吃共享连接池: 池里的 h2 连接按上游 host 复用, 重试时
+		// DialTLSContext 不再被调用 —— 于是上一轮刚冷却的出口仍被复用, 429/5xx
+		// 的"换出口重试"变成"同一个出口 IP 打到底"(用户实测: opencode 请求一路
+		// 429, 网关不停打同一个 IP, 出口轮换完全失效)。地区受限模型的出口选择
+		// 同理被整个绕过(RegionError 403 就是这么来的), 两条都要强制真实拨号。
+		//
+		// 判定用 attempt>0 而不是错误类型: 网络错误与 5xx 路径本就说"换一个出口
+		// 就是全新的机会", 401 退役 key 后也指望落到下一把 key; 它们全都依赖
+		// "重试 = 重新选出口"。首次 attempt 仍走共享池, 稳态延迟不受影响。
 		var freshH2 *http2.Transport
-		if isRegionRestrictedModel(zenModelIDOf(params)) {
+		if isRegionRestrictedModel(zenModelIDOf(params)) || attempt > 0 {
 			fresh := *client
-			freshH2 = zenHTTP2Transport()
-			fresh.Transport = freshH2
+			fresh.Transport, freshH2 = newZenTransport()
 			client = &fresh
 		}
 		resp, err := client.Do(req)
@@ -317,6 +349,9 @@ func callZenAPI(ctx context.Context, params map[string]any, stream bool) (*http.
 			// 这个出口调通了 → 清零它的连续 429 计数, 让冷却时长回到基准。
 			// 不清零的话计数单调递增, 出口被限流一次后就再也回不到短冷却。
 			clearActualExitQuotaStrike(ctx)
+			if owns {
+				dec.setWinner(decZenCandidate(zenResolvedModel))
+			}
 			// 地区能力**正向**学习: 这个出口对该模型可用。
 			//
 			// ★ 2026-09-17 审查 P1-1: 此前只有负向回写(失败时 setRegionNodeOK(false)),
@@ -379,6 +414,12 @@ func callZenAPI(ctx context.Context, params map[string]any, stream bool) (*http.
 		}
 		bodyBytes := kit.ReadBody(resp)
 		resp.Body.Close()
+		// 本次尝试的真实结局: 挪到所有分支(401/403/429/5xx/4xx)之前 —— 这些分支
+		// 都会 return 或 continue, 放在末尾会让"重试后 return"的路径跳过标记。
+		// 尤其 429: 上游限流时若漏标, 面板会把一次限流画成成功(状态 0 判 2xx)。
+		if owns {
+			dec.markCandidateResult(resp.StatusCode, errClassForStatus(resp.StatusCode))
+		}
 		// 401: 这把 key 失效(被吊销 / 冻结) → 临时退役, 受影响出口自动落到下一把
 		// key(zenSelectKey 会跳过退役的)。这是多 key 的**确定收益**: 一把 key 坏掉
 		// 不影响整体服务。退役状态不落盘 —— 上游随时可能恢复。
@@ -597,4 +638,10 @@ func describeExitRaw(p string) string {
 	default:
 		return "代理: " + kit.Truncate(maskProxyURL(p), 60)
 	}
+}
+
+// decZenCandidate 决策轨迹里直连 zen 站点的候选标签。
+// zen 是单一上游, 无模型轮换, 标签只含模型名, 便于面板区分上游。
+func decZenCandidate(resolvedModel string) string {
+	return "zen/" + resolvedModel
 }

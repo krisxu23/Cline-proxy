@@ -428,6 +428,46 @@ func pruneDecisionRingLocked() {
 	decisionRing = kept
 }
 
+// decisionTraceFrom 取"已创建"的决策轨迹对象(可继续写), 未创建或已过期返回 nil。
+//
+// 与 decisionTraceFor 的区别: 后者是面板读取面(返回拷贝、按 TTL 取),
+// 这个是**写入面** —— callZenAPI 用它判断"本次请求的轨迹是否已存在":
+// 候选链入口(handleChainedChat)与直连入口(handleZenChat)可能先后进入
+// callZenAPI, 轨迹只建一次。
+func decisionTraceFrom(reqID string) *routeDecision {
+	if reqID == "" {
+		return nil
+	}
+	decisionMu.Lock()
+	defer decisionMu.Unlock()
+	d := decisionIndex[reqID]
+	if d == nil {
+		return nil
+	}
+	if time.Since(d.Time) > decisionTraceTTL {
+		delete(decisionIndex, reqID)
+		return nil
+	}
+	return d
+}
+
+// markCandidateResult 装饰**最后一条**候选的真实结局(状态码与错误类别)。
+//
+// addCandidate 在 attempt 发出时记录"这一站被打了", 但那时还不知道结果;
+// 不补结果的话 UI 的候选列表会恒显绿灯(c.status 为 0 会被当成成功),
+// 一次 429/400 的失败看起来像成功。失败发生在响应体读完之后, 此刻补最合适。
+func (d *routeDecision) markCandidateResult(status int, errClass string) {
+	if d == nil || status == 0 {
+		return
+	}
+	decisionMu.Lock()
+	defer decisionMu.Unlock()
+	if n := len(d.Candidates); n > 0 {
+		d.Candidates[n-1].Status = status
+		d.Candidates[n-1].ErrClass = errClass
+	}
+}
+
 // decisionTraceFor 按请求 id 取轨迹(面板详情用)。返回值是拷贝, 调用方可安全读取。
 func decisionTraceFor(reqID string) *routeDecision {
 	if reqID == "" {

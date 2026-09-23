@@ -634,25 +634,37 @@ var zenDialGuarded = dialWithSSRFGuard(zenDialContext)
 var zenH2Transport *http2.Transport
 
 func buildZenTransport() *http.Transport {
+	t, h2 := newZenTransport()
+	zenH2Transport = h2 // 持引用供 rebuildZenTransport 关闭(指针注册, 主 transport 关不到)
+	return t
+}
+
+// newZenTransport 构建 zen transport 本体, 同时返回注册进 https 侧路的 h2
+// 引用。共享给两处调用方, 避免构造参数分叉:
+//   - buildZenTransport: 进程唯一共享实例(连接池复用, 配置变更时关闭并重建)。
+//   - zen call 每次重试的 fresh transport: 不复用连接, 让 zenDialContext
+//     现场选出口 —— 见 zen_call.go 的重试分支。
+//
+// http 走 http.Transport 主路(DialContext = zenDialGuarded, 明文), https
+// 走 RegisterProtocol 登记的 h2 + uTLS Chrome 指纹(完整浏览器指纹含 h2,
+// 避免 Go 原生指纹被 CF 风控)。h2 侧路自带握手超时与空闲探活, 主
+// transport 的 TLSHandshakeTimeout/IdleConnTimeout 对它不生效。
+func newZenTransport() (*http.Transport, *http2.Transport) {
 	t := &http.Transport{
 		MaxIdleConns:        100,
 		MaxIdleConnsPerHost: 10,
 		IdleConnTimeout:     90 * time.Second,
 		// 分层超时(P1-11): TLS 握手与响应头阶段单独设限, 不再依赖客户端
-		// 自己的超时兜底 —— 上游卡死握手/卡死响应头时, 网关能主动断开并
+		// 自己的超时兜底 -- 上游卡死握手/卡死响应头时, 网关能主动断开并
 		// 让链路换下一站。正文阶段不设限(流式回答可以持续很久)。
-		// 注意 https 流量不走这两个字段: RegisterProtocol 侧路在 RoundTrip 前
-		// 就把请求接走, 侧路自带握手上限与空闲探活(见 zenHTTP2Transport)。
 		TLSHandshakeTimeout:   zenTLSHandshakeTimeout,
 		ResponseHeaderTimeout: 120 * time.Second,
 		DisableCompression:    false,
 	}
 	t.DialContext = zenDialGuarded
-	// https 走 HTTP/2 + uTLS Chrome 指纹: 完整浏览器指纹(含 h2),避免 Go 原生指纹被 CF 风控
 	h2 := zenHTTP2Transport()
 	t.RegisterProtocol("https", h2)
-	zenH2Transport = h2 // 持引用供 rebuildZenTransport 关闭(指针注册, 主 transport 关不到)
-	return t
+	return t, h2
 }
 
 func zenHTTP2Transport() *http2.Transport {
