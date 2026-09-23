@@ -93,17 +93,17 @@ func runDesktop(host string, port int) {
 	consumed := false
 	select {
 	case err := <-errCh:
-		// 1.2s 内就拿到结果: 服务起不来且没有其他实例在跑, 直接弹窗报错;
+		// 快速失败: 服务起不来且没有其他实例在跑, 直接弹窗报错;
 		// 否则(成功, 或端口被已有实例占用)继续往下走正常进入流程。
 		consumed = true
 		if err != nil && !isServiceAlive(adminHealthBase(port)) {
 			msgboxFail(err)
 			return
 		}
-	case <-time.After(1200 * time.Millisecond): // 等端口就绪再开窗口(仅首次运行会开)
+	case <-time.After(300 * time.Millisecond):
 	}
-	// 常驻兜底: StartProxy 可能在 1.2s 之后才失败(例如 sing-box 节点初始化
-	// 要数秒), 那时窗口已开、errCh 也没人读, 错误会被静默吞掉——而 GUI 无控制台,
+	// 常驻兜底: StartProxy 可能在更晚才失败(例如 sing-box 节点初始化要数秒),
+	// 那时窗口已开、errCh 也没人读, 错误会被静默吞掉——而 GUI 无控制台,
 	// 用户什么都看不到。这里一直监听, 收到非 nil 错误且当前没有其他实例在跑,
 	// 就弹窗告知。成功(nil)或端口被已有实例占用则忽略。
 	// 仅在第一段没消费掉 errCh 时才挂: 否则这个 <-errCh 永远等不到第二次发送。
@@ -116,17 +116,28 @@ func runDesktop(host string, port int) {
 	}
 	// 每次启动都自动弹管理窗口(2026-09-24 用户要求: 打开就能看到后台在哪)。
 	//
-	// 此前是"只首次弹、之后纯后台", 靠 data/.panel-opened 标记门控 —— 用户实测
-	// 每次换新版本重启都不弹, 认为这不对, 已按要求取消门控。代价可控: Chrome
-	// 已在运行时只是多开一个 --app 窗口(共用同一进程), 只有 Chrome 没开才会
-	// 拉起浏览器进程树。
+	// ★ 必须在**服务真正就绪之后**才开窗, 且不能阻塞托盘。两件事都有实测依据:
+	//
+	//  1. 就绪时机: StartProxy 在开始监听**之前**要做同步初始化(loadPool +
+	//     账号 token 预热 + initRegionModels + syncNodeBox 构建 sing-box 节点池),
+	//     实测从进程启动到 3457 开始监听要 **16 秒**(2026-09-24 日志: 06:34:08
+	//     进程启动 → 06:34:24 admin panel 就绪)。此前只等固定 1.2 秒就开窗,
+	//     Chrome 打开的是一个还没监听的服务 —— 用户看到浏览器错误页, 关掉过一会儿
+	//     重开才正常。所以改为轮询 /health 直到真正可用(见 waitAdminReady)。
+	//  2. 顺序: 先起托盘。托盘图标立刻出现 = 用户马上看到"程序起来了", 否则双击后
+	//     十几秒毫无反馈; 面板在就绪后由后台协程弹出。
 	//
 	// 失败必须落日志: 交付的二进制是 windowsgui 子系统、没有控制台, 静默失败
 	// 时用户只能看到"双击了没反应"(见 OpenAdminWindow 的错误返回)。
 	// 注意日志里**不能**带 adminURL —— 它含访问令牌。
-	if err := app.OpenAdminWindow(adminURL); err != nil {
-		log.Printf("  admin panel: 自动打开管理界面失败: %v (可从托盘「打开管理界面」重试, 或手动访问 http://127.0.0.1:%d/admin/)", err, port)
-	}
+	go func() {
+		if !waitAdminReady(adminHealthBase(port), adminReadyWait) {
+			log.Printf("  admin panel: 等待服务就绪超时(%v), 仍打开管理界面(可能显示连接错误; 可稍后从托盘「打开管理界面」重开)", adminReadyWait)
+		}
+		if err := app.OpenAdminWindow(adminURL); err != nil {
+			log.Printf("  admin panel: 自动打开管理界面失败: %v (可从托盘「打开管理界面」重试, 或手动访问 http://127.0.0.1:%d/admin/)", err, port)
+		}
+	}()
 	app.RunTray(adminURL)
 }
 
@@ -137,6 +148,42 @@ func adminPanelURL(port int) string { return app.AdminPanelURL(port) }
 // adminHealthBase 健康端点地址, 仅用于探测已有实例是否真正可用。
 func adminHealthBase(port int) string {
 	return fmt.Sprintf("http://127.0.0.1:%d/health", port)
+}
+
+// adminReadyWait 开管理窗口前等待服务就绪的上限。
+//
+// 为什么不能等固定时长: StartProxy 在开始监听**之前**要做同步初始化(loadPool +
+// 账号 token 预热 + initRegionModels + syncNodeBox 构建 sing-box 节点池), 实测
+// 从进程启动到 3457 开始监听要 **16 秒**(2026-09-24 日志: 06:34:08 进程启动 →
+// 06:34:24 admin panel 就绪)。此前只等 1.2 秒就开窗, Chrome 打开的是一个还没
+// 监听的服务 —— 用户看到浏览器错误页, 关掉过一会儿重开才正常(用户实证)。
+//
+// 给 30 秒余量: 订阅节点多、机器慢时会更久。超时**不阻止**开窗 —— 让用户看到
+// "连不上"也比什么都不弹更可诊断, 且托盘随时可再开。
+const adminReadyWait = 30 * time.Second
+
+// adminReadyPollGap 就绪轮询间隔。
+//
+// isServiceAlive 自身有 2s 的 HTTP 超时, 未就绪时每次探测都要等满它, 所以实际
+// 节奏 ≈ 2s 一次; 这个间隔只是避免服务已就绪却被反复忙等。
+const adminReadyPollGap = 250 * time.Millisecond
+
+// waitAdminReady 轮询健康端点直到服务可用或超时; 返回 false 表示超时。
+//
+// 复用 isServiceAlive(打 /health 并校验响应 JSON 里的 version 字段)而不是
+// 只判"端口可连": 端口刚 bind、路由还没挂上的窗口里, 只判可连会得到假阳性,
+// 开出来的窗口照样是错误页。
+func waitAdminReady(healthURL string, timeout time.Duration) bool {
+	deadline := time.Now().Add(timeout)
+	for {
+		if isServiceAlive(healthURL) {
+			return true
+		}
+		if time.Now().After(deadline) {
+			return false
+		}
+		time.Sleep(adminReadyPollGap)
+	}
 }
 
 // isServiceAlive 探测已有实例是否真的在正常服务。
