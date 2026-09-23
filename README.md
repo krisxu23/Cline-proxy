@@ -11,17 +11,18 @@
 - [上游配置](#上游配置)
 - [配置客户端](#配置客户端)
 - [管理与观测](#管理与观测)
-- [项目结构](#项目结构)
+- [环境变量与数据目录](#环境变量与数据目录)
 - [开发与构建](#开发与构建)
+- [在国内无代理推送](#在国内无代理推送)
 - [致谢](#致谢)
 
 ## 特性
 
 - **四类上游、一个入口** —— Cline 账号池、opencode zen 免费模型、ClinePass 订阅池，以及自配的任意 OpenAI 兼容站点（Gemini / OpenRouter / TokenRouter / B.AI …）；`cline-pass/*`、`zen/*`、`provider:model` 三种前缀直选上游
 - **三协议对外** —— OpenAI `/v1/chat/completions`、Anthropic `/v1/messages`、OpenAI Responses `/v1/responses`，同一份上游能力给任意客户端；`GET /v1/models` 实时聚合全部可用模型
-- **opencode 伪装层** —— 出站 zen 请求与官方 opencode CLI 完全同形：官方式身份头 + 结构合法的 `prj_/ses_/usr_` ID，免费层强制 agent 形态（stream + 五件套工具），详见 [opencode 伪装层](#opencode-伪装层)
-- **出口治理** —— 内嵌 sing-box，节点链接直贴即成本地出口；代理池轮询 + 冷却，连通检测参与选路（不可达不再轮询），地区受限模型只走通过地区校验的出口
-- **三层自愈 + 账号池自动化** —— 上游熔断 → key/账号冷却 → 模型级路由，`X-Proxy-Route` 头标注每次决策；OAuth / 手动 Token / 批量导入入池，429 时长自动解析、到期恢复，请求失败自动换号
+- **opencode 伪装层** —— 出站 zen 请求与官方 opencode CLI 完全同形：官方式身份头 + 合法的 `prj_/ses_/usr_` ID，免费层强制 agent 形态（stream + 五件套工具），详见 [opencode 伪装层](#opencode-伪装层)
+- **出口治理** —— 内嵌 sing-box，节点链接直贴即成本地出口；代理池轮询 + 冷却，连通检测参与选路，地区受限模型只走通过地区校验的出口
+- **三层自愈 + 账号池自动化** —— 上游熔断 → key/账号冷却 → 模型级路由，`X-Proxy-Route` 头标注每次决策；OAuth / 手动 Token / 批量导入入池，429 到期自动恢复，请求失败自动换号
 - **Gemini 协议兼容** —— 原生目录方言归一化、thought-signature 回填与自动重放、免费配额语义区分
 - **上下文压缩** —— 移植 opencode 官方摘要算法（尾部预算 → 锚定摘要模板 → 重组会话），超长会话不撞上限
 - **单二进制 + 桌面形态** —— 无控制台黑窗，托盘 + 独立管理窗口；也支持服务器模式与 Docker；token 统计与请求日志落盘
@@ -33,8 +34,8 @@
 从 [Release](https://github.com/krisxu23/Free-Router/releases) 下载 `free-router-windows-amd64.exe`，双击即用：
 
 - **无控制台黑窗口**：GUI 子系统构建，启动即进桌面形态
-- **管理窗口**：自动弹出独立应用窗口渲染 Web 后台（无地址栏、独立任务栏图标）
-- **系统托盘**：右键菜单含 4 项——「打开管理界面」「打开数据目录」（资源管理器打开 `data/`）「导出诊断包」（打包日志与运行状态到 `data/diag-<时间戳>.zip`）「退出」
+- **管理窗口**：自动弹出独立应用窗口渲染 Web 后台
+- **系统托盘**：右键菜单含 4 项——「打开管理界面」「打开数据目录」「导出诊断包」（打包日志与运行状态到 `data/diag-<时间戳>.zip`）「退出」
 - **重复双击**：端口被占时自动并入已在运行的实例，直接弹出管理窗口
 - **启动失败**：弹窗提示原因（如端口占用，可换端口）
 - **完整性校验**：发布包未签名，Windows SmartScreen 可能拦截。下载后比对 Release 页的 `free-router-windows-amd64.exe.sha256`：
@@ -137,10 +138,6 @@ api.cline.bot  opencode.ai/zen  api.cline.bot   你配置的任意上游
                 可经节点出口)                     / TokenRouter / B.AI …)
 ```
 
-- `internal/protocol/` — 纯函数协议层：SSE 解析与归一化、Anthropic ↔ OpenAI、Responses ↔ Chat。无 I/O、无状态，单元测试覆盖。
-- `internal/providers/` — 上游 Provider 抽象 + 路由注册表 + ClinePass key 池。cline / zen 两个适配器留在 `internal/app/adapters.go`，复用账号池与限流状态机。
-- 通用 Provider 一族（`internal/app/providers_*.go`）与 `internal/providers/` 是两回事：前者是本项目新增的"任意 OpenAI 兼容上游"，后者是既有的 ClinePass 包。
-
 ## 路由规则
 
 | model 形态 | 上游 | 鉴权 |
@@ -153,9 +150,8 @@ api.cline.bot  opencode.ai/zen  api.cline.bot   你配置的任意上游
 几条边界行为：
 
 - `zen/` 前缀只接受免费 zen 模型，付费或未知模型明确 400 拒绝，不会误入 Cline 池；裸 `*-free` 名称继续兼容。
-- `provider:` 前缀要求该 provider 已在配置中声明，且模型命中它的**免费集合**，否则 400 拒绝——避免经网关误用付费模型。
-- zen 连续失败时自动故障转移到 Cline 账号池，**前提是池内存在可用账号**；否则保持 zen 继续尝试。
-- Cline 账号 429/掉线时自动换号重试（受池内可用账号数限制）。
+- `provider:` 前缀要求该 provider 已声明且模型命中它的**免费集合**，否则 400 拒绝——避免经网关误用付费模型。
+- zen 连续失败时自动故障转移到 Cline 账号池（**前提是池内有可用账号**，否则继续尝试 zen）；Cline 账号 429/掉线时自动换号重试。
 
 ## 上游配置
 
@@ -175,29 +171,29 @@ api.cline.bot  opencode.ai/zen  api.cline.bot   你配置的任意上游
 
 无需配置，启动即启用（匿名 key `public`）。
 
-- **多端点**：官方源 + 3 个 CDN 镜像共 4 个 API 端点（官方在前），重试与模型同步自动跨端点轮换
-- **模型同步**：每 10 分钟自动同步官方模型列表；付费 zen 模型显式 400 拒绝
-- **上游错误**：4xx 状态码原样返回（例如 `403 RegionError` 对客户端可见），网络错误与 5xx 归一为 502
-- **Responses 专用模型**：`muse-*` 家族的免费模型（`muse-spark-1.2/1.3-contributor-free` 等）在上游只提供 OpenAI Responses 接口——直接请求 `chat/completions` 会被上游后端崩成 500。网关对这类模型自动改走上游 `/v1/responses` 端点，请求体与响应（含流式）双向翻译回 chat 格式，对客户端完全透明；tool_calls 工具调用链路与 usage 统计不受影响。翻译时 `max_tokens` 会补足上游下限（<16 会被拒），推理强度默认降到 `low`（客户端可用 `reasoning_effort` 覆盖为 minimal/low/medium/high/xhigh）——这是推理型模型，effort 不压低时容易把预算全花在思考上导致正文为空，建议 `max_tokens` 给到 512 以上
+- **多端点**：官方源 + 3 个 CDN 镜像共 4 个端点（官方在前），重试与模型同步自动跨端点轮换
+- **模型同步**：每 10 分钟同步官方模型列表；付费 zen 模型显式 400 拒绝
+- **上游错误**：4xx 原样返回（如 `403 RegionError`），网络错误与 5xx 归一为 502
+- **Responses 专用模型**：`muse-*` 等免费模型上游只提供 OpenAI Responses 接口（直连 chat 会被崩成 500）。网关自动改走上游 `/v1/responses`，请求与响应（含流式、tool_calls、usage）双向翻译回 chat 格式，对客户端透明。翻译时 `max_tokens` 补足上游下限（<16 被拒），推理强度默认 `low`（可用 `reasoning_effort` 覆盖）；不压低时推理容易吃光预算导致正文为空，建议 `max_tokens` ≥ 512
 - **上下文压缩**：按 opencode 官方算法做摘要压缩（尾部预算 → 锚定摘要模板 → 重组会话）
 
 #### opencode 伪装层
 
 出站的每个 zen 请求都与官方 opencode CLI 同形，由两层构成：
 
-- **身份头**（`internal/app/opencode_headers.go`）——逐项对位官方 `opencodeHeaders.ts`：`User-Agent: opencode/<版本>`、`x-opencode-client: cli`，以及结构合法的 `prj_` / `ses_` / `usr_` ID（prefix + 6 字节时间 hex + 14 位 base62，照抄官方 `id.ts`）。project 与 user 全进程稳定；session 由请求体指纹（模型 / system / 首条用户消息 / 工具集）确定性派生——同一会话恒得同一 ID，命中上游 prompt cache。客户端自带的 `x-opencode-*` 原样转发，非 CLI 形态的 UA 替换为官方形态。
-- **免费层形态整形**（`internal/app/zen_free_shape.go`）——免费模型只认 agent 形态：强制 `stream: true` 并补齐 `bash / edit / glob / grep / read` 五件套（chat 嵌套、responses 扁平、messages claude 三种形状按端点分别生成）；客户端要非流式时，被强制出的 SSE 由网关汇总回 JSON，调用方全程无感。付费模型不整形，避免误触发上游 agent 语义分支；免费判定与匿名凭据选择共用同一口径（`zenFreeModelEligible`）。
+- **身份头**：`User-Agent: opencode/<版本>`、`x-opencode-client: cli`，以及结构合法的 `prj_` / `ses_` / `usr_` ID。project 与 user 全进程稳定；session 由请求体指纹（模型 / system / 首条用户消息 / 工具集）确定性派生——同一会话恒得同一 ID，命中上游 prompt cache。客户端自带的 `x-opencode-*` 原样转发，非 CLI 形态的 UA 替换为官方形态。
+- **免费层形态整形**：免费模型只认 agent 形态——强制 `stream: true` 并补齐 `bash / edit / glob / grep / read` 五件套（chat / responses / messages 三形状按端点生成）；客户端要非流式时，被强制出的 SSE 由网关汇总回 JSON，调用方无感。付费模型不整形。
 
-实测边界（`docs/opencode-zen-facts.md`）：身份头**不能造成也修不好** `403 FreeTierError`（2026-09-18 A/B/C 三向对照），保留它的理由是与官方客户端完全同形；免费层真正的硬门禁是请求体形态——缺 `stream` 或缺 agent 工具一律 403，补齐后同 IP 同 key 即 200（2026-09-22 双向实测）。
+实测边界（`docs/opencode-zen-facts.md`）：身份头**不能造成也修不好** `403 FreeTierError`（2026-09-18 A/B/C 三向对照），保留它是为了与官方客户端完全同形；免费层真正的硬门禁是请求体形态——缺 `stream` 或缺 agent 工具一律 403，补齐后同 IP 同 key 即 200（2026-09-22 双向实测）。
 
 出口（后台 **🌐 出口代理与节点**）：
 
-- 支持 http/https/socks5 代理池轮询（`round_robin` / `random` / `fill`）
-- 支持 vmess / vless / trojan / ss / hy2 / tuic / hysteria / anytls / ssh / shadowtls / snell 节点链接直接粘贴——内嵌 sing-box 把每个节点转成本地出口，轮询与冷却机制与普通代理一致
-- **连通检测参与选路**：检测判定为不可达的节点不再被轮询，网络错误会让该出口短暂冷却，避免重试反复撞上同一个坏节点
-- **按地区选择出口**：后台不再逐个罗列节点，而是把出口按实测出口国家归到 **美国 / 日本 / 台湾 / 香港 / 新加坡 / 欧洲 / 其他地区** 7 组，每组显示「可用 / 共」数量并带勾选框。勾选一个或多个地区后，**整个网关（zen / cline 池 / 通用 Provider / 订阅抓取）的出站只走所选地区的 IP**；不勾选 = 不限制。地区来自连通检测实测的出口国家，检测结果会落盘（`data/node-regions.json`），重启后仍可用；未检测或无法判定国家的出口（含手填代理）归入「其他地区」。兜底：所选地区一个出口都没有时不会让网关失去出口，而是临时回退全部出口并记日志告警
-- **地区受限模型**：部分模型（如 `muse-spark-1.3-contributor-free`）只对特定出口地区开放。这类模型会单独校验每个节点，请求该模型时只走通过校验的节点
-- **订阅链接**：后台填订阅地址，保存即抓取、默认**每 30 分钟**自动刷新（间隔可在面板调整，范围 1 分钟–30 天，改完即生效无需重启），支持 sing-box JSON / Clash YAML / base64 节点列表三种格式，节点并入代理池统一轮询，缓存落盘重启即用；订阅列表默认收起为「主机名 + 抓取状态 + 节点数」，点击展开才显示完整地址与删除按钮
+- http/https/socks5 代理池轮询（`round_robin` / `random` / `fill`）
+- vmess / vless / trojan / ss / hy2 / tuic / hysteria / anytls / ssh / shadowtls / snell 节点链接直接粘贴——内嵌 sing-box 把每个节点转成本地出口，轮询与冷却和普通代理一致
+- **连通检测参与选路**：不可达节点不再被轮询，网络错误让该出口短暂冷却，避免反复撞上同一个坏节点
+- **按地区选择出口**：出口按实测国家归到 **美国 / 日本 / 台湾 / 香港 / 新加坡 / 欧洲 / 其他** 7 组。勾选一个或多个地区后，整个网关（zen / cline 池 / 通用 Provider / 订阅抓取）的出站只走所选地区的 IP，不勾选 = 不限制；检测结果落盘（`data/node-regions.json`），重启后仍可用，未检测或无法判定的出口（含手填代理）归入「其他」。所选地区无可用出口时临时回退全部出口并记日志告警
+- **地区受限模型**：部分模型（如 `muse-spark-1.3-contributor-free`）只对特定出口地区开放，请求时只走通过地区校验的节点
+- **订阅链接**：保存即抓取、默认**每 30 分钟**自动刷新（间隔可在面板调整，1 分钟–30 天，改完即生效），支持 sing-box JSON / Clash YAML / base64 三种格式，并入代理池统一轮询，缓存落盘重启即用；订阅列表默认收起，点击展开才显示完整地址与删除按钮
 
 ### 3. ClinePass 订阅池
 
@@ -232,13 +228,13 @@ curl -H "X-Admin-Token: $TOKEN" http://127.0.0.1:3457/admin/api/clinepass/models
 
 免费模型由显式开关决定，按上游是否提供模型目录选择配置方式：
 
-- 提供目录的上游（`catalog: true`；Google 上游自动强制开启）：目录拉取后在面板「🔌 通用 Provider」页逐个勾选免费模型；
-- 不提供目录的上游（如 B.AI）：把模型名写进 `freeModels` 白名单；
-- 两者可叠加（`catalog: true` + `freeModels`）：白名单优先，上游已下架的模型自动剔除。
+- 提供目录的上游（`catalog: true`；Google 上游自动强制开启）：目录拉取后在面板逐个勾选免费模型
+- 不提供目录的上游（如 B.AI）：把模型名写进 `freeModels` 白名单
+- 两者可叠加：白名单优先，上游已下架的模型自动剔除
 
-> `catalog` 用于拉取模型清单与连通性，不据目录价格自动判定免费；上游目录若带价格字段，网关会解析但不以此判定免费。
+> `catalog` 用于拉取模型清单与连通性，**不据目录价格自动判定免费**；目录带价格字段时会解析但不以此判定。
 
-面板上的操作：**保存 Provider**、**🔍 连通测试**（对指定模型发一次最小请求）、**🔄 刷新目录**；列表里显示每个 provider 的 `目录 N · 免费 N · 可聊 N` 与最近一次错误。目录在启动时立即拉取、之后每 15 分钟刷新一次；目录为空时请求路径会按 1 分钟退避自行重试。
+面板操作：**保存 Provider**、**🔍 连通测试**（对指定模型发一次最小请求）、**🔄 刷新目录**；目录启动时立即拉取、之后每 15 分钟刷新，目录为空时请求路径按 1 分钟退避重试。
 
 配置示例：
 
@@ -263,7 +259,7 @@ curl -H "X-Admin-Token: $TOKEN" http://127.0.0.1:3457/admin/api/clinepass/models
 }
 ```
 
-Google（Gemini）上游只需填 Base URL + API Key：目录地址与鉴权方言由网关按 hostname 自动推导——OpenAI 兼容路径发 `Authorization: Bearer`，Google 原生目录路径（`/v1beta/models`）发 `x-goog-api-key`。历史工具调用的 thought-signature 缺失时自动回填跳过哨兵，上游拒绝已缓存签名时自动用哨兵重放一次。
+Google（Gemini）上游只需填 Base URL + API Key：目录地址与鉴权方言按 hostname 自动推导（OpenAI 兼容路径发 `Authorization: Bearer`，Google 原生目录路径发 `x-goog-api-key`）。历史工具调用的 thought-signature 缺失时自动回填，上游拒绝已缓存签名时自动重放一次。
 
 ## 配置客户端
 
@@ -290,22 +286,21 @@ Base URL: http://<本机局域网IP>:3457/v1
 Model:    同上
 ```
 
-`GET /v1/models` 实时聚合四类上游的全部可用模型：Cline 模型、zen 免费模型、ClinePass 订阅模型，以及通用 Provider 的免费模型（id 形如 `provider:model`）。具体有哪些以该接口为准——上游的模型清单变动频繁，没必要在文档里维护一份会过期的表。
+`GET /v1/models` 实时聚合四类上游的全部可用模型。具体有哪些以该接口为准——上游清单变动频繁，不在文档里维护一份会过期的表。
 
 ## 管理与观测
 
-- **API Key 鉴权**：后台 **🔑 API 密钥管理** 生成/删除。这是**调用方**访问 `/v1/*` 用的 key，与管理后台的访问令牌（`data/admin-token`）是两回事。未配置任何 Key 时 `/v1/*` 允许无鉴权访问 —— 因此默认只监听 127.0.0.1；若显式 `-host 0.0.0.0` 且未配置 Key，等于对局域网开放了一个会消耗你账号额度的开放代理，请务必先生成 Key。
+- **API Key 鉴权**：后台 **🔑 API 密钥管理** 生成/删除，这是**调用方**访问 `/v1/*` 用的 key，与管理后台访问令牌（`data/admin-token`）是两回事。未配置任何 Key 时 `/v1/*` 允许无鉴权访问——因此默认只监听 127.0.0.1；若显式 `-host 0.0.0.0` 且未配置 Key，等于对局域网开放了一个会消耗你账号额度的开放代理，**请务必先生成 Key**
 - **System Prompt 覆盖**：项目目录放 `override.md`，自动替换所有客户端的系统提示词
-- **自定义请求头**：后台 **📨 请求头配置（模拟 Cline CLI 发出）**，编辑转发给上游的头
-- **路由决策头**：每个响应带 `X-Proxy-Route`，标注 `upstream` / `model` / `failover`，排查路由一目了然
+- **自定义请求头**：后台 **📨 请求头配置**，编辑转发给上游的头
+- **路由决策头**：每个响应带 `X-Proxy-Route`，标注 `upstream` / `model` / `failover`
 - **token 统计**：每请求 JSONL 落盘（`data/zen-stats.jsonl`），按账号/上游/模型聚合，后台实时展示
-- **请求日志**：`data/requests.jsonl` 记录每次请求；运行日志写在 `data/free-router.log`（追加模式，桌面形态同样落盘）
-- **日志自轮转**：`free-router.log` / `free-router-stream.log` / `zen-stats.jsonl` / `requests.jsonl` 按大小自动轮转（主日志 10 MiB，超限截断只保留最近内容）。
+- **请求日志**：`data/requests.jsonl`；运行日志在 `data/free-router.log`；四类文件均按大小自动轮转（主日志 10 MiB）
 - **出口治理**：后台 **🌐 出口代理与节点** —— 代理策略、代理列表、订阅、节点列表与连通检测、限流防御、上下文压缩都在此页
 - **thinking 透传**：Anthropic 协议下上游 `reasoning_content` 自动转为 `thinking` 内容块（流式 + 非流式）
 - **SSE 稳健性**：上游流无任何 choices 时自动补一个空 chunk 收尾，避免客户端报 "Provider returned no completion choices"
-- **熔断与自愈**：上游级熔断（连续 5xx/408/429 触发，窗口过期后半开探测，探测失败立即重跳闸；4xx 客户端错误不计入）→ key/账号级冷却（ClinePass key 与 Cline 账号命中 429 独立冷却，成功自动清零）→ 模型级路由（前缀显式分流，付费/未知模型明确拒绝）
-- **多平台 CI/CD**：GitHub Actions 自动构建多平台二进制；Release 按语义版本递增，并附带 `sha256` 校验值
+- **熔断与自愈**：上游级熔断（连续 5xx/408/429 触发，窗口过期半开探测；4xx 不计入）→ key/账号级冷却（命中 429 独立冷却，成功清零）→ 模型级路由（付费/未知模型明确拒绝）
+- **多平台 CI/CD**：GitHub Actions 自动构建多平台二进制；Release 按语义版本递增，附 `sha256` 校验值
 
 ### 健康检查 `GET /health`
 
@@ -328,94 +323,7 @@ curl -s http://127.0.0.1:3457/health
 | `logBytes` | 主日志当前字节数 |
 | `dropped` | 请求日志因缓冲满被丢弃的条数 |
 
-## 项目结构
-
-标准 Go 布局：入口在 `cmd/`，业务代码全在 `internal/`。同目录内按**功能前缀**分文件，
-相关代码不必跨目录翻找（`proxy_*` 属中继层，`zen_*` 属 zen 上游，`node*` 属节点出口，以此类推）。
-
-```
-├── cmd/
-│   └── free-router/            入口包：CLI 参数、桌面/托盘模式、平台差异
-│       ├── main.go             main()、runDesktop、buildAndStart
-│       ├── main_windows.go     Windows 专用：回挂父控制台、失败弹窗
-│       ├── main_other.go       其它平台占位实现
-│       └── rsrc_windows_amd64.syso  编译期嵌入的图标/清单资源
-├── internal/
-│   ├── app/                    网关主体（HTTP 面 + 上游编排）
-│   │   ├── proxy.go            监听启动、健康信息、入站体限制、进程级状态
-│   │   ├── proxy_cline.go      Cline 池上游调用、账号轮换与故障转移
-│   │   ├── proxy_stream.go     流式/非流式中继与 usage 采集
-│   │   ├── proxy_http.go       CORS、路由标记、JSON 响应工具
-│   │   ├── proxy_sanitize.go   控制字符清洗（流式/非流式共用的坏 JSON 门卫）
-│   │   ├── proxy_log.go        主日志与流式诊断日志、日志轮转
-│   │   ├── proxy_lifecycle.go  优雅退出与后台收口
-│   │   ├── proxy_util.go       端口占用、进程名、时延解析等工具
-│   │   ├── proxy_pool.go       出口代理选择、冷却、按模型选路
-│   │   ├── anthropic.go        Anthropic Messages ↔ OpenAI 双向转换与流式桥接
-│   │   ├── protocol_normalize.go  chunk 归一化、tool_call 修复、内容清洗
-│   │   ├── zen.go              zen 模型目录、三态路由与配置结构
-│   │   ├── zen_call.go         zen 上游调用与错误映射
-│   │   ├── zen_state.go        限流熔断状态机（并发信号量/半开探测）
-│   │   ├── zen_config_store.go zen 配置读写与校验
-│   │   ├── zen_models.go       免费模型目录同步
-│   │   ├── zen_responses.go    仅支持 Responses 的模型：自适应学习与名单
-│   │   ├── zen_responses_convert.go chat ↔ Responses 请求/响应/流转换
-│   │   ├── zen_responses_quirks.go muse-spark 配额、reasoning 预算、回退
-│   │   ├── providers_config.go  通用 Provider 配置与运行时注册表
-│   │   ├── providers_catalog.go 目录拉取与免费模型判定
-│   │   ├── providers_chat.go    通用 Provider 请求转发
-│   │   ├── adapters.go         cline/zen Provider 适配器 + 网关组装
-│   │   ├── clinepass.go        ClinePass 三协议 handler
-│   │   ├── pool.go             账号池管理与持久化
-│   │   ├── nodes.go            节点出口（内嵌 sing-box）编排
-│   │   ├── node_*.go           节点解析/探测/健康/过滤/端口流量/视图
-│   │   ├── sub.go              订阅抓取、解析、缓存
-│   │   ├── routing_chain.go    候选链解析
-│   │   ├── routing_dispatch.go 选路与派发
-│   │   ├── exit_*.go           出口折叠、地区判定、出口选路
-│   │   ├── stream_*.go         SSE 保活心跳、空闲中断、早断守卫
-│   │   ├── json_to_sse.go      NDJSON / 完整 JSON → SSE 合成
-│   │   ├── admin.go            管理后台路由注册与页面出口
-│   │   ├── admin_accounts.go   账号/OAuth/导入导出 API
-│   │   ├── admin_config.go     网关配置与 key 管理 API
-│   │   ├── admin_logs.go       请求日志与统计 API
-│   │   ├── admin_nodes.go      节点黑名单与健康 API
-│   │   ├── admin_{zen,router,providers}.go  各页面专属 API
-│   │   ├── compact.go          opencode 官方摘要压缩机制移植
-│   │   ├── responses.go        /v1/responses 转换
-│   │   ├── models.go           Cline 官方免费模型同步
-│   │   ├── model_region.go     地区受限模型的节点校验与标记
-│   │   ├── thought_signature.go / gemini_quota.go  Gemini 适配
-│   │   ├── logs.go / log_rotate.go / stats.go / usage.go  日志、轮转、统计
-│   │   ├── tray_windows.go / tray_other.go  系统托盘
-│   │   └── types.go            数据结构
-│   ├── webui/                  管理后台整页资产（HTML/CSS/JS 原始字符串常量）
-│   │   ├── page_shell.go       框架/样式/导航 + 仪表盘 + 供应商管理页
-│   │   ├── page_router.go      自动路由页（含路由预演）
-│   │   ├── page_settings_logs.go 设置页 + 请求日志页
-│   │   └── script_*.go         面板脚本（core/accounts/logs/config/providers/router）
-│   ├── app/translate_registry/ 请求体转换注册表 + 出站体形态不变量校验（生产使用）
-│   ├── providers/              Provider 接口、按注入分类函数路由、ClinePass key 池
-│   ├── protocol/               SSE 扫描、chunk 归一化、跨协议转换
-│   ├── translate/              OmniRoute 协议互转实现（批次⑤预铺，尚未接线）
-│   ├── cline/                  WorkOS OAuth、token 刷新
-│   └── kit/                    HTTP 客户端、路径解析、身份轮换、原子写文件
-├── assets/                     图标源文件
-├── scripts/                    开发脚本（渲染冒烟测试、GitHub SSH 配置）
-├── docs/
-│   ├── reports/                历次审计/评审报告
-│   └── superpowers/            设计与实施计划（plans / specs）
-├── dist/                       构建产物（gitignore）
-├── Dockerfile / docker-compose.yml
-├── AGENTS.md / NOTICE / README.md
-└── go.mod / go.sum
-```
-
-> `internal/app/translate_registry`（转换注册表 + 出站体校验，**生产使用**，由
-> `zen_call.go` / `zen_responses.go` 消费）与 `internal/translate`（协议互转实现，
-> **待接线**）职责不同且已按职责命名区分，改动前先确认导入的是哪一个。
-
-### 环境变量
+## 环境变量与数据目录
 
 | 变量 | 作用 |
 |---|---|
@@ -443,7 +351,7 @@ go vet -tags "with_quic,with_grpc,with_utls" ./...     # 静态检查
 go test -tags "with_quic,with_grpc,with_utls" ./...    # 单元测试
 ```
 
-测试覆盖协议转换、provider 目录与免费判定、Gemini 签名与配额解析、路由与冷却逻辑。不带构建标签运行时，涉及节点出站的用例会因缺协议栈而失败——这是标签要求的一部分，不是测试本身的问题。
+覆盖协议转换、provider 目录与免费判定、Gemini 签名与配额、路由与冷却逻辑；不带构建标签时涉及节点出站的用例会失败（缺协议栈，属预期）。
 
 ## 在国内无代理推送
 
@@ -487,18 +395,17 @@ git config --global url."ssh://git@ssh.github.com:443/".insteadOf "https://githu
 - `git remote set-url` **只改 fetch**。若这个 remote 之前单独设过 push URL，
   必须再执行一次 `set-url --push`；否则 `git remote -v` 里 push 一行仍是
   `https://github.com/...`，推送照样要代理。排查时先看这一行。
-- 拉取慢时可以读加速镜像（本仓库保留了一个只读的 `mirror` remote）：
+- 拉取慢时可以配一个只读镜像作 `mirror` remote（这类镜像如 `github.boki.moe`
+  通常只代理只读流量，推送以 SSH 为准）：
 
   ```bash
-  git fetch mirror     # 读走镜像，写仍走 SSH
+  git remote add mirror <只读镜像地址>
+  git fetch mirror     # 读走镜像，写仍走 origin/SSH
   ```
-
-  这类镜像（如 `github.boki.moe`）只代理只读流量的居多，推送以 SSH 为准。
 
 ## 致谢
 
 - [diegosouzapw/OmniRoute](https://github.com/diegosouzapw/OmniRoute)（MIT）—— 本项目的路由/日志/错误规则/协议翻译/SSE 数据处理多处机制以其为参照并做了 Go 侧移植；MIT 版权声明见仓库根目录 `NOTICE`
-
 
 出口选路、节点池与订阅处理的设计参考了以下优秀项目（思路借鉴，代码均为原创实现）：
 
@@ -507,7 +414,6 @@ git config --global url."ssh://git@ssh.github.com:443/".insteadOf "https://githu
 - [MetaCubeX/mihomo](https://github.com/MetaCubeX/mihomo) —— url-test 选路 + tolerance 防抖
 - [nadoo/glider](https://github.com/nadoo/glider) —— 多策略转发与健康检查
 - [sub-store-org/Sub-Store](https://github.com/sub-store-org/Sub-Store) —— 订阅处理管线
-自动分流到四类上游，对外同时提供 OpenAI、Anthropic、OpenAI Responses 三种协议接口，内置中文管理后台。
 
 - [YuJunZhiXue/Cline-proxy](https://github.com/YuJunZhiXue/Cline-proxy) — 项目基座
 - [defyma/cline-proxy](https://github.com/defyma/cline-proxy) — SSE 空 choices 兜底思路
