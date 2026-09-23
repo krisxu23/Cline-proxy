@@ -152,7 +152,7 @@ func renderAdminTokenPrompt(mismatch bool, retain string) string {
 <body><main>
 <h1>管理后台需要访问令牌</h1>
 <p>本页面未携带有效的访问令牌, 因此只返回这段引导, 不加载完整管理界面(含全部前端脚本)。</p>
-<p><b>程序在正常运行</b> —— 这不是启动失败。双击 exe 自动弹出的窗口、以及托盘「打开管理界面」打开的地址, 都已自带令牌, 用那些入口打开不会看到本页。</p>
+<p><b>程序在正常运行</b> —— 这不是启动失败。首次双击 exe 自动弹出的窗口、以及托盘「打开管理界面」打开的地址, 都已自带令牌, 用那些入口打开不会看到本页。</p>
 ` + errBanner + `
 <form onsubmit="var v=document.getElementById('tk').value.replace(/\s+/g,'');if(v){location.href='/admin/?token='+encodeURIComponent(v);}return false;">
 <input id="tk" type="password" autocomplete="off" placeholder="粘贴 data/admin-token 文件内容" value="` + val + `">

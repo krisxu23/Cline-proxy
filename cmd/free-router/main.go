@@ -5,6 +5,7 @@ import (
 	"flag"
 	"fmt"
 	"free-router/internal/app"
+	"free-router/internal/kit"
 	"io"
 	"log"
 	"net/http"
@@ -81,7 +82,7 @@ func main() {
 	}
 }
 
-// runDesktop 桌面模式主流程: 后台起服务 → 打开管理窗口 → 托盘阻塞。
+// runDesktop 桌面模式主流程: 后台起服务 → 首次运行开管理窗口 → 托盘阻塞。
 func runDesktop(host string, port int) {
 	adminURL := adminPanelURL(port)
 	// errCh 只会收到一次(StartProxy 只返回一次), 必须保证只被消费一次:
@@ -100,7 +101,7 @@ func runDesktop(host string, port int) {
 			msgboxFail(err)
 			return
 		}
-	case <-time.After(1200 * time.Millisecond): // 等端口就绪再开窗口
+	case <-time.After(1200 * time.Millisecond): // 等端口就绪再开窗口(仅首次运行会开)
 	}
 	// 常驻兜底: StartProxy 可能在 1.2s 之后才失败(例如 sing-box 节点初始化
 	// 要数秒), 那时窗口已开、errCh 也没人读, 错误会被静默吞掉——而 GUI 无控制台,
@@ -114,7 +115,12 @@ func runDesktop(host string, port int) {
 			}
 		}()
 	}
-	go app.OpenAdminWindow(adminURL)
+	// 首次运行自动弹管理窗口(见 panelMarker), 之后纯后台启动; 托盘
+	// 「打开管理界面」始终可用, 随开随关。
+	if !panelOpened() {
+		go app.OpenAdminWindow(adminURL)
+		markPanelOpened()
+	}
 	app.RunTray(adminURL)
 }
 
@@ -125,6 +131,22 @@ func adminPanelURL(port int) string { return app.AdminPanelURL(port) }
 // adminHealthBase 健康端点地址, 仅用于探测已有实例是否真正可用。
 func adminHealthBase(port int) string {
 	return fmt.Sprintf("http://127.0.0.1:%d/health", port)
+}
+
+// panelMarker 记录管理窗口是否已自动弹出过。首次运行弹面板是为了让用户
+// 知道后台在哪看; 之后纯后台 —— 每次启动都弹等于为面板常驻拉起整棵浏览器
+// 进程树(Edge/Chrome --app, 见 OpenAdminWindow), 空载白吃内存。
+const panelMarker = ".panel-opened"
+
+// panelOpened 报告管理窗口此前是否已自动弹出过。
+func panelOpened() bool {
+	return kit.FileExists(kit.ResolveDataPath(panelMarker))
+}
+
+// markPanelOpened 记下"已弹过", 内容为弹出时刻便于排查。写失败 → 下次
+// 仍会弹(退化为改造前的每次启动都弹, 安全方向), 错误就此吞掉。
+func markPanelOpened() {
+	_ = os.WriteFile(kit.ResolveDataPath(panelMarker), []byte(time.Now().Format(time.RFC3339)), 0o644)
 }
 
 // isServiceAlive 探测已有实例是否真的在正常服务。
