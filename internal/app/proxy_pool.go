@@ -5,17 +5,20 @@ import (
 	"context"
 	"crypto/tls"
 	"encoding/base64"
+	"encoding/json"
 	"fmt"
 	"io"
 	"log"
 	"net"
 	"net/http"
 	"net/url"
+	"os"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 
+	"free-router/internal/kit"
 	utls "github.com/refraction-networking/utls"
 	"golang.org/x/net/http2"
 	"golang.org/x/net/proxy"
@@ -59,6 +62,11 @@ func cooldownZenProxy(proxy string, d time.Duration) {
 	if key == "" {
 		return
 	}
+	// 必须先加载: 否则"先写 2 分钟通用冷却、再加载"会让加载走只补空缺语义而跳过
+	// 该键, 文件里那条 8h 额度冷却就被这次短冷却覆盖了(见 ensureExitCooldownsLoaded)。
+	// 这一条有专门的回归用例 TestGenericCooldownDoesNotShortenPersistedQuotaCooldown ——
+	// 去掉本行它会立刻失败(实测: 剩余 2m0s)。
+	ensureExitCooldownsLoaded()
 	if d <= 0 {
 		d = 10 * time.Minute
 	}
@@ -103,6 +111,8 @@ func zenProxyAvailable(proxy string) bool {
 	if key == "" {
 		return true
 	}
+	// 选路的第一读: 惰性恢复落盘的冷却表, 让重启后立刻跳过"已知耗尽"的出口。
+	ensureExitCooldownsLoaded()
 	zenProxyCooldownsMu.Lock()
 	defer zenProxyCooldownsMu.Unlock()
 	until, ok := zenProxyCooldowns[key]
@@ -129,6 +139,7 @@ func zenProxyCooldownStatus() map[string]string {
 		}
 	}
 	now := time.Now()
+	ensureExitCooldownsLoaded() // 面板要看的是"含落盘恢复在内"的完整冷却视图
 	zenProxyCooldownsMu.Lock()
 	defer zenProxyCooldownsMu.Unlock()
 	out := map[string]string{}
@@ -201,8 +212,8 @@ func cooldownZenProxyQuota(proxy string, retryAfter time.Duration) time.Duration
 	if key == "" {
 		return 0
 	}
+	ensureExitCooldownsLoaded() // 见 ensureExitCooldownsLoaded: 写前必须先加载
 	zenProxyCooldownsMu.Lock()
-	defer zenProxyCooldownsMu.Unlock()
 	n := zenProxyQuotaStrikes[key] + 1
 	zenProxyQuotaStrikes[key] = n
 	d := zenQuotaCooldownBase
@@ -222,6 +233,10 @@ func cooldownZenProxyQuota(proxy string, retryAfter time.Duration) time.Duration
 		}
 	}
 	zenProxyCooldowns[key] = time.Now().Add(d)
+	zenProxyCooldownsMu.Unlock()
+	// 落盘放锁外(persistExitCooldowns 自身取锁)。这是额度冷却唯一的落盘点 ——
+	// 通用网络冷却不落盘, 它短到重启丢失无所谓。
+	persistExitCooldowns()
 	return d
 }
 
@@ -232,9 +247,15 @@ func clearZenProxyQuotaStrike(proxy string) {
 	if key == "" {
 		return
 	}
+	ensureExitCooldownsLoaded()
 	zenProxyCooldownsMu.Lock()
-	defer zenProxyCooldownsMu.Unlock()
+	_, had := zenProxyQuotaStrikes[key]
 	delete(zenProxyQuotaStrikes, key)
+	zenProxyCooldownsMu.Unlock()
+	// 只在真的删掉了才落盘: 本函数在每次成功请求上都会走, 无变化时写文件纯属浪费。
+	if had {
+		persistExitCooldowns()
+	}
 }
 
 // cooldownActualExitQuota 429 专用: 冷却本次请求**真实使用**的出口。
@@ -256,6 +277,111 @@ func clearActualExitQuotaStrike(ctx context.Context) {
 	}
 }
 
+// ============ 冷却表落盘(重启不丢"已知耗尽"的出口) ============
+
+// exitCooldownFile 冷却表 + 429 计数的落盘文件。
+//
+// 为什么需要(2026-09-23 实证): 冷却表此前只在内存里, 重启即清空 —— 那个已耗尽的
+// 出口会被重新选中一次、再吃一个 429、再重新学一遍。与健康表是同一类问题: 用户侧
+// 的正确预期是"本地存着上一次的状态, 可以直接用"。
+//
+// 只在 **429 额度冷却**时落盘: 通用网络错误的 2 分钟冷却短到重启丢失无所谓, 而
+// 额度冷却实测是 8h 级别(上游 Retry-After 就是到额度重置时刻), 丢了必然白打一次。
+const exitCooldownFile = "exit-cooldowns.json"
+
+type exitCooldownCache struct {
+	// Cooldowns 出口稳定键 -> 冷却截止时刻。
+	//
+	// 存的是**绝对时刻**, 所以不需要 TTL: 加载时丢掉已过期的即可(zenProxyAvailable
+	// 本来也会顺手删过期项)。这一点与健康表不同 —— 那张表存的是"结论", 必须靠 TTL
+	// 判断还值不值得信; 这张表存的是"到什么时候为止", 时间本身就是判据。
+	Cooldowns map[string]time.Time `json:"cooldowns"`
+	// Strikes 出口稳定键 -> 连续 429 次数(冷却时长指数升级的依据)。
+	// 只恢复**仍在冷却中**的出口的计数: 冷却已过期的出口视为拿到新机会, 下次失败
+	// 从基准时长重新升级 —— 否则几周前的陈旧计数会让冷却虚高。
+	Strikes map[string]int `json:"strikes"`
+}
+
+var (
+	exitCooldownLoadOnce     sync.Once
+	exitCooldownFileOverride string // 仅测试用; 空 = data/exit-cooldowns.json
+)
+
+func exitCooldownPath() string {
+	if exitCooldownFileOverride != "" {
+		return exitCooldownFileOverride
+	}
+	return kit.ResolveDataPath(exitCooldownFile)
+}
+
+// ensureExitCooldownsLoaded 惰性恢复落盘的冷却表(仅一次)。
+//
+// 必须在**任何冷却写操作之前**完成: 否则"先写一条 2 分钟的通用冷却、再加载"会让
+// 加载走"只补空缺"语义而跳过该键 —— 文件里那条 8h 额度冷却就被 2 分钟覆盖了。
+// 所以 cooldownZenProxy / cooldownZenProxyQuota / zenProxyAvailable 三处都先调它。
+func ensureExitCooldownsLoaded() { exitCooldownLoadOnce.Do(loadExitCooldownCache) }
+
+func loadExitCooldownCache() {
+	data, err := os.ReadFile(exitCooldownPath())
+	if err != nil {
+		return // 首次运行/文件被删: 正常路径, 静默
+	}
+	var snap exitCooldownCache
+	if err := json.Unmarshal(data, &snap); err != nil {
+		log.Printf("  exit: 冷却表缓存解析失败已忽略: %v", err)
+		return
+	}
+	now := time.Now()
+	restored, expired := 0, 0
+	zenProxyCooldownsMu.Lock()
+	for k, until := range snap.Cooldowns {
+		if !now.Before(until) {
+			expired++
+			continue
+		}
+		if _, ok := zenProxyCooldowns[k]; !ok { // 只补空缺: 本进程已写的新值优先
+			zenProxyCooldowns[k] = until
+			restored++
+			if n := snap.Strikes[k]; n > zenProxyQuotaStrikes[k] {
+				zenProxyQuotaStrikes[k] = n
+			}
+		}
+	}
+	zenProxyCooldownsMu.Unlock()
+	log.Printf("  exit: 已从本地缓存恢复 %d 条出口额度冷却(重启后不会重复打已耗尽的出口); 已过期丢弃 %d 条",
+		restored, expired)
+}
+
+// persistExitCooldowns 落盘未过期的冷却与对应的 429 计数(失败仅告警)。
+// 持锁拷贝快照、放锁后再做文件 I/O —— 与 persistNodeStablePorts 同一约定。
+func persistExitCooldowns() {
+	now := time.Now()
+	zenProxyCooldownsMu.Lock()
+	snap := exitCooldownCache{
+		Cooldowns: make(map[string]time.Time, len(zenProxyCooldowns)),
+		Strikes:   make(map[string]int, len(zenProxyQuotaStrikes)),
+	}
+	for k, until := range zenProxyCooldowns {
+		if now.Before(until) {
+			snap.Cooldowns[k] = until
+		}
+	}
+	for k, n := range zenProxyQuotaStrikes {
+		// 只写仍在冷却中的键: 与加载侧同一判据, 避免把陈旧计数落盘又被读回来。
+		if n > 0 {
+			if _, ok := snap.Cooldowns[k]; ok {
+				snap.Strikes[k] = n
+			}
+		}
+	}
+	zenProxyCooldownsMu.Unlock()
+	if b := mustJSONIndent(snap); b != nil {
+		if err := kit.WriteFileAtomicDefault(exitCooldownPath(), b); err != nil {
+			log.Printf("exit cooldowns persist failed: %v", err)
+		}
+	}
+}
+
 // pruneStaleExitKeys 冷却表/429 计数/国家映射按 active 集合清理, 与
 // pruneStaleNodeHealth 同一调用点。三张表此前只增不减: 订阅摘除的 key 再不会被
 // 访问到(冷却表只有 zenProxyAvailable 访问时才顺手删过期项), 永久驻留 ——
@@ -271,18 +397,26 @@ func pruneStaleExitKeys(activeNodeKeys []string) {
 			on[k] = true
 		}
 	}
+	ensureExitCooldownsLoaded() // 清理前先加载, 否则刚恢复的条目会被当成"不在 active 集合"删掉
 	zenProxyCooldownsMu.Lock()
+	dropped := 0
 	for k := range zenProxyCooldowns {
 		if !on[k] {
 			delete(zenProxyCooldowns, k)
+			dropped++
 		}
 	}
 	for k := range zenProxyQuotaStrikes {
 		if !on[k] {
 			delete(zenProxyQuotaStrikes, k)
+			dropped++
 		}
 	}
 	zenProxyCooldownsMu.Unlock()
+	// 订阅摘除的出口从冷却表消失后, 落盘文件也要同步收窄(否则下次启动又把它们读回来)。
+	if dropped > 0 {
+		persistExitCooldowns()
+	}
 	nodeCountryMu.Lock()
 	for k := range nodeCountryMap {
 		if !on[k] {
