@@ -27,11 +27,3 @@ type AccountPool struct {
 	Keys         []string   `json:"keys,omitempty"`
 	DefaultModel string     `json:"defaultModel,omitempty"` // 用户自定义默认模型，持久化
 }
-
-type LoginMethod int
-
-const (
-	MethodDeviceOAuth LoginMethod = iota
-	MethodRefreshToken
-	MethodSSOCookie
-)

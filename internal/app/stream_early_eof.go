@@ -54,7 +54,8 @@ func (b *prefixedBody) Close() error {
 //
 // ★ 旧实现只看 `data:` 行非空，会把 error-only 帧
 // （`data: {"error":{"message":"rate limit"}}`）误判为"流已就绪"。
-// 现在改用 stream_readiness.go 的 hasStreamReadinessSignal 状态机：
+// 现在改用 stream_readiness.go 的 appendStreamReadinessSignal +
+// finishStreamReadinessSignal 状态机：
 //   - 跳过 ping/keepalive/heartbeat 事件
 //   - 跳过空 data 与 [DONE]
 //   - JSON 解析后判 hasNonPingStructuredPayload（error-only 帧不算就绪）

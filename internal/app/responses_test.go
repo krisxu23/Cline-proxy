@@ -458,13 +458,13 @@ func TestChatToResponsesToolCalls(t *testing.T) {
 	}
 	resp := chatToResponses(chat)
 	outputs := resp["output"].([]any)
-	// output[0] = message(text empty), output[1] = function_call
-	if len(outputs) != 2 {
-		t.Fatalf("expected 2 outputs, got %d: %#v", len(outputs), outputs)
+	// content 为空的纯工具回合不补空 message item, output 直接以 function_call 开头
+	if len(outputs) != 1 {
+		t.Fatalf("expected 1 output, got %d: %#v", len(outputs), outputs)
 	}
-	fc := asMap(t, outputs[1])
+	fc := asMap(t, outputs[0])
 	if fc["type"] != "function_call" {
-		t.Fatalf("output[1].type = %v, want function_call", fc["type"])
+		t.Fatalf("output[0].type = %v, want function_call", fc["type"])
 	}
 	if fc["name"] != "f1" {
 		t.Fatalf("function_call.name = %v, want f1", fc["name"])

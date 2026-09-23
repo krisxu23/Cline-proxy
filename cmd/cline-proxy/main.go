@@ -78,7 +78,6 @@ func main() {
 
 	if err := app.StartProxy(*host, *port); err != nil {
 		log.Fatalf("Proxy failed: %v", err)
-		os.Exit(1)
 	}
 }
 
@@ -183,6 +182,10 @@ func buildAndStart(host string, port int) {
 		if len(out) > 0 {
 			running = true
 		}
+	} else if isServiceAlive(adminHealthBase(port)) {
+		// 非 Windows 此前恒 false: 无探活必然重复起第二实例(端口被占,
+		// 第二实例 ListenAndServe 失败但面板照开)。复用 /health 探活防重复。
+		running = true
 	}
 
 	if running {

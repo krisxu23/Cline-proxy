@@ -45,15 +45,18 @@ func handleZenConfig(w http.ResponseWriter, r *http.Request) {
 		"failoverCount":       cfg.FailoverCount,
 		"failoverMinutes":     cfg.FailoverMinutes,
 		"compaction":          cfg.Compaction,
-		"runtime": map[string]any{
-			"failoverActive": zenFailedNow(),
-			"proxyCooldowns": zenProxyCooldownStatus(),
-			"subsStatus":     subStatusSnapshot(),
-			"circuit": func() map[string]any {
-				open, probing := zenCircuitStatus()
-				return map[string]any{"open": open, "probing": probing}
-			}(),
-		},
+		"runtime": func() map[string]any {
+			// 只读快照: 这里**不能**调 zenFailedNow() —— 它会真实放行半开探测
+			// (改熔断状态), 面板刷新一下就把一次性 CAS 的探测名额消费掉,
+			// 卡住后续全部请求。展示统一走无副作用的 zenCircuitStatus。
+			open, probing := zenCircuitStatus()
+			return map[string]any{
+				"failoverActive": open || probing,
+				"proxyCooldowns": zenProxyCooldownStatus(),
+				"subsStatus":     subStatusSnapshot(),
+				"circuit":        map[string]any{"open": open, "probing": probing},
+			}
+		}(),
 	}
 	writeAPI(w, http.StatusOK, apiResponse{Success: true, Data: data})
 }
@@ -435,6 +438,9 @@ func handleZenModelsToggle(w http.ResponseWriter, r *http.Request) {
 	zenModelsMu.RLock()
 	m, exists := zenModels[id]
 	zenModelsMu.RUnlock()
+	// 校验(只读)先做完; 下面的读-改-写放进 updateZenConfig 同一临界区 ——
+	// 此前是 getZenConfig 快照 → 锁外构造 → setZenConfig 整体替换, 并发的
+	// config update / 另一次 toggle 会互相覆盖(P3 同型丢更新竞态)。
 	cur := getZenConfig()
 	listed := false
 	for _, e := range cur.EnabledModels {
@@ -458,25 +464,29 @@ func handleZenModelsToggle(w http.ResponseWriter, r *http.Request) {
 		writeAPI(w, http.StatusOK, apiResponse{Success: true, Message: fmt.Sprintf("模型 %q 本就是免费模型, 无需手动启用", id)})
 		return
 	}
-	next := cur.clone()
-	set := make(map[string]bool, len(next.EnabledModels))
-	for _, e := range next.EnabledModels {
-		if e = strings.TrimSpace(e); e != "" {
-			set[e] = true
+	if uerr := updateZenConfig(func(next *zenConfigData) error {
+		set := make(map[string]bool, len(next.EnabledModels))
+		for _, e := range next.EnabledModels {
+			if e = strings.TrimSpace(e); e != "" {
+				set[e] = true
+			}
 		}
+		if *req.Enabled {
+			set[id] = true
+		} else {
+			delete(set, id)
+		}
+		list := make([]string, 0, len(set))
+		for e := range set {
+			list = append(list, e)
+		}
+		sort.Strings(list)
+		next.EnabledModels = list
+		return nil
+	}); uerr != nil {
+		writeAPI(w, http.StatusInternalServerError, apiResponse{Error: uerr.Error()})
+		return
 	}
-	if *req.Enabled {
-		set[id] = true
-	} else {
-		delete(set, id)
-	}
-	list := make([]string, 0, len(set))
-	for e := range set {
-		list = append(list, e)
-	}
-	sort.Strings(list)
-	next.EnabledModels = list
-	setZenConfig(next)
 	writeAPI(w, http.StatusOK, apiResponse{
 		Success: true,
 		Message: fmt.Sprintf("模型 %q 已%s", id, map[bool]string{true: "启用", false: "禁用"}[*req.Enabled]),

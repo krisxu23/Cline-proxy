@@ -9,6 +9,12 @@ package protocol
 // Moved from internal/app (normalizeOpenAIResponse) so protocol consumers
 // (providers, SSE relays) can share it. Pure function: input is unchanged.
 func NormalizeOpenAIChunk(obj map[string]any) map[string]any {
+	// 热路径快路径: SSE 每帧都过这里, 绝大多数帧既无 provider/proxy_metadata
+	// 也无需补 content —— 先零分配探测, 无事可改就原样返回(调用方只读:
+	// providers/clinepass 序列化即弃, app/clinepass 只读取字段)。
+	if !chunkNeedsNormalize(obj) {
+		return obj
+	}
 	out := make(map[string]any, len(obj))
 	for k, v := range obj {
 		if k == "provider_metadata" || k == "proxy_metadata" {
@@ -54,6 +60,51 @@ func NormalizeOpenAIChunk(obj map[string]any) map[string]any {
 		out["choices"] = normalized
 	}
 	return out
+}
+
+// hasStripKeys 该对象是否含需剥离的元数据键。
+func hasStripKeys(m map[string]any) bool {
+	_, p := m["provider_metadata"]
+	_, q := m["proxy_metadata"]
+	return p || q
+}
+
+// contentNeedsFix tool_calls 非空而 content 缺失(nil)时需补空串。
+// SanitizeContent 目前是恒等变换, 探测无需覆盖它; 若未来实现真实清洗,
+// 快路径必须同步接入, 否则无 strip 键的帧会被跳过清洗。
+func contentNeedsFix(delta map[string]any) bool {
+	if tc, ok := delta["tool_calls"].([]any); ok && len(tc) > 0 && delta["content"] == nil {
+		return true
+	}
+	return false
+}
+
+// chunkNeedsNormalize 零分配探测: 归一化是否会产生任何可见改动。
+// 与 NormalizeOpenAIChunk 的拷贝分支逐条件对应 —— 两处必须同步维护。
+func chunkNeedsNormalize(obj map[string]any) bool {
+	if hasStripKeys(obj) {
+		return true
+	}
+	choices, ok := obj["choices"].([]any)
+	if !ok {
+		return false
+	}
+	for _, ch := range choices {
+		c, ok := ch.(map[string]any)
+		if !ok {
+			continue
+		}
+		if hasStripKeys(c) {
+			return true
+		}
+		if msg, ok := c["message"].(map[string]any); ok && (hasStripKeys(msg) || contentNeedsFix(msg)) {
+			return true
+		}
+		if delta, ok := c["delta"].(map[string]any); ok && (hasStripKeys(delta) || contentNeedsFix(delta)) {
+			return true
+		}
+	}
+	return false
 }
 
 func normalizeMsg(msg map[string]any) map[string]any {

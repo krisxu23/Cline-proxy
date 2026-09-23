@@ -345,10 +345,11 @@ func TestCollect_零宽字符调用可被收集(t *testing.T) {
 
 // ─────────────────── streamRequestTools / attach ───────────────────
 
-func TestAttachStreamRequestTools_写入并可读回(t *testing.T) {
+func TestAttachStreamRequestTools_快照写入并可读回(t *testing.T) {
 	body := map[string]any{"tools": j(`[{"function":{"name":"Read"}}]`)}
+	snap := snapshotStreamRequestTools(body)
 	req, _ := http.NewRequest("POST", "http://example.com", nil)
-	attachStreamRequestTools(req, body)
+	attachStreamRequestTools(req, snap)
 
 	resp := &http.Response{Request: req}
 	got := extractAllowedToolNames(streamRequestTools(resp))
@@ -358,14 +359,36 @@ func TestAttachStreamRequestTools_写入并可读回(t *testing.T) {
 }
 
 func TestAttachStreamRequestTools_无tools不写头(t *testing.T) {
+	if snap := snapshotStreamRequestTools(map[string]any{}); snap != "" {
+		t.Fatalf("无 tools 时快照应为空, got %q", snap)
+	}
 	req, _ := http.NewRequest("POST", "http://example.com", nil)
-	attachStreamRequestTools(req, map[string]any{})
+	attachStreamRequestTools(req, "")
 	if req.Header.Get(streamToolsHeaderName) != "" {
-		t.Fatal("无 tools 时不应写入 header")
+		t.Fatal("空快照不应写入 header")
 	}
 	resp := &http.Response{Request: req}
 	if got := streamRequestTools(resp); got != nil {
 		t.Fatalf("应读回 nil, got %#v", got)
+	}
+}
+
+// 快照是序列化时机取的值拷贝: 之后的就地改写(remapToolNamesInRequest 原地
+// 改 tool map 的 name)不得污染白名单 —— 挂到出站请求的必须是
+// cloak/remap 前的客户端原始工具名。
+func TestSnapshotStreamRequestTools_免疫后续就地改写(t *testing.T) {
+	tools := []any{map[string]any{"type": "function", "name": "read_file"}}
+	body := map[string]any{"tools": tools}
+	snap := snapshotStreamRequestTools(body)
+
+	// 模拟 remap 的就地改写
+	tools[0].(map[string]any)["name"] = "Read"
+
+	req, _ := http.NewRequest("POST", "http://example.com", nil)
+	attachStreamRequestTools(req, snap)
+	got := extractAllowedToolNames(streamRequestTools(&http.Response{Request: req}))
+	if !got["read_file"] || got["Read"] {
+		t.Fatalf("快照应保住原始名 read_file, got %#v", got)
 	}
 }
 

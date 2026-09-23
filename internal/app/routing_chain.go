@@ -392,17 +392,17 @@ func candidateContext(c routeCandidate) int {
 	if c.Model == clinePoolPlaceholder {
 		return 0 // 占位模型由默认模型决定, 这里无法确定
 	}
-	// cline 池与 ClinePass 共用订阅目录; 通用 provider 走自己的目录。
+	// cline 池与 ClinePass 共用订阅目录; 通用 provider 查自己的目录。
+	// 查表而不是 freeModelsFor 全量重建: /v1/models 对每个候选调一次本函数,
+	// 重建(拷贝 + 两次排序)会把单次请求放大成 O(候选数²·log)。
 	for _, m := range clinePassProvider().ListModels() {
 		if m.ID == c.Model && m.Context > 0 {
 			return m.Context
 		}
 	}
 	if p := providerByName(c.Upstream); p != nil {
-		for _, m := range freeModelsFor(c.Upstream, p) {
-			if m.ID == c.Model && m.ContextLength > 0 {
-				return m.ContextLength
-			}
+		if e := p.catalogEntry(c.Model); e != nil && e.ContextLength > 0 {
+			return e.ContextLength
 		}
 	}
 	return 0

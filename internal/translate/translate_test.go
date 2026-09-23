@@ -143,13 +143,6 @@ func TestOpenAIChatToClaudeRequestThinkingAndEdge(t *testing.T) {
 		t.Fatalf("缺省 max_tokens 应为 8192, got %v", out2["max_tokens"])
 	}
 
-	// registry 取用
-	if GetRequestTranslator(FormatOpenAI, FormatClaude) == nil {
-		t.Fatal("openai:claude 请求翻译器应已注册")
-	}
-	if GetRequestTranslator(FormatClaude, FormatOpenAI) != nil {
-		t.Fatal("尚未注册的反向翻译器应为 nil")
-	}
 	// JSON 往返: 翻译产物必须是合法 JSON
 	b, err := json.Marshal(out2)
 	if err != nil || !strings.HasPrefix(string(b), "{") {

@@ -125,11 +125,29 @@ func parseQuotaFailure(payload map[string]any) *geminiQuotaFailure {
 	for metric, entries := range byMetric {
 		ids := violationsByMetric[metric]
 		aligned := len(ids) == len(entries)
+		// 对不齐时 quotaID 留空会让窗口判成"", 日配额耗尽被降级成 10 分钟
+		// 冷却(当天每 10 分钟白撞 429)。同一指标的 violation 窗口通常一致:
+		// 全部一致就整体借用 —— 窗口只看 PerDay/PerMinute 子串, 不需逐条对应。
+		metricWindow, uniform := "", len(ids) > 0
+		for _, id := range ids {
+			w := quotaWindow(id)
+			if w == "" || (metricWindow != "" && w != metricWindow) {
+				uniform = false
+				break
+			}
+			metricWindow = w
+		}
+		if !uniform {
+			metricWindow = ""
+		}
 		for i, e := range entries {
 			if aligned {
 				e.quotaID = ids[i]
 			}
 			e.window = quotaWindow(e.quotaID)
+			if e.window == "" {
+				e.window = metricWindow
+			}
 			e.free = freeTierMetricRe.MatchString(metric)
 			e.req = requestMetricRe.MatchString(metric)
 			limits = append(limits, e)
@@ -159,18 +177,54 @@ func parseQuotaFailure(payload map[string]any) *geminiQuotaFailure {
 		}
 	}
 
-	exhausted := ""
-	for _, e := range freeTier {
-		if e.limit > 0 && e.window == "day" {
-			exhausted = "day"
-			break
+	// 真正触发 429 的是 details.violations —— message 行只是限额罗列, 常同时
+	// 含 day 与 minute 两行: 逐行挑第一个 limit>0 会把 minute 级限流误判成
+	// 日配额(冷却到太平洋午夜, 过冷), 或反过来(日耗尽只冷 10 分钟, 白撞)。
+	violatedDay, violatedMinute := false, false
+	for metric, ids := range violationsByMetric {
+		if !freeTierMetricRe.MatchString(metric) {
+			continue
+		}
+		positive := false
+		for _, e := range byMetric[metric] {
+			if e.limit > 0 {
+				positive = true
+				break
+			}
+		}
+		if !positive {
+			continue // limit 0 = 无免费层, 窗口语义归 NoFreeTier
+		}
+		for _, id := range ids {
+			switch quotaWindow(id) {
+			case "day":
+				violatedDay = true
+			case "minute":
+				violatedMinute = true
+			}
 		}
 	}
-	if exhausted == "" {
+	exhausted := ""
+	switch {
+	case violatedDay:
+		exhausted = "day"
+	case violatedMinute:
+		exhausted = "minute"
+	default:
+		// 没有可判窗的 violation: 退回 message 行 —— 有 day 行按 day,
+		// 否则任何 free 限额行按 minute(窗口未知时的保守短冷却)。
 		for _, e := range freeTier {
-			if e.limit > 0 {
-				exhausted = "minute"
+			if e.limit > 0 && e.window == "day" {
+				exhausted = "day"
 				break
+			}
+		}
+		if exhausted == "" {
+			for _, e := range freeTier {
+				if e.limit > 0 {
+					exhausted = "minute"
+					break
+				}
 			}
 		}
 	}

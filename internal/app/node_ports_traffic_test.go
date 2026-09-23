@@ -8,55 +8,6 @@ import (
 	"testing"
 )
 
-func TestAssignStablePortReusesAcrossCalls(t *testing.T) {
-	key := "socks5://127.0.0.1:9401#stable"
-	p1, reused1, err := assignStablePort(key)
-	if err != nil {
-		t.Fatal(err)
-	}
-	_ = reused1
-	p2, reused2, err := assignStablePort(key)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if p1 != p2 {
-		t.Fatalf("同 key 两次分配应得到同一端口: %d vs %d", p1, p2)
-	}
-	if !reused2 {
-		t.Fatalf("第二次分配应报告复用, got reused=%v", reused2)
-	}
-	nodeStableMu.Lock()
-	delete(nodeStablePorts, key)
-	nodeStableMu.Unlock()
-}
-
-func TestAssignStablePortReallocatesWhenOccupied(t *testing.T) {
-	key := "socks5://127.0.0.1:9402#occupied"
-	l, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer l.Close()
-	occupied := l.Addr().(*net.TCPAddr).Port
-	nodeStableMu.Lock()
-	nodeStablePorts[key] = occupied
-	nodeStableMu.Unlock()
-
-	p, reused, err := assignStablePort(key)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if reused {
-		t.Fatal("被占端口不应报告复用")
-	}
-	if p == occupied {
-		t.Fatal("新端口不应与被占端口相同")
-	}
-	nodeStableMu.Lock()
-	delete(nodeStablePorts, key)
-	nodeStableMu.Unlock()
-}
-
 func TestCountingConnCountsUpDown(t *testing.T) {
 	client, server := net.Pipe()
 	defer client.Close()

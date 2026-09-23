@@ -16,8 +16,10 @@ import (
 var ExecCommand = exec.Command
 
 var HTTPTransport = &http.Transport{
-	MaxIdleConns:        100,
-	MaxIdleConnsPerHost: 10,
+	MaxIdleConns: 100,
+	// 网关对同一上游的并发远超 10: 超额请求完成后连接不回池, 下一波重建
+	// TCP(+TLS) 握手。按典型上游并发上调(成本只是空闲连接内存)。
+	MaxIdleConnsPerHost: 128,
 	IdleConnTimeout:     90 * time.Second,
 	DisableCompression:  false,
 }

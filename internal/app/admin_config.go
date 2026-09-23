@@ -184,16 +184,26 @@ func handleAdminDeleteKey(w http.ResponseWriter, r *http.Request) {
 		writeAPI(w, http.StatusBadRequest, apiResponse{Error: "invalid JSON"})
 		return
 	}
+	found := false
 	p := loadPool()
 	poolMu.Lock()
 	for i, k := range p.Keys {
 		if k == req.Key {
 			p.Keys = append(p.Keys[:i], p.Keys[i+1:]...)
+			found = true
 			break
 		}
 	}
 	poolMu.Unlock()
 	savePool()
+	if found {
+		// 破坏性操作留痕(审计 P3); key 只记末 4 位, 全量不进日志(凭据不落日志)。
+		suffix := req.Key
+		if len(suffix) > 4 {
+			suffix = suffix[len(suffix)-4:]
+		}
+		log.Printf("Proxy key deleted: ****%s", suffix)
+	}
 	writeAPI(w, http.StatusOK, apiResponse{Success: true, Message: "Key deleted"})
 }
 
@@ -404,8 +414,11 @@ func handleConfigExport(w http.ResponseWriter, r *http.Request) {
 // body: {"files": {".zen-config.json": "<内容>", ...}}
 //
 // 安全与可靠性: 文件名必须命中白名单(防路径穿越); 内容必须是合法 JSON;
-// 覆盖前把现有文件备份为 <name>.bak-import-<时间戳>(保留最近若干份, 可人工回滚)。
-// 写入后提示重启 —— 各配置在启动时加载, 热加载不在本功能范围内。
+// .zen-config.json 的出站地址(baseURL/baseURLs/subs/providers.baseUrl)按面板
+// 直改的同一口径过 validateOutboundURL, 导入不能成为 SSRF 校验的旁路(P2);
+// 覆盖前把现有文件备份为 <name>.bak-import-<时间戳>(保留最近若干份, 可人工回滚);
+// 写入后把内存态重载到与磁盘一致 —— 只落盘不重载, 后台保存会用旧内存覆盖
+// 刚导入的文件(UI 报成功、重启生效的却是被写回的旧配置, P2 静默回退)。
 func handleConfigImport(w http.ResponseWriter, r *http.Request) {
 	if r.Method != "POST" {
 		writeAPI(w, http.StatusMethodNotAllowed, apiResponse{Error: "method not allowed"})
@@ -441,15 +454,43 @@ func handleConfigImport(w http.ResponseWriter, r *http.Request) {
 		// 导入此前只做 JSON/结构检查, 恶意 provider 名会绕过校验直接落盘, 再经面板
 		// 渲染(script_providers 拼进 innerHTML)形成存储型 XSS(P2-12)。
 		// 通用上游只存在 .zen-config.json 的 providers 字段里。
+		// 同理, 出站地址(baseURL/baseURLs/subs/providers.baseUrl)必须与面板直改
+		// 同口径过 validateOutboundURL —— 否则导入重启后 POST model=evil:any 即可
+		// 让网关向云元数据发请求并把响应回传(SSRF + 回读, P2)。
 		if name == ".zen-config.json" {
 			var z struct {
-				Providers map[string]json.RawMessage `json:"providers"`
+				BaseURL   string                    `json:"baseURL"`
+				BaseURLs  []string                  `json:"baseURLs"`
+				Subs      []string                  `json:"subs"`
+				Providers map[string]providerConfig `json:"providers"`
 			}
 			if err := json.Unmarshal([]byte(content), &z); err == nil {
 				for pname := range z.Providers {
 					if !providerIDRe.MatchString(pname) {
 						writeAPI(w, http.StatusBadRequest, apiResponse{
 							Error: fmt.Sprintf("provider 名不合法(文件 %s): %q, 需匹配 ^[a-z][a-z0-9_-]*$", name, pname),
+						})
+						return
+					}
+				}
+				urls := make([]string, 0, 2+len(z.BaseURLs)+len(z.Subs)+len(z.Providers))
+				if z.BaseURL != "" {
+					urls = append(urls, z.BaseURL)
+				}
+				urls = append(urls, z.BaseURLs...)
+				urls = append(urls, z.Subs...)
+				for _, pc := range z.Providers {
+					if pc.BaseURL != "" {
+						urls = append(urls, pc.BaseURL)
+					}
+				}
+				for _, u := range urls {
+					if strings.TrimSpace(u) == "" {
+						continue
+					}
+					if err := validateOutboundURL(u); err != nil {
+						writeAPI(w, http.StatusBadRequest, apiResponse{
+							Error: fmt.Sprintf("出站地址不合法(文件 %s): %v", name, err),
 						})
 						return
 					}
@@ -473,10 +514,33 @@ func handleConfigImport(w http.ResponseWriter, r *http.Request) {
 		}
 		imported = append(imported, name)
 	}
-	log.Printf("  admin: 配置导入完成 (%d 个文件), 重启后生效", len(imported))
+	// 落盘后逐个把内存态与磁盘对齐: 只写不重载的话, 后台保存(账号池 30s flusher、
+	// setProxyConfig、面板编辑 zen 配置)会用旧内存整文件覆盖刚导入的文件 ——
+	// UI 报导入完成, 重启生效的却是被写回的旧配置(P2 静默数据回退)。
+	for _, name := range imported {
+		switch name {
+		case ".cline-accounts.json":
+			// 锁内置空触发 loadPoolLocked 重读磁盘; 同一把锁内完成, 不留 nil 窗口。
+			poolMu.Lock()
+			pool = nil
+			loadPoolLocked()
+			poolMu.Unlock()
+		case ".proxy-config.json":
+			proxyConfigMu.Lock()
+			proxyConfig = loadProxyConfig()
+			proxyConfigMu.Unlock()
+		case ".zen-config.json":
+			setZenConfig(loadZenConfig())
+		case ".clinepass-keys.json":
+			reloadClinepassKeys()
+		}
+		// node-regions.json 是出口探测缓存: 下一轮探测会用实测数据自然覆盖,
+		// 不值得为它在 exit_region 里开重载口子(重启后也照常从磁盘读)。
+	}
+	log.Printf("  admin: 配置导入完成 (%d 个文件), 内存态已与磁盘对齐", len(imported))
 	writeAPI(w, http.StatusOK, apiResponse{Success: true, Data: map[string]any{
 		"imported": imported,
-		"note":     fmt.Sprintf("导入完成, 重启网关后生效; 原文件已备份为 <文件名>.bak-import-<时间戳>(最多保留 %d 份)", importBackupKeep),
+		"note":     fmt.Sprintf("导入完成并已即时生效(节点地区缓存 node-regions.json 于重启或下轮探测生效); 原文件已备份为 <文件名>.bak-import-<时间戳>(最多保留 %d 份)", importBackupKeep),
 	}})
 }
 

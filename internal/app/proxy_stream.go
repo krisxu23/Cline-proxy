@@ -13,8 +13,32 @@ import (
 	"time"
 )
 
-func handleStreamResponseWithUsage(w http.ResponseWriter, upstream *http.Response, onUsage func(map[string]any)) {
-	handleStreamResponseWithToolNameMap(w, upstream, onUsage, nil)
+// readStreamLine 读一行(含行尾), 语义对齐 bufio.Reader.ReadString('\n') ——
+// EOF/底层错误时返回已读前缀 + err。区别: 单行长度受 jsonBodyMaxBytes 约束
+// (终审 P1)。此前四处 ReadString 均无上限, 上游持续推不带换行的字节会让
+// 缓冲单调增长直到 OOM(字节一直在到达, idle 超时不触发); 现与 io.ReadAll /
+// providerResponseMaxBytes 同用仓内既有的 64MiB 口径, 超限返回读错误,
+// 各调用方按既有"非 EOF 错误→断流收尾"处理。
+func readStreamLine(r *bufio.Reader) (string, error) {
+	var buf []byte
+	for {
+		frag, err := r.ReadSlice('\n')
+		buf = append(buf, frag...)
+		if len(buf) > jsonBodyMaxBytes {
+			return string(buf), fmt.Errorf("stream line exceeds %d bytes", jsonBodyMaxBytes)
+		}
+		if err == bufio.ErrBufferFull {
+			continue
+		}
+		return string(buf), err
+	}
+}
+
+// handleStreamResponseWithUsage 返回最终交付状态(终审 P2): 空流守卫/内部
+// 失败按 502 回传, 正常收尾 200 —— 调用方在 tracker.finish 前同步, 否则
+// zen-stats 把失败记成成功(status 仍停留在 resp.StatusCode=200)。
+func handleStreamResponseWithUsage(w http.ResponseWriter, upstream *http.Response, onUsage func(map[string]any)) int {
+	return handleStreamResponseWithToolNameMap(w, upstream, onUsage, nil)
 }
 
 // handleStreamResponseWithToolNameMap 是 OpenAI 形态流式回写的实际实现，
@@ -30,7 +54,7 @@ func handleStreamResponseWithUsage(w http.ResponseWriter, upstream *http.Respons
 //	anthropic-compatible-* 都要 cloak），而与客户端形态无关。若客户端是 OpenAI
 //	形态而只做了 cloak 不做还原，它会收到自己从未声明过的工具名 → 调用静默失败。
 //	toolNameMap 为 nil 时逐字节等价于旧行为。
-func handleStreamResponseWithToolNameMap(w http.ResponseWriter, upstream *http.Response, onUsage func(map[string]any), toolNameMap *toolNameMap) {
+func handleStreamResponseWithToolNameMap(w http.ResponseWriter, upstream *http.Response, onUsage func(map[string]any), toolNameMap *toolNameMap) int {
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
@@ -40,7 +64,7 @@ func handleStreamResponseWithToolNameMap(w http.ResponseWriter, upstream *http.R
 	flusher, ok := w.(http.Flusher)
 	if !ok {
 		log.Printf("  streaming not supported for client")
-		return
+		return http.StatusInternalServerError
 	}
 
 	// 上游流空闲保护(P2, 参照 OmniRoute 的流式 idle 机制): 正文阶段挂起时
@@ -238,7 +262,7 @@ func handleStreamResponseWithToolNameMap(w http.ResponseWriter, upstream *http.R
 	// 注意: 这两条合成路径同样要计入 forwardedValuableChunk —— 空流判定必须
 	// 覆盖所有转发路径, 否则"上游回一个空壳 JSON"会绕过防护, 退回成客户端
 	// 眼中的"干净空回合"(正是要根治的静默中断)。
-	if firstLine, ferr := reader.ReadString('\n'); looksLikeJSONBody(firstLine) {
+	if firstLine, ferr := readStreamLine(reader); looksLikeJSONBody(firstLine) {
 		trimmedFirst := strings.TrimSpace(firstLine)
 		if json.Valid([]byte(trimmedFirst)) {
 			// 判别"完整 JSON body"与"NDJSON 首行": 两者首行都是合法 JSON。
@@ -291,7 +315,7 @@ func handleStreamResponseWithToolNameMap(w http.ResponseWriter, upstream *http.R
 					hb.writeFlush(frame)
 				}
 				for {
-					line, lerr := reader.ReadString('\n')
+					line, lerr := readStreamLine(reader)
 					if t := stripData(line); t != "" {
 						markValuable(t)
 						if t == "[DONE]" {
@@ -311,14 +335,14 @@ func handleStreamResponseWithToolNameMap(w http.ResponseWriter, upstream *http.R
 				if streamDeliveryEmpty(forwardedValuableChunk, hasValidUsage, sawLegitEmptyTerminal) {
 					log.Printf("  stream: NDJSON 流未交付任何有价值内容, 回 error 帧而非静默空 200")
 					writeStreamEmptyContentError(w, hb, lastModel)
-					return
+					return http.StatusBadGateway
 				}
 				// 合成 finish chunk 之后才发 [DONE], 且**全程只发这一次**(P2-23②)。
 				if b, mErr := json.Marshal(protocol.EmptyOpenAIChunk("").Payload); mErr == nil {
 					hb.writeFlush([]byte("data: " + string(b) + "\n\n"))
 				}
 				hb.writeFlush([]byte("data: [DONE]\n\n"))
-				return
+				return http.StatusOK
 			}
 		}
 		// 多行 / 单行完整 JSON body: 缓冲全部后解析合成
@@ -338,33 +362,39 @@ func handleStreamResponseWithToolNameMap(w http.ResponseWriter, upstream *http.R
 			// 去判会让"content 为空、只补了 role + finish"的空壳 body 被判成
 			// 有交付价值, 空流防护当场失效。必须按原始 body 里**真实存在的**
 			// 正文/工具调用判定(Test空流_完整JSON空壳body必须失败 抓出的缺陷)。
+			//
+			// 终审 P3: 合成已保证 body 可解析, 此处**只 parse 一次**复用于
+			// onUsage / hasValidUsage / 内容 / 白名单四个判定 —— 此前同一份
+			// 最高 64MiB 的 body 被反复全量 Unmarshal(~6 次)。
+			parsedBody, _ := parseJSONMap(body)
 			if onUsage != nil {
-				if u, ok := parsedUsageFromJSONBody(body); ok {
+				if u, ok := parsedBody["usage"].(map[string]any); ok && len(u) > 0 {
 					onUsage(u)
 				}
 			}
-			if u, ok := parsedUsageFromJSONBody(body); ok && hasOutputUsageTokens(u) {
+			if u, ok := parsedBody["usage"].(map[string]any); ok && hasOutputUsageTokens(u) {
 				hasValidUsage = true
 			}
-			if fullCompletionBodyHasContent(body) {
+			if fullCompletionBodyHasContent(parsedBody) {
 				forwardedValuableChunk = true
 			}
 			// 合法空终止态同样要按**原始 body** 判定(理由同上: 合成器补的终止帧
 			// 会把任意空壳 body 都带上 finish_reason="stop", 而 "stop" 不在白名单里,
 			// 所以只有原始 body 真实携带 length/tool_calls 等才算数)。
-			if b, ok := parseJSONMap(body); ok && legitEmptyTerminalReason(b) {
+			if legitEmptyTerminalReason(parsedBody) {
 				sawLegitEmptyTerminal = true
 			}
 			if streamDeliveryEmpty(forwardedValuableChunk, hasValidUsage, sawLegitEmptyTerminal) {
 				log.Printf("  stream: 上游完整 JSON body 不含任何有价值内容, 补 error 帧")
 				writeStreamEmptyContentError(w, hb, lastModel)
+				return http.StatusBadGateway
 			}
-			return
+			return http.StatusOK
 		}
-		// 合不成: 交给主循环按坏行门卫处理(不再原样透传裸 JSON)
-		if _, ok := ndjsonLineToSSE(firstLine); !ok {
-			log.Printf("  stream: 上游返回无法识别的非 SSE 数据(%d 字节首行), 将按坏行丢弃而非透传", len(firstLine))
-		}
+		// 合不成: firstLine 已被消费, 主循环不会再看到它 —— 终审 P3: 显式走
+		// 一遍统一行处理器(能按 NDJSON 抢救的抢救, 不能的丢弃并留日志),
+		// 不再与注释里"交给主循环按坏行门卫处理"的承诺相悖地静默消失。
+		handleLine(firstLine, ferr == io.EOF)
 	} else if ferr == nil || (ferr == io.EOF && firstLine != "") {
 		// 首行是正常 SSE: 走统一实现处理一次再进主循环(F2 修复点 —— 此处
 		// 旧代码是独立的精简版循环体, 现收敛)。
@@ -378,7 +408,7 @@ func handleStreamResponseWithToolNameMap(w http.ResponseWriter, upstream *http.R
 	}
 
 	for {
-		line, err := reader.ReadString('\n')
+		line, err := readStreamLine(reader)
 		// EOF 时残行(最后一帧不带换行)也要走统一处理, 不能裸写回客户端。
 		if err != nil && err != io.EOF {
 			break
@@ -403,7 +433,7 @@ func handleStreamResponseWithToolNameMap(w http.ResponseWriter, upstream *http.R
 		log.Printf("  stream: 上游整条流未交付任何有价值内容(model=%s, 已发 finish=%v), 回 502 而非静默空 200",
 			lastModel, sawFinish)
 		writeStreamEmptyContentError(w, hb, lastModel)
-		return
+		return http.StatusBadGateway
 	}
 
 	// 上游断流未发 [DONE](或发 [DONE] 前无 finish_reason): 合成收尾,
@@ -417,6 +447,7 @@ func handleStreamResponseWithToolNameMap(w http.ResponseWriter, upstream *http.R
 		hb.write([]byte("data: [DONE]\n\n"))
 	}
 	hb.flush()
+	return http.StatusOK
 }
 
 // 注(2026-09-17 审查 P0-1): 此处原有 openAIChunkHasValuableContent 与
@@ -537,11 +568,7 @@ func looksLikeFullCompletionBody(payload string) bool {
 //   - choices[].text(旧版 text_completion 形态)非空。
 //
 // 全都没有 → 上游交付的是一个空壳。
-func fullCompletionBodyHasContent(body []byte) bool {
-	var parsed map[string]any
-	if err := json.Unmarshal(body, &parsed); err != nil {
-		return false
-	}
+func fullCompletionBodyHasContent(parsed map[string]any) bool {
 	choices, ok := parsed["choices"].([]any)
 	if !ok {
 		return false
@@ -587,28 +614,6 @@ func fullCompletionBodyHasContent(body []byte) bool {
 		}
 	}
 	return false
-}
-
-// splitSynthesizedSSEFrames 把合成出来的 SSE 文本切成 data 帧的对象列表,
-// 供空流判定逐帧使用。无法解析的帧直接跳过(合成器产出的帧一定是合法 JSON,
-// 跳过只是防御)。
-func splitSynthesizedSSEFrames(sse []byte) []map[string]any {
-	var frames []map[string]any
-	for _, line := range strings.Split(string(sse), "\n") {
-		line = strings.TrimSpace(line)
-		if !strings.HasPrefix(line, "data:") {
-			continue
-		}
-		payload := strings.TrimSpace(strings.TrimPrefix(line, "data:"))
-		if payload == "" || payload == "[DONE]" {
-			continue
-		}
-		var obj map[string]any
-		if err := json.Unmarshal([]byte(payload), &obj); err == nil {
-			frames = append(frames, obj)
-		}
-	}
-	return frames
 }
 
 // parseJSONMap 把完整 JSON body 解析成 map, 供"合法空终止态"判定使用。
@@ -662,14 +667,15 @@ func writeStreamEmptyContentError(w http.ResponseWriter, hb *sseHeartbeat, model
 	hb.flush()
 }
 
-func handleNonStreamResponseWithUsage(w http.ResponseWriter, upstream *http.Response, onUsage func(map[string]any)) {
-	handleNonStreamResponseWithToolNameMap(w, upstream, onUsage, nil)
+func handleNonStreamResponseWithUsage(w http.ResponseWriter, upstream *http.Response, onUsage func(map[string]any)) int {
+	return handleNonStreamResponseWithToolNameMap(w, upstream, onUsage, nil)
 }
 
 // handleNonStreamResponseWithToolNameMap 是 OpenAI 形态非流式回写的实际实现，
 // 多一个可选的工具名还原映射（出处与流式版同: responseTranslator.ts:165/173
-// `restoreOpenAIToolNames`）。
-func handleNonStreamResponseWithToolNameMap(w http.ResponseWriter, upstream *http.Response, onUsage func(map[string]any), toolNameMap *toolNameMap) {
+// `restoreOpenAIToolNames`）。返回最终交付状态(终审 P2): 内部写 500/502 时
+// 调用方必须同步给 tracker, 否则 zen-stats 把失败记成成功。
+func handleNonStreamResponseWithToolNameMap(w http.ResponseWriter, upstream *http.Response, onUsage func(map[string]any), toolNameMap *toolNameMap) int {
 	// 非流式响应同样要过控制字符清洗 —— 此前只有流式路径有清洗器, 于是上游
 	// (实测 B.AI 图片响应的 C2PA _manifest)忽略 stream:true 直接回完整 JSON,
 	// 或流式被掏空退化成裸 body 时, 字符串里的裸控制字符会原样直达客户端,
@@ -679,13 +685,13 @@ func handleNonStreamResponseWithToolNameMap(w http.ResponseWriter, upstream *htt
 		writeJSON(w, http.StatusInternalServerError, map[string]any{
 			"error": map[string]string{"message": readErr.Error(), "type": "parse_error"},
 		})
-		return
+		return http.StatusInternalServerError
 	}
 	if len(rawBody) > providerResponseMaxBytes {
 		writeJSON(w, http.StatusBadGateway, map[string]any{
 			"error": map[string]string{"message": "upstream response exceeds size limit", "type": "api_error"},
 		})
-		return
+		return http.StatusBadGateway
 	}
 	var raw map[string]any
 	if err := json.Unmarshal(rawBody, &raw); err != nil {
@@ -698,13 +704,13 @@ func handleNonStreamResponseWithToolNameMap(w http.ResponseWriter, upstream *htt
 				writeJSON(w, http.StatusInternalServerError, map[string]any{
 					"error": map[string]string{"message": err.Error(), "type": "parse_error"},
 				})
-				return
+				return http.StatusInternalServerError
 			}
 		} else {
 			writeJSON(w, http.StatusInternalServerError, map[string]any{
 				"error": map[string]string{"message": err.Error(), "type": "parse_error"},
 			})
-			return
+			return http.StatusInternalServerError
 		}
 	}
 
@@ -761,6 +767,7 @@ func handleNonStreamResponseWithToolNameMap(w http.ResponseWriter, upstream *htt
 	}
 
 	writeJSON(w, http.StatusOK, out)
+	return http.StatusOK
 }
 
 func collectStreamResponse(upstream *http.Response) (map[string]any, error) {
@@ -776,16 +783,21 @@ func collectStreamResponse(upstream *http.Response) (map[string]any, error) {
 	)
 
 	reader := bufio.NewReader(upstream.Body)
+	sawDataLine := false
 	for {
-		line, err := reader.ReadString('\n')
+		line, err := readStreamLine(reader)
 		if err != nil {
-			if err != io.EOF && err != bufio.ErrBufferFull {
-				break
+			if err != io.EOF {
+				// 终审 P1: 非 EOF 读错误(context 取消/连接重置/idle 超时)必须
+				// 上抛 —— 此前只 break 再无条件 return nil, 半截正文会按 200
+				// 成功交付, 无法与完整回答区分(静默中断类别)。
+				return nil, err
 			}
 		}
 		line = strings.TrimRight(line, "\r\n")
 
 		if strings.HasPrefix(line, "data:") {
+			sawDataLine = true
 			payload := strings.TrimSpace(line[5:])
 			if payload == "" || payload == "[DONE]" {
 				if err == io.EOF {
@@ -867,6 +879,11 @@ func collectStreamResponse(upstream *http.Response) (map[string]any, error) {
 	if curToolCall != nil {
 		curToolCall["function"].(map[string]any)["arguments"] = curArgs.String()
 		toolCalls = append(toolCalls, curToolCall)
+	}
+	// 终审 P1: EOF 且从未见任何 data 行 = 上游一个 chunk 都没发, 判空上抛,
+	// 调用方已有 err→500 分支(proxy.go / anthropic.go / responses.go / zen)。
+	if !sawDataLine {
+		return nil, fmt.Errorf("upstream stream ended without any data frame")
 	}
 
 	message := map[string]any{

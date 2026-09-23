@@ -17,7 +17,8 @@ import "testing"
 func TestAnytlsMissingTLSPassesSingBoxValidation(t *testing.T) {
 	ob := map[string]any{"type": "anytls", "server": "a.com", "server_port": 443, "password": "x"}
 	sanitizeOutboundTLS(ob)
-	if err := validateOutboundEntry(ob); err != nil {
+	dnsCfg, resolverTag := buildNodeDNS(getZenConfig())
+	if err := validateOutboundEntry(ob, dnsCfg, resolverTag); err != nil {
 		t.Fatalf("补块后仍被判无效: %v", err)
 	}
 }
@@ -45,7 +46,8 @@ func TestRealitySanitizedPassesSingBoxValidation(t *testing.T) {
 		}
 		sanitizeOutboundTLS(ob)
 		sanitizeOutboundShape(ob)
-		if err := validateOutboundEntry(ob); err != nil {
+		dnsCfg, resolverTag := buildNodeDNS(getZenConfig())
+		if err := validateOutboundEntry(ob, dnsCfg, resolverTag); err != nil {
 			t.Fatalf("%s: 净化后仍被 sing-box 拒绝: %v", name, err)
 		}
 		if u := ob["tls"].(map[string]any)["utls"].(map[string]any); u["fingerprint"] != "chrome" {

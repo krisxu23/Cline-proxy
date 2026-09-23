@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"io"
 	"strings"
+
+	"cline-go-proxy/internal/kit"
 )
 
 // SSEEvent is a single Server-Sent Event payload normalized for downstream
@@ -28,8 +30,12 @@ func ScanSSE(r io.Reader) (<-chan SSEEvent, <-chan error) {
 	out := make(chan SSEEvent, 16)
 	errc := make(chan error, 1)
 	go func() {
-		defer close(out)
+		// defer 是 LIFO: 先注册 close(errc)、后注册 close(out), 退出时 out 先于
+		// errc 关闭 —— 消费端必须先排空 events(拿到 EOF 合成收尾所需的残余帧),
+		// 之后 errc 的关闭/读取才可见; 反序会让消费端在 errc 关闭处提前返回,
+		// 跳过 !ok 合成 finish/[DONE] 并丢掉 out 缓冲里的残余帧。
 		defer close(errc)
+		defer close(out)
 		reader := bufio.NewReaderSize(r, 64*1024)
 		var buf strings.Builder
 		flush := func() {
@@ -72,6 +78,13 @@ func ScanSSE(r io.Reader) (<-chan SSEEvent, <-chan error) {
 			line, err := reader.ReadString('\n')
 			if line != "" {
 				buf.WriteString(line)
+				// 单帧缓冲硬上限(与 kit/http.go 的上游体上限同一纪律): 只发不带
+				// 空行的坏上游会让 buf 无限增长直至 OOM, 单流即可打满内存。
+				// 超限即丢弃已缓冲内容并断流, 错误经 errc 交消费端记录日志。
+				if buf.Len() > kit.MaxUpstreamBodyBytes {
+					errc <- fmt.Errorf("protocol: SSE frame buffer exceeds %d bytes, stream aborted", kit.MaxUpstreamBodyBytes)
+					return
+				}
 				// Flush on blank line (event boundary).
 				if strings.TrimRight(line, "\r\n") == "" {
 					flush()
@@ -124,19 +137,6 @@ func SanitizeContent(s string) string {
 	return s
 }
 
-// ReasonToAnthropicStop maps an OpenAI finish_reason to the equivalent
-// Anthropic stop_reason string. Used by the Anthropic streaming emitter.
-func ReasonToAnthropicStop(reason string) string {
-	switch reason {
-	case "length":
-		return "max_tokens"
-	case "tool_calls":
-		return "tool_use"
-	default:
-		return "end_turn"
-	}
-}
-
 // AppendStopChunkIfNoFinish writes a final chunk carrying
 // finish_reason "stop" when the upstream stream ended without any
 // finish_reason, so OpenAI-compatible clients (e.g. the Cline extension)
@@ -152,26 +152,4 @@ func AppendStopChunkIfNoFinish(w io.Writer, sawFinish bool, model string) error 
 	}
 	_, err = fmt.Fprintf(w, "data: %s\n\n", string(b))
 	return err
-}
-
-// AppendEmptyChunkIfNoChoice is a small convenience that the proxy layer
-// can call after the upstream stream closes; if no SSEEvent reported a
-// choices array, the helper writes an empty chunk to w (in OpenAI SSE
-// format) so clients never see a "no completion choices" error.
-func AppendEmptyChunkIfNoChoice(w io.Writer, emittedChoice bool, model string) error {
-	if emittedChoice {
-		return nil
-	}
-	ev := EmptyOpenAIChunk(model)
-	b, err := json.Marshal(ev.Payload)
-	if err != nil {
-		return err
-	}
-	if _, err := fmt.Fprintf(w, "data: %s\n\n", string(b)); err != nil {
-		return err
-	}
-	if _, err := io.WriteString(w, "data: [DONE]\n\n"); err != nil {
-		return err
-	}
-	return nil
 }

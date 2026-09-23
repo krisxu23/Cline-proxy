@@ -81,12 +81,12 @@ func handleZenChat(w http.ResponseWriter, r *http.Request, params map[string]any
 	}
 
 	if isStream {
-		handleStreamResponseWithUsage(w, resp, usageFn)
-		tracker.finish(true, resp.StatusCode)
+		st := handleStreamResponseWithUsage(w, resp, usageFn)
+		tracker.finish(st < 400, st)
 		return
 	}
-	handleNonStreamResponseWithUsage(w, resp, usageFn)
-	tracker.finish(true, resp.StatusCode)
+	st := handleNonStreamResponseWithUsage(w, resp, usageFn)
+	tracker.finish(st < 400, st)
 }
 
 func cleanMessages(messages []any) []any {
@@ -314,18 +314,20 @@ func callClineAPI(ctx context.Context, params map[string]any, stream bool) (*htt
 			}
 			if resp.StatusCode == 401 {
 				resp.Body.Close()
+				// savePoolLocked 内部释放 poolMu: 共享字段在锁内取, 之后不再 Unlock。
 				poolMu.Lock()
+				email := acc.Email
 				acc.Status = "expired"
 				savePoolLocked()
-				poolMu.Unlock()
-				return nil, acc, fmt.Errorf("account %s token expired permanently", acc.Email)
+				return nil, acc, fmt.Errorf("account %s token expired permanently", email)
 			}
 		} else {
+			// savePoolLocked 内部释放 poolMu: 共享字段在锁内取, 之后不再 Unlock。
 			poolMu.Lock()
+			email := acc.Email
 			acc.Status = "expired"
 			savePoolLocked()
-			poolMu.Unlock()
-			return nil, acc, fmt.Errorf("account %s refresh failed: %w", acc.Email, err)
+			return nil, acc, fmt.Errorf("account %s refresh failed: %w", email, err)
 		}
 	}
 

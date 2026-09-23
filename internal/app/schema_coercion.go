@@ -2,6 +2,7 @@ package app
 
 import (
 	"regexp"
+	"slices"
 	"strconv"
 	"strings"
 )
@@ -280,12 +281,12 @@ func stripInvalidSchemaConstructs(schema any) any {
 	result := make(map[string]any, len(rec))
 	for key, value := range rec {
 		// :547-550 数值约束键: 字符串数字转数值
-		if sliceContainsString(numericSchemaFields, key) {
+		if slices.Contains(numericSchemaFields, key) {
 			result[key] = coerceNumericString(value)
 			continue
 		}
 		// :551-559 数组关键字键
-		if sliceContainsString(arraySchemaKeys, key) {
+		if slices.Contains(arraySchemaKeys, key) {
 			array := coerceIndexedObjectToArray(value)
 			if array == nil {
 				continue // :554 `drop invalid non-array keyword (e.g. enum: "[MaxDepth]")`
@@ -302,7 +303,7 @@ func stripInvalidSchemaConstructs(schema any) any {
 			continue
 		}
 		// :560-579 schema 槽位键
-		if sliceContainsString(schemaSlotKeys, key) {
+		if slices.Contains(schemaSlotKeys, key) {
 			// :561-565 布尔子 schema 必须保留(`additionalProperties: false` 是合法的
 			// "锁死对象"写法; 换成 {} 会静默放开额外字段并诱发模型幻觉参数)。
 			if isPlainObject(value) || isArrayValue(value) {
@@ -416,14 +417,4 @@ func shallowCopyRecord(rec map[string]any) map[string]any {
 func isArrayValue(v any) bool {
 	_, ok := v.([]any)
 	return ok
-}
-
-// sliceContainsString 等价于 JS 的 `arr.includes(x)`。
-func sliceContainsString(arr []string, target string) bool {
-	for _, s := range arr {
-		if s == target {
-			return true
-		}
-	}
-	return false
 }

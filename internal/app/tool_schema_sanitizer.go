@@ -1,6 +1,8 @@
 package app
 
-// 工具定义清洗 —— 逐函数照抄 OmniRoute open-sse/services/toolSchemaSanitizer.ts。
+import "log"
+
+// 工具定义清洗 —— 逐字照抄 OmniRoute open-sse/services/toolSchemaSanitizer.ts。
 //
 // 文件头原注释(说明这个模块为什么存在):
 //
@@ -62,7 +64,10 @@ func keepOpaqueObjectSchemasOpen(schema map[string]any) {
 //   - required: 只保留字符串条目, 且必须存在于 properties
 func sanitizeSchema(value any, depth int) map[string]any {
 	if depth > maxSchemaRecursionDepth {
-		return map[string]any{}
+		// 超深子树不再下钻: 返回"放开"语义而不是静默抹空 —— 空对象会被严格
+		// 上游当"接受任意输入"放行, 合法的深嵌套 anyOf 语义全丢且无 400。
+		log.Printf("[schema-sanitizer] schema depth exceeds %d, truncating subtree to open object schema", maxSchemaRecursionDepth)
+		return map[string]any{"type": "object", "additionalProperties": true}
 	}
 	src, ok := value.(map[string]any)
 	if !ok {
@@ -258,16 +263,10 @@ func sanitizeOpenAITool(tool any) any {
 	if !ok {
 		return tool
 	}
-	out := make(map[string]any, len(t))
-	for k, v := range t {
-		out[k] = v
-	}
+	out := shallowCopyRecord(t)
 
 	if fn, ok := out["function"].(map[string]any); ok {
-		f := make(map[string]any, len(fn))
-		for k, v := range fn {
-			f[k] = v
-		}
+		f := shallowCopyRecord(fn)
 		f["parameters"] = normalizeParameters(f["parameters"])
 		out["function"] = f
 	} else if out["type"] == "function" {
@@ -301,18 +300,12 @@ func flattenOpenAIToolRootAnyOf(tools any) any {
 			continue
 		}
 
-		next := make(map[string]any, len(tool))
-		for k, v := range tool {
-			next[k] = v
-		}
+		next := shallowCopyRecord(tool)
 
 		fn, wrapped := next["function"].(map[string]any)
 		var fnCopy map[string]any
 		if wrapped {
-			fnCopy = make(map[string]any, len(fn))
-			for k, v := range fn {
-				fnCopy[k] = v
-			}
+			fnCopy = shallowCopyRecord(fn)
 		} else {
 			fnCopy = next
 		}
@@ -327,13 +320,8 @@ func flattenOpenAIToolRootAnyOf(tools any) any {
 			continue
 		}
 
-		newParams := make(map[string]any, len(params))
-		for k, v := range params {
-			if k == "anyOf" {
-				continue
-			}
-			newParams[k] = v
-		}
+		newParams := shallowCopyRecord(params)
+		delete(newParams, "anyOf")
 		fnCopy["parameters"] = newParams
 		if wrapped {
 			next["function"] = fnCopy

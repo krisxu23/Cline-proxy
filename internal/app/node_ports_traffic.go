@@ -15,7 +15,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
-	"math/rand/v2"
 	"net"
 	"os"
 	"regexp"
@@ -74,27 +73,6 @@ func persistNodeStablePorts() {
 			log.Printf("node ports persist failed: %v", err)
 		}
 	}
-}
-
-// assignStablePort 给节点分配本地端口: 优先复用历史端口(且该端口当前未被占),
-// 否则分配新的空闲端口并更新记录。返回 (端口, 是否复用了旧端口)。
-func assignStablePort(key string) (int, bool, error) {
-	nodeStableMu.Lock()
-	loadNodeStablePorts()
-	if old, ok := nodeStablePorts[key]; ok && old > 0 && !portReservedByService(old) && tcpPortFree(old) {
-		nodeStableMu.Unlock()
-		return old, true, nil
-	}
-	p, err := freeNodePortInRange()
-	if err != nil {
-		nodeStableMu.Unlock()
-		return 0, false, err
-	}
-	nodeStablePorts[key] = p
-	nodeStableMu.Unlock()
-	// 落盘放到放锁之后(persist 自己持锁取快照), 持锁期间不做慢 I/O。
-	persistNodeStablePorts()
-	return p, false, nil
 }
 
 // purgeStablePortsFromError Start 失败时按错误信息做**最小范围**端口清除。
@@ -247,20 +225,6 @@ func tcpPortFree(port int) bool {
 	}
 	l.Close()
 	return true
-}
-
-// freeNodePortInRange 在 [min,max] 里找一个当前空闲的端口。
-func freeNodePortInRange() (int, error) {
-	for attempt := 0; attempt < 64; attempt++ {
-		p := nodePortMin + rand.IntN(nodePortMax-nodePortMin+1)
-		if portReservedByService(p) {
-			continue
-		}
-		if tcpPortFree(p) {
-			return p, nil
-		}
-	}
-	return 0, fmt.Errorf("no free port in [%d,%d]", nodePortMin, nodePortMax)
 }
 
 // ============ 每节点流量统计 ============

@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"os"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -53,19 +54,49 @@ type anthropicReq struct {
 	Extra        map[string]any  `json:"-"`
 }
 
+// overrideCache 缓存 override.md 的读取结果:loadOverrideContent 在每个请求的
+// 热路径上被调(anthropicToOpenAI 与 applyOverride 各一), 旧实现每请求
+// os.ReadFile + 两条日志。现在 stat 判 mtime, 未变不重读;值未变不打日志。
+// 带互斥 —— 服务长驻并发。
+var overrideCache struct {
+	mu      sync.Mutex
+	modTime time.Time
+	content string
+	loaded  bool
+}
+
 func loadOverrideContent() string {
-	data, err := os.ReadFile("override.md")
+	overrideCache.mu.Lock()
+	defer overrideCache.mu.Unlock()
+	// override.md 是可选功能，文件不存在时静默使用客户端自带提示词。
+	// stat 不存在时同时让缓存失效, 防止文件被删/工作目录切换后返回陈旧值。
+	fi, err := os.Stat("override.md")
 	if err != nil {
-		// override.md 是可选功能，文件不存在时静默使用客户端自带提示词
+		overrideCache.loaded = false
+		overrideCache.content = ""
 		return ""
 	}
-	content := strings.TrimSpace(string(data))
-	if content != "" {
-		log.Printf("  using override.md as system prompt (%d bytes)", len(content))
-	} else {
-		log.Printf("  override.md is empty, using client system prompt")
+	mod := fi.ModTime()
+	if !overrideCache.loaded || overrideCache.modTime != mod {
+		data, err := os.ReadFile("override.md")
+		if err != nil {
+			// 刚被并发删除: 沿用上次已知值(stat 成功说明此刻还在, 概率极低)。
+			return overrideCache.content
+		}
+		content := strings.TrimSpace(string(data))
+		if !overrideCache.loaded || content != overrideCache.content {
+			// 只在值变化时打日志(首次加载也算变化)。
+			if content != "" {
+				log.Printf("  using override.md as system prompt (%d bytes)", len(content))
+			} else {
+				log.Printf("  override.md is empty, using client system prompt")
+			}
+		}
+		overrideCache.modTime = mod
+		overrideCache.content = content
+		overrideCache.loaded = true
 	}
-	return content
+	return overrideCache.content
 }
 
 // extractStringContent 把 Anthropic 形态的 system 字段（字符串或 text 块数组）
@@ -248,6 +279,9 @@ func anthropicToOpenAI(req anthropicReq) map[string]any {
 			textParts := []string{}
 			var toolCalls []any
 			var toolResults []map[string]any
+			// P2: image 块此前被无条件跳过 —— 视觉输入静默消失, 纯图回合还会
+			// 产出空 content。先收集可渲染 URL(有图时才在下方按原序组装分段)。
+			var imageURLs []string
 
 			for _, block := range c {
 				if b, ok := block.(map[string]any); ok {
@@ -257,7 +291,9 @@ func anthropicToOpenAI(req anthropicReq) map[string]any {
 							textParts = append(textParts, t)
 						}
 					case "image":
-						// skip images
+						if kind, a, d := anthropicImageSource(b); kind != "" {
+							imageURLs = append(imageURLs, anthropicImageDataURL(kind, a, d))
+						}
 					case "tool_use":
 						argsStr := "{}"
 						if input, ok := b["input"]; ok && input != nil {
@@ -299,17 +335,30 @@ func anthropicToOpenAI(req anthropicReq) map[string]any {
 				msgs = append(msgs, msg)
 				log.Printf("  anthropic req: assistant tool_calls=%d", len(toolCalls))
 			} else if m.Role == "user" && len(toolResults) > 0 {
+				// P3: 每条 tool_result 打 400B content 前缀的日志已删 —— 热路径
+				// 最多 (400B × 结果数)/轮, 纯观测噪声。
 				for _, tr := range toolResults {
 					msgs = append(msgs, tr)
-					content, _ := tr["content"].(string)
-					id, _ := tr["tool_call_id"].(string)
-					log.Printf("  anthropic req: tool_result id=%s content_len=%d prefix=%s", id, len(content), kit.Truncate(content, 400))
 				}
 				// P1-9: 工具结果之后的用户文字指示不能丢 —— 照 openai_anthropic.go
 				// anthropicUserToOpenAI 的正确做法, 在 tool 消息之后补一条 user 消息。
-				if text := strings.Join(textParts, "\n"); text != "" {
+				// 同回合的 image 块也不能丢(带图的工具轮): 有图时按原序组装全量分段。
+				if len(imageURLs) > 0 {
+					msgs = append(msgs, map[string]any{
+						"role":    "user",
+						"content": anthropicBlocksToOpenAIContent(c, imageURLs),
+					})
+				} else if text := strings.Join(textParts, "\n"); text != "" {
 					msgs = append(msgs, map[string]any{"role": "user", "content": text})
 				}
+			} else if len(imageURLs) > 0 {
+				// 有图的回合按原序组装 text/image_url 分段(纯图回合也有非空 content);
+				// 不支持图的上游由 providers_chat 的 stripTypesForModel/model-strip 剥,
+				// 不在协议转换层无条件丢视觉输入。
+				msgs = append(msgs, map[string]any{
+					"role":    m.Role,
+					"content": anthropicBlocksToOpenAIContent(c, imageURLs),
+				})
 			} else {
 				content := strings.Join(textParts, "\n")
 				msgs = append(msgs, map[string]any{"role": m.Role, "content": content})
@@ -403,19 +452,8 @@ func extractToolSchemas(tools json.RawMessage) map[string]map[string]bool {
 		}
 		schema, _ := t["input_schema"].(map[string]any)
 		props, _ := schema["properties"].(map[string]any)
-		var propNames []string
-		for k := range props {
-			propNames = append(propNames, k)
-		}
-		var required []string
-		if req, ok := schema["required"].([]any); ok {
-			for _, r := range req {
-				if s, ok := r.(string); ok {
-					required = append(required, s)
-				}
-			}
-		}
-		log.Printf("  tool schema: name=%s properties=%v required=%v", name, propNames, required)
+		// P3: 此前每工具每请求打一行 schema 日志(Claude Code ~20 工具 = 20 行/请求),
+		// 还为此先构建 propNames 切片 —— 纯热路径噪声与多余分配, 一并删除。
 		if len(props) == 0 {
 			continue
 		}
@@ -447,6 +485,120 @@ func filterToolInput(name string, input map[string]any, schemas map[string]map[s
 	return out
 }
 
+// anthropicImageSource 解开 image 块的 source, 返回构成可渲染 URL 的分量:
+// "base64" → (media_type, data); "url" → ("", url); 无有效图 → kind 为空。
+// 拆开返回是为了让"有效性判定"零分配(主循环每块都判), 拼接只对有效图做一次。
+func anthropicImageSource(b map[string]any) (kind, a, d string) {
+	src, _ := b["source"].(map[string]any)
+	if src == nil {
+		return "", "", ""
+	}
+	switch src["type"] {
+	case "base64":
+		data, _ := src["data"].(string)
+		if data == "" {
+			return "", "", ""
+		}
+		mt, _ := src["media_type"].(string)
+		return "base64", mt, data
+	case "url":
+		u, _ := src["url"].(string)
+		if u == "" {
+			return "", "", ""
+		}
+		return "url", "", u
+	}
+	return "", "", ""
+}
+
+// anthropicImageDataURL 组成 OpenAI image_url 的 url 字段:
+// base64 → `data:<mime>;base64,<data>`;url 源原样透传。
+// Anthropic 协议必带 media_type, 缺失时按 image/png 兜底而非丢图。
+func anthropicImageDataURL(kind, a, d string) string {
+	if kind == "url" {
+		return d
+	}
+	mt := a
+	if mt == "" {
+		mt = "image/png"
+	}
+	return "data:" + mt + ";base64," + d
+}
+
+// anthropicBlocksToOpenAIContent 把 Anthropic content 块按**原序**组装成 OpenAI
+// content 数组(text → {"type":"text"}, image → {"type":"image_url"})。
+// imageURLs 是主循环按同一谓词(anthropicImageSource != 空)收集的队列, 此处
+// 同谓词跳过无效图, 队列与块严格对齐。
+func anthropicBlocksToOpenAIContent(blocks []any, imageURLs []string) []any {
+	parts := make([]any, 0, len(blocks))
+	img := 0
+	for _, raw := range blocks {
+		b, ok := raw.(map[string]any)
+		if !ok {
+			continue
+		}
+		switch b["type"] {
+		case "text":
+			if t, ok := b["text"].(string); ok {
+				parts = append(parts, map[string]any{"type": "text", "text": t})
+			}
+		case "image":
+			if kind, _, _ := anthropicImageSource(b); kind != "" && img < len(imageURLs) {
+				parts = append(parts, map[string]any{
+					"type":      "image_url",
+					"image_url": map[string]any{"url": imageURLs[img]},
+				})
+				img++
+			}
+		}
+	}
+	return parts
+}
+
+// cleanToolUseInput 是流式 emitToolBlock 与非流式 openAIToAnthropicWithMap
+// **共用**的"裁剪 + tool_call_shim"清洗(此前只有流式过这两道, 非流式与聚合
+// 路径完全裸奔 —— Claude Code 的 Read 对 limit>2000 直接拒收并每轮重发整个
+// 上下文, token 成倍烧掉)。
+//
+// 两个名字各查各的表:
+//   - clientName(restoreClaudeToolName 恢复后的**客户端声明名**): toolSchemas
+//     由客户端原始 tools 构建, 键就是客户端名 —— 用上游回显名查会 miss, 把
+//     未裁剪字段直发严格校验的客户端。miss 时回退 echoName(客户端声明的恰是
+//     canonical 名、恢复走了 REVERSE_MAP 反向时, 键在 echo 侧)。
+//   - shim 表两种键都有(Claude 权威名 Read / 客户端原名 submit_pr_review),
+//     先按 clientName 查, 未命中回退 echoName。
+//
+// 顺序照抄参考实现: 先裁字段(filterToolInput), 再套结构 shim。
+// 返回清洗后的**值**: 流式调用方自行 marshal 成 input_json_delta 的
+// partial_json, 非流式直接放进 tool_use.input(此前非流式不过这两道清洗)。
+func cleanToolUseInput(echoName, clientName string, input any, schemas map[string]map[string]bool) any {
+	filtered := input
+	if m, ok := input.(map[string]any); ok {
+		key := clientName
+		if _, ok := schemas[key]; !ok {
+			if _, ok := schemas[echoName]; ok {
+				key = echoName
+			}
+		}
+		filtered = filterToolInput(key, m, schemas)
+	}
+	shimName := clientName
+	if !hasToolCallShim(shimName) {
+		shimName = echoName
+	}
+	// 值级应用 shim(与 applyToolCallShimToBuffer 同一 resolve, 省一次字符串往返):
+	// 无 shim 原样返回; shim 只认对象, 数组/标量按其语义原样穿过。
+	if fn, ok := resolveToolCallShim(shimName); ok {
+		before, _ := json.Marshal(filtered)
+		patched := fn(filtered)
+		after, _ := json.Marshal(patched)
+		log.Printf("  tool_call_shim applied: name=%s before=%s after=%s",
+			shimName, kit.Truncate(string(before), 300), kit.Truncate(string(after), 300))
+		filtered = patched
+	}
+	return filtered
+}
+
 // anthropicContentToString 将 Anthropic content（字符串或块数组）转为纯文本
 func anthropicContentToString(v any) string {
 	if v == nil {
@@ -470,7 +622,7 @@ func anthropicContentToString(v any) string {
 }
 
 func openAIToAnthropic(openAI map[string]any) map[string]any {
-	return openAIToAnthropicWithMap(openAI, nil)
+	return openAIToAnthropicWithMap(openAI, nil, nil)
 }
 
 // openAIToAnthropicWithMap 是 openAIToAnthropic 的带映射版本。
@@ -497,7 +649,11 @@ func openAIToAnthropic(openAI map[string]any) map[string]any {
 //
 // nameMap 为 nil 时行为与 openAIToAnthropic 完全一致（纯 PascalCase 真 Claude Code
 // 流量不走伪装，故恒为 nil）—— 保证对既有路径零影响。
-func openAIToAnthropicWithMap(openAI map[string]any, nameMap *toolNameMap) map[string]any {
+//
+// toolSchemas 为请求侧 extractToolSchemas 的产物, 传入即让非流式 tool_use 也过
+// "裁剪 + shim" 清洗(与流式 emitToolBlock 共用 cleanToolUseInput); nil 表示不做
+// 裁剪(shim 仍生效)。
+func openAIToAnthropicWithMap(openAI map[string]any, nameMap *toolNameMap, toolSchemas map[string]map[string]bool) map[string]any {
 	out := map[string]any{
 		"id":    "msg_" + fmt.Sprintf("%x", time.Now().UnixMilli()),
 		"type":  "message",
@@ -541,55 +697,79 @@ func openAIToAnthropicWithMap(openAI map[string]any, nameMap *toolNameMap) map[s
 	}
 
 	// Convert tool_calls to Anthropic tool_use blocks
+	toolUseEmitted := false
 	if msg != nil {
 		if tc, ok := msg["tool_calls"].([]any); ok && len(tc) > 0 {
-			contentBlocks = []any{}
-			if text != "" {
-				contentBlocks = append(contentBlocks, map[string]any{"type": "text", "text": text})
-			}
-			for _, tcItem := range tc {
-				if tcMap, ok := tcItem.(map[string]any); ok {
-					funcData, _ := tcMap["function"].(map[string]any)
-					if funcData == nil {
-						continue
-					}
-					input := funcData["arguments"]
-					// OpenAI arguments is a JSON string; Anthropic expects an object
-					if argsStr, ok := input.(string); ok {
-						var argsObj any
-						if json.Unmarshal([]byte(argsStr), &argsObj) == nil {
-							input = argsObj
-						}
-					}
-					if input == nil {
-						input = map[string]any{}
-					}
-					id, _ := tcMap["id"].(string)
-					if id == "" {
-						id = fmt.Sprintf("toolu_%x_%d", time.Now().UnixMilli(), len(contentBlocks))
-					}
-					name, _ := funcData["name"].(string)
-					if name == "" {
-						continue
-					}
-					// 工具名还原（照抄 responseTranslator.ts:740
-					// `restoreClaudeToolName(toString(fn.name), toolNameMap ?? null)`）。
-					//
-					// nameMap 为空时 restoreClaudeToolName 仍会走它的
-					// "canonical casing upgrade" 分支（`bash` → `Bash`），
-					// 这正是参考实现想要的：非流式上游 JSON（或 stream:true 但上游
-					// 以 application/json 回）送到 Claude Code 时，小写工具名会被
-					// CLI 拒为 "No such tool available"。
-					name = restoreClaudeToolName(name, nameMap)
-					block := map[string]any{
-						"type":  "tool_use",
-						"id":    id,
-						"name":  name,
-						"input": input,
-					}
-					contentBlocks = append(contentBlocks, block)
+			// 重建时**保留**已前插的 thinking 块(顺序 thinking → text → tool_use):
+			// 此前 `contentBlocks = []any{}` 整体重建, reasoning+tool_calls 共存的
+			// 推理模型回合会把刚前插的 thinking 静默删掉(与流式语义漂移, 原推理
+			// 内容只能靠占位符兜底, 永久丢失)。
+			blocks := []any{}
+			for _, b := range contentBlocks {
+				if bm, ok := b.(map[string]any); ok && bm["type"] == "thinking" {
+					blocks = append(blocks, b)
 				}
 			}
+			if text != "" {
+				blocks = append(blocks, map[string]any{"type": "text", "text": text})
+			}
+			for _, tcItem := range tc {
+				tcMap, ok := tcItem.(map[string]any)
+				if !ok {
+					continue
+				}
+				funcData, _ := tcMap["function"].(map[string]any)
+				if funcData == nil {
+					continue
+				}
+				id, _ := tcMap["id"].(string)
+				if id == "" {
+					id = fmt.Sprintf("toolu_%x_%d", time.Now().UnixMilli(), len(blocks))
+				}
+				name, _ := funcData["name"].(string)
+				if name == "" {
+					continue
+				}
+				echoName := name
+				// 工具名还原（照抄 responseTranslator.ts:740
+				// `restoreClaudeToolName(toString(fn.name), toolNameMap ?? null)`）。
+				//
+				// nameMap 为空时 restoreClaudeToolName 仍会走它的
+				// "canonical casing upgrade" 分支（`bash` → `Bash`），
+				// 这正是参考实现想要的：非流式上游 JSON（或 stream:true 但上游
+				// 以 application/json 回）送到 Claude Code 时，小写工具名会被
+				// CLI 拒为 "No such tool available"。
+				name = restoreClaudeToolName(name, nameMap)
+				// input: OpenAI arguments 是 JSON 字符串, Anthropic 要求对象。
+				// 坏 JSON(截断的半截参数)走 parseToolArgs 同款容错, 救不回来兜底 {} ——
+				// 此前 unmarshal 失败会把**字符串**原样透传成 input(协议非法, 客户端
+				// 按完整调用执行后必失败, 也无从按 max_tokens 语义重试)。
+				input := funcData["arguments"]
+				if argsStr, ok := input.(string); ok {
+					parsedArgs, perr := parseToolArgs(argsStr)
+					if perr != nil {
+						log.Printf("  tool args parse failed for %s: %v (raw: %s)",
+							name, perr, kit.Truncate(argsStr, 300))
+						parsedArgs = map[string]any{}
+					}
+					input = parsedArgs
+				}
+				if input == nil {
+					input = map[string]any{}
+				}
+				// 裁剪 + shim: 与流式 emitToolBlock 共用 cleanToolUseInput ——
+				// 此前非流式(含聚合)完全不过这两道清洗, 裸奔直发客户端。
+				input = cleanToolUseInput(echoName, name, input, toolSchemas)
+				block := map[string]any{
+					"type":  "tool_use",
+					"id":    id,
+					"name":  name,
+					"input": input,
+				}
+				blocks = append(blocks, block)
+				toolUseEmitted = true
+			}
+			contentBlocks = blocks
 		}
 	}
 
@@ -604,6 +784,12 @@ func openAIToAnthropicWithMap(openAI map[string]any, nameMap *toolNameMap) map[s
 		out["stop_reason"] = "tool_use"
 	default:
 		out["stop_reason"] = "end_turn"
+	}
+	// 覆写守卫: 只有映射结果仍是 end_turn 且确有 tool_calls 时才覆写成 tool_use。
+	// finish_reason=length 映射出的 max_tokens 必须保留 —— 截断的半截参数伪装成
+	// 完整调用会让客户端解析失败且无从重试(流式路径此前就是这个正确行为)。
+	if toolUseEmitted && out["stop_reason"] == "end_turn" {
+		out["stop_reason"] = "tool_use"
 	}
 
 	usage := map[string]any{}
@@ -673,9 +859,10 @@ func handleAnthropicMessages(w http.ResponseWriter, r *http.Request) {
 	//
 	// ★ 作用域同样照抄: 本网关的 Anthropic 入站端点只服务 Claude 协议,
 	//   不会把 Anthropic 形状的 body 交给任何非 Anthropic 上游 —— 即
-	//   `provider !== "claude"` 在这个入口上恒为真，故恒走
+	//   `provider !== "claude"` 在这个入口上恒为真，故主走
 	//   extractSystemRoleMessages 这一支（`mid-conversation-system` 是
-	//   Anthropic 1M beta 档的例外, 见 providerSupportsMidConversationSystem）。
+	//   Anthropic 1M beta 档的例外, 走 else 的 relocateDirectiveOnlyMessages,
+	//   见 providerSupportsMidConversationSystem）。
 	//
 	// 为什么这条必须做: Anthropic Messages API **拒绝** `system` / `developer`
 	// 作为 messages[] 里的角色。Codex / OpenCode / Kilo Code 风格客户端会把
@@ -694,10 +881,31 @@ func handleAnthropicMessages(w http.ResponseWriter, r *http.Request) {
 			hasTools = true
 		}
 		if !providerSupportsMidConversationSystem(hasSystemField, hasTools, req.Model) {
-			fixed, _, _, changed := extractSystemRoleMessages(msgs, nil, false, nil, false)
+			// P0: 第 2 返回值此前被 `_` 丢弃 —— 提升把(含 msgs[0] 顶层 system 的)
+			// 全部 system 内容从 messages 里拿走却无人回填, 上游一个字都收不到。
+			// changed 时把 sysOut 写回请求顶层 system(参考实现写入 payload.system;
+			// 探针 G3 锁定的最终形态: system 只用顶层字段承载)。
+			fixed, sysOut, _, changed := extractSystemRoleMessages(msgs, nil, false, nil, false)
 			if changed {
 				openAIReq["messages"] = fixed
+				if sysOut != nil {
+					openAIReq["system"] = sysOut
+				}
 				log.Printf("  anthropic req: lifted system/developer roles out of messages[] (%d -> %d)", len(msgs), len(fixed))
+			}
+		} else {
+			// 参考实现 else 分支(claudeSystemRole.ts:167-247, 1M-context Opus 档):
+			// mid-conversation-system 通路**故意**保留 system 角色, 但 directive-only
+			// 形态(空 content + output_config, Claude Code 客户端的形态)停在
+			// messages[0] 会被 Anthropic 当作初始 system 位置拒收 400 —— 移到
+			// 首个真实轮次之后。
+			fixed, newOC, changed := relocateDirectiveOnlyMessages(msgs, nil, false)
+			if changed {
+				openAIReq["messages"] = fixed
+				if newOC != nil {
+					openAIReq["output_config"] = newOC
+				}
+				log.Printf("  anthropic req: relocated directive-only system message off messages[0]")
 			}
 		}
 	}
@@ -816,7 +1024,9 @@ func handleAnthropicMessages(w http.ResponseWriter, r *http.Request) {
 		}
 		out = normalizeOpenAIResponse(out)
 		anthropicResp := openAIToAnthropic(out)
-		if tc, ok := getNested(out, "choices", 0, "message", "tool_calls").([]any); ok && len(tc) > 0 {
+		// P2: 守卫同非流式路径 —— 仅 end_turn 可覆写成 tool_use, 保留 max_tokens。
+		if tc, ok := getNested(out, "choices", 0, "message", "tool_calls").([]any); ok && len(tc) > 0 &&
+			anthropicResp["stop_reason"] == "end_turn" {
 			anthropicResp["stop_reason"] = "tool_use"
 		}
 		writeJSON(w, http.StatusOK, anthropicResp)
@@ -830,19 +1040,25 @@ func handleAnthropicMessages(w http.ResponseWriter, r *http.Request) {
 		})
 		return
 	}
-	if u, ok := raw["usage"].(map[string]any); ok && len(u) > 0 {
-		usageFn(u)
-	}
 	out := raw
 	if data, ok := raw["data"]; ok {
 		if d, ok := data.(map[string]any); ok {
 			out = d
 		}
 	}
+	// P1: usage 必须在解 data 包裹**之后**再取(与 proxy_stream.go 同序) ——
+	// 旧顺序先查外层 raw["usage"], 包裹形态的 usage 永远取不到, 账单/统计漏记。
+	if u, ok := out["usage"].(map[string]any); ok && len(u) > 0 {
+		usageFn(u)
+	}
 	out = normalizeOpenAIResponse(out)
 	anthropicResp := openAIToAnthropic(out)
 
-	if tc, ok := getNested(out, "choices", 0, "message", "tool_calls").([]any); ok && len(tc) > 0 {
+	// P2: 仅当映射结果仍是 end_turn 且 tool_calls 非空才覆写成 tool_use ——
+	// finish_reason=length 映射出的 max_tokens 必须保留(与 openAIToAnthropic
+	// 内的覆写守卫同口径), 截断的半截参数不得伪装成完整调用。
+	if tc, ok := getNested(out, "choices", 0, "message", "tool_calls").([]any); ok && len(tc) > 0 &&
+		anthropicResp["stop_reason"] == "end_turn" {
 		anthropicResp["stop_reason"] = "tool_use"
 	}
 
@@ -917,18 +1133,21 @@ func handleZenAnthropic(w http.ResponseWriter, r *http.Request, req anthropicReq
 		tracker.finish(false, http.StatusInternalServerError)
 		return
 	}
-	if u, ok := raw["usage"].(map[string]any); ok && len(u) > 0 {
-		usageFn(u)
-	}
 	chatOut := raw
 	if data, ok := raw["data"]; ok {
 		if d, ok := data.(map[string]any); ok {
 			chatOut = d
 		}
 	}
+	// P1: 同 handleAnthropicMessages 非流式路径 —— 先解 data 包裹再取 usage。
+	if u, ok := chatOut["usage"].(map[string]any); ok && len(u) > 0 {
+		usageFn(u)
+	}
 	chatOut = normalizeOpenAIResponse(chatOut)
 	anthropicResp := openAIToAnthropic(chatOut)
-	if tc, ok := getNested(chatOut, "choices", 0, "message", "tool_calls").([]any); ok && len(tc) > 0 {
+	// P2: 守卫同非流式路径 —— 仅 end_turn 可覆写成 tool_use, 保留 max_tokens。
+	if tc, ok := getNested(chatOut, "choices", 0, "message", "tool_calls").([]any); ok && len(tc) > 0 &&
+		anthropicResp["stop_reason"] == "end_turn" {
 		anthropicResp["stop_reason"] = "tool_use"
 	}
 	writeJSON(w, http.StatusOK, anthropicResp)
@@ -953,42 +1172,71 @@ func handleAnthropicStreamWithUsage(w http.ResponseWriter, upstream *http.Respon
 //	"No such tool available: Read"。
 func handleAnthropicStreamWithToolNameMap(w http.ResponseWriter, upstream *http.Response, modelName string, toolSchemas map[string]map[string]bool, onUsage func(map[string]any), toolNameMap *toolNameMap) {
 	log.Printf("  anthropic stream: starting real-time forward")
+	// P2: Flush 断言必须挪到 WriteHeader **之前** —— 旧顺序先提交 200+SSE 头,
+	// 再因 ResponseWriter 不支持 Flush 直接 return: 客户端拿到空 200 流, 既无
+	// 任何事件, 也永远到不了下方的空流守卫(静默挂起)。此处尚未提交, 显式 500。
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		writeJSON(w, http.StatusInternalServerError, map[string]any{
+			"error": map[string]string{"message": "response writer does not support flushing", "type": "api_error"},
+		})
+		return
+	}
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
 	setCORSOrigin(w)
 	w.WriteHeader(http.StatusOK)
-	flusher, ok := w.(http.Flusher)
-	if !ok {
-		return
-	}
 
+	msgID := "msg_" + fmt.Sprintf("%x", time.Now().UnixMilli())
+	stopReason := "end_turn"
+	// P3: take-last 暂存末次上游 usage —— message_start / message_delta 的计量
+	// 回填与 onUsage(内部 tracker)共用同一份。
+	var lastUsage map[string]any
+	usageInt := func(key string) int {
+		if v, ok := lastUsage[key].(float64); ok {
+			return int(v)
+		}
+		return 0
+	}
+	// P3: message_start 改为**惰性首发**(任何真实事件写出之前补发)。上游常见
+	// "usage 帧先行、正文在后"的形态(见 stream_firstline_test 首帧带 usage),
+	// 在流打开瞬间就发只会把 input_tokens 恒写成 0; 惰性化后 usage 先到即可
+	// 回填, 且 message_start 先于一切事件的协议序不被破坏。
+	msSent := false
+	var emit func(event string, data any)
+	emitMessageStart := func() {
+		if msSent {
+			return
+		}
+		msSent = true
+		emit("message_start", map[string]any{
+			"type": "message_start",
+			"message": map[string]any{
+				"id":      msgID,
+				"type":    "message",
+				"role":    "assistant",
+				"content": []any{},
+				"model":   modelName,
+				"usage": map[string]any{
+					"input_tokens":  usageInt("prompt_tokens"),
+					"output_tokens": usageInt("completion_tokens"),
+				},
+				"stop_reason": nil,
+			},
+		})
+	}
 	// 流式诊断日志改走共享、带轮转上限的 writeStreamLog(见其定义), 不再每请求独占句柄。
-	emit := func(event string, data any) {
+	emit = func(event string, data any) {
+		if !msSent {
+			emitMessageStart()
+		}
 		d, _ := json.Marshal(data)
 		line := fmt.Sprintf("event: %s\ndata: %s\n\n", event, string(d))
 		w.Write([]byte(line))
 		writeStreamLog(line)
 		flusher.Flush()
 	}
-
-	msgID := "msg_" + fmt.Sprintf("%x", time.Now().UnixMilli())
-	stopReason := "end_turn"
-	emit("message_start", map[string]any{
-		"type": "message_start",
-		"message": map[string]any{
-			"id":      msgID,
-			"type":    "message",
-			"role":    "assistant",
-			"content": []any{},
-			"model":   modelName,
-			"usage": map[string]any{
-				"input_tokens":  0,
-				"output_tokens": 0,
-			},
-			"stop_reason": nil,
-		},
-	})
 
 	textIndex := new(int)
 	*textIndex = -1
@@ -1002,6 +1250,9 @@ func handleAnthropicStreamWithToolNameMap(w http.ResponseWriter, upstream *http.
 	// 因此交付判定用 trim 后的口径(与 stream_delivery.go 的流级判据一致)。
 	reasoningDelivered := false
 	pendingTools := map[int]*toolAccumulator{}
+	// P3: 上游 SSE 已发过 error 帧(processSSELine 内置位) —— error 即终止,
+	// 收尾的空流守卫与 message_delta/message_stop 据此整体跳过, 不补第二条 error。
+	upstreamErrored := false
 	emitIndex := 0
 	nextIndex := func() int {
 		i := emitIndex
@@ -1026,8 +1277,21 @@ func handleAnthropicStreamWithToolNameMap(w http.ResponseWriter, upstream *http.
 			log.Printf("  tool args parse failed for %s: %v (raw: %s)", acc.name, err, kit.Truncate(acc.args, 300))
 			argsObj = map[string]any{}
 		}
+		// 工具名恢复(照抄 OmniRoute utils/stream.ts:restoreClaudePassthroughToolUseName,
+		// 映射来源 chatCore.ts:2592-2610; 非流式对位 responseTranslator.ts:740):
+		// 产出**写给客户端的原名**(如 read_file), 不碰 acc.name(上游回显别名)。
+		// P2: 必须在 filterToolInput **之前**算好 —— toolSchemas 键=客户端声明名,
+		// 只用回显名查会在名字不一致时 miss, 未裁剪字段直达严格校验的客户端。
+		emitName := restoreClaudeToolName(acc.name, toolNameMap)
 		if inputMap, ok := argsObj.(map[string]any); ok {
-			argsObj = filterToolInput(acc.name, inputMap, toolSchemas)
+			// 与 cleanToolUseInput 同键序: 先按客户端声明名查, miss 再回退回显名。
+			filterKey := emitName
+			if _, ok := toolSchemas[filterKey]; !ok {
+				if _, ok := toolSchemas[acc.name]; ok {
+					filterKey = acc.name
+				}
+			}
+			argsObj = filterToolInput(filterKey, inputMap, toolSchemas)
 		}
 		parsed, _ := json.Marshal(argsObj)
 		// 照抄 OmniRoute open-sse/translator/helpers/toolCallShim.ts:112 `applyToolCallShimToBuffer`。
@@ -1052,15 +1316,9 @@ func handleAnthropicStreamWithToolNameMap(w http.ResponseWriter, upstream *http.
 				acc.name, kit.Truncate(string(parsed), 300), kit.Truncate(cleaned, 300))
 			parsed = []byte(cleaned)
 		}
-		// 工具名还原（照抄 OmniRoute utils/stream.ts:restoreClaudePassthroughToolUseName，
-		// 映射来源 chatCore.ts:2592-2610；非流式对位 responseTranslator.ts:740）。
-		//
-		// ★ 还原的是**写给客户端的那个名字**，不碰 acc.name 本身:
-		//   上面的 filterToolInput / hasToolCallShim 都以 acc.name（上游回显的
-		//   别名，如 `Read`）为键 —— 那两张表按 Claude 权威名建索引，用别名查才对。
-		//   只有**发给客户端**的 content_block.name 必须还原成客户端声明的原名
-		//   （如 `read_file`），否则 Claude Code 报 "No such tool available: Read"。
-		emitName := restoreClaudeToolName(acc.name, toolNameMap)
+		// emitName(客户端声明原名, 如 read_file)已在 filter 前算好 —— 这里只把它
+		// 写进发给客户端的 content_block.name; acc.name(上游回显别名, 如 Read)
+		// 本身不改, shim 仍按 acc.name 查表(shim 表按 Claude 权威名建索引)。
 		log.Printf("  tool_use emit: name=%s id=%s input=%s", emitName, id, string(parsed))
 		emit("content_block_start", map[string]any{
 			"type":  "content_block_start",
@@ -1100,20 +1358,27 @@ func handleAnthropicStreamWithToolNameMap(w http.ResponseWriter, upstream *http.
 		if err := json.Unmarshal([]byte(payload), &obj); err != nil {
 			return
 		}
-		if onUsage != nil {
-			if u, ok := obj["usage"].(map[string]any); ok && len(u) > 0 {
-				onUsage(u)
-			}
-		}
 		if data, ok := obj["data"]; ok {
 			if d, ok := data.(map[string]any); ok {
 				obj = d
+			}
+		}
+		// P1: usage 必须在解 data 包裹**之后**再取(与 proxy_stream.go F2 顺序
+		// 一致) —— 旧顺序先查外层, 包裹形态的 usage 永远取不到, 计量/统计漏记。
+		// P3: 顺带 take-last 暂存, 供 message_start/message_delta 计量回填。
+		if u, ok := obj["usage"].(map[string]any); ok && len(u) > 0 {
+			lastUsage = u
+			if onUsage != nil {
+				onUsage(u)
 			}
 		}
 
 		if errPayload, ok := obj["error"]; ok {
 			errBody, _ := json.Marshal(errPayload)
 			log.Printf("  upstream SSE error: %s", string(errBody))
+			// P3: error 帧即终止 —— 置标志, 收尾的空流守卫与 message_delta/
+			// message_stop 据此跳过, 不再补第二条 error。
+			upstreamErrored = true
 			emit("error", map[string]any{"type": "error", "error": errPayload})
 			return
 		}
@@ -1239,6 +1504,12 @@ func handleAnthropicStreamWithToolNameMap(w http.ResponseWriter, upstream *http.
 		}
 	}
 
+	// P3: 上游 error 帧已终止本流 —— 空流守卫不得再发第二条 error,
+	// message_delta/message_stop 收尾也一并跳过(Anthropic 语义里 error 即终止)。
+	if upstreamErrored {
+		return
+	}
+
 	// ★ 空流守卫(2026-09-17 审查 P0-2)。
 	//
 	// 三条流式入口里, 此前只有 chat 与 responses 有守卫, 本路径**完全没有** ——
@@ -1302,7 +1573,10 @@ func handleAnthropicStreamWithToolNameMap(w http.ResponseWriter, upstream *http.
 			"stop_sequence": nil,
 		},
 		"usage": map[string]any{
-			"output_tokens": 0,
+			// P3: 回填末次上游 usage 的累计输出(协议允许 message_delta 携带累计
+			// usage) —— 旧值恒 0, 客户端计费显示全错; 上游从未给 usage 时暂存
+			// 为空, 保持 0 与旧实现一致。
+			"output_tokens": usageInt("completion_tokens"),
 		},
 	})
 

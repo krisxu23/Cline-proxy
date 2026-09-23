@@ -1,29 +1,20 @@
 // Package translate 提供网关内部统一格式(OpenAI chat)与上游原生协议之间的
 // 双向翻译, 方案与结构参照 OmniRoute 的 open-sse/translator(MIT, 版权声明见
-// 仓库根 NOTICE)。注册表语义与其 registry.ts 一致: register(from, to, reqFn,
-// respFn) 后按 "from:to" 取用。
+// 仓库根 NOTICE)。调用方直接调用各转换函数(无注册表)。
 //
-// **接线状态(重要, R2 审计 F4)**: 本包目前是"预铺基础设施", 生产调用点为零,
-// 仅被自身测试消费 —— 中继仍走 internal/app 内的既有转换路径。计划随移植
-// 批次⑤接入; 在此之前请勿删除, 但引用本包能力时须先补真实调用链与端到端
-// 用例。勿与 `internal/app/translate_registry` 混淆: 那个是"转换注册表 + 出站体
+// **接线状态(按生产调用点实测)**:
+//   - claude 请求方向已接线: OpenAIChatToClaudeRequest
+//     (providers_api_format.go 的 Anthropic Messages 出站、
+//     zen_messages_convert.go 的 zen /messages 请求);
+//   - claude 响应方向已接线: ClaudeResponseToOpenAIChat /
+//     ClaudeSSEToOpenAISSE(zen_messages_convert.go 的非流式与流式回转);
+//   - gemini 双向目前仅被测试引用: 网关的 Google 上游一律走 OpenAI 兼容
+//     方言(/v1beta/openai), 不经本包的 Gemini 原生转换 —— 待真正接线后再
+//     扩展, 勿按"已接线"引用 gemini 方向。
+//
+// 勿与 `internal/app/translate_registry` 混淆: 那个是"转换注册表 + 出站体
 // 形态不变量校验"(防重复转换事故, 已在生产使用), 本包是"协议格式互转实现"。
 // (两包 2026-09-16 之前同名 `translate`, 已按职责改名去歧义。)
-//
-// Deprecated: 本包未接线 —— 生产调用点为零, 仅被测试引用
-// (translate 包自身测试与 internal/app/node_filter_test.go); 中继仍走
-// internal/app 内的既有转换路径, 接线计划见 docs/omniroute-mapping.md 批次⑤。
-// P2-22 / P3-24 / P3-25 已修, 但接入生产前仍须整体复核(逐方向端到端用例、
-// 错误路径与真实上游形态), 不要直接引用后上线。请勿删除本包(有测试引用)。
-//
-// 已注册方向:
-//
-//	openai → claude(请求方向): OpenAIChatToClaudeRequest
-//	openai → gemini(请求方向): OpenAIChatToGeminiRequest
-//	响应方向: ClaudeResponseToOpenAIChat / ClaudeSSEToOpenAISSE /
-//	          GeminiResponseToOpenAIChat / GeminiSSEToOpenAISSE
-//	响应方向与其余组合将按批次继续移植(参照源码快照见工作区
-//	omniroute-translator-ref/, 随本声明保留 MIT 版权)。
 //
 // 与上游参照实现的**有意差异**(均为 OmniRoute 特有的供应商分支, 不适用于
 // 本网关, 已在移植时略去): kimi-coding 思考注入、Copilot summarized
@@ -34,7 +25,6 @@ import (
 	"encoding/json"
 	"errors"
 	"strings"
-	"sync"
 )
 
 // 格式标识(与 OmniRoute formats.ts 对齐, 只保留本网关需要的)。
@@ -44,54 +34,11 @@ const (
 	FormatGemini = "gemini"
 )
 
-// RequestTranslator 把 from 格式的请求体翻译为 to 格式。
-// model: 解析后的模型名; body: 原请求体; stream: 是否流式。
-type RequestTranslator func(model string, body map[string]any, stream bool) (map[string]any, error)
-
-// ResponseTranslator 把 to 格式的一个响应事件翻译为 from 格式的分块。
-// state 为跨事件的转换状态(由具体翻译器定义)。
-type ResponseTranslator func(chunk map[string]any, state map[string]any) (map[string]any, error)
-
-var (
-	regMu            sync.RWMutex
-	requestRegistry  = map[string]RequestTranslator{}
-	responseRegistry = map[string]ResponseTranslator{}
-)
-
-func makeKey(from, to string) string { return from + ":" + to }
-
 // 哨兵错误: 空请求体 / 无可转换消息。
 var (
 	errNilBody     = errors.New("translate: nil request body")
 	errNilMessages = errors.New("translate: request has no convertible messages")
 )
-
-// Register 注册一个方向的翻译器(与 OmniRoute registry.ts 同名同义)。
-func Register(from, to string, reqFn RequestTranslator, respFn ResponseTranslator) {
-	regMu.Lock()
-	defer regMu.Unlock()
-	k := makeKey(from, to)
-	if reqFn != nil {
-		requestRegistry[k] = reqFn
-	}
-	if respFn != nil {
-		responseRegistry[k] = respFn
-	}
-}
-
-// GetRequestTranslator 取请求方向翻译器。
-func GetRequestTranslator(from, to string) RequestTranslator {
-	regMu.RLock()
-	defer regMu.RUnlock()
-	return requestRegistry[makeKey(from, to)]
-}
-
-// GetResponseTranslator 取响应方向翻译器。
-func GetResponseTranslator(from, to string) ResponseTranslator {
-	regMu.RLock()
-	defer regMu.RUnlock()
-	return responseRegistry[makeKey(from, to)]
-}
 
 // OpenAIChatToClaudeRequest 把 OpenAI chat 请求体翻译为 Anthropic Messages
 // 请求体(核心协议映射, 与上游参照实现的差异见包注释)。要点:
@@ -355,9 +302,4 @@ func numOr(v any, def int) int {
 		}
 	}
 	return def
-}
-
-func init() {
-	Register(FormatOpenAI, FormatClaude, OpenAIChatToClaudeRequest, nil)
-	Register(FormatOpenAI, FormatGemini, OpenAIChatToGeminiRequest, nil)
 }

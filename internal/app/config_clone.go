@@ -98,6 +98,12 @@ func (c *zenConfigData) clone() *zenConfigData {
 	out.BaseURLs = cloneStrings(c.BaseURLs)
 	out.Proxies = cloneStrings(c.Proxies)
 	out.Subs = cloneStrings(c.Subs)
+	// 与其余 []string 字段一视同仁: 漏掉的字段只拷了 slice header, 快照持有方
+	// 在 cap>len 时 append 会写穿共享底层数组(与全局 mutate 及其它快照串台)。
+	out.Keys = cloneStrings(c.Keys)
+	out.EnabledRegions = cloneStrings(c.EnabledRegions)
+	out.NodeExcludeKeywords = cloneStrings(c.NodeExcludeKeywords)
+	out.EnabledModels = cloneStrings(c.EnabledModels)
 	out.RescueDirect = cloneBoolPtr(c.RescueDirect)
 	out.Compaction = c.Compaction.clone()
 	out.Usage = c.Usage.clone()

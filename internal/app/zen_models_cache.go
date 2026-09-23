@@ -51,7 +51,12 @@ func saveZenModelsCacheWithSyncedAtLocked(refresh bool) {
 			models = append(models, *m)
 		}
 	}
-	if len(models) == 0 {
+	if len(models) == 0 && !refresh {
+		// 非同步路径没有"上游目录可用"的背书, 空列表照写会把磁盘缓存清空
+		// (首次运行/尚未同步场景的原保护)。同步路径(refresh)不受此限:
+		// 空 payload 在 decodeZenModels 已被拦下, 能走到这里只可能是差量
+		// 删除摘光了 synced 条目 —— 必须写空列表, 否则重启后已下架的模型
+		// 从旧缓存复活, 抵消差量删除(终审 P3)。
 		return
 	}
 	syncedAt := time.Now().Unix()

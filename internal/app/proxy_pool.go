@@ -52,6 +52,8 @@ func zenProxyCooldownKey(proxy string) string {
 }
 
 // cooldownZenProxy 标记某出口冷却,冷却期内轮询跳过。
+// 只允许延长不允许缩短: 429 配额/Retry-After 已写入更长的冷却时, 请求级网络
+// 错误/5xx 的短冷却不能把已知耗尽的出口提前放回池子再撞一次 429(审查 P2)。
 func cooldownZenProxy(proxy string, d time.Duration) {
 	key := zenProxyCooldownKey(proxy)
 	if key == "" {
@@ -61,8 +63,12 @@ func cooldownZenProxy(proxy string, d time.Duration) {
 		d = 10 * time.Minute
 	}
 	zenProxyCooldownsMu.Lock()
-	zenProxyCooldowns[key] = time.Now().Add(d)
-	zenProxyCooldownsMu.Unlock()
+	defer zenProxyCooldownsMu.Unlock()
+	until := time.Now().Add(d)
+	if cur, ok := zenProxyCooldowns[key]; ok && cur.After(until) {
+		return // 已有更长的冷却, 不缩短
+	}
+	zenProxyCooldowns[key] = until
 }
 
 // cooldownZenProxyByIndex 按**当前**列表下标解析出出口再冷却。
@@ -250,17 +256,61 @@ func clearActualExitQuotaStrike(ctx context.Context) {
 	}
 }
 
+// pruneStaleExitKeys 冷却表/429 计数/国家映射按 active 集合清理, 与
+// pruneStaleNodeHealth 同一调用点。三张表此前只增不减: 订阅摘除的 key 再不会被
+// 访问到(冷却表只有 zenProxyAvailable 访问时才顺手删过期项), 永久驻留 ——
+// 国家映射还会被 persistNodeCountries 一起落盘(2026-09-23 审查 P3)。
+// active = 当前 nodePorts 键(节点);手动代理虽不在其中, 但只要还配着就保留。
+func pruneStaleExitKeys(activeNodeKeys []string) {
+	on := make(map[string]bool, len(activeNodeKeys)+8)
+	for _, k := range activeNodeKeys {
+		on[k] = true
+	}
+	for _, p := range getZenConfig().Proxies {
+		if k := zenProxyCooldownKey(p); k != "" {
+			on[k] = true
+		}
+	}
+	zenProxyCooldownsMu.Lock()
+	for k := range zenProxyCooldowns {
+		if !on[k] {
+			delete(zenProxyCooldowns, k)
+		}
+	}
+	for k := range zenProxyQuotaStrikes {
+		if !on[k] {
+			delete(zenProxyQuotaStrikes, k)
+		}
+	}
+	zenProxyCooldownsMu.Unlock()
+	nodeCountryMu.Lock()
+	for k := range nodeCountryMap {
+		if !on[k] {
+			delete(nodeCountryMap, k)
+			nodeCountryDirty = true
+		}
+	}
+	nodeCountryMu.Unlock()
+}
+
 // rebuildZenTransport 代理池或配置变化时重建 zen 上游 HTTP 客户端。
 //
 // 必须显式关掉旧 transport 的空闲连接: 它持有已经建好的 TCP/TLS 连接,
 // 直接丢弃引用会让这些连接无人回收。setZenConfig 每次保存配置都会走到这里,
 // 所以"反复改配置"就是成批泄漏连接。
+// 注意侧路 h2 必须单独关: RegisterProtocol 注册的是 *http2.Transport 指针,
+// stdlib 的 CloseIdleConnections 只对单字段**结构体**值注册的侧路派生 h2transport,
+// 指针注册恒为 nil —— 只调 old.CloseIdleConnections() 关不到真正承载流量的 h2
+// (2026-09-23 审查 P2), 所以自己持引用单独关(见 zenH2Transport)。
 func rebuildZenTransport() {
 	zenTransportMu.Lock()
 	if old, ok := zenHTTPClient.Transport.(*http.Transport); ok {
 		old.CloseIdleConnections()
 	}
-	zenHTTPClient = &http.Client{Transport: buildZenTransport()}
+	if zenH2Transport != nil {
+		zenH2Transport.CloseIdleConnections()
+	}
+	zenHTTPClient = &http.Client{Transport: buildZenTransport()} // 内部会刷新 zenH2Transport
 	zenTransportMu.Unlock()
 }
 
@@ -282,7 +332,9 @@ func getZenHTTPClient() *http.Client {
 func directHTTPClient() *http.Client {
 	directTransportOnce.Do(func() {
 		directTransport = &http.Transport{
-			DialContext:         (&net.Dialer{Timeout: 30 * time.Second, KeepAlive: 30 * time.Second}).DialContext,
+			// 控制面直连也过 SSRF 防线(链路本地/封禁域名拒收, loopback/私网不拦),
+			// 判定见 outbound_url.go —— 目录/模型同步会拨上游给的 URL, 这是直连面。
+			DialContext:         dialWithSSRFGuard((&net.Dialer{Timeout: 30 * time.Second, KeepAlive: 30 * time.Second}).DialContext),
 			MaxIdleConns:        16,
 			MaxIdleConnsPerHost: 4,
 			IdleConnTimeout:     90 * time.Second,
@@ -315,6 +367,18 @@ func effectiveProxyList() []string {
 	list := make([]string, 0, len(cfg.Proxies)+len(cfg.Subs)*4)
 	list = append(list, cfg.Proxies...)
 	list = append(list, subNodeKeysSnapshot()...)
+	// 节点页「排除关键词」过滤: 判据只在 nodes.go, 这里仅调用。kws 循环外取
+	// 一次 —— getZenConfig 是深拷贝, 逐项走旧单参签名等于每项深拷一次。
+	if kws := cfg.NodeExcludeKeywords; len(kws) > 0 {
+		kept := make([]string, 0, len(list))
+		for _, p := range list {
+			if nodeExcludedByFilter(kws, nodeDisplayName(p)) {
+				continue
+			}
+			kept = append(kept, p)
+		}
+		list = kept
+	}
 	// 地区过滤: 用户在设置页勾选地区后, 全网关出站只走所选地区的出口。
 	return filterByExitRegion(list)
 }
@@ -489,13 +553,30 @@ func nodeSlow(p string) bool {
 	return sp > 0 && sp < nodeSpeedSlowBPS
 }
 
-// lastZenProxyIdx 最近一次选择的代理索引(日志用)
+// lastZenExitKey 最近一次**拨号成功**的真实出口 key(空串 = 直连兜底),
+// 由 zenDialContext 在拨号成功时回写。
+var lastZenExitKey atomic.Value // string
+
+// setLastZenExit 拨号层记录真实出口;atomic 保证并发拨号下读方无竞争。
+func setLastZenExit(p string) { lastZenExitKey.Store(p) }
+
+// lastZenProxyIdx 最近一次拨号成功出口在**当前**列表中的下标;尚无成功拨号、
+// 走了直连兜底、或该出口已被移出列表时返回 -1。
+//
+// 曾用轮询计数 % 列表长度反推下标 —— 那只在 round_robin 且全列表可用时碰巧等于
+// 真实选路, 拿它冷却/描述会误伤没被用过的健康出口、漏掉真正用过的(审查 P2)。
+// 反推法已退役: 现在以拨号层回写的真实出口为准, 签名与调用方不变。
 func lastZenProxyIdx() int {
-	v := int64(zenProxyCount.Load())
-	if v <= 0 {
+	key, _ := lastZenExitKey.Load().(string)
+	if key == "" {
 		return -1
 	}
-	return int((v - 1) % int64(max(1, len(effectiveProxyList()))))
+	for i, p := range effectiveProxyList() {
+		if p == key {
+			return i
+		}
+	}
+	return -1
 }
 
 func maskProxyURL(raw string) string {
@@ -537,6 +618,21 @@ func maskURLForLog(raw string) string {
 	return "***"
 }
 
+// zenTLSHandshakeTimeout 上游 TLS 握手上限。主 transport 的同名字段会被
+// RegisterProtocol 的 https 侧路旁路(stdlib RoundTrip 先走 alternateRoundTripper),
+// 所以侧路的 DialTLSContext 按同一口径自己限时。
+const zenTLSHandshakeTimeout = 10 * time.Second
+
+// zenDialGuarded zenDialContext 接上 SSRF 防线后的拨号口(判定在 outbound_url.go):
+// 链路本地地址与封禁域名拒收, loopback/私网不拦。经节点、catch-all、Go 原生直连
+// 三条路径都在这里汇合, 所以防线挂接线处而不是各自的拨号实现里。
+var zenDialGuarded = dialWithSSRFGuard(zenDialContext)
+
+// zenH2Transport 当前 RegisterProtocol("https") 侧路登记的 h2 transport 引用。
+// 必须自己持引用: stdlib 的 Transport.CloseIdleConnections 对指针注册的侧路
+// 恒判非结构体、不派生 h2transport, 只调主 transport 的方法关不到侧路连接。
+var zenH2Transport *http2.Transport
+
 func buildZenTransport() *http.Transport {
 	t := &http.Transport{
 		MaxIdleConns:        100,
@@ -545,20 +641,31 @@ func buildZenTransport() *http.Transport {
 		// 分层超时(P1-11): TLS 握手与响应头阶段单独设限, 不再依赖客户端
 		// 自己的超时兜底 —— 上游卡死握手/卡死响应头时, 网关能主动断开并
 		// 让链路换下一站。正文阶段不设限(流式回答可以持续很久)。
-		TLSHandshakeTimeout:   10 * time.Second,
+		// 注意 https 流量不走这两个字段: RegisterProtocol 侧路在 RoundTrip 前
+		// 就把请求接走, 侧路自带握手上限与空闲探活(见 zenHTTP2Transport)。
+		TLSHandshakeTimeout:   zenTLSHandshakeTimeout,
 		ResponseHeaderTimeout: 120 * time.Second,
 		DisableCompression:    false,
 	}
-	t.DialContext = zenDialContext
+	t.DialContext = zenDialGuarded
 	// https 走 HTTP/2 + uTLS Chrome 指纹: 完整浏览器指纹(含 h2),避免 Go 原生指纹被 CF 风控
-	t.RegisterProtocol("https", zenHTTP2Transport())
+	h2 := zenHTTP2Transport()
+	t.RegisterProtocol("https", h2)
+	zenH2Transport = h2 // 持引用供 rebuildZenTransport 关闭(指针注册, 主 transport 关不到)
 	return t
 }
 
 func zenHTTP2Transport() *http2.Transport {
 	return &http2.Transport{
+		// 侧路被 RegisterProtocol 旁路, 主 transport 的 IdleConnTimeout/
+		// TLSHandshakeTimeout 对它全部不生效(2026-09-23 审查 P2: 裸 h2
+		// transport 空闲连接客户端侧永不回收、握手无上限)—— 侧路自带等价物。
+		IdleConnTimeout: 90 * time.Second, // 等价主 transport 的 IdleConnTimeout
+		// 30s 收不到任何帧即发 PING, 默认 PingTimeout(15s)内无 PONG 判死链 ——
+		// 兜住"accept 后对端静默挂死"这类占满 8 槽并发的僵持连接。
+		ReadIdleTimeout: 30 * time.Second,
 		DialTLSContext: func(ctx context.Context, network, addr string, _ *tls.Config) (net.Conn, error) {
-			raw, err := zenDialContext(ctx, network, addr)
+			raw, err := zenDialGuarded(ctx, network, addr)
 			if err != nil {
 				return nil, err
 			}
@@ -571,7 +678,11 @@ func zenHTTP2Transport() *http2.Transport {
 				ServerName: host,
 				NextProtos: []string{"h2", "http/1.1"},
 			}, utls.HelloChrome_120)
-			if err := uconn.HandshakeContext(ctx); err != nil {
+			// 握手单独限时(等价被旁路的 TLSHandshakeTimeout): ctx 由调用方
+			// 给, 可能是整请求的长超时, 不能让半死上游把握手挂满。
+			hctx, cancel := context.WithTimeout(ctx, zenTLSHandshakeTimeout)
+			defer cancel()
+			if err := uconn.HandshakeContext(hctx); err != nil {
 				raw.Close()
 				return nil, err
 			}
@@ -669,6 +780,7 @@ func zenDialContext(ctx context.Context, network, addr string) (net.Conn, error)
 		setReqExit(ctx, p)
 		conn, err := dialViaProxy(ctx, p, network, addr)
 		if err == nil {
+			setLastZenExit(p)
 			return conn, nil
 		}
 		lastErr = err
@@ -706,6 +818,10 @@ func zenDialContext(ctx context.Context, network, addr string) (net.Conn, error)
 		u := &url.URL{Scheme: "socks5", Host: local}
 		conn, err := dialSOCKS5(ctx, u, network, addr)
 		if err == nil {
+			// 兜底成功: 本次真实出口是本机直连, reqExit 不能残留最后失败的节点
+			// —— 否则成功的反馈会错归给它(污染地区知识/错清 429 计数, 审查 P2)。
+			setReqExit(ctx, "")
+			setLastZenExit("")
 			return conn, nil
 		}
 		lastErr = err
@@ -715,6 +831,8 @@ func zenDialContext(ctx context.Context, network, addr string) (net.Conn, error)
 	d := &net.Dialer{Timeout: 30 * time.Second, KeepAlive: 30 * time.Second}
 	conn, err := d.DialContext(ctx, network, addr)
 	if err == nil {
+		setReqExit(ctx, "")
+		setLastZenExit("")
 		return conn, nil
 	}
 	if lastErr != nil {

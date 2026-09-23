@@ -3,6 +3,7 @@ package app
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -238,10 +239,10 @@ func catalogHeaders(cfg providerConfig, target string) map[string]string {
 }
 
 // nativeCatalogParams 该目录地址是否使用 Google 原生分页参数。
-// 自定义目录地址(尤其 Google 原生 /v1beta/models)才带 pageSize;
-// OpenAI 兼容端点忽略未知查询参数, 但没必要无谓地加。
-func nativeCatalogParams(rawURL string) bool {
-	return !strings.Contains(strings.ToLower(rawURL), "/openai")
+// 只有已知的 Google 原生目录(isGoogleProvider 且路径不含 /openai)才带 pageSize;
+// 其余端点(普通 /v1/models、严格签名校验的自建网关)加未知查询参数可能被 400 拒掉。
+func nativeCatalogParams(cfg providerConfig, rawURL string) bool {
+	return isGoogleProvider(cfg) && !strings.Contains(strings.ToLower(rawURL), "/openai")
 }
 
 func (p *modelProvider) fetchCatalogPage(ctx context.Context, cfg providerConfig, rawURL, pageToken string, client *http.Client) (catalogPage, error) {
@@ -250,7 +251,7 @@ func (p *modelProvider) fetchCatalogPage(ctx context.Context, cfg providerConfig
 		return catalogPage{}, err
 	}
 	q := u.Query()
-	if nativeCatalogParams(rawURL) {
+	if nativeCatalogParams(cfg, rawURL) {
 		q.Set("pageSize", providerCatalogPageSize)
 	}
 	if pageToken != "" {
@@ -423,6 +424,9 @@ func (p *modelProvider) retryCatalogOnNextExit(err error) bool {
 	if status != 0 && !regionRejected {
 		return false // HTTP 层错误(4xx/5xx)换节点无意义, 只有连接层/地区拒绝才换
 	}
+	if status == 0 && !isCatalogRotatableErr(err) {
+		return false // 调用方取消/超时、URL 解析、响应形状: 换哪个出口都会复现
+	}
 	if p.catalogExitRetries == 0 {
 		p.catalogExitAt = time.Now()
 	}
@@ -516,6 +520,26 @@ func (p *modelProvider) noteCatalogSuccess() {
 	p.mu.Unlock()
 }
 
+// isCatalogRotatableErr status==0 的错误里只有真网络问题才值得换出口重试:
+// 调用方取消/超时、URL 解析失败、响应形状不可识别换个出口照样复现。
+func isCatalogRotatableErr(err error) bool {
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return false
+	}
+	if errors.Is(err, errUnrecognisedCatalogShape) {
+		return false
+	}
+	var ue *url.Error
+	if errors.As(err, &ue) && ue.Op == "parse" {
+		return false
+	}
+	return true
+}
+
+// errUnrecognisedCatalogShape 200 但响应形状不可识别: 换出口重打必然复现,
+// 不属于可轮换的网络错误(见 retryCatalogOnNextExit)。
+var errUnrecognisedCatalogShape = errors.New("unrecognised catalog response shape")
+
 // catalogHTTPError 把 fetchCatalogPage 的非 200 带结构化状态码, 供换出口判定。
 type catalogHTTPError struct {
 	status int
@@ -591,7 +615,12 @@ func (p *modelProvider) refreshCatalog(ctx context.Context, force bool) error {
 		}
 	}
 	if lastErr != nil {
-		p.noteCatalogFailure()
+		// 调用方主动取消(客户端断开/面板中止)不算连续失败: 它没有证明目录
+		// 拉不下来, 却会把退避逐级放大到 6h, 期间请求路径全部失败。
+		// 超时(deadline)是真实失败, 照常计数。
+		if !errors.Is(lastErr, context.Canceled) {
+			p.noteCatalogFailure()
+		}
 		p.mu.Lock()
 		p.catalogErr = lastErr.Error()
 		p.mu.Unlock()

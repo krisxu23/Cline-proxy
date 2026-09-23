@@ -165,6 +165,38 @@ func TestSanitizeClaudeToolIDs_多字符替换(t *testing.T) {
 	}
 }
 
+// TestSanitizeClaudeToolIDs_净化撞名去重 —— P2: a#b 与 a_b 净化后同为 a_b,
+// 同遍去重给后到者追加 _2; 双侧在同一遍里查同一张表, 配对仍存活。
+func TestSanitizeClaudeToolIDs_净化撞名去重(t *testing.T) {
+	in := []any{
+		map[string]any{"role": "assistant", "content": []any{
+			map[string]any{"type": "tool_use", "id": "a#b", "name": "T1", "input": map[string]any{}},
+			map[string]any{"type": "tool_use", "id": "a_b", "name": "T2", "input": map[string]any{}},
+		}},
+		map[string]any{"role": "user", "content": []any{
+			map[string]any{"type": "tool_result", "tool_use_id": "a#b", "content": "r1"},
+			map[string]any{"type": "tool_result", "tool_use_id": "a_b", "content": "r2"},
+		}},
+	}
+	out, changed := sanitizeClaudeToolIDs(in)
+	if !changed {
+		t.Fatal("应报告已改动")
+	}
+	uses, results, _ := walkToolIDs(t, out)
+	if len(uses) != 2 || len(results) != 2 {
+		t.Fatalf("uses=%v results=%v, 期望各 2 个", uses, results)
+	}
+	if uses[0] != "a_b" {
+		t.Fatalf("先到的原始 id 应保 base, got %q", uses[0])
+	}
+	if uses[1] != "a_b_2" {
+		t.Fatalf("撞名应追加 _2, got %q", uses[1])
+	}
+	if uses[0] != results[0] || uses[1] != results[1] {
+		t.Fatalf("配对断裂: uses=%v results=%v", uses, results)
+	}
+}
+
 // TestSanitizeClaudeToolIDs_合法id不变 对应探针 T5 —— no-op 幂等。
 func TestSanitizeClaudeToolIDs_合法id不变(t *testing.T) {
 	in := []any{

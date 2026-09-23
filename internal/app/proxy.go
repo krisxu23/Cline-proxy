@@ -386,7 +386,8 @@ func StartProxy(host string, port int) error {
 		}
 
 		if isStream {
-			handleStreamResponseWithUsage(w, resp, usageFn)
+			// 终审 P2: 交付状态(空流守卫 502 等)回传, defer 才能按真实结果记账。
+			status = handleStreamResponseWithUsage(w, resp, usageFn)
 			return
 		}
 
@@ -406,13 +407,46 @@ func StartProxy(host string, port int) error {
 				usageFn(u)
 			}
 			out = normalizeOpenAIResponse(out)
+			// 终审 P2: 直连非流式聚合路径此前无空内容守卫 —— 上游 200-空流时
+			// 客户端拿到 200 + content:"" 的"成功空回合", 静默中断不重试。
+			// 判据与流式守卫同源: 正文/工具调用/reasoning + 输出侧 usage + 合法空终止态。
+			msg, _ := getNested(out, "choices", 0, "message").(map[string]any)
+			var delivered bool
+			if msg != nil {
+				switch c := msg["content"].(type) {
+				case string:
+					delivered = strings.TrimSpace(c) != ""
+				case []any:
+					delivered = len(c) > 0
+				}
+				if !delivered {
+					if tc, ok := msg["tool_calls"].([]any); ok && len(tc) > 0 {
+						delivered = true
+					}
+				}
+				if !delivered {
+					delivered = hasAnyReasoningSignal(msg)
+				}
+			}
+			u, _ := out["usage"].(map[string]any)
+			if streamDeliveryEmpty(delivered, hasOutputUsageTokens(u), legitEmptyTerminalReason(out)) {
+				log.Printf("  nonstream (aggregated): 上游交付空回合, 回 empty_content 错误而非空 200")
+				status = http.StatusBadGateway
+				writeJSON(w, http.StatusBadGateway, map[string]any{
+					"error": map[string]string{
+						"message": "上游未返回任何内容(聚合结果无有效正文)。这通常是出口节点或上游 worker 异常所致, 请重试; 若持续出现请更换出口节点。",
+						"type":    "empty_content",
+					},
+				})
+				return
+			}
 			log.Printf("  nonstream (aggregated): model=%v content_len=%d finish=%v",
 				out["model"], len(getNested(out, "choices", 0, "message", "content").(string)), getNested(out, "choices", 0, "finish_reason"))
 			writeJSON(w, http.StatusOK, out)
 			return
 		}
 
-		handleNonStreamResponseWithUsage(w, resp, usageFn)
+		status = handleNonStreamResponseWithUsage(w, resp, usageFn)
 	})
 	mux.HandleFunc("/v1/chat/completions", chatHandler)
 	mux.HandleFunc("/chat/completions", chatHandler)

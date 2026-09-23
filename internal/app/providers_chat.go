@@ -217,6 +217,10 @@ func (p *modelProvider) Chat(ctx context.Context, params map[string]any, stream 
 func (p *modelProvider) chatWithKey(ctx context.Context, cfg providerConfig, params map[string]any, key string, stream, needsSig bool, client *http.Client) (*http.Response, error) {
 	model, _ := params["model"].(string)
 
+	// 客户端原始工具名快照: 必须赶在下方 remapToolNamesInRequest/cloak 改写
+	// tools 之前取(取数即序列化), 供每次出站 attempt 挂到内部头。
+	toolsSnapshot := snapshotStreamRequestTools(params)
+
 	// 上游不支持参数剥离（照抄 OmniRoute open-sse/translator/paramSupport.ts）。
 	//
 	// 这里是 generic provider 出站的**真正咽喉**, 与参考实现
@@ -602,6 +606,7 @@ func (p *modelProvider) chatWithKey(ctx context.Context, cfg providerConfig, par
 					req.Header.Set(k, v)
 				}
 			}
+			attachStreamRequestTools(req, toolsSnapshot)
 			return client.Do(req)
 		}
 
@@ -777,14 +782,31 @@ func handleProviderChat(w http.ResponseWriter, r *http.Request, params map[strin
 		// 而健康出口只有 25~95 个, 出口池被抽干, 所有请求退化成直连并失败
 		// (2026-09-17 实证: 日志满屏"节点池无可用出口")。
 		gateMs := catalogRequestGateMs(p.catalogFailStreak)
-		need := len(p.catalog) == 0 && time.Now().UnixMilli()-p.attemptedAt >= gateMs
+		empty := len(p.catalog) == 0
+		need := empty && time.Now().UnixMilli()-p.attemptedAt >= gateMs
 		p.mu.Unlock()
 		if need {
-			ctx, cancel := context.WithTimeout(r.Context(), providerCatalogTimeout)
-			if err := p.refreshCatalog(ctx, true); err != nil {
-				log.Printf("  providers: request-path catalog refresh (%s) failed: %v", name, err)
-			}
-			cancel()
+			// 刷新放后台: 请求路径不再同步等(最长 90s), 客户端断开也不会把
+			// 取消传进刷新(否则计成一次连续失败, 退避最长锁到 6h)。
+			// refreshCatalog 自带 inflight 去重, 并发触发不会重复打上游。
+			go func() {
+				ctx, cancel := context.WithTimeout(context.Background(), providerCatalogTimeout)
+				defer cancel()
+				if err := p.refreshCatalog(ctx, true); err != nil {
+					log.Printf("  providers: request-path catalog refresh (%s) failed: %v", name, err)
+				}
+			}()
+		}
+		if empty {
+			// 目录空着 isFree 必判 false, 回 400 会把"目录加载中"误报成
+			// "非法模型" —— 明确 503 让客户端稍后重试。
+			writeJSON(w, http.StatusServiceUnavailable, map[string]any{
+				"error": map[string]string{
+					"message": fmt.Sprintf("provider %q catalog is loading, retry shortly", name),
+					"type":    "api_error",
+				},
+			})
+			return
 		}
 	}
 
@@ -833,8 +855,8 @@ func handleProviderChat(w http.ResponseWriter, r *http.Request, params map[strin
 	// 否则客户端收到自己从未声明过的工具名。无伪装时为 nil, 行为不变。
 	responseToolNameMap := takeToolNameMap(params)
 	if isStream {
-		handleStreamResponseWithToolNameMap(w, resp, usageFn, responseToolNameMap)
+		status = handleStreamResponseWithToolNameMap(w, resp, usageFn, responseToolNameMap)
 		return
 	}
-	handleNonStreamResponseWithToolNameMap(w, resp, usageFn, responseToolNameMap)
+	status = handleNonStreamResponseWithToolNameMap(w, resp, usageFn, responseToolNameMap)
 }

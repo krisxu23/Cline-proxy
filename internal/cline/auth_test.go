@@ -203,12 +203,6 @@ func TestParseExpiry(t *testing.T) {
 	}
 }
 
-func TestFindCredentialsFileUsesCanonicalName(t *testing.T) {
-	if p := FindCredentialsFile(); !strings.HasSuffix(p, ".cline-credentials.json") {
-		t.Fatalf("凭据文件名不对: %s", p)
-	}
-}
-
 func TestIsWindowsMatchesRuntime(t *testing.T) {
 	// 该判定用于选浏览器打开方式, 逻辑本身是环境变量嗅探, 这里只固化"不 panic 且稳定"。
 	first := IsWindows()

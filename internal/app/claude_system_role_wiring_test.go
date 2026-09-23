@@ -87,6 +87,13 @@ func TestHandleAnthropicMessages_接入system提升_源码层(t *testing.T) {
 	if iDispatch < 0 || iLift > iDispatch {
 		t.Fatalf("接线必须在派发之前: lift@%d dispatch@%d", iLift, iDispatch)
 	}
+	// 6. P0 回归锁: 提升出的 sysOut(第 2 返回值)必须回填顶层 system ——
+	//    它曾被 `_` 丢弃, 上游收不到任何 system 指令(端到端断言, 见 review P0)。
+	iBackfill := strings.Index(text, `openAIReq["system"] = sysOut`)
+	if iBackfill < 0 || iBackfill < iLift || iBackfill > iDispatch {
+		t.Fatalf("sysOut 未回填 openAIReq[\"system\"] 或位置错误: backfill@%d lift@%d dispatch@%d",
+			iBackfill, iLift, iDispatch)
+	}
 }
 
 // TestHandleAnthropicMessages_行为_system角色被提升 走真实 handler, 断言

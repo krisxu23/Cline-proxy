@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"strings"
 	"time"
@@ -41,12 +42,20 @@ func handleNodeBlacklistClear(w http.ResponseWriter, r *http.Request) {
 	}
 	_ = json.NewDecoder(io.LimitReader(r.Body, 16<<10)).Decode(&body)
 	manualBlackMu.Lock()
+	n := len(manualBlack)
+	key := strings.TrimSpace(body.Key)
 	if body.All {
 		manualBlack = map[string]time.Time{}
-	} else if strings.TrimSpace(body.Key) != "" {
-		delete(manualBlack, strings.TrimSpace(body.Key))
+	} else if key != "" {
+		delete(manualBlack, key)
 	}
 	manualBlackMu.Unlock()
+	// 破坏性操作留痕(审计 P3): 全清带数量, 单删带标识。
+	if body.All {
+		log.Printf("Node blacklist cleared (%d)", n)
+	} else if key != "" {
+		log.Printf("Node blacklist deleted: %q", key)
+	}
 	writeAPI(w, http.StatusOK, apiResponse{Success: true, Data: map[string]any{"list": blacklistList()}})
 }
 

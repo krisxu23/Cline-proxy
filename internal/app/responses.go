@@ -177,15 +177,19 @@ func chatToResponses(chat map[string]any) map[string]any {
 				outputText.WriteString(c)
 				content = append(content, map[string]any{"type": "output_text", "text": c, "annotations": []any{}})
 			}
-			msgOut := map[string]any{
-				"type":        "message",
-				"id":          "msg_" + fmt.Sprintf("%x", time.Now().UnixMilli()),
-				"status":      "completed",
-				"role":        "assistant",
-				"content":     content,
-				"output_text": outputText.String(),
+			// content 为空时跳过 message item —— 纯工具回合补一个空 content[]
+			// 会被严格客户端按 "content must be non-empty" 拒收; Responses
+			// 协议允许 output 直接由 function_call 项开头。
+			if len(content) > 0 {
+				outputs = append(outputs, map[string]any{
+					"type":        "message",
+					"id":          "msg_" + fmt.Sprintf("%x", time.Now().UnixMilli()),
+					"status":      "completed",
+					"role":        "assistant",
+					"content":     content,
+					"output_text": outputText.String(),
+				})
 			}
-			outputs = append(outputs, msgOut)
 
 			if tc, ok := msg["tool_calls"].([]any); ok {
 				for _, c := range tc {
@@ -271,6 +275,7 @@ type responsesFnCall struct {
 	args     strings.Builder
 	emitted  bool // 是否已发 output_item.added
 	deltaed  int  // 已作为 arguments.delta 发出的 args 字节数
+	finished bool // 同 index 新累加器入场即收尾; 空 id 分片不再续接(上游复用 index)
 }
 
 // chatStreamToResponses 将上游 chat.completions SSE 流转换为 Responses SSE 流
@@ -311,8 +316,20 @@ func chatStreamToResponses(w http.ResponseWriter, upstream *http.Response, onUsa
 	pickCall := func(key, idStr, name string) *responsesFnCall {
 		if key != "" {
 			for _, fc := range fcalls {
-				// index 相同但 id 不同视为不同调用(容错上游复用 index)
-				if fc.key == key && (idStr == "" || fc.callID == "" || idStr == fc.callID) {
+				if fc.key != key {
+					continue
+				}
+				// 分片带非空 id: 必须与累加器 callID 相等才复用 —— 上游复用
+				// index 发第二个调用时, 新调用首片的 id 与旧累加器不同, 各自成项。
+				if idStr != "" {
+					if fc.callID == idStr {
+						return fc
+					}
+					continue
+				}
+				// 空 id 分片(流里 id 只在首分片): 只续接未收尾的同 index 累加器 ——
+				// 旧累加器已因新调用入场收尾, 再续接会把两段 arguments 拼成非法 JSON。
+				if !fc.finished {
 					return fc
 				}
 			}
@@ -328,12 +345,42 @@ func chatStreamToResponses(w http.ResponseWriter, upstream *http.Response, onUsa
 		nextOutIndex++
 		// outIndex 唯一, 保证并行同名调用的 item_id 也不撞车
 		fc.itemID = fmt.Sprintf("fc_%d_%x", fc.outIndex, time.Now().UnixNano())
+		// 同 index 的旧累加器就此收尾: 上游复用 index 开了新调用
+		if key != "" {
+			for _, prev := range fcalls {
+				if prev.key == key {
+					prev.finished = true
+				}
+			}
+		}
 		fcalls = append(fcalls, fc)
 		return fc
 	}
 	// 暂存最后一次 usage, 收尾时回填 response.completed, 不再硬编码全 0(P1-12)。
 	var lastUsage map[string]any
 	var outText strings.Builder
+	// ensureTextItem: message item 的 added 事件, 全流恰好一次。文本与推理
+	// 分片都可能先到 —— 凡引用 msgID/output_index=0 的 delta 都必须晚于
+	// added, 否则严格事件机拒绝整条流或丢弃推理段(先推理后正文是
+	// DeepSeek/Kimi/Qwen thinking 模型的常态帧序)。
+	ensureTextItem := func() {
+		if textEmitted {
+			return
+		}
+		textEmitted = true
+		s.event("response.output_item.added", map[string]any{
+			"type":         "response.output_item.added",
+			"output_index": 0,
+			"item":         map[string]any{"id": s.msgID, "type": "message", "role": "assistant", "status": "in_progress", "content": []any{}},
+		})
+		s.event("response.content_part.added", map[string]any{
+			"type":          "response.content_part.added",
+			"item_id":       s.msgID,
+			"output_index":  0,
+			"content_index": 0,
+			"part":          map[string]any{"type": "output_text", "text": "", "annotations": []any{}},
+		})
+	}
 
 	reader := bufio.NewReader(upstream.Body)
 	for {
@@ -398,21 +445,7 @@ func chatStreamToResponses(w http.ResponseWriter, upstream *http.Response, onUsa
 				}
 				// 文本
 				if c, ok := delta["content"].(string); ok && c != "" {
-					if !textEmitted {
-						textEmitted = true
-						s.event("response.output_item.added", map[string]any{
-							"type":         "response.output_item.added",
-							"output_index": 0,
-							"item":         map[string]any{"id": s.msgID, "type": "message", "role": "assistant", "status": "in_progress", "content": []any{}},
-						})
-						s.event("response.content_part.added", map[string]any{
-							"type":          "response.content_part.added",
-							"item_id":       s.msgID,
-							"output_index":  0,
-							"content_index": 0,
-							"part":          map[string]any{"type": "output_text", "text": "", "annotations": []any{}},
-						})
-					}
+					ensureTextItem()
 					outText.WriteString(c)
 					s.event("response.output_text.delta", map[string]any{
 						"type":          "response.output_text.delta",
@@ -422,8 +455,9 @@ func chatStreamToResponses(w http.ResponseWriter, upstream *http.Response, onUsa
 						"delta":         c,
 					})
 				}
-				// 推理
+				// 推理: 同样先补齐 item added(推理分片历来先于正文), 再发 delta
 				if r, ok := delta["reasoning_content"].(string); ok && r != "" {
+					ensureTextItem()
 					s.event("response.reasoning_summary_text.delta", map[string]any{
 						"type":          "response.reasoning_summary_text.delta",
 						"item_id":       s.msgID,

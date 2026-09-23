@@ -285,11 +285,18 @@ func TestStripUnsupported_azure_non_mini_untouched(t *testing.T) {
 }
 
 func TestStripUnsupported_clamp_ignores_non_numeric(t *testing.T) {
-	// :132 `if (typeof value === "number" ...)` —— 非数字不处理
+	// 我方差异 (param_support.go applyMaxOutputClamp): 纯数字字符串会经 toFloat64
+	// 解析后 clamp —— IDE/SDK 常发 "1000" 形态, 断言 float64 会让上限校验整体失效;
+	// 真正的非数字值仍然不动。
 	body := map[string]any{"max_tokens": "65536"}
 	stripUnsupportedParams("volcengine", "kimi-k2-5-260127", body)
-	if body["max_tokens"] != "65536" {
-		t.Fatalf("字符串形态不应被改动, got %#v", body["max_tokens"])
+	if body["max_tokens"] != float64(32768) {
+		t.Fatalf("数字字符串应被 clamp 到 32768, got %#v", body["max_tokens"])
+	}
+	body = map[string]any{"max_tokens": "many"}
+	stripUnsupportedParams("volcengine", "kimi-k2-5-260127", body)
+	if body["max_tokens"] != "many" {
+		t.Fatalf("非数字值不应被改动, got %#v", body["max_tokens"])
 	}
 }
 

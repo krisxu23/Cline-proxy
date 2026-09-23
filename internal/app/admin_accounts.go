@@ -11,8 +11,28 @@ import (
 	"log"
 	"net/http"
 	"strings"
+	"sync/atomic"
 	"time"
 )
+
+// uidSeq newUID 的进程内序号, 见 newUID。
+var uidSeq int64
+
+// newUID 生成带前缀的唯一 ID。
+// 原来用毫秒时间戳作 ID: 同毫秒并发创建即碰撞(P2)—— 两个面板标签页同时导入
+// 得到同一 AccountID, getAccountByID/removeAccount 首个匹配就返回/删除, 操作错
+// 账号且第二个永远点不掉; 同毫秒两次 OAuth start 也会互相顶掉对方的会话。
+// 时间戳 + 进程内原子序号在进程内必不重复, 重启之间由时间戳前进保证。
+func newUID(prefix string) string {
+	return fmt.Sprintf("%s_%d_%d", prefix, time.Now().UnixMilli(), atomic.AddInt64(&uidSeq, 1))
+}
+
+// sanitizeEmail 入库前把 email 里的换行换成空格。
+// 含 \r\n 的 email 会经 refresh-all 等日志点伪造日志行(日志注入, P3)——
+// 在入口统一清洗, 取代逐个打印点各自处理。
+func sanitizeEmail(s string) string {
+	return strings.NewReplacer("\r", " ", "\n", " ").Replace(s)
+}
 
 // GET /admin/api/accounts
 func handleAdminAccounts(w http.ResponseWriter, r *http.Request) {
@@ -68,9 +88,10 @@ func handleAdminAccountAdd(w http.ResponseWriter, r *http.Request) {
 	if req.Email == "" {
 		req.Email = fmt.Sprintf("user_%d", len(poolSnapshot().Accounts)+1)
 	}
+	req.Email = sanitizeEmail(req.Email)
 
 	acc := &Account{
-		AccountID:    fmt.Sprintf("acc_%d", time.Now().UnixMilli()),
+		AccountID:    newUID("acc"),
 		Email:        req.Email,
 		RefreshToken: req.RefreshToken,
 		AccessToken:  "workos:" + resp.Data.AccessToken,
@@ -83,8 +104,8 @@ func handleAdminAccountAdd(w http.ResponseWriter, r *http.Request) {
 	}
 
 	addAccount(acc)
-	// %q + 去换行: 含 \n 的 email 可伪造日志行(日志注入, P3-10)。
-	log.Printf("Account added via API: %q", strings.NewReplacer("\r", " ", "\n", " ").Replace(req.Email))
+	// email 已在入口 sanitizeEmail 统一去换行(日志注入, P3-10);%q 兜底引号包裹。
+	log.Printf("Account added via API: %q", req.Email)
 
 	writeAPI(w, http.StatusOK, apiResponse{
 		Success: true,
@@ -124,6 +145,8 @@ func handleAdminAccountDelete(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if removeAccount(req.AccountID) {
+		// 破坏性操作留痕(审计 P3): 谁删了哪个账号。
+		log.Printf("Account deleted: %s", req.AccountID)
 		writeAPI(w, http.StatusOK, apiResponse{Success: true, Message: "Account deleted"})
 	} else {
 		writeAPI(w, http.StatusNotFound, apiResponse{Error: "Account not found"})
@@ -148,7 +171,7 @@ func handleOAuthStart(w http.ResponseWriter, r *http.Request) {
 		authURL = device.VerificationURI
 	}
 
-	sessionID := fmt.Sprintf("oauth_%d", time.Now().UnixMilli())
+	sessionID := newUID("oauth")
 	state := &oauthSessionState{
 		DeviceCode: device.DeviceCode,
 		UserCode:   device.UserCode,
@@ -197,9 +220,10 @@ func handleOAuthStart(w http.ResponseWriter, r *http.Request) {
 		if reg.Data.UserInfo != nil && reg.Data.UserInfo.Email != "" {
 			email = reg.Data.UserInfo.Email
 		}
+		email = sanitizeEmail(email)
 
 		acc := &Account{
-			AccountID:    fmt.Sprintf("acc_%d", time.Now().UnixMilli()),
+			AccountID:    newUID("acc"),
 			Email:        email,
 			RefreshToken: reg.Data.RefreshToken,
 			AccessToken:  "workos:" + reg.Data.AccessToken,
@@ -304,6 +328,8 @@ func handleSSOImport(w http.ResponseWriter, r *http.Request) {
 		writeAPI(w, http.StatusBadRequest, apiResponse{Error: "invalid JSON"})
 		return
 	}
+	// email 入口统一清洗: failEmail 错误行与入库共用同一来源(P3)。
+	req.Email = sanitizeEmail(req.Email)
 
 	if req.SSOCookies == "" {
 		writeAPI(w, http.StatusBadRequest, apiResponse{Error: "ssoCookies is required"})
@@ -345,7 +371,7 @@ func handleSSOImport(w http.ResponseWriter, r *http.Request) {
 			}
 
 			acc := &Account{
-				AccountID:    fmt.Sprintf("acc_%d", time.Now().UnixMilli()),
+				AccountID:    newUID("acc"),
 				Email:        email,
 				RefreshToken: token,
 				AccessToken:  "workos:" + resp.Data.AccessToken,
@@ -409,6 +435,7 @@ func handleBatchImport(w http.ResponseWriter, r *http.Request) {
 		if t.RefreshToken == "" {
 			continue
 		}
+		t.Email = sanitizeEmail(t.Email)
 		resp, err := cline.RefreshClineToken(t.RefreshToken)
 		if err != nil {
 			errors = append(errors, fmt.Sprintf("%s: %v", t.Email, err))
@@ -419,7 +446,7 @@ func handleBatchImport(w http.ResponseWriter, r *http.Request) {
 			email = fmt.Sprintf("batch_%d", time.Now().UnixMilli())
 		}
 		acc := &Account{
-			AccountID:    fmt.Sprintf("acc_%d", time.Now().UnixMilli()),
+			AccountID:    newUID("acc"),
 			Email:        email,
 			RefreshToken: t.RefreshToken,
 			AccessToken:  "workos:" + resp.Data.AccessToken,
@@ -466,10 +493,14 @@ func handleAdminDeleteAll(w http.ResponseWriter, r *http.Request) {
 		writeAPI(w, http.StatusMethodNotAllowed, apiResponse{Error: "method not allowed"})
 		return
 	}
+	p := loadPool()
 	poolMu.Lock()
+	n := len(p.Accounts)
 	pool = &AccountPool{Accounts: []*Account{}, Keys: []string{}}
 	poolMu.Unlock()
 	savePool()
+	// 破坏性操作留痕(审计 P3): 清掉多少、何时清。
+	log.Printf("All accounts deleted (%d)", n)
 	writeAPI(w, http.StatusOK, apiResponse{Success: true, Message: "All accounts deleted"})
 }
 
@@ -584,9 +615,12 @@ func handleAdminAccountTest(w http.ResponseWriter, r *http.Request) {
 // 都会尝试刷新 Token 并发起一次真实探测；成功则清除所有异常状态。
 // 返回的 status: active / cooldown / expired / error
 func testAccount(acc *Account) (map[string]any, string) {
+	// acc 是 getAccountByID 返回的池内活指针, 写方(refreshAccountToken /
+	// markAccountCooldown / pickAccount / bumpUsage)全在 poolMu 内改同批字段;
+	// 锁内快照再解锁使用 —— Status/CooldownUntil 是多字字段, 裸读会 torn read(P1)。
+	poolMu.Lock()
 	prevStatus := acc.Status
-	prevCooldownUntil := acc.CooldownUntil
-	_ = prevCooldownUntil
+	poolMu.Unlock()
 
 	// 取 token（expired/cooldown 也尝试刷新，测试按钮不因状态直接拒绝）
 	token, err := ensureAccountToken(acc)
@@ -595,13 +629,15 @@ func testAccount(acc *Account) (map[string]any, string) {
 		acc.LastReason = "token refresh failed: " + err.Error()
 		acc.Status = "expired"
 		acc.CooldownUntil = time.Time{}
+		reason := acc.LastReason
+		// savePoolLocked 已释放 poolMu(其契约: 调用后不得再 Unlock)——
+		// 此前多出的一次 Unlock 触发 "sync: unlock of unlocked mutex" 直接 fatal(P0)。
 		savePoolLocked()
-		poolMu.Unlock()
 		return map[string]any{
 			"accountId":  acc.AccountID,
 			"email":      acc.Email,
 			"status":     "expired",
-			"reason":     acc.LastReason,
+			"reason":     reason,
 			"prevStatus": prevStatus,
 		}, "expired"
 	}
@@ -644,13 +680,17 @@ func testAccount(acc *Account) (map[string]any, string) {
 	if err != nil {
 		// 网络错误：5 分钟短冷却
 		markAccountCooldown(acc, "network error: "+err.Error(), 5*time.Minute)
+		// markAccountCooldown 释放锁后不再裸读共享字段(P1): 锁内快照结果。
+		poolMu.Lock()
+		reason, until := acc.LastReason, acc.CooldownUntil
+		poolMu.Unlock()
 		return map[string]any{
 			"accountId":     acc.AccountID,
 			"email":         acc.Email,
 			"status":        "cooldown",
-			"reason":        acc.LastReason,
-			"cooldownUntil": acc.CooldownUntil.Format("2006-01-02 15:04:05"),
-			"remaining":     formatDuration(time.Until(acc.CooldownUntil)),
+			"reason":        reason,
+			"cooldownUntil": until.Format("2006-01-02 15:04:05"),
+			"remaining":     formatDuration(time.Until(until)),
 		}, "cooldown"
 	}
 	defer resp.Body.Close()
@@ -666,13 +706,17 @@ func testAccount(acc *Account) (map[string]any, string) {
 		reason := kit.Truncate(bodyStr, 500)
 		markAccountCooldown(acc, "429: "+reason, duration)
 		log.Printf("Test hit 429 on %s, cooldown %v", truncateEmail(acc.Email), duration)
+		// 同上: markAccountCooldown 已释放锁, 锁内快照再读(P1)。
+		poolMu.Lock()
+		why, until := acc.LastReason, acc.CooldownUntil
+		poolMu.Unlock()
 		return map[string]any{
 			"accountId":     acc.AccountID,
 			"email":         acc.Email,
 			"status":        "cooldown",
-			"reason":        acc.LastReason,
-			"cooldownUntil": acc.CooldownUntil.Format("2006-01-02 15:04:05"),
-			"remaining":     formatDuration(time.Until(acc.CooldownUntil)),
+			"reason":        why,
+			"cooldownUntil": until.Format("2006-01-02 15:04:05"),
+			"remaining":     formatDuration(time.Until(until)),
 			"httpStatus":    resp.StatusCode,
 		}, "cooldown"
 	}
@@ -682,13 +726,14 @@ func testAccount(acc *Account) (map[string]any, string) {
 		acc.Status = "expired"
 		acc.LastReason = "401 unauthorized"
 		acc.CooldownUntil = time.Time{}
+		reason := acc.LastReason
+		// savePoolLocked 已释放 poolMu, 不得再 Unlock(P0)。
 		savePoolLocked()
-		poolMu.Unlock()
 		return map[string]any{
 			"accountId":  acc.AccountID,
 			"email":      acc.Email,
 			"status":     "expired",
-			"reason":     acc.LastReason,
+			"reason":     reason,
 			"httpStatus": resp.StatusCode,
 		}, "expired"
 	}

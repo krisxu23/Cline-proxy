@@ -37,7 +37,7 @@ var (
 	nodeMu        sync.Mutex
 	nodeBox       nodeBoxInstance
 	nodePorts     map[string]int // 节点链接(去 # 名称) -> 本地 mixed 端口
-	nodePortsKeys string         // 当前运行实例对应的链接集合, 用于配置变化比对
+	nodePortsKeys string         // 当前运行实例的链接集合 + 构建指纹(nodeBuildFingerprint), 用于配置变化比对
 	catchAllPort  int            // 常驻 catch-all 入站的本地端口(0 = 未就绪)
 )
 
@@ -159,6 +159,21 @@ func nodeBoxSkipRequested() bool {
 // "节点全部 0 可用"事故的直接原因之一。
 var nodeBuildMu sync.Mutex
 
+// nodeBuildFingerprint 除节点链接外的全部构建输入指纹: DNS 模式 + 自定义 DoH
+// 地址 + 排除关键词。拼进 syncNodeBox 的早退判据 —— 这些输入不改变链接集合,
+// 只比集合会让 DNS/关键词变更命中早退、静默不生效(P1: admin_zen 注释明言
+// "DNS 段变了要重建单例", 实际空转)。关键词按生效形态归一(去空白、转小写、
+// 跳过空项), 等价写法不触发无谓重建。
+func nodeBuildFingerprint(cfg *zenConfigData) string {
+	parts := []string{normalizeDNSMode(cfg.DNSMode), strings.TrimSpace(cfg.DNSCustomDNS)}
+	for _, k := range cfg.NodeExcludeKeywords {
+		if k = strings.ToLower(strings.TrimSpace(k)); k != "" {
+			parts = append(parts, "kw:"+k)
+		}
+	}
+	return strings.Join(parts, "\x00")
+}
+
 func syncNodeBox() {
 	nodeBuildMu.Lock()
 	defer nodeBuildMu.Unlock()
@@ -209,10 +224,13 @@ func syncNodeBox() {
 		}
 	}
 	sort.Strings(keys)
-	joined := strings.Join(keys, "|")
-	// 链接集合没变且实例已在, 无需重建。注意必须同时判断实例存在:
-	// 零节点启动时 joined 与初值都是空串, 但实例还没建, 要建出只含
-	// catch-all 的实例(直连模式也要经过 sing-box)。
+	// 早退判据 = 链接集合 + 构建指纹: DNS 模式/自定义 DoH/排除关键词不改变链接
+	// 集合, 只比集合会让这些变更命中早退、静默不生效(P1)。任一构建输入变化
+	// 都必须触发重建。
+	joined := strings.Join(keys, "|") + "\x00" + nodeBuildFingerprint(cfg)
+	// 判据没变且实例已在, 无需重建。注意必须同时判断实例存在 ——
+	// 启动期(nodeBox 为 nil)哪怕判据相同也要建出只含 catch-all 的实例
+	// (直连模式也要经过 sing-box)。
 	if joined == nodePortsKeys && nodeBox != nil {
 		nodeMu.Unlock()
 		return
@@ -225,6 +243,14 @@ func syncNodeBox() {
 	// ---- 构建阶段: 锁外完成可达秒级的 I/O(freeLocalPort / box.New / Start) ----
 	// 三条失败路径均不修改全局状态: 旧实例继续服务, 出口池不被清空, catch-all 保留旧值。
 	ports, inbounds, outbounds, rules, endpoints := buildNodeParts(entries)
+	// 构建后守卫(空入口守卫的延伸, P2): 条目非空却全部被关键词/解析/校验剔除时,
+	// buildNodeParts 返回 0 出口 —— 照常替换会用"仅 catch-all"实例顶掉在服实例,
+	// 探测循环因"没有可检测的出口"跳过、面板全部 0 可用(与空入口守卫同一实测
+	// 事故), 且下次 sync 因判据未变持续早退。按 failKeepOld 语义保留旧实例。
+	if len(entries) > 0 && len(ports) == 0 && hasPrev {
+		log.Printf("  nodes: 构建产出 0 出口(条目 %d 个全部被过滤或剔除), 保留上一个可用实例(%d 个出口)继续服务", len(entries), len(prevPorts))
+		return
+	}
 	// hasMap(entries 是否含订阅原始 map 出站)改由调用方判定: buildNodeParts 的
 	// 返回位腾给了 endpoints(P3-6)。语义不变 —— 只要入口里有 map 条目, 全量构建
 	// 失败时就允许退回"仅手动节点链接"重建。
@@ -312,6 +338,11 @@ func syncNodeBox() {
 		if len(prevPorts) == 0 && len(entries) > 0 {
 			go func() {
 				time.Sleep(30 * time.Second)
+				// 退出流程已把 nodeBox 摘成 nil: 此时再 sync 会在替换分支的
+				// nil==nil 判定下把新实例装回全局, 与退出设计的丢弃分支相悖(P3)。
+				if appRootCtx.Err() != nil {
+					return
+				}
 				syncNodeBox()
 			}()
 		}
@@ -611,9 +642,9 @@ func sanitizeOutboundTLS(ob map[string]any) {
 }
 
 // nodeExcludedByFilter 订阅过滤管道(P2): 节点显示名命中排除关键词(不区分
-// 大小写)即返回 true。关键词来自配置 nodeExcludeKeywords, 面板可编辑。
-func nodeExcludedByFilter(displayName string) bool {
-	kws := getZenConfig().NodeExcludeKeywords
+// 大小写)即返回 true。关键词由调用方传入(构建期在循环外取一次配置, 避免每
+// 节点深拷贝整份配置), 来自配置 nodeExcludeKeywords, 面板可编辑。
+func nodeExcludedByFilter(kws []string, displayName string) bool {
 	if len(kws) == 0 {
 		return false
 	}

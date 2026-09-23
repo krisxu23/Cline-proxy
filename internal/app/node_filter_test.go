@@ -26,15 +26,16 @@ func TestNodeExcludedByFilter(t *testing.T) {
 		"US 剩余流量 10G":   true,
 		"🇸🇬 SG-premium": false,
 	}
+	kws := getZenConfig().NodeExcludeKeywords
 	for name, want := range cases {
-		if got := nodeExcludedByFilter(name); got != want {
+		if got := nodeExcludedByFilter(kws, name); got != want {
 			t.Fatalf("nodeExcludedByFilter(%q)=%v, want %v", name, got, want)
 		}
 	}
 	next = getZenConfig().clone()
 	next.NodeExcludeKeywords = nil
 	setZenConfig(next)
-	if nodeExcludedByFilter("任意 节点") {
+	if nodeExcludedByFilter(getZenConfig().NodeExcludeKeywords, "任意 节点") {
 		t.Fatal("无关键词时不应过滤")
 	}
 }

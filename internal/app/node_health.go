@@ -48,18 +48,6 @@ func healthCheckTargets() []string {
 	return hosts
 }
 
-// checkNodeHealth 经单个节点出口跑增强测试(活性/出口IP/测速/MITM/分类)。
-// 增强测试的"健康"判定: 活且无 MITM 劫持且未**真断流**。
-// 2026-09-22 审查后 IsStalled 只在读空闲 >3s 时为真: 测速端点全挂
-// (SpeedTestFailed)与慢速(<nodeSpeedSlowBPS)都不再判死, 后者由选路降权兜底。
-// 上游可达性矩阵(probeUpstreamMatrixAsync)仍独立运行, 两者互补。
-func checkNodeHealth(key string) bool {
-	r := testNodeComprehensiveFn(key)
-	// 健康 = 节点存活 + 无 MITM 劫持 + 未真断流
-	ok := r.Alive && !r.MITMRisk && !r.IsStalled
-	return ok
-}
-
 // pruneStaleNodeHealth 删除健康表里不在当前出口池中的残留条目。
 // 订阅删除节点后, 旧 key 永远不会再被 record 覆写或清理 —— 见调用点注释。
 func pruneStaleNodeHealth(active []string) {
@@ -120,6 +108,10 @@ func checkAllNodeHealth() {
 		log.Printf("  nodes: 没有可检测的出口(sing-box 实例未就绪), 本轮检测跳过")
 		return
 	}
+	// 冷却表/429 计数/国家映射与健康表同一时机按 active 集合清理(审查 P3):
+	// 订阅摘除的 key 在这三张表里同样只增不减, 永久驻留。放在空池早退之后 ——
+	// 空池是 sing-box 实例故障不是订阅摘除, 此时清表会把仍在生效的 429 冷却误删。
+	pruneStaleExitKeys(keys)
 	// 并发随规模走: 固定 10 并发跑 800+ 节点, 一轮要几十分钟, 远超 30 分钟周期,
 	// 导致绝大多数节点在两次周期之间始终没被测到。
 	workers := nodeTestWorkers
@@ -200,8 +192,44 @@ func checkAllNodeHealth() {
 	}
 	wg.Wait()
 
-	// 阶段 2: 代表变体连不上(Alive=false)的组, 其余变体**不再探测** —— 同一台
-	// 服务器连不上, 它的 SNI 变体不可能连得上。
+	// 阶段 1.5: 代表失败的组先复探确认, 不让一次瞬态失败(三源同超时抖动、或
+	// 探测恰逢 syncNodeBox 重建 nodePorts)把整组 SNI 变体判死 30 分钟(审查 P2)。
+	// 抽同组 1 个变体复探: 两个都连不上才维持整组判死, 任一成功则回退逐探。
+	// "本地入站未就绪"类失败不级联: 代表的本地 mixed 入站没起来(nodeLocalAddr
+	// 为空, socks5ProxyURL 报 "outbound not running")时, 失败发生在拨本地
+	// sing-box 阶段、与远端服务器无关, 该结果代表不了同组其他变体 —— 直接放行。
+	reprobed := make([]string, len(groups)) // 每组复探过的变体, 阶段 2 跳过不重复探
+	var confirmWg sync.WaitGroup
+	for i := range groups {
+		if !serverDead[i] || len(groups[i]) == 0 {
+			continue
+		}
+		if nodeLocalAddr(groups[i][0]) == "" {
+			serverDead[i] = false
+			continue
+		}
+		if len(groups[i]) < 2 {
+			continue // 独苗组没有可复探的变体, 维持原判定
+		}
+		confirmWg.Add(1)
+		go func(i int) {
+			defer confirmWg.Done()
+			alt := groups[i][1]
+			sem <- struct{}{}
+			defer func() { <-sem }()
+			r := testNodeComprehensiveFn(alt)
+			reprobed[i] = alt
+			record(alt, r)
+			// 复探方自己本地入站没就绪时失败发生在本地、不代表远端, 不作为判死确认
+			if r.Alive || nodeLocalAddr(alt) == "" {
+				serverDead[i] = false
+			}
+		}(i)
+	}
+	confirmWg.Wait()
+
+	// 阶段 2: 经复探确认连不上(Alive=false)的组, 其余变体**不再探测** —— 同一台
+	// 服务器连不上, 它的 SNI 变体不可能连得上(代表单次失败只触发阶段 1.5 复探)。
 	// 必须显式记为不可用, 而不是留空: nodeUsable 对"未探测"是按可用处理的,
 	// 留空会让几十个死变体继续参与选路。
 	// (代表探测成功时仍逐个探: SNI 变体在 MITM/测速/断流上确实可能不同。)
@@ -209,6 +237,9 @@ func checkAllNodeHealth() {
 	for i := range groups {
 		if serverDead[i] {
 			for _, k := range groups[i][1:] {
+				if k == reprobed[i] {
+					continue // 复探已 record: 保留完整 Result, 不覆盖成零值也不重复计数
+				}
 				nodeHealthMu.Lock()
 				nodeHealth[k] = nodeHealthState{Ok: false, At: time.Now()}
 				nodeHealthMu.Unlock()
@@ -217,6 +248,9 @@ func checkAllNodeHealth() {
 			continue
 		}
 		for _, k := range groups[i][1:] {
+			if k == reprobed[i] {
+				continue // 复探已记账, 不重复探
+			}
 			wg.Add(1)
 			go func(key string) {
 				defer wg.Done()

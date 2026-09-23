@@ -11,9 +11,14 @@ package app
 // 到达就关闭底层流并让 Read 返回错误, 中继随后走既有的断流收尾路径
 // (合成 finish chunk + [DONE]), 客户端不会拿到"半截流 + 永久挂起"。
 //
-// 实现要点: 用带缓冲的结果 channel + timer 轮询, 避免 goroutine 泄漏 ——
-// 每次 Read 只有一个在途读 goroutine, 且它在返回时会阻塞在 channel 上直到
-// 结果被取走(缓冲 1 保证不泄漏)。
+// 实现要点(终审 P3): **每条流一个常驻读协程**, 而不是每次 Read 起一个 ——
+// 中继层与探测层各包一层, 旧实现稳态每 ~4KiB 上游读 2 次 goroutine spawn/
+// teardown + 2 个 timer + 每字节多拷 2 遍(10MB 流 ≈ 2500+ goroutine 往返)。
+// 现在: 常驻协程读进私有缓冲, 经 channel 交给 Read; 读侧用**同一个 timer**
+// 逐批 reset 后 select 等待。缓冲复用走 ack 握手 —— 消费方排空一批后才放行
+// 下一次底层读, 保证常驻协程绝不会在消费方还引用着旧批时覆盖它(原 per-Read
+// scratch 是为修 -race 而生, 握手是同一保证的零分配形态)。超时/Close 统一走
+// done 通道, 在途读、待发结果、待 ack 三种阻塞点都能退出, 不泄漏协程。
 
 import (
 	"io"
@@ -29,57 +34,162 @@ func streamIdleTimeout() time.Duration {
 	return 90 * time.Second
 }
 
+// idleReadBufSize 常驻读协程的私有缓冲。中继层 bufio 默认 4096、上层
+// controlSanitizingReader 同量级 —— 16KiB 覆盖常见批大小, 偶发更大批由
+// remain 分批交付, 语义不变。
+const idleReadBufSize = 16 << 10
+
+type idleReadResult struct {
+	data []byte // 指向常驻协程的私有缓冲, ack 前不得复用
+	err  error
+}
+
 type idleAbortReader struct {
 	src     io.Closer
 	reader  io.Reader
 	timeout time.Duration
 
-	mu     sync.Mutex
-	closed bool
+	resCh  chan idleReadResult // 常驻协程 → 消费方: 一批结果
+	ackCh  chan struct{}       // 消费方 → 常驻协程: 该批已排空, 可复用缓冲
+	doneCh chan struct{}       // Close/超时后所有阻塞点的退出通道
 	once   sync.Once
+
+	timer *time.Timer // 单 timer, 每次等待前 reset(终审 P3)
+
+	remain    []byte // 已收到但尚未交付给调用方的余量
+	remainErr error  // remain 排空后要上抛的终端错误(io.EOF / 底层错误)
+	terminal  error  // 终端错误已上抛, 后续 Read 直接返回
 }
 
 // newIdleAbortReader 包装上游流: 空闲超时即 Close 上游(中断阻塞的读)。
+// 常驻读协程在此启动(每流一个)。
 func newIdleAbortReader(rc io.ReadCloser, timeout time.Duration) *idleAbortReader {
 	if timeout <= 0 {
 		timeout = 90 * time.Second
 	}
-	return &idleAbortReader{src: rc, reader: rc, timeout: timeout}
+	r := &idleAbortReader{
+		src:     rc,
+		reader:  rc,
+		timeout: timeout,
+		resCh:   make(chan idleReadResult),
+		ackCh:   make(chan struct{}),
+		doneCh:  make(chan struct{}),
+		timer:   time.NewTimer(timeout),
+	}
+	if !r.timer.Stop() {
+		<-r.timer.C
+	}
+	go r.pump()
+	return r
+}
+
+// pump 常驻读协程: 读一批 → 发送 → 等 ack(复用保护) → 下一批。
+// 三个阻塞点(发送、等 ack、底层读)都 select doneCh, Close 后必退。
+func (r *idleAbortReader) pump() {
+	buf := make([]byte, idleReadBufSize)
+	for {
+		n, err := r.reader.Read(buf)
+		select {
+		case r.resCh <- idleReadResult{data: buf[:n], err: err}:
+		case <-r.doneCh:
+			return
+		}
+		if err != nil {
+			return // 终端批不复用缓冲, 也无需 ack
+		}
+		select {
+		case <-r.ackCh: // 消费方排空本批后才允许覆盖 buf
+		case <-r.doneCh:
+			return
+		}
+	}
 }
 
 func (r *idleAbortReader) Read(p []byte) (int, error) {
-	// 关键: 在途读必须写进**私有 scratch**而不是调用方的 p —— 超时路径返回后
-	// goroutine 可能仍在读, 若它直接写 p 会与调用方对 p 的后续使用构成数据竞态
-	// (CI 的 -race 在 Linux 上实测抓到; Windows 本地时序不同未触发)。
-	// 私有缓冲 + 缓冲 channel 收口: 超时后 goroutine 正常完成并把结果丢弃,
-	// 不泄漏 goroutine, 也不污染 p。
-	type result struct {
-		n    int
-		err  error
-		data []byte
+	if r.terminal != nil {
+		return 0, r.terminal
 	}
-	scratch := make([]byte, len(p))
-	ch := make(chan result, 1) // 缓冲 1: 即使超时后读才返回也不会泄漏
-	go func() {
-		n, err := r.reader.Read(scratch)
-		ch <- result{n, err, scratch[:n]}
-	}()
-
-	timer := time.NewTimer(r.timeout)
-	defer timer.Stop()
-	select {
-	case res := <-ch:
-		copy(p, res.data)
-		return res.n, res.err
-	case <-timer.C:
-		// 空闲超时: 关闭上游让在途的 Read 立即返回, 并向上报告超时
-		r.mu.Lock()
-		if !r.closed {
-			r.closed = true
-			r.once.Do(func() { _ = r.src.Close() })
+	for {
+		// 已有余量: 先交付, 不碰 channel/timer。
+		if len(r.remain) > 0 {
+			n := copy(p, r.remain)
+			r.remain = r.remain[n:]
+			if len(r.remain) == 0 {
+				if r.remainErr != nil {
+					r.terminal = r.remainErr
+				} else {
+					r.ack() // 本批排空, 放行常驻协程复用缓冲
+				}
+			}
+			return n, nil
 		}
-		r.mu.Unlock()
-		return 0, errStreamIdleTimeout
+
+		armTimer(r.timer, r.timeout)
+		select {
+		case res := <-r.resCh:
+			stopTimer(r.timer)
+			if len(res.data) == 0 && res.err == nil {
+				r.ackCh <- struct{}{} // 空批: 立即放行, 继续等
+				continue
+			}
+			n := copy(p, res.data)
+			rest := res.data[n:]
+			if len(rest) == 0 {
+				if res.err == nil {
+					r.ack()
+				} else if n > 0 {
+					// 批数据已交付, 终端错误留到下一次 Read。
+					r.terminal = res.err
+				} else {
+					return 0, res.err
+				}
+			} else {
+				r.remain = rest
+				r.remainErr = res.err
+			}
+			return n, nil
+		case <-r.timer.C:
+			r.fail(errStreamIdleTimeout)
+			return 0, errStreamIdleTimeout
+		case <-r.doneCh:
+			// Close 先于本批到达: 优雅收尾按 EOF 处理。
+			r.terminal = io.EOF
+			return 0, io.EOF
+		}
+	}
+}
+
+// ack 放行常驻协程复用刚消费完的缓冲(done 已关时协程可能已退出, 不得死等)。
+func (r *idleAbortReader) ack() {
+	select {
+	case r.ackCh <- struct{}{}:
+	case <-r.doneCh:
+	}
+}
+
+// fail 空闲超时: 关上游(中断在途读)+ 关 done(收掉发送/ack 阻塞点),
+// 并把超时错误设为终端 —— 此后 Read 立即复现同一错误, 不会再挂起。
+func (r *idleAbortReader) fail(err error) {
+	r.terminal = err
+	r.closeOnce()
+}
+
+func armTimer(t *time.Timer, d time.Duration) {
+	if !t.Stop() {
+		select {
+		case <-t.C:
+		default: // 已被上一轮 select 消费
+		}
+	}
+	t.Reset(d)
+}
+
+func stopTimer(t *time.Timer) {
+	if !t.Stop() {
+		select {
+		case <-t.C:
+		default:
+		}
 	}
 }
 
@@ -92,15 +202,18 @@ func (e *streamIdleError) Error() string {
 	return "upstream stream idle timeout (no bytes within limit)"
 }
 
-// Close 幂等关闭(中继正常收尾时调用)。
+// Close 幂等关闭(中继正常收尾时调用): 关上游 + 通知常驻协程退出。
 func (r *idleAbortReader) Close() error {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	if r.closed {
-		return nil
-	}
-	r.closed = true
+	r.closeOnce()
+	return nil
+}
+
+func (r *idleAbortReader) closeOnce() {
 	var err error
-	r.once.Do(func() { err = r.src.Close() })
-	return err
+	r.once.Do(func() {
+		close(r.doneCh)
+		err = r.src.Close()
+	})
+	// once 已执行过的并发调用拿不到 err, 与旧实现语义一致(Close 幂等返回 nil)。
+	_ = err
 }

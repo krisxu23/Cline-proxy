@@ -419,7 +419,10 @@ func maybeCompact(ctx context.Context, params map[string]any, m *ZenModel, sessi
 	}
 
 	threshold := context - max(output, buffer)
-	if estimateJSON(params) <= threshold {
+	// 整请求只算一次: 阈值判定与下方 compact 日志共用同一份估算,
+	// 不在请求路径上重复整包 marshal(P3 —— 不改 estimateJSON 定义)。
+	est := estimateJSON(params)
+	if est <= threshold {
 		return compactOutcome{}
 	}
 
@@ -473,7 +476,7 @@ func maybeCompact(ctx context.Context, params map[string]any, m *ZenModel, sessi
 		summaryModel = m.ID
 	}
 	log.Printf("  compact: ctx=%d est=%d > threshold=%d keep=%d split@%d summary_model=%s",
-		context, estimateJSON(params), threshold, keep, sel.split, summaryModel)
+		context, est, threshold, keep, sel.split, summaryModel)
 	summary, err := generateSummary(ctx, summaryModel, prompt, maxSum)
 	if err != nil {
 		log.Printf("  compact: summary generation failed (%v), falling back to truncation", err)

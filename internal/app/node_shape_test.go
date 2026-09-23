@@ -245,7 +245,8 @@ func TestShapeSanitizeRescuesRejectedNodes(t *testing.T) {
 			sanitizeOutboundShape(ob)
 			c.check(t, ob)
 			// 净化后仍必须是结构合法的出站(不能把节点改坏)
-			if err := validateOutboundEntry(ob); err != nil {
+			dnsCfg, resolverTag := buildNodeDNS(getZenConfig())
+			if err := validateOutboundEntry(ob, dnsCfg, resolverTag); err != nil {
 				t.Fatalf("净化后出站结构必须仍合法: %v", err)
 			}
 		})
@@ -266,7 +267,8 @@ func TestShapeSanitizeKeepsGenuinelyInvalidRejected(t *testing.T) {
 	if _, ok := ob["transport"]; !ok {
 		t.Fatal("xhttp 不应被净化剥掉(它语义上不是「无传输层」标记)")
 	}
-	if err := validateOutboundEntry(ob); err == nil {
+	dnsCfg, resolverTag := buildNodeDNS(getZenConfig())
+	if err := validateOutboundEntry(ob, dnsCfg, resolverTag); err == nil {
 		t.Fatal("xhttp 无 sing-box 对应实现, 必须被继续剔除")
 	}
 }
@@ -358,7 +360,8 @@ func TestSanitizeOutboundShapeSSBase64Method(t *testing.T) {
 			"method": b64Userinfo, "password": "garbage",
 		}
 		sanitizeOutboundShape(ob)
-		if err := validateOutboundEntry(ob); err != nil {
+		dnsCfg, resolverTag := buildNodeDNS(getZenConfig())
+		if err := validateOutboundEntry(ob, dnsCfg, resolverTag); err != nil {
 			t.Fatalf("还原后应通过 sing-box 校验(它对 SS method 是真校验的): %v", err)
 		}
 	})

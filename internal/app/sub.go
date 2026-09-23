@@ -3,10 +3,13 @@ package app
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"hash/fnv"
 	"io"
 	"log"
 	"net/http"
+	"net/url"
 	"os"
 	"sort"
 	"strconv"
@@ -82,14 +85,25 @@ func saveSubCache(nodes []any) {
 
 // loadSubCache 启动时恢复上次解析的订阅节点, 无需等待网络
 func loadSubCache() {
-	b, err := os.ReadFile(subCacheFile())
+	path := subCacheFile()
+	b, err := os.ReadFile(path)
 	if err != nil {
+		// 文件不存在是首次启动的正常情况; 其余读失败若不打日志, "重启后出口池空"
+		// 就没有任何线索可查(P3)。
+		if !os.IsNotExist(err) {
+			log.Printf("  订阅缓存读取失败(%s): %v", path, err)
+		}
 		return
 	}
 	var c struct {
 		Nodes []any `json:"nodes"`
 	}
-	if json.Unmarshal(b, &c) == nil && len(c.Nodes) > 0 {
+	if json.Unmarshal(b, &c) != nil {
+		// 文件存在但 JSON 损坏: 原实现静默放弃恢复, 重启后出口池空、日志无线索(P3)。
+		log.Printf("  订阅缓存损坏, 忽略恢复(%s, %d 字节)", path, len(b))
+		return
+	}
+	if len(c.Nodes) > 0 {
 		subMu.Lock()
 		subNodes = c.Nodes
 		rebuildSubKeysLocked()
@@ -120,6 +134,27 @@ func subEntryKey(e any) string {
 	default:
 		return ""
 	}
+}
+
+// subSourceID 订阅源标识: 订阅 URL 的 8 位短哈希。生成订阅内节点 tag 时混入,
+// 避免两个订阅各自的同名/同下标节点共用一个 key、后者在合并去重时被静默丢弃(P2)。
+// 用哈希而非 host: 同 host 不同路径/token 的两条订阅也要互相区分; URL 不变则
+// 标识跨重启稳定(稳定端口表键只在升级换 tag 时漂移一次, 可接受)。
+func subSourceID(u string) string {
+	h := fnv.New32a()
+	_, _ = h.Write([]byte(u))
+	return fmt.Sprintf("%08x", h.Sum32())
+}
+
+// errReasonNoURL 剥掉错误里内嵌的完整请求 URL: *url.Error 的 Error() 形如
+// `Get "https://user:token@host/path?token=…": dial tcp …`, 直接入状态接口或
+// 日志等于把订阅凭据明文外泄(对照 maskURLForLog: 一条落盘等于泄露)。只留内层原因。
+func errReasonNoURL(err error) string {
+	var ue *url.Error
+	if errors.As(err, &ue) && ue.Err != nil {
+		return ue.Err.Error()
+	}
+	return err.Error()
 }
 
 // resolveSubscriptions 抓取全部订阅并重建节点池
@@ -166,9 +201,13 @@ func resolveSubscriptions(urls []string) {
 	for _, u := range clean {
 		nodes, err := fetchSubscription(u)
 		if err != nil {
-			log.Printf("  订阅 %s 抓取失败: %v", maskURLForLog(u), err)
+			// *url.Error 的 Error() 内嵌完整请求 URL(含 userinfo 与 ?token=):
+			// 状态接口会原样回给面板、日志一条落盘等于泄露 —— 只留遮蔽后的 URL
+			// 与剥掉 URL 的内层原因。
+			reason := errReasonNoURL(err)
+			log.Printf("  订阅 %s 抓取失败: %s", maskURLForLog(u), reason)
 			subMu.Lock()
-			subStatus[u] = "❌ 抓取失败: " + err.Error()
+			subStatus[u] = "❌ 抓取失败: " + maskURLForLog(u) + " — " + reason
 			subMu.Unlock()
 			continue
 		}
@@ -298,27 +337,43 @@ func refreshSubsLoop(subs []string) {
 // 抓取失败且打开了"节点全挂时直连兜底"时, 再用 Go 原生直连救一次 ——
 // 订阅是整个出口池的唯一来源, 它不能跟着出口一起死。
 func fetchSubscription(u string) ([]any, error) {
+	// 订阅源标识: 生成订阅内节点 tag 时混入, 让两个订阅的同名/同下标节点各有
+	// 独立 key, 不再在合并去重时被静默丢弃(P2)。
+	src := subSourceID(u)
 	ctx, cancel := context.WithTimeout(context.Background(), subsFetchTimeout)
 	defer cancel()
 	body, err := doFetch(ctx, u, getZenHTTPClient())
 	if err == nil {
-		return parseSubContent(string(body))
+		return parseSubContent(string(body), src)
 	}
 	if !rescueDirectEnabled() {
 		return nil, err
 	}
-	log.Printf("  订阅 %s 经出口抓取失败(%v), 用直连兜底再试一次", maskURLForLog(u), err)
+	log.Printf("  订阅 %s 经出口抓取失败(%s), 用直连兜底再试一次", maskURLForLog(u), errReasonNoURL(err))
 	dctx, dcancel := context.WithTimeout(context.Background(), subsFetchTimeout)
 	defer dcancel()
-	body, err = doFetch(dctx, u, &http.Client{Timeout: subsFetchTimeout})
+	body, err = doFetch(dctx, u, &http.Client{Timeout: subsFetchTimeout, Transport: rescueDirectTransport})
 	if err != nil {
 		return nil, err
 	}
-	return parseSubContent(string(body))
+	return parseSubContent(string(body), src)
 }
+
+// rescueDirectTransport 直连兜底抓取专用: DefaultTransport 克隆 + dialWithSSRFGuard。
+// 主路径经 zenTransport(其基础拨号统一挂 guard); 兜底路径不经它, 这里单独接上,
+// 否则兜底拨号就是 SSRF 防线的缺口。共享单例而非每次抓取克隆 —— 复用连接池,
+// 免得每次兜底新建一个池、旧池的空闲连接无人回收。
+var rescueDirectTransport = func() *http.Transport {
+	tr := http.DefaultTransport.(*http.Transport).Clone()
+	tr.DialContext = dialWithSSRFGuard(tr.DialContext)
+	return tr
+}()
 
 // subsFetchTimeout 单次订阅抓取的整体超时。
 const subsFetchTimeout = 60 * time.Second
+
+// subMaxBodyBytes 单个订阅响应体的读取上限(8MiB)。
+const subMaxBodyBytes = 8 << 20
 
 func doFetch(ctx context.Context, u string, client *http.Client) ([]byte, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
@@ -335,20 +390,30 @@ func doFetch(ctx context.Context, u string, client *http.Client) ([]byte, error)
 	if resp.StatusCode != http.StatusOK {
 		return nil, fmt.Errorf("HTTP %d", resp.StatusCode)
 	}
-	return io.ReadAll(io.LimitReader(resp.Body, 8<<20))
+	// 读 limit+1 判触顶: 直接 LimitReader(8MiB) 会把超大订阅静默截断, 截断结果
+	// 照常解析出前 N 条并记"✅ N 节点", 尾部节点无声丢失(P3)。
+	b, err := io.ReadAll(io.LimitReader(resp.Body, subMaxBodyBytes+1))
+	if err != nil {
+		return nil, err
+	}
+	if len(b) > subMaxBodyBytes {
+		return nil, fmt.Errorf("订阅内容超过 %dMiB 上限", subMaxBodyBytes>>20)
+	}
+	return b, nil
 }
 
-// parseSubContent 识别订阅内容格式并解析为节点列表
-func parseSubContent(body string) ([]any, error) {
+// parseSubContent 识别订阅内容格式并解析为节点列表。
+// src 是订阅源标识(subSourceID), 传给 map 类内容生成带命名空间的 tag。
+func parseSubContent(body string, src string) ([]any, error) {
 	trimmed := strings.TrimSpace(body)
 	if trimmed == "" {
 		return nil, fmt.Errorf("订阅内容为空")
 	}
 	if strings.HasPrefix(trimmed, "{") {
-		return parseSingBoxSub(trimmed)
+		return parseSingBoxSub(trimmed, src)
 	}
 	if strings.Contains(trimmed, "\nproxies:") || strings.HasPrefix(trimmed, "proxies:") {
-		if nodes, err := parseClashSub(trimmed); err == nil && len(nodes) > 0 {
+		if nodes, err := parseClashSub(trimmed, src); err == nil && len(nodes) > 0 {
 			return nodes, nil
 		}
 	}
@@ -408,7 +473,9 @@ func isNodeOrProxyLine(line string) bool {
 }
 
 // parseSingBoxSub sing-box JSON 配置: 取可用出站(跳过 direct/block/分组等)
-func parseSingBoxSub(body string) ([]any, error) {
+// tag 混入订阅源标识(src): 两个订阅各自含同名节点时键必须独立, 否则后者在
+// resolveSubscriptions 合并去重时被静默丢弃(P2)。
+func parseSingBoxSub(body string, src string) ([]any, error) {
 	var cfg struct {
 		Outbounds []map[string]any `json:"outbounds"`
 	}
@@ -427,7 +494,7 @@ func parseSingBoxSub(body string) ([]any, error) {
 		if name == "" {
 			name = fmt.Sprint(ob["server"])
 		}
-		tag := "sub-" + sanitizeNodeName(name)
+		tag := "sub-" + src + "-" + sanitizeNodeName(name)
 		for used[tag] {
 			tag += "x"
 		}
@@ -451,7 +518,7 @@ func sanitizeNodeName(s string) string {
 }
 
 // parseClashSub Clash YAML proxies → sing-box 出站
-func parseClashSub(body string) ([]any, error) {
+func parseClashSub(body string, src string) ([]any, error) {
 	var doc struct {
 		Proxies []map[string]any `yaml:"proxies"`
 	}
@@ -461,7 +528,7 @@ func parseClashSub(body string) ([]any, error) {
 	var nodes []any
 	used := map[string]bool{}
 	for i, m := range doc.Proxies {
-		ob, err := clashToOutbound(m, i)
+		ob, err := clashToOutbound(m, i, src)
 		if err != nil {
 			log.Printf("  订阅: 跳过 Clash 节点 %v: %v", m["name"], err)
 			continue
@@ -481,7 +548,8 @@ func parseClashSub(body string) ([]any, error) {
 }
 
 // clashToOutbound 常见 Clash 节点字段 → sing-box 出站配置
-func clashToOutbound(m map[string]any, i int) (map[string]any, error) {
+// src 为订阅源标识, 混入 tag 使跨订阅的同名/同下标节点键独立(P2, 见 parseClashSub)。
+func clashToOutbound(m map[string]any, i int, src string) (map[string]any, error) {
 	typ, _ := m["type"].(string)
 	server, _ := m["server"].(string)
 	port, err := yInt(m["port"])
@@ -489,7 +557,7 @@ func clashToOutbound(m map[string]any, i int) (map[string]any, error) {
 		return nil, fmt.Errorf("bad server/port")
 	}
 	name, _ := m["name"].(string)
-	tag := fmt.Sprintf("sub-%d-%s", i, sanitizeNodeName(name))
+	tag := fmt.Sprintf("sub-%s-%d-%s", src, i, sanitizeNodeName(name))
 	ob := map[string]any{"tag": tag, "server": server, "server_port": port}
 	tls := clashTLS(m, server, typ)
 	switch typ {
@@ -497,7 +565,9 @@ func clashToOutbound(m map[string]any, i int) (map[string]any, error) {
 		cipher, _ := m["cipher"].(string)
 		password, _ := m["password"].(string)
 		ob["type"] = "shadowsocks"
-		ob["method"] = cipher
+		// 大写/别名 cipher 与分享链接路径同规归一, 否则 sing-box 不认、
+		// 整条节点被 validateOutboundEntry 剔除(P2)。
+		ob["method"] = normalizeSSMethod(cipher)
 		ob["password"] = password
 		if pname, _ := m["plugin"].(string); pname != "" {
 			ob["plugin"] = clashPluginName(pname)
@@ -742,11 +812,6 @@ func yInt(v any) (int, error) {
 	default:
 		return 0, fmt.Errorf("not a number")
 	}
-}
-
-func yBool(v any) bool {
-	b, _ := v.(bool)
-	return b
 }
 
 func yStrList(v any) []string {

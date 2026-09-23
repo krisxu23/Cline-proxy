@@ -7,6 +7,8 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"golang.org/x/net/http2"
+	"io"
 	"log"
 	"net/http"
 	"strings"
@@ -20,6 +22,35 @@ import (
 // 且循环顶的 ctx 检查打不断它。超过上限就不再占槽干等, 直接把 429 交还
 // 客户端自重试(与冷却表侧 zenQuotaRetryAfterCap 同口径, P1-4)。
 const zenRetryAfterMaxWait = 60 * time.Second
+
+// zenAttemptHeaderTimeout 单次 attempt 等待响应头的上限 —— 对齐主 transport
+// 的 ResponseHeaderTimeout(120s, proxy_pool.go)。https 被 RegisterProtocol
+// 整体旁路到裸 http2.Transport, 主 transport 的该字段对 zen 流量不生效:
+// 上游 accept 后不回响应头会把请求连同并发信号量槽(默认 8)一起挂死。
+const zenAttemptHeaderTimeout = 120 * time.Second
+
+// zenAttemptBody 把 attempt 级回收绑到响应体关闭上, 流读取期间二者都不能动:
+//   - cancel: 响应头超时的 cancel; 拿到响应头后已停表, body 关闭即归还资源;
+//   - h2: 地区受限模型每次 attempt 新建的专用 transport(裸 transport 的
+//     IdleConnTimeout 为 0, 客户端侧永不闲置关闭)。挂着流的连接不受
+//     CloseIdleConnections 影响, 流结束归还为闲置后立刻回收 —— 不改变
+//     "每次真实拨号选出口"的语义(transport 依旧每次 attempt 新建)。
+type zenAttemptBody struct {
+	io.ReadCloser
+	cancel context.CancelFunc
+	h2     *http2.Transport
+}
+
+func (b *zenAttemptBody) Close() error {
+	err := b.ReadCloser.Close()
+	if b.cancel != nil {
+		b.cancel()
+	}
+	if b.h2 != nil {
+		b.h2.CloseIdleConnections()
+	}
+	return err
+}
 
 // buildZenBody 构造 zen 请求体:只带 OpenAI 兼容字段,改写模型为 zen ID
 func buildZenBody(params map[string]any, stream bool) map[string]any {
@@ -108,6 +139,8 @@ func callZenAPI(ctx context.Context, params map[string]any, stream bool) (*http.
 		// 失败即返回, 不把畸形请求发给上游。
 		converted, cerr := translateZenMessagesRequest(zenResolvedModel, body, stream)
 		if cerr != nil {
+			// 请求没发出去 → 半开探测无判定, 释放探测标志(见 clearZenProbing)。
+			clearZenProbing()
 			return nil, 0, cerr
 		}
 		body = converted
@@ -126,12 +159,14 @@ func callZenAPI(ctx context.Context, params map[string]any, stream bool) (*http.
 		// 出站体形态不变量(P1-9): 违例说明转换层或整形层有 bug,
 		// 宁可网关 500 也不把畸形请求发给上游换回难以理解的 400。
 		if problems := translate_registry.ValidateOutbound(translate_registry.Responses, body); len(problems) > 0 {
+			clearZenProbing()
 			return nil, 0, fmt.Errorf("responses outbound shape invalid: %s", strings.Join(problems, "; "))
 		}
 	}
 
 	bodyJSON, err := json.Marshal(body)
 	if err != nil {
+		clearZenProbing()
 		return nil, 0, fmt.Errorf("marshal zen body: %w", err)
 	}
 
@@ -146,6 +181,8 @@ func callZenAPI(ctx context.Context, params map[string]any, stream bool) (*http.
 	select {
 	case sem <- struct{}{}:
 	case <-ctx.Done():
+		// 排队中客户端已断开 → 半开探测无判定, 释放探测标志。
+		clearZenProbing()
 		return nil, rateLimited, ctx.Err()
 	}
 	defer func() { <-sem }()
@@ -169,7 +206,9 @@ func callZenAPI(ctx context.Context, params map[string]any, stream bool) (*http.
 
 	for attempt := 0; ; attempt++ {
 		// 客户端已断开(超时/取消): 立即停止, 再重试也没有人接收结果。
+		// 请求未获判定 → 释放半开探测标志(见 clearZenProbing)。
 		if ctx.Err() != nil {
+			clearZenProbing()
 			return nil, rateLimited, fmt.Errorf("zen request aborted: %v", ctx.Err())
 		}
 		// 端点轮换: 第 N 次尝试用第 N % len(baseURLs) 个端点,
@@ -178,8 +217,14 @@ func callZenAPI(ctx context.Context, params map[string]any, stream bool) (*http.
 		// 相对路径由端点形态决定。★ base 已含 /v1, 所以 /messages 端点的相对
 		// 路径是 "/messages" 而不是 "/v1/messages"(后者拼出 .../zen/v1/v1/messages)。
 		endpoint := base + zenEndpoint.pathFor(zenResolvedModel)
-		req, err := http.NewRequestWithContext(ctx, "POST", endpoint, bytes.NewReader(bodyJSON))
+		// attempt 级响应头超时: 只管到响应头(见 zenAttemptHeaderTimeout),
+		// 拿到 resp 即停表, 流式响应体沿用既往的空闲看门狗不额外设限。
+		attemptCtx, cancelAttempt := context.WithCancel(ctx)
+		headerTimer := time.AfterFunc(zenAttemptHeaderTimeout, cancelAttempt)
+		req, err := http.NewRequestWithContext(attemptCtx, "POST", endpoint, bytes.NewReader(bodyJSON))
 		if err != nil {
+			cancelAttempt()
+			clearZenProbing()
 			return nil, rateLimited, fmt.Errorf("create zen request: %w", err)
 		}
 		// 官方 opencode CLI 身份形态(见 opencode_headers.go):
@@ -218,15 +263,23 @@ func callZenAPI(ctx context.Context, params map[string]any, stream bool) (*http.
 		// 被调用 —— 按模型的出口选择被整个绕过, RegionError 403 就是这么来的
 		// (其他 zen 模型不限地区所以正常, 只有受限模型暴露)。
 		// 每次用全新传输真实拨号, 让 zenDialContext 现场选出口。
+		var freshH2 *http2.Transport
 		if isRegionRestrictedModel(zenModelIDOf(params)) {
 			fresh := *client
-			fresh.Transport = zenHTTP2Transport()
+			freshH2 = zenHTTP2Transport()
+			fresh.Transport = freshH2
 			client = &fresh
 		}
 		resp, err := client.Do(req)
+		// 响应头已到(或本次拨号已终局), 停掉响应头超时计时任务。
+		headerTimer.Stop()
 		if err != nil {
-			// 客户端断开导致的取消: 直接终止, 不再重试
+			// attempt 终局: 归还 cancel。成功路径的归还挂在 resp.Body 关闭上
+			// (zenAttemptBody), 流读取期间不能触发。
+			cancelAttempt()
+			// 客户端断开导致的取消: 直接终止, 不再重试。探测无判定, 释放标志。
 			if ctx.Err() != nil {
+				clearZenProbing()
 				return nil, rateLimited, fmt.Errorf("zen request aborted: %v", ctx.Err())
 			}
 			// 网络错误: 冷却本次真实出口(而非全局轮询位置), 立即换出口/端点重试
@@ -236,15 +289,25 @@ func callZenAPI(ctx context.Context, params map[string]any, stream bool) (*http.
 					err, attempt+1, retries, baseURLs[(attempt+1)%len(baseURLs)])
 				continue
 			}
-			// 传输层失败(拨号/socks5/握手/超时)说明的是**出口线路**, 不是模型本身。
+			// 传输层失败(拨号/socks5/握手/超时/响应头超时)说明的是**出口线路**, 不是模型本身。
 			// 此前这里记了一次模型硬失败 —— 出口池大面积失效时, 5 次连败就把一个
 			// 完全健康的免费模型"暂停使用 30 分钟", 它随即从免费模型列表里消失
 			// (2026-09-16 用户实证: opencode 官方客户端里 muse-spark 仍在免费列表,
-			//  我们这边没了)。出口的冷却已由 cooldownActualExit 处理, 这里不记。
-			log.Printf("  zen: 全部出口尝试失败(model=%s, 最后一次: %v) — 属线路故障, 不计入模型健康门",
+			//  我们这边没了)。出口的冷却已由 cooldownActualExit 处理, **模型健康门**
+			// (recordZenModelResult)依旧不计 —— 但**熔断/failover** 计数要进
+			// (markZenFail): DNS 劫持、防火墙封上游这类纯网络故障下若 zenFailCount
+			// 永不增长, Failover=true 也永远切不到健康的 cline 池, 客户端全部吃
+			// 502(终审 P1)。markZenFail 同时收尾半开探测: 探测走网络错误路径
+			// 不会再永久卡住 zenProbing。
+			log.Printf("  zen: 全部出口尝试失败(model=%s, 最后一次: %v) — 属线路故障, 不计入模型健康门, 计入熔断",
 				zenModelIDOf(params), err)
+			markZenFail()
 			return nil, rateLimited, fmt.Errorf("zen request: %w", err)
 		}
+		// 回收钩子(zenAttemptBody): attempt 的 cancel 与地区受限模型专用 h2
+		// transport 都绑到响应体关闭上 —— body 关闭(流结束、连接归还)后立即回收,
+		// 不改变"每次真实拨号选出口"的语义。
+		resp.Body = &zenAttemptBody{ReadCloser: resp.Body, cancel: cancelAttempt, h2: freshH2}
 		if resp.StatusCode == http.StatusOK {
 			markZenSuccess()
 			// 健康门的"成功"记录挪到下方转换与空回合判定全部通过之后:
@@ -350,6 +413,8 @@ func callZenAPI(ctx context.Context, params map[string]any, stream bool) (*http.
 			}
 			log.Printf("  zen: model %s free-tier rejected via %s (重试预算已用完, 等待节点能力探测找出可用出口)",
 				modelID, describeExitRaw(actual))
+			// 上游已回包 → 半开探测已有可达性结论, 释放探测标志(不计熔断)。
+			clearZenProbing()
 			return nil, rateLimited, &zenUpstreamError{Status: resp.StatusCode, Body: kit.Truncate(bodyBytes, 500)}
 		}
 		// 首次遇到地区限制时自动登记该模型, 并触发节点能力探测
@@ -394,10 +459,12 @@ func callZenAPI(ctx context.Context, params map[string]any, stream bool) (*http.
 					log.Printf("  zen rate limited (%d), retry %d/%d after %v (next endpoint: %s)",
 						resp.StatusCode, attempt+1, retries, wait, baseURLs[(attempt+1)%len(baseURLs)])
 					// 睡眠必须可被客户端取消: ctx 已死还继续占槽睡, 只会拖住
-					// 整个并发窗口(信号量容量默认仅 8)。取消时立即返回。
+					// 整个并发窗口(信号量容量默认仅 8)。取消时立即返回 ——
+					// 半开探测已收到 429 但终局未到, 客户端取消视为无判定。
 					select {
 					case <-time.After(kit.WithRetryJitter(wait)):
 					case <-ctx.Done():
+						clearZenProbing()
 						return nil, rateLimited, fmt.Errorf("zen request aborted: %v", ctx.Err())
 					}
 					delay *= 2
@@ -430,6 +497,11 @@ func callZenAPI(ctx context.Context, params map[string]any, stream bool) (*http.
 					if problems := translate_registry.ValidateOutbound(translate_registry.Responses, altBody); len(problems) == 0 {
 						if alt := tryZenResponsesFallback(ctx, base, altBody, stream, client, reqKey, zenBudget); alt != nil {
 							markZenSuccess()
+							// 回退响应同样跑在地区专用 transport 上(若本次是
+							// fresh): 挂同样的连接回收钩子, 否则该连接无人关闭。
+							if freshH2 != nil {
+								alt.Body = &zenAttemptBody{ReadCloser: alt.Body, h2: freshH2}
+							}
 							recordZenModelResult(zenModelIDOf(params), false)
 							return alt, rateLimited, nil
 						}
@@ -439,6 +511,9 @@ func callZenAPI(ctx context.Context, params map[string]any, stream bool) (*http.
 					msgTried = true
 					if alt := tryZenMessagesFallback(ctx, base, body, stream, client, reqKey); alt != nil {
 						markZenSuccess()
+						if freshH2 != nil {
+							alt.Body = &zenAttemptBody{ReadCloser: alt.Body, h2: freshH2}
+						}
 						recordZenModelResult(zenModelIDOf(params), false)
 						return alt, rateLimited, nil
 					}
@@ -485,6 +560,11 @@ func zenErrorStatus(err error) int {
 func markZenFailOnStatus(status int) {
 	if status >= http.StatusInternalServerError || status == http.StatusRequestTimeout || status == http.StatusTooManyRequests {
 		markZenFail()
+	} else {
+		// 客户端类错误不计熔断, 但"上游能回包"已是半开探测的可达性结论 ——
+		// 清掉探测在途标志, 免得一次性 CAS 放行后 zenProbing 永久卡住
+		// (含 401/地区受限 403 耗尽预算后落到这里的终局)。
+		clearZenProbing()
 	}
 }
 

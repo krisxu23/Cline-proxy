@@ -209,10 +209,7 @@ var toolShims = map[string]shimFn{
 			return input
 		}
 		// `const patched = { ...input };`
-		patched := make(map[string]any, len(obj))
-		for k, v := range obj {
-			patched[k] = v
-		}
+		patched := shallowCopyRecord(obj)
 		sanitizeReadArgs(patched)
 		return patched
 	},
@@ -227,10 +224,7 @@ var toolShims = map[string]shimFn{
 		if !ok {
 			return input
 		}
-		patched := make(map[string]any, len(obj)+2)
-		for k, v := range obj {
-			patched[k] = v
-		}
+		patched := shallowCopyRecord(obj)
 		// ★ 顺序是照抄的: 先 functionalChanges, 后 findings。
 		//   两个键**无条件写入**(即使原本不存在)。
 		for _, key := range []string{"functionalChanges", "findings"} {

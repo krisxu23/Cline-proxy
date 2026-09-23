@@ -647,7 +647,7 @@ func AddAccountFromDeviceAuth() (*Account, error) {
 	}
 
 	acc := &Account{
-		AccountID:    fmt.Sprintf("acc_%d", time.Now().UnixMilli()),
+		AccountID:    newUID("acc"),
 		Email:        email,
 		RefreshToken: reg.Data.RefreshToken,
 		AccessToken:  "workos:" + reg.Data.AccessToken,

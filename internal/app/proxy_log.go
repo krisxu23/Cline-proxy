@@ -116,6 +116,7 @@ func (w *logFanout) truncateIfNeeded() {
 var (
 	streamLogMu   sync.Mutex
 	streamLogFile *os.File
+	streamLogSize int64 // 终审 P3: 内存字节计数(仅 streamLogMu 保护), 消掉每次写前的 Stat
 )
 
 // streamLogFileName 流式诊断日志文件名。截断需要按路径重新开句柄(见 writeStreamLog),
@@ -131,17 +132,28 @@ func writeStreamLog(line string) {
 			return
 		}
 		streamLogFile = f
+		// 打开时 Stat 一次建立基线 —— 每打开一次仅一次, 不在写路径上(终审 P3)。
+		if st, serr := f.Stat(); serr == nil {
+			streamLogSize = st.Size()
+		} else {
+			streamLogSize = 0
+		}
 	}
 	// 超过上限则截断成空, 只保留最近内容(与 cline-proxy.log 的轮转思路一致)。
-	if st, serr := streamLogFile.Stat(); serr == nil && st.Size() > maxLogBytes {
-		// 必须用 os.Truncate 而不是句柄级 Truncate: O_APPEND 句柄在 Windows 上
+	// 终审 P3: 用内存计数代替此前**每次写**前的 Stat —— 该调用点在每个 SSE 事件上,
+	// 每帧一次内核调用纯属浪费。
+	if streamLogSize > maxLogBytes {
+		// 必须用 os.Truncate 而不是句柄级截断: O_APPEND 句柄在 Windows 上
 		// 拿不到 GENERIC_WRITE, 句柄级截断会 "Access is denied" —— 旧实现因此
 		// 一直静默失效(详见 logFanout.truncateIfNeeded 的注释)。
 		if terr := os.Truncate(kit.ResolveDataPath(streamLogFileName), 0); terr != nil {
 			log.Printf("streamlog: truncate 失败: %v", terr)
+		} else {
+			streamLogSize = 0
 		}
 	}
-	streamLogFile.WriteString(line)
+	n, _ := streamLogFile.WriteString(line)
+	streamLogSize += int64(n)
 }
 
 func closeStreamLog() {

@@ -14,6 +14,8 @@
 //
 // Source-of-truth modules:
 //   - streaming.go: SSE normalization and choice-block guards.
-//   - openai_anthropic.go: Anthropic Messages <-> OpenAI Chat Completions.
-//   - responses_chat.go: OpenAI Responses API <-> Chat Completions.
+//   - normalize.go: OpenAI chunk normalization (metadata stripping).
+//
+// (openai_anthropic.go / responses_chat.go 已删除: 生产零调用, 等价转换在
+// internal/app 侧各自维护 —— 本次终审 P3 死代码清理。)
 package protocol

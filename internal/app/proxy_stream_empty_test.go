@@ -8,20 +8,30 @@ import (
 	"testing"
 )
 
+// mustParsedBody 把测试 JSON 字节解析成判定入参(fullCompletionBodyHasContent 吃已解析 map)。
+func mustParsedBody(t *testing.T, body []byte) map[string]any {
+	t.Helper()
+	m, ok := parseJSONMap(body)
+	if !ok {
+		t.Fatalf("测试 JSON 解析失败: %s", body)
+	}
+	return m
+}
+
 // TestFullCompletionBodyArrayContent 完整 JSON body 的 content 若为数组形态
 // (OpenAI content-parts / 翻译后的 blocks), 任一块带非空 text 即算有内容,
 // 不能把正常回包误判成空壳打 502(2026-09-17 审查 R2-6)。
 func TestFullCompletionBodyArrayContent(t *testing.T) {
 	withText := []byte(`{"choices":[{"message":{"content":[{"type":"text","text":"hello"}]}}]}`)
-	if !fullCompletionBodyHasContent(withText) {
+	if !fullCompletionBodyHasContent(mustParsedBody(t, withText)) {
 		t.Fatal("带非空 text 的 content 数组应判为有内容")
 	}
 	emptyBlocks := []byte(`{"choices":[{"message":{"content":[{"type":"text","text":""}]}}]}`)
-	if fullCompletionBodyHasContent(emptyBlocks) {
+	if fullCompletionBodyHasContent(mustParsedBody(t, emptyBlocks)) {
 		t.Fatal("content 数组里全是空 text 不应判为有内容")
 	}
 	stringContent := []byte(`{"choices":[{"message":{"content":"hello"}}]}`)
-	if !fullCompletionBodyHasContent(stringContent) {
+	if !fullCompletionBodyHasContent(mustParsedBody(t, stringContent)) {
 		t.Fatal("字符串 content 应照旧判为有内容")
 	}
 }

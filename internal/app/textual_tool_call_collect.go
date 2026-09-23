@@ -16,6 +16,7 @@ package app
 import (
 	"encoding/json"
 	"net/http"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -56,32 +57,49 @@ func streamRequestTools(upstream *http.Response) any {
 // 用前缀区分业务 header, 避免与上游真实 header 冲突。
 const streamToolsHeaderName = "X-Cline-Proxy-Client-Tools"
 
-// attachStreamRequestTools 把 body["tools"] 序列化后挂到出站请求头。
+// snapshotStreamRequestTools 在 cloak/remap 等网关改写**之前**把 body["tools"]
+// 序列化成 header 值快照。
+//
+// 为什么必须"取数即序列化"而不是存 tools 引用、发送时再序列化:
+// remapToolNamesInRequest 会**就地**改写共享 tool map 的 name(cloak 虽换新数组,
+// 但它排在 remap 之后), 发送时再取到的已是改写后的名字。白名单必须是
+// cloak/remap 前的**客户端原始工具名** —— providers_chat.go 在 remap 之前取快照。
+//
+// 无 tools / 空 / 非数组 / 序列化失败 → 返回 "" —— 读回时为 nil, 等价于参考实现
+// 返回 null(不做白名单过滤)。
+func snapshotStreamRequestTools(body map[string]any) string {
+	tools, ok := body["tools"]
+	if !ok || tools == nil {
+		return ""
+	}
+	arr, ok := tools.([]any)
+	if !ok || len(arr) == 0 {
+		return ""
+	}
+	b, err := json.Marshal(arr)
+	if err != nil {
+		return ""
+	}
+	return string(b)
+}
+
+// attachStreamRequestTools 把快照挂到出站请求头。
+//
+// 拆成"快照/挂载"两段的原因: 出站请求每个 attempt 都要重建(见 providers_chat
+// 的 send 闭包), 快照只能在改写前取一次, 挂载则要在每次发送前做。
 //
 // 为什么用 header 而不是直接传 body: handleStreamResponseWithUsage 只拿到
 // *http.Response, 拿不到原始请求体; 而 http.Response.Request 会保留出站请求,
 // 于是可以在这里把 tools 顺带捎过去。判定逻辑本身照抄参考实现, 只有取数通道
 // 是为适配我方函数签名而选定的。
 //
-// tools 为空/非法时什么都不做 —— 读回时为 nil, 等价于参考实现返回 null
+// req 为 nil 或快照为空时什么都不做 —— 读回时为 nil, 等价于参考实现返回 null
 // (不做白名单过滤)。
-func attachStreamRequestTools(req *http.Request, body map[string]any) {
-	if req == nil {
+func attachStreamRequestTools(req *http.Request, snapshot string) {
+	if req == nil || snapshot == "" {
 		return
 	}
-	tools, ok := body["tools"]
-	if !ok || tools == nil {
-		return
-	}
-	arr, ok := tools.([]any)
-	if !ok || len(arr) == 0 {
-		return
-	}
-	b, err := json.Marshal(arr)
-	if err != nil {
-		return
-	}
-	req.Header.Set(streamToolsHeaderName, string(b))
+	req.Header.Set(streamToolsHeaderName, snapshot)
 }
 
 // parseTextualToolCallFromContent 照抄 stream.ts:261-264。
@@ -355,15 +373,11 @@ func textualToolCallsToDelta(toolCalls map[string]textualToolCallRecord) []any {
 	for _, r := range toolCalls {
 		records = append(records, r)
 	}
-	// 按 index 升序(插入序即 index 序, 这里用简单选择排序保持确定性,
-	// 避免依赖 map 遍历顺序)
-	for i := 0; i < len(records); i++ {
-		for j := i + 1; j < len(records); j++ {
-			if records[j].Index < records[i].Index {
-				records[i], records[j] = records[j], records[i]
-			}
-		}
-	}
+	// 按 index 升序(插入序即 index 序): 每帧都要重建, 用 sort.Slice (O(k log k))
+	// 而非 O(k^2) 选择排序; 同样不依赖 map 遍历顺序。
+	sort.Slice(records, func(i, j int) bool {
+		return records[i].Index < records[j].Index
+	})
 	out := make([]any, 0, len(records))
 	for _, r := range records {
 		out = append(out, map[string]any{

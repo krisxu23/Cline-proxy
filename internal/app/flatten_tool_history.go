@@ -134,13 +134,8 @@ func flattenToolHistory(messages []any) []any {
 					names = append(names, toolCallName(c))
 				}
 				// :67 `const { tool_calls, ...rest } = msg;` —— 去掉 tool_calls 字段
-				rest := make(map[string]any, len(msg))
-				for k, v := range msg {
-					if k == "tool_calls" {
-						continue
-					}
-					rest[k] = v
-				}
+				rest := shallowCopyRecord(msg)
+				delete(rest, "tool_calls")
 				base := flattenExtractTextContent(rest["content"])
 				if base == "" {
 					// :72-73 `|| (typeof rest.content === "string" ? rest.content : "")`
@@ -220,10 +215,7 @@ func flattenToolHistory(messages []any) []any {
 					}
 					newContent += flattenToolResultPrefix + strings.Join(toolResults, "\n") + "]"
 				}
-				replaced := make(map[string]any, len(msg))
-				for k, v := range msg {
-					replaced[k] = v
-				}
+				replaced := shallowCopyRecord(msg)
 				replaced["content"] = newContent
 				out = append(out, replaced)
 				continue

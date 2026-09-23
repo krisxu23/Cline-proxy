@@ -82,12 +82,15 @@ func dialSOCKS5(ctx context.Context, proxyURL *url.URL, network, addr string) (n
 	if err != nil {
 		return nil, err
 	}
-	// 握手整体受 ctx 与固定超时双重约束: 卡在半路不能被无限期挂着。
-	if deadline, ok := ctx.Deadline(); ok {
-		_ = conn.SetDeadline(deadline)
-	} else {
-		_ = conn.SetDeadline(time.Now().Add(socks5HandshakeTimeout))
+	// 握手整体受 ctx 与固定超时**双重约束**: 取两者更早的那个 —— ctx 自带的
+	// deadline 可能远大于 15s(直连客户端 60s 超时、长时上游请求), 二选一的旧写法
+	// 会让半死的本地 sing-box 把握手挂满整个 ctx, 常量 socks5HandshakeTimeout
+	// 声称的上限不成立(审查 P2)。
+	handshakeDL := time.Now().Add(socks5HandshakeTimeout)
+	if dl, ok := ctx.Deadline(); ok && dl.Before(handshakeDL) {
+		handshakeDL = dl
 	}
+	_ = conn.SetDeadline(handshakeDL)
 	if err := socks5Handshake(conn, proxyURL, host, port); err != nil {
 		conn.Close()
 		return nil, err

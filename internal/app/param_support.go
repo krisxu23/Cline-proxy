@@ -186,12 +186,14 @@ func stripUnsupportedParams(provider, model string, body map[string]any) {
 //	}
 //
 // 要点:
-//   - 只压**已存在且是数字**的键, 绝不新建键 (:117 原注释 "never introduces a new key")
+//   - 只压**已存在且是数值(含纯数字字符串, 走 toFloat64 —— IDE/SDK 会发
+//     "1000" 这种字符串, 断言 float64 会让上限校验整体失效)**的键,
+//     绝不新建键 (:117 原注释 "never introduces a new key")
 //   - 只在**大于**上限时才改 (小值保持原样)
 //   - 两个上限同时存在时取较小者
 //
 // 我方差异: `clampToModelMaxOutput` 需要 model catalog 表 (getProviderModel),
-// 我方没有, 因此该分支贡献不了候选值。只看 maxOutputCap。已在文件头声明。
+// 我们没有, 因此该分支贡献不了候选值。只看 maxOutputCap。已在文件头声明。
 func applyMaxOutputClamp(rule stripRule, body map[string]any) {
 	// :114 `if (!rule.clampToModelMaxOutput && !Number.isFinite(rule.maxOutputCap)) return;`
 	if !rule.clampToModelMaxOutput && rule.maxOutputCap <= 0 {
@@ -203,7 +205,7 @@ func applyMaxOutputClamp(rule stripRule, body map[string]any) {
 	}
 	ceiling := float64(rule.maxOutputCap)
 	for _, key := range maxOutputTokenKeys {
-		value, ok := body[key].(float64)
+		value, ok := toFloat64(body[key])
 		if !ok {
 			continue
 		}

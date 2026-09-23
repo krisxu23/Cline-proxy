@@ -9,6 +9,7 @@ package app
 
 import (
 	"fmt"
+	"log"
 	"os"
 	"path/filepath"
 	"sort"
@@ -19,9 +20,7 @@ import (
 )
 
 const (
-	logRetentionDays  = 7  // 日志保留天数
-	logCleanupJitter  = 0  // 保留用于未来错峰的占位
-	logDailyExtSuffix = "" // 扩展名由调用方给出
+	logRetentionDays = 7 // 日志保留天数
 )
 
 // dailyLogPath 返回按天分段的日志文件绝对路径:
@@ -60,8 +59,10 @@ func cleanupOldDailyLogs(base string, now time.Time) {
 	// 稳定顺序删除(老文件优先), 便于日志观察
 	sort.Strings(victims)
 	for _, v := range victims {
-		if err := os.Remove(v); err != nil {
-			time.Sleep(0) // no-op: 保持删除节奏, 失败仅记录
+		if err := os.Remove(v); err != nil && !os.IsNotExist(err) {
+			// 终审 P3: 原实现是 time.Sleep(0) no-op —— 注释承诺"失败仅记录"
+			// 却既不记录也不做任何事。改为真实记录。
+			log.Printf("日志清理: 删除过期文件 %s 失败: %v", v, err)
 		}
 	}
 }

@@ -64,6 +64,9 @@ func handleChainedChatAs(w http.ResponseWriter, r *http.Request, params map[stri
 		skipped    int
 		tried      int
 	)
+	// 统计估算整包 marshal 每请求只算一次: hopParams 与 params 只差 model 名,
+	// 候选间复用同一估值(真实 usage 回来后 observeUsage 会覆盖)。
+	promptTokens := estimateJSON(params)
 	for _, cand := range chain {
 		if why := candidateSkip(cand); why != "" {
 			skipped++
@@ -125,7 +128,7 @@ func handleChainedChatAs(w http.ResponseWriter, r *http.Request, params map[stri
 					Upstream:     chainUpstreamLabel(cand),
 					Model:        model,
 					Stream:       false,
-					PromptTokens: estimateJSON(hopParams),
+					PromptTokens: promptTokens,
 				})
 				setRouteHeader(w, chainUpstreamLabel(cand), model, chainFailoverHeader)
 				tr.SetUpstream(chainUpstreamLabel(cand), model)
@@ -177,7 +180,7 @@ func handleChainedChatAs(w http.ResponseWriter, r *http.Request, params map[stri
 				Upstream:     chainUpstreamLabel(cand),
 				Model:        model,
 				Stream:       true,
-				PromptTokens: estimateJSON(hopParams),
+				PromptTokens: promptTokens,
 			})
 			setRouteHeader(w, chainUpstreamLabel(cand), model, chainFailoverHeader)
 			tr.SetUpstream(chainUpstreamLabel(cand), model)
@@ -194,6 +197,9 @@ func handleChainedChatAs(w http.ResponseWriter, r *http.Request, params map[stri
 				tracker.observeUsage(u)
 				tr.ObserveUsage(u)
 			}
+			// 终审 P2: 交付状态回传 —— 空流守卫的 502 错误帧若记成 200,
+			// 成功率指标与 request-log 互相矛盾。
+			delivered := resp.StatusCode
 			switch tgt.Shape {
 			case shapeAnthropic:
 				handleAnthropicStreamWithToolNameMap(w, resp, model, tgt.ToolSchemas, observe, responseToolNameMap)
@@ -205,13 +211,13 @@ func handleChainedChatAs(w http.ResponseWriter, r *http.Request, params map[stri
 				w.WriteHeader(http.StatusOK)
 				chatStreamToResponses(w, resp, nil)
 			default:
-				handleStreamResponseWithToolNameMap(w, resp, observe, responseToolNameMap)
+				delivered = handleStreamResponseWithToolNameMap(w, resp, observe, responseToolNameMap)
 			}
 			// 这里以前从不关闭上游响应体。对比上面两条失败路径(87/154 行)都显式
 			// Close 了, 唯独流式成功这条漏掉, 而三个流式 handler 内部也都只读到
 			// EOF、不负责 Close —— 连接因此无法归还复用池, 长时间运行持续堆积。
 			resp.Body.Close()
-			tracker.finish(resp.StatusCode < 400, resp.StatusCode)
+			tracker.finish(delivered < 400, delivered)
 			recordUsageForCandidate(cand, true)
 			markCandidateSuccess(cand.Upstream, cand.Model)
 			dec.addCandidate(cand.String(), "tried", "", resp.StatusCode, "")
@@ -326,12 +332,6 @@ func resetTZFor(upstream string) string {
 	return "Asia/Shanghai"
 }
 
-// quotaDayExhausted 429 是否属于"当日额度耗尽"(而非分钟级限流)。
-func quotaDayExhausted(body []byte) bool {
-	qf := parseQuotaFailure(jsonObject(body))
-	return qf != nil && qf.ExhaustedWindow == "day"
-}
-
 // applyCandidateFailure 把一次失败落到具体的冷却动作上。三个归宿:
 //   - permanent: 永久剔除(无免费层 / 已下架 / 非 chat 模型), 不再消耗候选位;
 //   - quotaDay : 当日免费额度耗尽 -> 冷却到提供方时区的日界;
@@ -347,18 +347,26 @@ func applyCandidateFailure(cand routeCandidate, class, reason string, body []byt
 	if class == classServerError || class == classEmpty {
 		recordZenModelResult(cand.Model, true)
 	}
-	key := candidateKey(cand.Upstream, cand.Model) // Gemini 的回包里带了"每日限额"就回填账本: 之后到量即跳过,
+	key := candidateKey(cand.Upstream, cand.Model)
+	// Gemini 的回包里带了"每日限额"就回填账本: 之后到量即跳过,
 	// 不必等到真的撞一次 429 才知道用完。
-	if qf := parseQuotaFailure(jsonObject(body)); qf != nil && qf.DailyRequestLimit != nil {
+	qf := parseQuotaFailure(jsonObject(body))
+	if qf != nil && qf.DailyRequestLimit != nil {
 		autoFillDailyLimit(key, *qf.DailyRequestLimit)
 	}
 	switch {
 	case class == classPermanent:
 		markCandidatePermanent(cand.Upstream, cand.Model, reason)
-	case class == classRateLimit && quotaDayExhausted(body):
+	case class == classRateLimit && qf != nil && qf.ExhaustedWindow == "day":
 		markQuotaDayCooldown(cand.Upstream, cand.Model, resetTZFor(cand.Upstream), reason)
 	default:
-		markCandidateCooldown(cand.Upstream, cand.Model, class, reason)
+		// 上游 RetryInfo 给了明确延迟就覆盖类别默认时长: 分钟级 429 的真实
+		// 窗口可能 <10min(过冷)或 >10min(反复白撞)。
+		var retryMs int64
+		if class == classRateLimit && qf != nil {
+			retryMs = qf.RetryDelayMs
+		}
+		markCandidateCooldownFor(cand.Upstream, cand.Model, class, reason, retryMs)
 	}
 }
 
@@ -431,8 +439,12 @@ func writeChainNonStreamWithMap(w http.ResponseWriter, body []byte, tgt chainTar
 		writeJSON(w, http.StatusOK, chatToResponses(chatOut))
 		return
 	}
-	anthropicResp := openAIToAnthropicWithMap(chatOut, toolNameMap)
-	if tc, ok := getNested(chatOut, "choices", 0, "message", "tool_calls").([]any); ok && len(tc) > 0 {
+	anthropicResp := openAIToAnthropicWithMap(chatOut, toolNameMap, tgt.ToolSchemas)
+	// 覆写守卫(与 anthropic.go 同款): 只有映射结果仍是 end_turn 才覆写成 tool_use ——
+	// finish_reason=length 映射出的 max_tokens 必须保留, 截断的半截工具参数伪装成
+	// 完整调用会让客户端解析失败且无从重试。
+	if tc, ok := getNested(chatOut, "choices", 0, "message", "tool_calls").([]any); ok && len(tc) > 0 &&
+		anthropicResp["stop_reason"] == "end_turn" {
 		anthropicResp["stop_reason"] = "tool_use"
 	}
 	writeJSON(w, http.StatusOK, anthropicResp)

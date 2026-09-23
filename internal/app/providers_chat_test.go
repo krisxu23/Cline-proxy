@@ -264,6 +264,20 @@ func TestHandleProviderChatRejectsKeylessProvider(t *testing.T) {
 	}
 }
 
+// waitUntil 轮询直到条件满足: 请求路径的目录刷新已改为后台执行,
+// 断言它落地前必须先等异步刷新完成。
+func waitUntil(t *testing.T, cond func() bool, msg string) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if cond() {
+			return
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	t.Fatal("timeout waiting: " + msg)
+}
+
 func TestHandleProviderChatRefreshesCatalogBeforeGate(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/models" {
@@ -280,11 +294,21 @@ func TestHandleProviderChatRefreshesCatalogBeforeGate(t *testing.T) {
 	rec := httptest.NewRecorder()
 	req := httptest.NewRequest("POST", "/chat/completions", nil)
 	handleProviderChat(rec, req, map[string]any{"model": "cat:cat-free", "messages": []any{}}, "cat")
+	// 目录为空时不阻塞转发: 立即 503, 刷新在后台进行(审 P2)。
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("empty catalog must fail fast with 503: %d body=%s", rec.Code, rec.Body.String())
+	}
+	waitUntil(t, func() bool {
+		p.mu.Lock()
+		defer p.mu.Unlock()
+		return len(p.catalog) > 0
+	}, "first request must trigger a background catalog refresh")
+	// 目录拉到后回填仍是 opt-in 禁用: isFree 门控仍关闭 → 400。
+	rec = httptest.NewRecorder()
+	req = httptest.NewRequest("POST", "/chat/completions", nil)
+	handleProviderChat(rec, req, map[string]any{"model": "cat:cat-free", "messages": []any{}}, "cat")
 	if rec.Code != http.StatusBadRequest {
 		t.Fatalf("catalog backfill is opt-in disabled, gate must stay closed: %d body=%s", rec.Code, rec.Body.String())
-	}
-	if len(p.catalog) == 0 {
-		t.Fatal("catalog should be populated by the first request")
 	}
 	if p.isFree("cat-free") {
 		t.Fatal("catalog-backfilled model must not be free before opt-in")
@@ -325,9 +349,15 @@ func TestHandleProviderChatCatalogRefreshBacksOffAndRecovers(t *testing.T) {
 	rec := httptest.NewRecorder()
 	req := httptest.NewRequest("POST", "/chat/completions", nil)
 	handleProviderChat(rec, req, map[string]any{"model": "catretry:cat-free", "messages": []any{}}, "catretry")
-	if rec.Code != http.StatusBadRequest {
-		t.Fatalf("failed refresh must leave the gate closed: %d body=%s", rec.Code, rec.Body.String())
+	// 目录为空: 立即 503, 刷新后台进行并失败(上游 500)。
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("empty catalog must fail fast with 503: %d body=%s", rec.Code, rec.Body.String())
 	}
+	waitUntil(t, func() bool {
+		p.mu.Lock()
+		defer p.mu.Unlock()
+		return p.catalogFailStreak >= 1
+	}, "first request's background refresh must record its failure")
 	if calls() != 1 {
 		t.Fatalf("first request must attempt the catalog fetch, got %d", calls())
 	}
@@ -336,23 +366,34 @@ func TestHandleProviderChatCatalogRefreshBacksOffAndRecovers(t *testing.T) {
 	rec = httptest.NewRecorder()
 	req = httptest.NewRequest("POST", "/chat/completions", nil)
 	handleProviderChat(rec, req, map[string]any{"model": "catretry:cat-free", "messages": []any{}}, "catretry")
-	if rec.Code != http.StatusBadRequest {
-		t.Fatalf("backoff window must not refresh: %d body=%s", rec.Code, rec.Body.String())
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("backoff window must keep failing fast with 503: %d body=%s", rec.Code, rec.Body.String())
 	}
 	if calls() != 1 {
 		t.Fatalf("second request must back off, catalog fetched %d times", calls())
 	}
 
-	// 退避窗口过去后必须重试; 目录回填为 opt-in 禁用, 门控仍关闭但目录已拉取。
+	// 退避窗口过去后必须重试; 目录回填为 opt-in 禁用, 刷新成功但 isFree 仍关闭。
 	p.mu.Lock()
 	p.attemptedAt = time.Now().UnixMilli() - providerCatalogRetryMs - 1000
 	p.mu.Unlock()
 	rec = httptest.NewRecorder()
 	req = httptest.NewRequest("POST", "/chat/completions", nil)
 	handleProviderChat(rec, req, map[string]any{"model": "catretry:cat-free", "messages": []any{}}, "catretry")
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("empty catalog must keep failing fast with 503: %d body=%s", rec.Code, rec.Body.String())
+	}
+	waitUntil(t, func() bool {
+		p.mu.Lock()
+		defer p.mu.Unlock()
+		return len(p.catalog) > 0
+	}, "recovery retry must repopulate the catalog")
 	if calls() != 2 {
 		t.Fatalf("retry past the backoff window must fetch again, got %d", calls())
 	}
+	rec = httptest.NewRecorder()
+	req = httptest.NewRequest("POST", "/chat/completions", nil)
+	handleProviderChat(rec, req, map[string]any{"model": "catretry:cat-free", "messages": []any{}}, "catretry")
 	if rec.Code != http.StatusBadRequest {
 		t.Fatalf("catalog backfill is opt-in disabled, gate must stay closed after recovery: %d body=%s", rec.Code, rec.Body.String())
 	}

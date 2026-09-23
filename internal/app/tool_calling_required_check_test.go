@@ -98,20 +98,3 @@ func TestResponsesItemId_仅字符串合法(t *testing.T) {
 		}
 	}
 }
-
-// stringSliceContains 的行为锁 (供 checkToolCallingRequiredButUnsupported 使用)。
-func TestStringSliceContains(t *testing.T) {
-	arr := []string{"a", "tools", "c"}
-	if !stringSliceContains(arr, "tools") {
-		t.Fatal("应命中")
-	}
-	if stringSliceContains(arr, "tool") {
-		t.Fatal("必须精确匹配, 不做前缀匹配")
-	}
-	if stringSliceContains(nil, "tools") {
-		t.Fatal("nil 切片不应命中")
-	}
-	if stringSliceContains([]string{}, "tools") {
-		t.Fatal("空切片不应命中")
-	}
-}

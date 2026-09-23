@@ -204,7 +204,7 @@ func TestToolRemap接线_chain分支透传映射(t *testing.T) {
 		t.Fatalf("非流式 OpenAI 分支未透传映射, 出现 %d 次, 期望 1", got)
 	}
 	// 非流式 Claude 分支必须传 toolNameMap。
-	if got := countToken(src, "openAIToAnthropicWithMap(chatOut, toolNameMap)"); got != 1 {
+	if got := countToken(src, "openAIToAnthropicWithMap(chatOut, toolNameMap, tgt.ToolSchemas)"); got != 1 {
 		t.Fatalf("非流式 Claude 分支未透传映射, 出现 %d 次, 期望 1", got)
 	}
 }

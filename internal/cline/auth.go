@@ -4,10 +4,8 @@ import (
 	"cline-go-proxy/internal/kit"
 	"encoding/json"
 	"fmt"
-	"log"
 	"net/url"
 	"os"
-	"path/filepath"
 	"strings"
 	"time"
 )
@@ -24,10 +22,6 @@ var (
 	workosBaseURL = "https://api.workos.com"
 	clineAPIBase  = ClineAPIBase
 )
-
-type credentials struct {
-	RefreshToken string `json:"refreshToken"`
-}
 
 type deviceAuthResp struct {
 	DeviceCode              string `json:"device_code"`
@@ -62,64 +56,6 @@ type clineRefreshResp struct {
 		RefreshToken string `json:"refreshToken"`
 		ExpiresAt    any    `json:"expiresAt"`
 	} `json:"data"`
-}
-
-var (
-	cachedToken      string
-	cachedExpiry     int64
-	cachedRefreshTok string
-	credentialsPath  string
-)
-
-func init() {
-	credentialsPath = FindCredentialsFile()
-}
-
-func FindCredentialsFile() string {
-	// First, try next to the executable
-	exe, err := os.Executable()
-	if err == nil {
-		p := filepath.Join(filepath.Dir(exe), ".cline-credentials.json")
-		if kit.FileExists(p) {
-			return p
-		}
-	}
-	// Second, try current working directory
-	pwd, err := os.Getwd()
-	if err == nil {
-		p := filepath.Join(pwd, ".cline-credentials.json")
-		if kit.FileExists(p) {
-			return p
-		}
-	}
-	// Default to executable directory
-	if err == nil {
-		return filepath.Join(filepath.Dir(exe), ".cline-credentials.json")
-	}
-	pwd, _ = os.Getwd()
-	return filepath.Join(pwd, ".cline-credentials.json")
-}
-
-func LoadCredentials() *credentials {
-	data, err := os.ReadFile(credentialsPath)
-	if err != nil {
-		return nil
-	}
-	var c credentials
-	if err := json.Unmarshal(data, &c); err != nil {
-		return nil
-	}
-	return &c
-}
-
-func SaveCredentials(rt string) {
-	c := credentials{RefreshToken: rt}
-	data, _ := json.MarshalIndent(c, "", "  ")
-	if err := os.WriteFile(credentialsPath, data, 0600); err != nil {
-		log.Printf("Failed to save credentials: %v", err)
-		return
-	}
-	log.Printf("Credentials saved to %s", credentialsPath)
 }
 
 func WorkosDeviceAuth() (*deviceAuthResp, error) {
@@ -233,29 +169,6 @@ func RefreshClineToken(refreshToken string) (*clineRefreshResp, error) {
 	return &c, nil
 }
 
-func GetToken() (string, error) {
-	if cachedToken != "" && time.Now().UnixMilli() < cachedExpiry {
-		return cachedToken, nil
-	}
-
-	creds := LoadCredentials()
-	if creds != nil && creds.RefreshToken != "" {
-		resp, err := RefreshClineToken(creds.RefreshToken)
-		if err == nil && resp.Data.AccessToken != "" {
-			cachedToken = "workos:" + resp.Data.AccessToken
-			cachedRefreshTok = resp.Data.RefreshToken
-			if cachedRefreshTok == "" {
-				cachedRefreshTok = creds.RefreshToken
-			}
-			cachedExpiry = ParseExpiry(resp.Data.ExpiresAt) - 60000
-			SaveCredentials(cachedRefreshTok)
-			return cachedToken, nil
-		}
-		log.Printf("Token refresh failed: %v", err)
-	}
-	return "", fmt.Errorf("no valid credentials. Run with --login flag first")
-}
-
 func ParseExpiry(exp any) int64 {
 	switch v := exp.(type) {
 	case float64:
@@ -275,67 +188,6 @@ func ParseExpiry(exp any) int64 {
 		}
 	}
 	return 0
-}
-
-func DoLogin() error {
-	fmt.Println("\nStarting Cline OAuth login...")
-
-	device, err := WorkosDeviceAuth()
-	if err != nil {
-		return err
-	}
-
-	authURL := device.VerificationURIComplete
-	if authURL == "" {
-		authURL = device.VerificationURI
-	}
-
-	fmt.Println("  1. Open this URL in your browser:")
-	fmt.Println("     " + authURL)
-	fmt.Println("  2. Enter code: " + device.UserCode)
-	fmt.Println("  3. Log in with Google, GitHub, or email")
-
-	// Try to open browser automatically
-	_ = OpenBrowser(authURL)
-
-	fmt.Println("  Waiting for authorization...")
-
-	interval := device.Interval
-	if interval < 5 {
-		interval = 5
-	}
-	expiresIn := device.ExpiresIn
-	if expiresIn <= 0 {
-		expiresIn = 300
-	}
-
-	workosTok, err := PollWorkosToken(device.DeviceCode, interval, expiresIn)
-	if err != nil {
-		return err
-	}
-
-	fmt.Println("  WorkOS authorized. Registering with Cline...")
-
-	reg, err := RegisterWithCline(workosTok.AccessToken, workosTok.RefreshToken)
-	if err != nil {
-		return err
-	}
-
-	if reg.Data.RefreshToken == "" {
-		return fmt.Errorf("cline registration missing refresh token")
-	}
-
-	SaveCredentials(reg.Data.RefreshToken)
-	cachedToken = "workos:" + reg.Data.AccessToken
-	cachedRefreshTok = reg.Data.RefreshToken
-	cachedExpiry = ParseExpiry(reg.Data.ExpiresAt) - 60000
-
-	email := "unknown"
-	if reg.Data.UserInfo != nil && reg.Data.UserInfo.Email != "" {
-		email = reg.Data.UserInfo.Email
-	}
-	fmt.Printf("  Login successful! Account: %s\n", email)
-	return nil
 }
 
 func OpenBrowser(url string) error {

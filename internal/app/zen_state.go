@@ -79,9 +79,17 @@ func markZenFail() {
 // zenFailedNow zen 是否处于故障转移状态。
 // 窗口过期时放行一个半开探测请求: 探测成功则熔断清零(markZenSuccess),
 // 探测失败则立即重新跳闸(markZenFail), 与标准熔断器 HALF-OPEN 语义一致。
+// 放行是**一次性 CAS**: 只有第一个越过窗口的调用拿到 false, 探测完成前
+// 其余调用按熔断处理(此前会清零 zenFailUntil 后集体放行, "放行一个探测"
+// 形同虚设)。网络级全故障在 zen_call.go 重试耗尽时也调 markZenFail,
+// 探测走网络错误路径同样能收尾。
 func zenFailedNow() bool {
 	zenStateMu.Lock()
 	defer zenStateMu.Unlock()
+	// 半开探测在途: 其余请求一律按熔断处理, 直到探测终局。
+	if zenProbing {
+		return true
+	}
 	if zenFailUntil.IsZero() {
 		return false
 	}
@@ -92,6 +100,17 @@ func zenFailedNow() bool {
 		return false
 	}
 	return true
+}
+
+// clearZenProbing 结束半开探测但不改动熔断计数 —— 供"请求根本没发出去"
+// (构造失败/客户端取消/排队中取消)这类**无判定**终局调用。上游可达与否
+// 没有结论, 不该累计故障也不该重新跳闸; 但一次性 CAS 放行后 zenProbing
+// 若无人清理会永久卡住, 后续请求全部按熔断处理。释放后若上游确实仍故障,
+// 下一次真实请求的网络级失败会经 markZenFail 重新累计、重新跳闸。
+func clearZenProbing() {
+	zenStateMu.Lock()
+	zenProbing = false
+	zenStateMu.Unlock()
 }
 
 // zenCircuitStatus 供管理端展示: (熔断中, 探测在途)。

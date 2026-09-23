@@ -1,6 +1,7 @@
 package app
 
 import (
+	"context"
 	"fmt"
 	"net"
 	"net/url"
@@ -79,7 +80,7 @@ func validateOutboundURL(raw string) error {
 // (云 metadata 服务就在这一段); 私网(10/8、172.16/12、192.168/16、fc00::/7)
 // 与回环**绝不在此拦** —— 局域网/LAN 上游是正当用途, 它们的拦截策略由
 // blockedOutboundReason 按 CLINE_PROXY_ALLOW_PRIVATE_UPSTREAM 单独管理。
-// 解析失败(离线/NXDOMAIN)不拦: 配置期判定不了, 拨号时仍有字面 IP 规则兜底。
+// 解析失败(离线/NXDOMAIN)在配置期判定不了, 不拦。
 func resolvedLinkLocalReason(host string) string {
 	if net.ParseIP(host) != nil {
 		return "" // IP 字面量已由 blockedOutboundReason 判过, 无需再解析
@@ -129,11 +130,6 @@ func blockedOutboundReason(host string) string {
 	return ""
 }
 
-// isBlockedOutboundHost 主机名是否为不允许的出站目标。
-func isBlockedOutboundHost(host string) bool {
-	return blockedOutboundReason(host) != ""
-}
-
 // filterOutboundURLs 逐条校验并归一化(去空白、去尾部斜杠)。
 // 返回清理后的列表; 任一非法即整体失败, 不做静默丢弃 —— 静默丢会让用户
 // 以为配好了, 实际少了一条。
@@ -150,4 +146,45 @@ func filterOutboundURLs(raw []string, what string) ([]string, error) {
 		cleaned = append(cleaned, u)
 	}
 	return cleaned, nil
+}
+
+// dialWithSSRFGuard 给拨号函数包一层运行时 SSRF 防线: 配置期校验只覆盖写入
+// 那一刻, 之后域名重新解析到 169.254.169.254(DNS rebinding)会绕开它 —— 拨号
+// 前后按 addr 字面量与**实际连接对端**各查一次, 堵住配置期到拨号期的窗口。
+//
+// 刻意只拦两类: 链路本地(169.254.0.0/16 / fe80::/10, 云 metadata 服务就在
+// 这一段)与 blockedOutboundHosts 里的云元数据主机名字面量。回环/私网**绝不在
+// 此拦** —— 本地 sing-box 与 LAN 上游是正当用途, 它们的策略由
+// blockedOutboundReason 按 CLINE_PROXY_ALLOW_PRIVATE_UPSTREAM 管理。
+// 拦下时关闭已建连接并返回错误, 口径与 blockedOutboundReason /
+// resolvedLinkLocalReason 一致。
+func dialWithSSRFGuard(dial func(ctx context.Context, network, addr string) (net.Conn, error)) func(ctx context.Context, network, addr string) (net.Conn, error) {
+	return func(ctx context.Context, network, addr string) (net.Conn, error) {
+		// 拨号前: addr 里的主机名字面量/字面 IP 先判, 不给链路本地任何建连机会。
+		if host, _, err := net.SplitHostPort(addr); err == nil {
+			host = strings.TrimSuffix(strings.ToLower(strings.TrimSpace(host)), ".")
+			if blockedOutboundHosts[host] {
+				return nil, fmt.Errorf("目标地址被拒绝（云元数据主机名不允许作为上游）: %q", addr)
+			}
+			if ip := net.ParseIP(host); ip != nil && (ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast()) {
+				return nil, fmt.Errorf("目标地址被拒绝（链路本地地址 / 云元数据地址不允许作为上游）: %q", addr)
+			}
+		}
+		conn, err := dial(ctx, network, addr)
+		if err != nil {
+			return nil, err
+		}
+		// 拨号后: 域名可能刚被重绑定到云 metadata 段, 按实际对端 IP 再查一次
+		// (配置期 resolvedLinkLocalReason 只保证那一刻的解析结果干净)。
+		if ra, _, err := net.SplitHostPort(conn.RemoteAddr().String()); err == nil {
+			if i := strings.IndexByte(ra, '%'); i >= 0 {
+				ra = ra[:i] // IPv6 zone(fe80::1%eth0)不参与判定
+			}
+			if ip := net.ParseIP(ra); ip != nil && (ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast()) {
+				conn.Close()
+				return nil, fmt.Errorf("目标地址被拒绝（主机名解析到链路本地/云元数据地址 %s）", ip)
+			}
+		}
+		return conn, nil
+	}
 }

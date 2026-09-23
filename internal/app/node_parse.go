@@ -44,6 +44,10 @@ func nodeOutbound(link, tag string) (map[string]any, error) {
 		return parseShadowtls(rest, tag)
 	case "snell":
 		return parseSnell(rest, tag)
+	case "http", "https":
+		return parseHTTPProxy(rest, tag, scheme == "https")
+	case "socks5", "socks5h":
+		return parseSocksProxy(rest, tag)
 	default:
 		return nil, fmt.Errorf("unsupported scheme %q", scheme)
 	}
@@ -627,11 +631,65 @@ func parseSnell(rest, tag string) (map[string]any, error) {
 		"type": "snell", "tag": tag, "server": host, "server_port": port,
 		"psk": psk, "version": version,
 	}
-	if o := q.Get("obfs"); o != "" {
+	if o, _ := ob["obfs"].(string); o != "" {
 		if version == 4 {
 			ob["obfs"] = map[string]any{"type": o, "host": q.Get("obfs-host")}
 		} else {
 			return nil, fmt.Errorf("snell v6 不支持 obfs 参数")
+		}
+	}
+	return ob, nil
+}
+
+// parseHTTPProxy 手动 http/https 代理行 → sing-box http 出站。
+// isNodeOrProxyLine 会把"仅 authority、无资源路径"的 http/https/socks5(5h) 行当
+// 节点收进订阅池 —— 此前 nodeOutbound 无对应分支, 这些行每次重建都打
+// "解析失败: unsupported scheme" 被跳过, 面板 Running 恒 false(P3)。
+func parseHTTPProxy(rest, tag string, secure bool) (map[string]any, error) {
+	u, err := url.Parse("//" + rest)
+	if err != nil {
+		return nil, err
+	}
+	host := u.Hostname()
+	port, err := strconv.Atoi(u.Port())
+	if err != nil || host == "" {
+		return nil, fmt.Errorf("http proxy: bad host/port")
+	}
+	ob := map[string]any{"type": "http", "tag": tag, "server": host, "server_port": port}
+	if u.User != nil {
+		if name := u.User.Username(); name != "" {
+			ob["username"] = name
+		}
+		if pw, _ := u.User.Password(); pw != "" {
+			ob["password"] = pw
+		}
+	}
+	if secure {
+		// https:// 行 = 经 TLS 连的 HTTP 代理; sing-box http 出站用 tls 块表达。
+		ob["tls"] = map[string]any{"enabled": true, "server_name": host}
+	}
+	return ob, nil
+}
+
+// parseSocksProxy 手动 socks5/socks5h 代理行 → sing-box socks 出站。
+// socks5h 的"域名交给代理侧解析"正是 sing-box socks 出站的默认行为, 与 socks5 同映射。
+func parseSocksProxy(rest, tag string) (map[string]any, error) {
+	u, err := url.Parse("//" + rest)
+	if err != nil {
+		return nil, err
+	}
+	host := u.Hostname()
+	port, err := strconv.Atoi(u.Port())
+	if err != nil || host == "" {
+		return nil, fmt.Errorf("socks proxy: bad host/port")
+	}
+	ob := map[string]any{"type": "socks", "tag": tag, "server": host, "server_port": port, "version": "5"}
+	if u.User != nil {
+		if name := u.User.Username(); name != "" {
+			ob["username"] = name
+		}
+		if pw, _ := u.User.Password(); pw != "" {
+			ob["password"] = pw
 		}
 	}
 	return ob, nil

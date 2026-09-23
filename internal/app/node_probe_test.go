@@ -65,7 +65,8 @@ func TestSandboxRejectsRawChacha20Poly1305(t *testing.T) {
 		"type": "shadowsocks", "server": "1.2.3.4", "server_port": 8388,
 		"method": "chacha20-poly1305", "password": "p0000",
 	}
-	if err := validateOutboundEntry(ob); err == nil {
+	dnsCfg, resolverTag := buildNodeDNS(getZenConfig())
+	if err := validateOutboundEntry(ob, dnsCfg, resolverTag); err == nil {
 		t.Fatal("chacha20-poly1305 未被 sing-box 拒绝 —— 与线上日志矛盾, 测试前提失效")
 	}
 }
@@ -78,7 +79,8 @@ func TestSSBadMethodNormalizedAndValid(t *testing.T) {
 	if got := ob["method"].(string); got != "chacha20-ietf-poly1305" {
 		t.Fatalf("method = %q, 期望归一化为 chacha20-ietf-poly1305", got)
 	}
-	if err := validateOutboundEntry(ob); err != nil {
+	dnsCfg, resolverTag := buildNodeDNS(getZenConfig())
+	if err := validateOutboundEntry(ob, dnsCfg, resolverTag); err != nil {
 		t.Fatalf("归一化后仍被判无效: %v", err)
 	}
 }

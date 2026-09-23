@@ -202,6 +202,12 @@ func rememberedNodeCountry(key string) string {
 // nodeExitRegion 出口所属地区: 优先最近一次连通检测的实测结果, 其次是落盘的
 // 历史实测值(重启后仍可用); 都没有则归「其他地区」(手填代理也走这里)。
 func nodeExitRegion(key string) string {
+	// 健康/国家一律按 nodeLocalKey(去 # 名称)存储, 而过滤路径传进来的是
+	// effectiveProxyList 的原始行(可能带 #名称)—— 入口统一规范化, 否则手动
+	// 添加的带名节点恒被归「其他地区」, 随后被地区过滤静默排除(审查 P1;
+	// exitRegionSummary 的同类问题此前已修, 这里补过滤路径)。nodeLocalKey
+	// 只截断 # 后缀, 对已规范化的键幂等。
+	key = nodeLocalKey(key)
 	if r, ok := healthResultOf(key); ok && strings.TrimSpace(r.ExitCountry) != "" {
 		return regionOfCountry(r.ExitCountry)
 	}
@@ -290,6 +296,12 @@ func filterByExitRegion(list []string) []string {
 	if len(out) == 0 && len(list) > 0 {
 		warnRegionFilterEmpty(regKey, len(list))
 		out = append(out, list...)
+	} else if len(out) > 0 {
+		// 过滤恢复正常(有匹配项): 清掉告警记忆, 下次再变空还能再警 —— 否则同一
+		// 地区组合告警一次后, 之后每次回退都静默(审查 P2 的 warn-once 问题)。
+		regionFilterWarnMu.Lock()
+		regionFilterWarnedFor = ""
+		regionFilterWarnMu.Unlock()
 	}
 
 	exitListCache.mu.Lock()
@@ -301,7 +313,8 @@ func filterByExitRegion(list []string) []string {
 	return out
 }
 
-// warnRegionFilterEmpty 同一情形只告警一次, 避免每个请求刷屏。
+// warnRegionFilterEmpty 同一情形连续只告警一次, 避免每个请求刷屏;
+// 过滤恢复正常后由 filterByExitRegion 清掉记忆, 再次变空可再警。
 var regionFilterWarnMu sync.Mutex
 var regionFilterWarnedFor string
 

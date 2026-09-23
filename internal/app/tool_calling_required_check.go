@@ -1,6 +1,9 @@
 package app
 
-import "fmt"
+import (
+	"fmt"
+	"slices"
+)
 
 // 逐字照抄 OmniRoute open-sse/handlers/chatCore/toolCallingRequiredCheck.ts (33 行)。
 //
@@ -46,7 +49,7 @@ func checkToolCallingRequiredButUnsupported(body map[string]any, unsupported []s
 		return toolCallingCheckResult{blocked: false}
 	}
 	// :26 `if (!unsupported.includes("tools")) return { blocked: false };`
-	if !stringSliceContains(unsupported, "tools") {
+	if !slices.Contains(unsupported, "tools") {
 		return toolCallingCheckResult{blocked: false}
 	}
 	// :27 `if (!Array.isArray(body.tools) || body.tools.length === 0) return { blocked: false };`
@@ -68,14 +71,4 @@ func checkToolCallingRequiredButUnsupported(body map[string]any, unsupported []s
 			model,
 		),
 	}
-}
-
-// stringSliceContains 等价于 JS 的 `arr.includes(x)`。
-func stringSliceContains(arr []string, target string) bool {
-	for _, s := range arr {
-		if s == target {
-			return true
-		}
-	}
-	return false
 }

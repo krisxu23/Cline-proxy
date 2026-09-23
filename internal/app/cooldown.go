@@ -109,10 +109,19 @@ func cooldownDuration(class string) time.Duration {
 
 // markCandidateCooldown 把某个候选按错误类别冷却一段时间。
 func markCandidateCooldown(upstream, model, class, reason string) {
+	markCandidateCooldownFor(upstream, model, class, reason, 0)
+}
+
+// markCandidateCooldownFor 同 markCandidateCooldown, 但时长可被上游明确给出的
+// RetryInfo 覆盖(overrideMs<=0 时按类别默认; 覆盖值同样参与探测失败翻倍)。
+func markCandidateCooldownFor(upstream, model, class, reason string, overrideMs int64) {
 	if upstream == "" || model == "" || class == "" {
 		return
 	}
 	d := cooldownDurationMs(class)
+	if overrideMs > 0 {
+		d = overrideMs
+	}
 	if d <= 0 {
 		return
 	}
@@ -427,26 +436,6 @@ func recordKeyResult(provider, key string, status int, netErr bool) {
 	} else {
 		delete(m, key)
 	}
-}
-
-// pickHealthyKeys returns observed healthy keys for the provider (empty if
-// none observed). providerConfig.APIKey is a single key string today — there
-// is no established multi-key config format (clinepass keeps its own key-pool
-// file), so key sourcing arrives with provider-chat wiring; this stays
-// observed-map-only until then.
-func pickHealthyKeys(provider string) []string {
-	now := time.Now().UnixMilli()
-	keyHealthMu.Lock()
-	defer keyHealthMu.Unlock()
-	var out []string
-	for k, st := range keyHealth[provider] {
-		if st != nil && st.failures >= keyFailThreshold && now-st.demotedAt < keyCooldownMs {
-			continue
-		}
-		out = append(out, k)
-	}
-	sort.Strings(out)
-	return out
 }
 
 // isKeyDemoted reports whether the key is currently cooled down after

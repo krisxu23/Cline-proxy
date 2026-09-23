@@ -83,7 +83,8 @@ func TestPruneStaleNodeHealth(t *testing.T) {
 // 实测背景: 订阅源为同一台服务器生成多个 SNI 变体(13,841 实例 / 3,722 个
 // host:port, 平均 3.7 个; 最极端的单台 94 个)。服务器连不上时逐个探测纯属浪费。
 // 本用例断言:
-//  1. 代表变体 Alive=false 的组, 其余变体**一次都不探**;
+//  1. 代表变体 Alive=false 的组, 先抽 1 个变体复探确认(防瞬态失败误杀整组,
+//     审查 P2), 确认仍死则其余变体**一次都不探** —— 死组总探测数 = 2;
 //  2. 那些变体被**显式记为不可用**(不是留空 —— 留空会被 nodeUsable 当"未探测即可用");
 //  3. 代表变体 Alive=true 的组, 其余变体**仍然逐个探**(SNI 变体可能确实不同)。
 func TestCheckAllNodeHealthSkipsSiblingsOfDeadServer(t *testing.T) {
@@ -146,9 +147,12 @@ func TestCheckAllNodeHealthSkipsSiblingsOfDeadServer(t *testing.T) {
 	cTotal := probed["c1"] + probed["c2"]
 	mu.Unlock()
 
-	// 1) 死服务器只探了代表变体这一次
-	if aTotal != 1 {
-		t.Fatalf("同一台死服务器应只探测 1 次(代表变体), 实际 %d 次: %v", aTotal, probed)
+	// 1) 死服务器: 代表 + 1 个复探确认共 2 次; 第三个变体(a3)一次都不探
+	if aTotal != 2 {
+		t.Fatalf("同一台死服务器应只探测 2 次(代表变体 + 1 个复探确认), 实际 %d 次: %v", aTotal, probed)
+	}
+	if probed["a3"] != 0 {
+		t.Fatalf("复探确认后其余变体应一次都不探, a3 实际 %d 次: %v", probed["a3"], probed)
 	}
 	// 2) 独占一台的节点正常探
 	if bTotal != 1 {

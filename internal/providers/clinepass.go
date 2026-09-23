@@ -83,6 +83,15 @@ func (p *clinepassProvider) load() {
 	p.keys = arr
 }
 
+// Reload 在 key 文件被本进程之外改写(面板配置导入等)后把磁盘内容重读进内存。
+// 构造期 load() 不加锁(此时尚无并发方); 这里是运行期入口, 锁内整体替换,
+// 避免与 pickActive/KeyStatuses 的锁外读构成 data race。
+func (p *clinepassProvider) Reload() {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.load()
+}
+
 // save 落盘 key 池: 锁内取快照、放锁后再做慢 I/O(本仓 §2.3 第 10 项),
 // 且必须用原子写 —— 此前在锁外 json.Marshal(p.keys) 与锁内 mutate 构成
 // data race, 非原子 os.WriteFile 会留下半截 JSON, load() 解析失败时静默
@@ -155,9 +164,20 @@ func (p *clinepassProvider) Chat(ctx context.Context, req ChatRequest) (*ChatRes
 	}
 	defer resp.Body.Close()
 	var out map[string]any
-	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+	// 成功路径也必须封顶: 错误分支走 kit.ReadBody(8MiB), 这里此前 Decoder 直读
+	// 无界, 被劫持/发疯端点可单请求把进程吃 OOM。超限时 LimitReader 在
+	// Max+1 处截断, 按字节判定给出明确超限错误(小 body 的坏 JSON 仍报解码错)。
+	dec := json.NewDecoder(io.LimitReader(resp.Body, kit.MaxUpstreamBodyBytes+1))
+	err = dec.Decode(&out)
+	if dec.InputOffset() > kit.MaxUpstreamBodyBytes {
+		return nil, fmt.Errorf("clinepass decode: response body exceeds %d bytes", kit.MaxUpstreamBodyBytes)
+	}
+	if err != nil {
 		return nil, fmt.Errorf("clinepass decode: %w", err)
 	}
+	// 解码成功后尽量读到 EOF 再 Close, h1 连接才能回池复用
+	// (否则单次 Decode 未到 EOF 即 Close, 每次非流式调用都要重建连接)。
+	io.Copy(io.Discard, resp.Body)
 	// ClinePass wraps payloads in {data: {...}}; unwrap one level.
 	if d, ok := out["data"].(map[string]any); ok {
 		out = d
@@ -204,47 +224,53 @@ func (p *clinepassProvider) ChatStream(ctx context.Context, req ChatRequest, w i
 
 	sawFinish := false // 上游是否已发过 finish_reason
 	events, errc := protocol.ScanSSE(resp.Body)
-	for {
-		select {
-		case ev, ok := <-events:
-			if !ok {
-				// 上游断流(未发 [DONE]): 合成 finish_reason + [DONE] 收尾
-				if err := protocol.AppendStopChunkIfNoFinish(w, sawFinish, req.Model); err != nil {
-					return err
-				}
-				_, err := io.WriteString(w, "data: [DONE]\n\n")
+	// 按 ScanSSE 契约消费: 先 for range 排空 events(out 先于 errc 关闭,
+	// 循环自然退出即上游 EOF/断流), 循环里/循环后统一合成收尾, 最后
+	// 非阻塞读一次 errc —— 非 nil 才是真错误; 旧写法 select 到已关闭的
+	// errc 会立即以 nil 返回, 跳过合成 finish/[DONE] 并丢掉残余帧。
+	for ev := range events {
+		if ev.Done {
+			if err := protocol.AppendStopChunkIfNoFinish(w, sawFinish, req.Model); err != nil {
 				return err
 			}
-			if ev.Done {
-				if err := protocol.AppendStopChunkIfNoFinish(w, sawFinish, req.Model); err != nil {
-					return err
-				}
-				_, err := io.WriteString(w, "data: [DONE]\n\n")
-				return err
-			}
-			if ev.Payload != nil {
-				if !sawFinish && protocol.HasFinishReason(ev.Payload) {
-					sawFinish = true
-				}
-				if onUsage != nil {
-					if u, ok := ev.Payload["usage"].(map[string]any); ok && len(u) > 0 {
-						onUsage(u)
-					}
-				}
-				// reasoning/reasoning_content fields pass through untouched.
-				norm := protocol.NormalizeOpenAIChunk(ev.Payload)
-				b, err := json.Marshal(norm)
-				if err != nil {
-					continue
-				}
-				if _, err := fmt.Fprintf(w, "data: %s\n\n", b); err != nil {
-					return err
-				}
-			}
-		case err := <-errc:
+			_, err := io.WriteString(w, "data: [DONE]\n\n")
 			return err
 		}
+		if ev.Payload != nil {
+			if !sawFinish && protocol.HasFinishReason(ev.Payload) {
+				sawFinish = true
+			}
+			if onUsage != nil {
+				if u, ok := ev.Payload["usage"].(map[string]any); ok && len(u) > 0 {
+					onUsage(u)
+				}
+			}
+			// reasoning/reasoning_content fields pass through untouched.
+			norm := protocol.NormalizeOpenAIChunk(ev.Payload)
+			b, err := json.Marshal(norm)
+			if err != nil {
+				continue
+			}
+			if _, err := fmt.Fprintf(w, "data: %s\n\n", b); err != nil {
+				return err
+			}
+		}
 	}
+	// 上游断流(未发 [DONE]): 合成 finish_reason + [DONE] 收尾
+	if err := protocol.AppendStopChunkIfNoFinish(w, sawFinish, req.Model); err != nil {
+		return err
+	}
+	if _, err := io.WriteString(w, "data: [DONE]\n\n"); err != nil {
+		return err
+	}
+	select {
+	case err := <-errc:
+		if err != nil {
+			return err
+		}
+	default:
+	}
+	return nil
 }
 
 func (p *clinepassProvider) ListModels() []ModelInfo {

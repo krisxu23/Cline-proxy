@@ -55,6 +55,12 @@ type nodeBuildItem struct {
 // 调用方自行判定(entries 里是否含 map 条目)。
 func buildNodeParts(entries []any) (ports map[string]int, inbounds, outbounds, rules []map[string]any, endpoints map[string]string) {
 	ports = map[string]int{}
+	// 构建输入只取一次(P3): getZenConfig 返回深拷贝, 旧实现每节点
+	// (nodeExcludedByFilter + validateOutboundEntry)各克隆一次, 4k 节点重建
+	// ≈ 2N 次全量配置克隆; 自定义 DoH 非法时 buildNodeDNS 的回退日志也会刷屏。
+	cfg := getZenConfig()
+	kws := cfg.NodeExcludeKeywords
+	dnsCfg, resolverTag := buildNodeDNS(cfg)
 	// 阶段 A: 按 key 去重 + 解析 + 校验(同一节点可能在多个订阅源重复出现,
 	// 稳定端口下重复条目 = 同端口两个 inbound, 必须收敛)。
 	items := make([]nodeBuildItem, 0, len(entries))
@@ -71,7 +77,7 @@ func buildNodeParts(entries []any) (ports map[string]int, inbounds, outbounds, r
 				continue
 			}
 			seenBuild[key] = true
-			if nodeExcludedByFilter(name) {
+			if nodeExcludedByFilter(kws, name) {
 				log.Printf("  node %d(%s): 命中排除关键词已跳过", i+1, name)
 				continue
 			}
@@ -92,7 +98,7 @@ func buildNodeParts(entries []any) (ports map[string]int, inbounds, outbounds, r
 			// 节点一路进到 box.New, 把**整个实例**打死 → nodePorts 归零 → 健康检测
 			// 直接跳过 → 面板上全部节点永久停在"未检测"。校验只做 box.New 不建连,
 			// 成本极低, 逐节点剔除即可。
-			if verr := validateOutboundEntry(ob); verr != nil {
+			if verr := validateOutboundEntry(ob, dnsCfg, resolverTag); verr != nil {
 				log.Printf("  node %d(%s): 出站无效已剔除: %v", i+1, name, verr)
 				continue
 			}
@@ -103,7 +109,7 @@ func buildNodeParts(entries []any) (ports map[string]int, inbounds, outbounds, r
 				continue
 			}
 			seenBuild[key] = true
-			if nodeExcludedByFilter(name) {
+			if nodeExcludedByFilter(kws, name) {
 				log.Printf("  node %d(%s): 命中排除关键词已跳过", i+1, name)
 				continue
 			}
@@ -117,7 +123,7 @@ func buildNodeParts(entries []any) (ports map[string]int, inbounds, outbounds, r
 			// 最集中的来源 —— transport:{"type":"tcp"} 正是从这里进来的)。
 			sanitizeOutboundTLS(cp)
 			sanitizeOutboundShape(cp)
-			if verr := validateOutboundEntry(cp); verr != nil {
+			if verr := validateOutboundEntry(cp, dnsCfg, resolverTag); verr != nil {
 				log.Printf("  node %d(%s): 出站无效已剔除: %v", i+1, name, verr)
 				continue
 			}
@@ -223,7 +229,11 @@ func startNodeInstance(ctx context.Context, inbounds, outbounds, rules []map[str
 //   - 别把"过了这个校验"当成"节点能用";
 //   - 这些取值必须靠 sanitizeOutboundShape 在**送进真实实例之前**处理掉,
 //     不能指望校验兜底。
-func validateOutboundEntry(ob map[string]any) error {
+//
+// dnsCfg/resolverTag 由调用方在循环外经 buildNodeDNS(getZenConfig()) 预先算好
+// 传入: 每节点重取配置 = 每节点一次深拷贝(P3), 且非法自定义 DoH 的回退日志
+// 会按节点数刷屏。
+func validateOutboundEntry(ob map[string]any, dnsCfg map[string]any, resolverTag string) error {
 	entry := map[string]any{"tag": "check"}
 	for k, v := range ob {
 		if k != "tag" {
@@ -234,7 +244,6 @@ func validateOutboundEntry(ob map[string]any) error {
 	// 否则"校验时剔除、运行时能跑"(或反过来), 两边结论打架。
 	sanitizeOutboundTLS(entry)
 	sanitizeOutboundShape(entry)
-	dnsCfg, resolverTag := buildNodeDNS(getZenConfig())
 	boxCfg := map[string]any{
 		"log":       map[string]any{"disabled": true},
 		"dns":       dnsCfg,

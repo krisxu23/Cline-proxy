@@ -1,5 +1,7 @@
 package app
 
+import "strings"
+
 // 逐字照抄 OmniRoute open-sse/translator/helpers/schemaCoercion.ts:77-81, 226-254, 444-447。
 //
 // 原注释（逐字, :219-225）:
@@ -96,24 +98,12 @@ func jsStringOf(v any) string {
 			}
 			parts = append(parts, jsStringOf(e))
 		}
-		return joinComma(parts)
+		return strings.Join(parts, ",")
 	case map[string]any:
 		return "[object Object]"
 	default:
 		return ""
 	}
-}
-
-// joinComma 复刻 JS 数组的 `join(",")`。
-func joinComma(parts []string) string {
-	out := ""
-	for i, p := range parts {
-		if i > 0 {
-			out += ","
-		}
-		out += p
-	}
-	return out
 }
 
 // sanitizeToolDescription 照抄 schemaCoercion.ts:226-254。

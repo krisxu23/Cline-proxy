@@ -390,8 +390,10 @@ func requestLogMiddleware(next http.Handler) http.Handler {
 			// chunked(ContentLength<0)长度未知, 必须走"读回剩余再拼接"的分支,
 			// 否则只放回探针读到的前 8KB, 下游拿到的 body 被截断(转发即坏)。
 			if r.ContentLength < 0 || r.ContentLength > int64(len(bodyBytes)) {
-				rest, _ := io.ReadAll(r.Body)
-				r.Body = io.NopCloser(bytes.NewReader(append(bodyBytes, rest...)))
+				// 终审 P3: 零拷贝拼回 —— 旧实现 io.ReadAll(rest) + append 会把
+				// 整份剩余 body 再进内存并复制一次(chunked 请求最多 64MiB×2 瞬时)。
+				// MultiReader 串接已读前缀与剩余 body, ContentLength 语义不变。
+				r.Body = io.NopCloser(io.MultiReader(bytes.NewReader(bodyBytes), r.Body))
 			} else {
 				r.Body = io.NopCloser(bytes.NewReader(bodyBytes))
 			}

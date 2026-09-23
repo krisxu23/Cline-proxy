@@ -3,7 +3,6 @@ package app
 import (
 	"encoding/json"
 	"fmt"
-	"math/rand"
 	"net/url"
 	"os"
 	"regexp"
@@ -225,7 +224,7 @@ func hasEnabledKey(cfg providerConfig) bool {
 	return false
 }
 
-// enabledAPIKeys 可轮换的 key 列表: 健康打散在前、被冷却的沉底。
+// enabledAPIKeys 可轮换的 key 列表: 健康在前、被冷却的沉底。
 // 只看显式开关, 不依赖 legacy 单 key 是否回填 —— 只有 APIKeys 列表的
 // provider 同样视为已配置。
 func enabledAPIKeys(cfg providerConfig, provider string) []string {
@@ -243,7 +242,8 @@ func enabledAPIKeys(cfg providerConfig, provider string) []string {
 			head = append(head, e.Key)
 		}
 	}
-	rand.Shuffle(len(head), func(i, j int) { head[i], head[j] = head[j], head[i] })
+	// 稳定分段即可: isKeyDemoted 已把降级 key 沉底, 洗牌只多付每调用一次
+	// 分配与随机源, 而链上每候选每请求都会调到这里。
 	return append(head, tail...)
 }
 

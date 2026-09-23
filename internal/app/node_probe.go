@@ -69,7 +69,7 @@ const (
 //	  1. 出口拿着这个**国内 IP** 去连, 连不上 → 活性探测失败;
 //	  2. 更致命的是 MITM 探测(见 nodeMITMURL)打的也是这个域名 —— 出口连到
 //	     国内 IP, TLS 证书对不上 → 判定"被劫持" → MITM_Risk=true →
-//	     checkNodeHealth 的 `Alive && !MITMRisk && !IsStalled` **对每个节点都返回 false**。
+//	     健康判定 `Alive && !MITMRisk && !IsStalled` **对每个节点都返回 false**。
 //
 //	修法: 换成 (a) **IP 字面量**(DNS 无从污染) 与 (b) 国内也能正确解析到真实
 //	Cloudflare(AS13335) 的端点。`cp.cloudflare.com` 实测解析为
@@ -448,9 +448,12 @@ func truncateStr(s string, maxLen int) string {
 
 // probeNodeSpeed 经代理做限时下载测速, 返回 (吞吐字节/s, 是否断流, 测速是否失败)。
 //
-// 三态语义(2026-09-22 审查 P1 修复):
-//   - 断流(IsStalled): 下载中途出现 >3s 读空闲 —— 这才是节点自身的"断流签名",
-//     唯一足以判死的信号;
+// 三态语义(2026-09-23 审查 P1 修订):
+//   - 断流(IsStalled): **单次 Read 耗时 >3s**(不论是否读到数据) —— 读前记时刻
+//     直接量这一次 Read 卡了多久; 旧写法拿与上次 chunk 的时间差判, 而 Read 返回
+//     数据后差值刚被刷新、恒 ≈0, 判定实际不可达。预算 ctx 超时(5s>3s)时被卡住
+//     的那次 Read 同样落在此判定内, 无进展的断流不会漏 —— 这是节点自身的"断流
+//     签名", 唯一足以判死的信号;
 //   - 测速失败(SpeedTestFailed): 所有端点都连不上/非 200/0 字节 —— 端点抽风
 //     (两个 URL 同为 speed.cloudflare.com, 同生同死)不是节点的错, 不判死;
 //   - 慢(仅记 SpeedBPS): 持续有数据但吞吐 < nodeSpeedSlowBPS —— 由选路降权兜底,
@@ -475,24 +478,27 @@ func probeNodeSpeed(client *http.Client) (int64, bool, bool) {
 		}
 		var downloaded int64
 		t0 := time.Now()
-		lastChunk := t0
 		stalled := false
 		chunk := make([]byte, nodeSpeedChunkSize)
 		for {
+			// 读前记时刻: 断流判定看单次 Read 本身耗时, 不再依赖与上次 chunk 的
+			// 时间差(旧写法先刷新 lastChunk 再判空闲, 差值恒 ≈0, 判定不可达)。
+			readStart := time.Now()
 			n, err := resp.Body.Read(chunk)
+			readDur := time.Since(readStart)
 			if n > 0 {
 				downloaded += int64(n)
-				lastChunk = time.Now()
 			}
-			now := time.Now()
+			if readDur.Seconds() > nodeSpeedIdleTimeout {
+				stalled = true // 单次 Read 卡 >3s: 不论是否读到数据, 都是断流签名
+				break
+			}
 			if err != nil {
+				// 预算 ctx 超时时被卡住的那次 Read 会在上面计入 stalled
+				// (5s 预算 >3s 阈值); 快速返回的 err 是预算耗尽/连接结束, 不算断流。
 				break
 			}
-			if now.Sub(t0).Seconds() > nodeSpeedBudget {
-				break
-			}
-			if now.Sub(lastChunk).Seconds() > nodeSpeedIdleTimeout {
-				stalled = true // 空闲断流: 节点自身的签名
+			if time.Since(t0).Seconds() > nodeSpeedBudget {
 				break
 			}
 		}

@@ -140,6 +140,10 @@ func ClaudeSSEToOpenAISSE(src io.Reader, dst io.Writer, model string) error {
 	toolMeta := map[int]map[string]any{} // index -> {"id","name"}
 	roleSent := false
 	sawStop := false
+	// message_start 帧的 input_tokens: message_delta 的 usage 只带 output_tokens,
+	// 末帧合并后再映射输出, 否则最后一帧(OpenAI 客户端取帧)会变成
+	// prompt_tokens:null、total=completion, 把 message_start 的正确值覆盖掉。
+	var startInputTokens any
 
 	for {
 		line, err := reader.ReadString('\n')
@@ -188,6 +192,9 @@ func ClaudeSSEToOpenAISSE(src io.Reader, dst io.Writer, model string) error {
 			// 为 OpenAI 形态。
 			if u, ok := ev["message"].(map[string]any); ok {
 				if uu, ok := u["usage"].(map[string]any); ok {
+					if it, ok := uu["input_tokens"]; ok {
+						startInputTokens = it
+					}
 					if err := writeChunk(map[string]any{
 						"choices": []any{},
 						"usage":   claudeUsageToOpenAI(uu),
@@ -250,7 +257,17 @@ func ClaudeSSEToOpenAISSE(src io.Reader, dst io.Writer, model string) error {
 			// (output_tokens)会让客户端读不到任何 token 数。
 			var usageOut any
 			if u, ok := ev["usage"].(map[string]any); ok {
-				usageOut = claudeUsageToOpenAI(u)
+				// 末帧合并: message_delta 通常只带 output_tokens, 补上
+				// message_start 记住的 input_tokens → prompt+completion+total 齐全。
+				merged := u
+				if _, has := u["input_tokens"]; !has && startInputTokens != nil {
+					merged = make(map[string]any, len(u)+1)
+					for k, v := range u {
+						merged[k] = v
+					}
+					merged["input_tokens"] = startInputTokens
+				}
+				usageOut = claudeUsageToOpenAI(merged)
 			}
 			if err := writeChunk(map[string]any{
 				"choices": []any{map[string]any{

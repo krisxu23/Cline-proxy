@@ -166,7 +166,10 @@ func applyOpencodeHeaders(outbound map[string]string, clientHeaders map[string]s
 	}
 	// 3. 补默认 CLI 身份(客户端没给的就填; UA 例外会替换)
 	ua := outbound["User-Agent"]
-	clientUaIsCliLike := strings.HasPrefix(strings.TrimSpace(ua), "opencode-cli/")
+	// 官方与本网关形态都是 opencode/<ver>(见文件头); opencode-cli/ 是历史前缀,
+	// 一并放行 —— 否则真实客户端的版本号会被硬编码 1.18.31 顶掉。
+	trimmedUA := strings.TrimSpace(ua)
+	clientUaIsCliLike := strings.HasPrefix(trimmedUA, "opencode/") || strings.HasPrefix(trimmedUA, "opencode-cli/")
 	if !clientUaIsCliLike {
 		outbound["User-Agent"] = identity.userAgent
 	}

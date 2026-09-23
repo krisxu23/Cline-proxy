@@ -1,6 +1,10 @@
 package app
 
 import (
+	"bytes"
+	"encoding/json"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"testing"
@@ -58,5 +62,29 @@ func TestPruneImportBackupsNoopWhenFew(t *testing.T) {
 	left, _ := filepath.Glob(target + ".bak-import-*")
 	if len(left) != 1 {
 		t.Fatalf("不足保留数时不应删除, 实际 %d", len(left))
+	}
+}
+
+// 审计 P2: 导入 .zen-config.json 必须与面板直改同一口径过出站地址校验 ——
+// 否则云元数据地址经导入落盘, 重启后 POST model=evil:any 即可让网关去取
+// 元数据并把响应回传(SSRF + 回读)。169.254.169.254 是链路本地字面量,
+// 判定不依赖 DNS, 结果确定; 校验环在任何写盘之前即拒绝, 零副作用。
+func TestConfigImportRejectsLinkLocalOutboundURLs(t *testing.T) {
+	cases := map[string]string{
+		"providers.baseUrl": `{"providers":{"evil":{"baseUrl":"http://169.254.169.254/latest/meta-data"}}}`,
+		"baseURLs":          `{"baseURLs":["http://169.254.169.254/v1"]}`,
+		"subs":              `{"subs":["http://169.254.169.254/sub"]}`,
+	}
+	for what, zen := range cases {
+		body, err := json.Marshal(map[string]any{"files": map[string]string{".zen-config.json": zen}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		req := httptest.NewRequest(http.MethodPost, "/admin/api/config/import", bytes.NewReader(body))
+		rec := httptest.NewRecorder()
+		handleConfigImport(rec, req)
+		if rec.Code != http.StatusBadRequest {
+			t.Fatalf("%s: 链路本地地址应被拒绝, got %d, body=%s", what, rec.Code, rec.Body.String())
+		}
 	}
 }

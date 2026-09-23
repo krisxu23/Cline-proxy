@@ -82,7 +82,10 @@ package app
 //
 // 返回 (净化后的 messages, 是否有改动)。
 
-import "strings"
+import (
+	"strconv"
+	"strings"
+)
 
 // sanitizeClaudeToolIDs 对 messages[] 里的 tool_use / tool_result 做双侧对称 id 净化，
 // 并顺带剔除「空名 tool_use」「缺 id 的 tool_result」两类必然 400 的块。
@@ -94,12 +97,36 @@ import "strings"
 //   - tool_use 侧要求 `typeof block.id === "string" && block.id`；
 //   - tool_result 侧要求 `typeof block.tool_use_id === "string" && block.tool_use_id`；
 //   - 其余块类型原样保留。
+//   - 净化结果**同遍去重**(超出参考实现的补充): 净化可把两个不同原始 id
+//     (如 `a#b` 与 `a_b`)压成同一值, 上游会回 400 duplicate tool_use id;
+//     撞名时追加 `_2`/`_3` 后缀(与 cloak aliasFor 的撞名消解同风格)。
+//     tool_use 与 tool_result 在同一遍查同一张表, 同一原始 id 两侧得同一终值。
 func sanitizeClaudeToolIDs(messages []any) ([]any, bool) {
 	if len(messages) == 0 {
 		return messages, false
 	}
 	changed := false
 	out := make([]any, 0, len(messages))
+	// final: 原始 id → 最终 id (memo, 双侧配对共用同一张表);
+	// taken: 已被占用的净化值 → 占用它的原始 id。
+	final := map[string]string{}
+	taken := map[string]string{}
+	resolve := func(id string) string {
+		if v, ok := final[id]; ok {
+			return v
+		}
+		base := sanitizeToolID(id)
+		cand := base
+		for n := 2; ; n++ {
+			if _, used := taken[cand]; !used {
+				break
+			}
+			cand = base + "_" + strconv.Itoa(n)
+		}
+		taken[cand] = id
+		final[id] = cand
+		return cand
+	}
 	for _, raw := range messages {
 		msg, ok := raw.(map[string]any)
 		if !ok {
@@ -162,7 +189,7 @@ func sanitizeClaudeToolIDs(messages []any) ([]any, bool) {
 					next = append(next, bRaw)
 					continue
 				}
-				sid := sanitizeToolID(id)
+				sid := resolve(id)
 				if sid != id {
 					nb := shallowCopyStringAny(b)
 					nb["id"] = sid
@@ -176,7 +203,7 @@ func sanitizeClaudeToolIDs(messages []any) ([]any, bool) {
 					next = append(next, bRaw)
 					continue
 				}
-				sid := sanitizeToolID(id)
+				sid := resolve(id)
 				if sid != id {
 					nb := shallowCopyStringAny(b)
 					nb["tool_use_id"] = sid

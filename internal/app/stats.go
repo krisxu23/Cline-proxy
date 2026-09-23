@@ -79,9 +79,11 @@ type zenStatsModel struct {
 var (
 	statsFile   *os.File
 	statsFileMu sync.Mutex
-	statsToday  *zenStatsAgg
-	statsTotal  *zenStatsAgg
-	statsAggMu  sync.Mutex
+	// 当前 zen-stats.jsonl 已写字节数(轮转判据), open 时播种、截断成功后清零; 受 statsFileMu 保护。
+	statsBytesWritten int64
+	statsToday        *zenStatsAgg
+	statsTotal        *zenStatsAgg
+	statsAggMu        sync.Mutex
 
 	// 可重试初始化: 用 Mutex + 状态替代 sync.Once, 打开失败后能重试而不永久降级。
 	statsInitMu      sync.Mutex
@@ -201,6 +203,9 @@ func initStats() {
 	}
 	statsFileMu.Lock()
 	statsFile = f
+	if st, serr := f.Stat(); serr == nil {
+		statsBytesWritten = st.Size()
+	}
 	statsFileMu.Unlock()
 
 	// 从落盘文件重建的聚合要在 statsAggMu 内一次性 swap 进全局变量,
@@ -405,18 +410,24 @@ func recordZenStats(rec zenStatsRecord) {
 	if statsFile != nil {
 		b, err := json.Marshal(rec)
 		if err == nil {
-			statsFile.Write(append(b, '\n'))
+			if n, werr := statsFile.Write(append(b, '\n')); werr == nil {
+				// 终审 P3: 内存计数替代每条一次 Stat 系统调用(open 时播种,
+				// 截断时清零); 超限判断不再走内核。
+				statsBytesWritten += int64(n)
+			}
 		}
 		// 轮转: 超过上限则截断成空, 只保留最近记录(与 cline-proxy.log / requests.jsonl 同思路)。
 		// 必须用 os.Truncate 而不是句柄级 Truncate: statsFile 是 O_APPEND 打开的,
 		// Windows 下该句柄没有 GENERIC_WRITE, 句柄级截断会 "Access is denied"。
-		if st, serr := statsFile.Stat(); serr == nil && st.Size() > maxZenStatsBytes {
+		if statsBytesWritten > maxZenStatsBytes {
 			tp := statsFilePath
 			if tp == "" {
 				tp = kit.ResolveDataPath("zen-stats.jsonl")
 			}
 			if terr := os.Truncate(tp, 0); terr != nil {
 				log.Printf("zen-stats: truncate 失败: %v", terr)
+			} else {
+				statsBytesWritten = 0
 			}
 		}
 	}

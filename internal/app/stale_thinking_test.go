@@ -91,24 +91,40 @@ func TestStripStaleThinking_Claude形态(t *testing.T) {
 	}
 }
 
-func TestStripStaleThinking_Chat形态不动reasoning字段(t *testing.T) {
-	// chat 形态: content 是字符串、reasoning_content 是 OpenAI 反向契约的
-	// 补齐对象 —— 剥离函数只认 claude 块与顶层 thinking 配置, 这里必须原样。
+func TestStripStaleThinking_剥assistant字段型reasoning_content(t *testing.T) {
+	// 字段型推理(kimi-coding 一类): reasoning_content 是字段、content 是普通
+	// 文本 —— assistant 侧必须删掉, 否则转换层在重放体里原样重建 thinking,
+	// 重放与原请求相同、再次 400(剥离项 4)。非 assistant 消息与其余字段原样。
 	params := map[string]any{
 		"messages": []any{
-			map[string]any{"role": "user", "content": "hi"},
+			map[string]any{"role": "user", "content": "hi",
+				"reasoning_content": "user 侧不动"},
 			map[string]any{"role": "assistant", "content": "ok",
 				"reasoning_content": "thinking about it",
 				"tool_calls":        []any{map[string]any{"id": "c1", "type": "function"}},
 			},
 		},
 	}
-	if stripStaleThinking(params) {
-		t.Fatal("chat 形态无可剥项时应返回 false")
+	if !stripStaleThinking(params) {
+		t.Fatal("assistant 带字段型 reasoning_content 时应返回 true")
 	}
 	m := params["messages"].([]any)[1].(map[string]any)
-	if _, ok := m["reasoning_content"]; !ok {
-		t.Fatal("reasoning_content 不属于剥离范围, 不得被删")
+	if _, ok := m["reasoning_content"]; ok {
+		t.Fatal("assistant reasoning_content 应被删")
+	}
+	if m["content"] != "ok" {
+		t.Fatalf("content 字符串应原样, got %#v", m["content"])
+	}
+	if _, ok := m["tool_calls"]; !ok {
+		t.Fatal("tool_calls 应保留")
+	}
+	um := params["messages"].([]any)[0].(map[string]any)
+	if _, ok := um["reasoning_content"]; !ok {
+		t.Fatal("非 assistant 消息的 reasoning_content 不得被删")
+	}
+	// 幂等: 已剥干净再调返回 false —— 调用方据 false 不做无意义重放。
+	if stripStaleThinking(params) {
+		t.Fatal("第二次调用应返回 false(幂等)")
 	}
 	if stripStaleThinking(nil) {
 		t.Fatal("nil 安全且返回 false")

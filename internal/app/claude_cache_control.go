@@ -397,6 +397,17 @@ func reanchorClaudePromptCache(params map[string]any, provider string) {
 		return
 	}
 
+	// copy-on-write 深拷贝(根治跨候选 cache_control 泄漏): params 在候选链里被
+	// 多个候选共享, 下面 2/3/5/6 步会**就地**改写 msg map(stripMessageCacheControl /
+	// markMessageCacheControl / ensureMessageContentArray)并把新 marker 写进共享
+	// 内容块 —— 不拷贝的话, 后续候选会把上一候选补的断点原样带出去。
+	// 拷贝逐 map 进行(msg map / content 块 map / tool map / system 块 map, 值本身
+	// 从不被就地改写, 不递归进 input_schema); preserve 早退在前, 这笔拷贝只在真正
+	// 要改写的非 preserve 路径、且只在 anthropic 候选(reanchor 的唯一调用作用域)
+	// 付出。tools/system 的重锚函数本身就是先建新切片新 map 再写(自带 COW),
+	// 这里一并入口拷贝是为防御未来就地改写, 代价仅一层浅 map。
+	deepCopyClaudeReanchorTargets(params)
+
 	// 2. system 重锚
 	if system, ok := params["system"].([]any); ok {
 		params["system"] = reanchorSystemCacheControl(system, supportsPromptCaching)
@@ -424,5 +435,73 @@ func reanchorClaudePromptCache(params map[string]any, provider string) {
 	if hasMessages && supportsPromptCaching {
 		markSecondToLastUserCacheControl(messages)
 		markLastAssistantCacheControl(messages)
+	}
+}
+
+// deepCopyClaudeReanchorTargets 把重锚将要**就地改写**的三层 map 逐个拷一份,
+// 写回 params —— copy-on-write 的入口半边(写回的是拷贝, 原对象不再被碰)。
+//
+// 拷贝深度止于"这一层的 map":候选链的泄漏只经过 msg map(strip 删 cc)、
+// content 块 map(mark 写 cc)、tool/system 块 map(reanchor 写 cc)这三类;
+// map 的值(字符串/嵌套 schema)从不被就地改写, 递归拷它们只烧 CPU。
+// 非 map 元素原样搬运(块数组里的字符串等)。
+func deepCopyClaudeReanchorTargets(params map[string]any) {
+	copyMapSlice := func(raw any) (any, bool) {
+		arr, ok := raw.([]any)
+		if !ok {
+			return nil, false
+		}
+		out := make([]any, len(arr))
+		for i, el := range arr {
+			if m, ok := el.(map[string]any); ok {
+				cp := make(map[string]any, len(m))
+				for k, v := range m {
+					cp[k] = v
+				}
+				out[i] = cp
+			} else {
+				out[i] = el
+			}
+		}
+		return out, true
+	}
+	// messages: msg map 拷一层; content 是块数组时, 块 map 再拷一层
+	// (stripMessageCacheControl / markMessageCacheControl 正是改到这一层)。
+	if arr, ok := params["messages"].([]any); ok {
+		out := make([]any, len(arr))
+		for i, raw := range arr {
+			msg, isMap := raw.(map[string]any)
+			if !isMap {
+				out[i] = raw
+				continue
+			}
+			cp := make(map[string]any, len(msg))
+			for k, v := range msg {
+				cp[k] = v
+			}
+			if blocks, ok := msg["content"].([]any); ok {
+				bc := make([]any, len(blocks))
+				for j, braw := range blocks {
+					if b, isMap := braw.(map[string]any); isMap {
+						bcp := make(map[string]any, len(b))
+						for k, v := range b {
+							bcp[k] = v
+						}
+						bc[j] = bcp
+					} else {
+						bc[j] = braw
+					}
+				}
+				cp["content"] = bc
+			}
+			out[i] = cp
+		}
+		params["messages"] = out
+	}
+	if v, ok := copyMapSlice(params["tools"]); ok {
+		params["tools"] = v
+	}
+	if v, ok := copyMapSlice(params["system"]); ok {
+		params["system"] = v
 	}
 }

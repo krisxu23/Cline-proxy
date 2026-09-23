@@ -7,12 +7,24 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"net/http"
 	"strings"
+	"time"
 
+	"cline-go-proxy/internal/kit"
 	"cline-go-proxy/internal/protocol"
 	"cline-go-proxy/internal/providers"
 )
+
+// init 把共享 HTTP 传输(HTTPClient/HTTPClientTimeout 共用同一指针)的基础拨号
+// 挂上 SSRF 运行时防线: dialWithSSRFGuard 在包 outbound_url.go, kit 不能 import
+// app, 接线只能落在 app 侧 —— 包 init 早于 main, 对之后所有经 kit 客户端的出站
+// 请求生效(配置期校验之外, 堵住 DNS rebinding 到链路本地/云元数据的窗口)。
+func init() {
+	kit.HTTPTransport.DialContext = dialWithSSRFGuard(
+		(&net.Dialer{Timeout: 30 * time.Second, KeepAlive: 30 * time.Second}).DialContext)
+}
 
 // ClinePass handler paths: cline-pass/ prefixed models route through the
 // ClinePass key pool. The upstream speaks OpenAI chat format, so the
@@ -123,6 +135,15 @@ func clinePassModelByID(id string) (providers.ModelInfo, bool) {
 
 func clinePassProvider() *providers.ClinePassProvider {
 	return getGateway().ClinePass
+}
+
+// reloadClinepassKeys 供 .clinepass-keys.json 被本进程之外改写(面板配置导入)后
+// 刷新内存 key 池 —— 不刷新的话, 下一次面板增删 key 的 p.save() 会用旧内存
+// 整文件覆盖刚导入的内容(静默回退)。
+func reloadClinepassKeys() {
+	if cp := clinePassProvider(); cp != nil {
+		cp.Reload()
+	}
 }
 
 // handleClinePassChat serves POST /v1/chat/completions with cline-pass/ models.

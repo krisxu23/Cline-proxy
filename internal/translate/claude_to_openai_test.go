@@ -65,6 +65,9 @@ func TestClaudeSSEToOpenAISSE(t *testing.T) {
 		`"role":"assistant"`, `你好`, `"reasoning_content":"think"`,
 		`"id":"tu_9"`, `"name":"f"`, `"arguments":"{\"a\":1}"`,
 		`"finish_reason":"tool_calls"`, "data: [DONE]",
+		// 末帧 usage 必须合并 message_start 的 input_tokens(9)+message_delta 的
+		// output_tokens(7) → prompt+completion+total 齐全, 不能覆盖成 null/total=7。
+		`"usage":{"completion_tokens":7,"prompt_tokens":9,"total_tokens":16}`,
 	} {
 		if !strings.Contains(out, want) {
 			t.Fatalf("SSE 缺少 %q:\n%s", want, out)
