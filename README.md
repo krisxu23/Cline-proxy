@@ -352,7 +352,6 @@ go test -tags "with_quic,with_grpc,with_utls" ./...    # 单元测试
 ```
 
 覆盖协议转换、provider 目录与免费判定、Gemini 签名与配额、路由与冷却逻辑；不带构建标签时涉及节点出站的用例会失败（缺协议栈，属预期）。
-  ```
 
 ## 致谢
 
