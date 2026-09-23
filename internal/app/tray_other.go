@@ -3,18 +3,25 @@
 package app
 
 import (
+	"fmt"
 	"os/exec"
 	"runtime"
 )
 
 // OpenAdminWindow 非 Windows 平台回退到默认浏览器。
-func OpenAdminWindow(adminURL string) {
+// 返回错误供调用方记录(与 Windows 实现同一契约)。
+func OpenAdminWindow(adminURL string) error {
+	var err error
 	switch runtime.GOOS {
 	case "darwin":
-		exec.Command("open", adminURL).Start()
+		err = exec.Command("open", adminURL).Start()
 	default:
-		exec.Command("xdg-open", adminURL).Start()
+		err = exec.Command("xdg-open", adminURL).Start()
 	}
+	if err != nil {
+		return fmt.Errorf("启动默认浏览器失败: %w", err)
+	}
+	return nil
 }
 
 // RunTray 非 Windows 没有托盘图标: 必须阻塞等根上下文取消(退出信号或显式

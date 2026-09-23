@@ -7,6 +7,7 @@ import (
 	"bytes"
 	_ "embed"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -58,15 +59,27 @@ func findAppBrowser() string {
 
 // OpenAdminWindow 用 Edge/Chrome 应用模式打开管理界面(独立窗口、无地址栏、
 // 独立任务栏图标,观感即桌面应用); 都没有时回退到默认浏览器。
-func OpenAdminWindow(adminURL string) {
+//
+// 返回错误供调用方记录 —— 此前两条路径的错误都被静默吞掉: 窗口没起来时
+// 日志里查不到任何线索, 用户只能看到"双击了没反应"(2026-09-24 实证)。
+func OpenAdminWindow(adminURL string) error {
+	var appErr error
 	if browser := findAppBrowser(); browser != "" {
-		// ponytail: --app 窗口由用户手动关闭; 服务端继续运行,托盘可再次打开。
+		// --app 窗口由用户手动关闭; 服务端继续运行, 托盘可再次打开。
 		cmd := exec.Command(browser, "--app="+adminURL, "--window-size=1280,860")
 		if err := cmd.Start(); err == nil {
-			return
+			return nil
+		} else {
+			// 应用模式起不来不算终局: 继续往下走默认浏览器回退, 别直接放弃。
+			appErr = fmt.Errorf("应用窗口模式启动失败(%s): %w", filepath.Base(browser), err)
 		}
+	} else {
+		appErr = errors.New("未找到 Edge/Chrome(应用窗口模式需要 Chromium 系浏览器)")
 	}
-	exec.Command("rundll32", "url.dll,FileProtocolHandler", adminURL).Start()
+	if err := exec.Command("rundll32", "url.dll,FileProtocolHandler", adminURL).Start(); err != nil {
+		return fmt.Errorf("%v; 默认浏览器回退也失败: %w", appErr, err)
+	}
+	return nil
 }
 
 // RunTray 启动系统托盘并阻塞,直到用户点击「退出」。
@@ -84,7 +97,9 @@ func RunTray(adminURL string) {
 			for {
 				select {
 				case <-mOpen.ClickedCh:
-					OpenAdminWindow(adminURL)
+					if err := OpenAdminWindow(adminURL); err != nil {
+						log.Printf("  admin panel: 托盘打开管理界面失败: %v", err)
+					}
 				case <-mData.ClickedCh:
 					openDataDir()
 				case <-mDiag.ClickedCh:

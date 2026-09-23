@@ -5,7 +5,6 @@ import (
 	"flag"
 	"fmt"
 	"free-router/internal/app"
-	"free-router/internal/kit"
 	"io"
 	"log"
 	"net/http"
@@ -115,11 +114,18 @@ func runDesktop(host string, port int) {
 			}
 		}()
 	}
-	// 首次运行自动弹管理窗口(见 panelMarker), 之后纯后台启动; 托盘
-	// 「打开管理界面」始终可用, 随开随关。
-	if !panelOpened() {
-		go app.OpenAdminWindow(adminURL)
-		markPanelOpened()
+	// 每次启动都自动弹管理窗口(2026-09-24 用户要求: 打开就能看到后台在哪)。
+	//
+	// 此前是"只首次弹、之后纯后台", 靠 data/.panel-opened 标记门控 —— 用户实测
+	// 每次换新版本重启都不弹, 认为这不对, 已按要求取消门控。代价可控: Chrome
+	// 已在运行时只是多开一个 --app 窗口(共用同一进程), 只有 Chrome 没开才会
+	// 拉起浏览器进程树。
+	//
+	// 失败必须落日志: 交付的二进制是 windowsgui 子系统、没有控制台, 静默失败
+	// 时用户只能看到"双击了没反应"(见 OpenAdminWindow 的错误返回)。
+	// 注意日志里**不能**带 adminURL —— 它含访问令牌。
+	if err := app.OpenAdminWindow(adminURL); err != nil {
+		log.Printf("  admin panel: 自动打开管理界面失败: %v (可从托盘「打开管理界面」重试, 或手动访问 http://127.0.0.1:%d/admin/)", err, port)
 	}
 	app.RunTray(adminURL)
 }
@@ -131,22 +137,6 @@ func adminPanelURL(port int) string { return app.AdminPanelURL(port) }
 // adminHealthBase 健康端点地址, 仅用于探测已有实例是否真正可用。
 func adminHealthBase(port int) string {
 	return fmt.Sprintf("http://127.0.0.1:%d/health", port)
-}
-
-// panelMarker 记录管理窗口是否已自动弹出过。首次运行弹面板是为了让用户
-// 知道后台在哪看; 之后纯后台 —— 每次启动都弹等于为面板常驻拉起整棵浏览器
-// 进程树(Edge/Chrome --app, 见 OpenAdminWindow), 空载白吃内存。
-const panelMarker = ".panel-opened"
-
-// panelOpened 报告管理窗口此前是否已自动弹出过。
-func panelOpened() bool {
-	return kit.FileExists(kit.ResolveDataPath(panelMarker))
-}
-
-// markPanelOpened 记下"已弹过", 内容为弹出时刻便于排查。写失败 → 下次
-// 仍会弹(退化为改造前的每次启动都弹, 安全方向), 错误就此吞掉。
-func markPanelOpened() {
-	_ = os.WriteFile(kit.ResolveDataPath(panelMarker), []byte(time.Now().Format(time.RFC3339)), 0o644)
 }
 
 // isServiceAlive 探测已有实例是否真的在正常服务。
@@ -232,12 +222,9 @@ func buildAndStart(host string, port int) {
 	url := adminPanelURL(port)
 	fmt.Printf("\nAdmin panel: %s\n", url)
 
-	switch runtime.GOOS {
-	case "windows":
-		app.OpenAdminWindow(url)
-	case "darwin":
-		exec.Command("open", url).Start()
-	default:
-		exec.Command("xdg-open", url).Start()
+	// 统一走 app.OpenAdminWindow: 它内部已按平台分流(Windows 用 Edge/Chrome --app,
+	// 其它平台 open/xdg-open), 这里的 switch 是重复的; 且它的错误返回需要被记录。
+	if err := app.OpenAdminWindow(url); err != nil {
+		log.Printf("admin panel: 打开浏览器失败: %v", err)
 	}
 }
