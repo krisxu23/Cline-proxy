@@ -106,6 +106,43 @@ func purgeStablePortsFromError(err error, ports map[string]int) int {
 // listenAddrRe 匹配错误串里的本机监听地址(端口 2~5 位数字)。
 var listenAddrRe = regexp.MustCompile(`127\.0\.0\.1:(\d{2,5})`)
 
+// pruneStablePortsTo 把稳定端口表裁剪到当前快照的 key 集合。
+//
+// 这张表的唯一用途是"让**仍在订阅里**的节点的本地入站端口不漂移"(见文件头注释:
+// 面板上的 127.0.0.1:port 可以当该节点的固定调试入口)。已经不在订阅里的 key
+// 保留端口毫无意义 —— 而它此前只增不减: 订阅长期 churn 下无限增长
+// (2026-09-23 实测 27634 条 / 3.8MB, 每次重建都要整份重写), 而实际生效的只有
+// 当前池里那 1000 多条。
+//
+// prevSnapshot 守卫: 订阅抓取**部分失败**时快照会大幅缩小, 此时按快照裁剪会把
+// 仍在的节点误删、端口漂移 —— 那正是这张表要解决的问题。所以只在"新快照不小于
+// 上一轮的一半"时裁剪; 明显缩小视为中间态, 本轮跳过(下一轮基线会跟上, 不会永久
+// 卡住)。
+//
+// 返回裁剪条数(日志用)。
+func pruneStablePortsTo(current map[string]int, prevSnapshot int) int {
+	if len(current) == 0 {
+		return 0 // 空快照已被 syncNodeBox 的空入口守卫拦住; 这里再兜一层
+	}
+	if prevSnapshot > 0 && len(current)*2 < prevSnapshot {
+		return 0 // 疑似部分抓取: 本轮不裁剪
+	}
+	nodeStableMu.Lock()
+	loadNodeStablePorts()
+	dropped := 0
+	for k := range nodeStablePorts {
+		if _, ok := current[k]; !ok {
+			delete(nodeStablePorts, k)
+			dropped++
+		}
+	}
+	nodeStableMu.Unlock()
+	if dropped > 0 {
+		persistNodeStablePorts() // 自身取锁, 必须在放锁之后调用
+	}
+	return dropped
+}
+
 // purgeStablePorts 清除一批节点的稳定端口记录(Start 失败自愈: 这些端口
 // 可能被半启动实例或其它进程占用, 下次重建应重新分配而不是复用)。
 func purgeStablePorts(ports map[string]int) {

@@ -355,7 +355,8 @@ func syncNodeBox() {
 	// 这保证了 failKeepOld 的核心不变量: 先建新实例、成功才 Close 旧实例, 无半替换窗口,
 	// 且任何失败路径都不修改全局状态(§2.6 第 22 项测试锁住此性质)。
 	nodeMu.Lock()
-	if nodeBox == prevBox {
+	committed := nodeBox == prevBox
+	if committed {
 		if prevBox != nil {
 			prevBox.Close()
 		}
@@ -377,6 +378,17 @@ func syncNodeBox() {
 		instance.Close()
 	}
 	nodeMu.Unlock()
+
+	if committed {
+		// 稳定端口表按当前快照裁剪: 它此前只增不减, 会随订阅 churn 无限增长
+		// (实测 27634 条 / 3.8MB, 每次重建整份重写), 而只有当前池里的条目有用。
+		// 用上一轮的池规模作"疑似订阅部分抓取"的守卫 —— 见 pruneStablePortsTo。
+		// 放在 nodeMu 之外调用: 它自己持 nodeStableMu, 不引入新的锁序。
+		if n := pruneStablePortsTo(ports, len(prevPorts)); n > 0 {
+			log.Printf("  nodes: 稳定端口表已按当前快照裁剪, 移除 %d 条不在订阅里的记录(现有 %d 条)",
+				n, len(ports))
+		}
+	}
 
 	// 每出口一份的 client 全部回收: 本次替换让旧出口的本地入站端口作废, 钉在
 	// 旧端口上的 client 已经用不上了。放在 nodeMu 之外调用 —— 它自己持
