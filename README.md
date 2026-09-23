@@ -1,3 +1,7 @@
+# Cline-proxy
+
+把 Cline 账号池、opencode zen 免费模型、ClinePass 订阅与任意 OpenAI 兼容站点合流为一个本地网关：三协议对外、按 model 前缀直选上游；单二进制，Windows 桌面形态开箱即用。
+
 ## 目录
 
 - [特性](#特性)
@@ -13,15 +17,14 @@
 
 ## 特性
 
-- **四类上游，一个入口** —— Cline 账号池、opencode zen 免费模型、ClinePass 订阅池，以及你自己挂的任意 OpenAI 兼容站点（Gemini、OpenRouter、TokenRouter、B.AI…），按 model 自动分流
-- **三种协议对外** —— OpenAI `/v1/chat/completions`、Anthropic `/v1/messages`、OpenAI Responses `/v1/responses`，同一份上游能力给任意客户端
-- **前缀直选 + 模型聚合** —— `cline-pass/*`、`zen/*`、`provider:model` 三种写法精确指定上游；`GET /v1/models` 实时聚合四类上游的全部可用模型
-- **出口治理** —— 内嵌 sing-box 把节点链接直接转成本地出口，代理池轮询 + 冷却；**连通检测结果参与选路**（判定不可达的节点不再被轮询）；**地区受限模型只在通过地区校验的节点上路由**
-- **三层自愈** —— 上游熔断 → key/账号级冷却 → 模型级路由；每个响应带 `X-Proxy-Route` 头标注本次决策，排查路由一目了然
-- **账号池自动化** —— OAuth 浏览器登录 / 手动 Token / 批量导入；命中 429 自动解析冷却时长并到期恢复，请求失败自动换下一个可用账号
-- **Gemini 协议兼容** —— 原生目录方言归一化、thought-signature 回填与自动重放、免费配额语义区分（"没有免费层"与"当日额度用尽"走不同处置）
+- **四类上游、一个入口** —— Cline 账号池、opencode zen 免费模型、ClinePass 订阅池，以及自配的任意 OpenAI 兼容站点（Gemini / OpenRouter / TokenRouter / B.AI …）；`cline-pass/*`、`zen/*`、`provider:model` 三种前缀直选上游
+- **三协议对外** —— OpenAI `/v1/chat/completions`、Anthropic `/v1/messages`、OpenAI Responses `/v1/responses`，同一份上游能力给任意客户端；`GET /v1/models` 实时聚合全部可用模型
+- **opencode 伪装层** —— 出站 zen 请求与官方 opencode CLI 完全同形：官方式身份头 + 结构合法的 `prj_/ses_/usr_` ID，免费层强制 agent 形态（stream + 五件套工具），详见 [opencode 伪装层](#opencode-伪装层)
+- **出口治理** —— 内嵌 sing-box，节点链接直贴即成本地出口；代理池轮询 + 冷却，连通检测参与选路（不可达不再轮询），地区受限模型只走通过地区校验的出口
+- **三层自愈 + 账号池自动化** —— 上游熔断 → key/账号冷却 → 模型级路由，`X-Proxy-Route` 头标注每次决策；OAuth / 手动 Token / 批量导入入池，429 时长自动解析、到期恢复，请求失败自动换号
+- **Gemini 协议兼容** —— 原生目录方言归一化、thought-signature 回填与自动重放、免费配额语义区分
 - **上下文压缩** —— 移植 opencode 官方摘要算法（尾部预算 → 锚定摘要模板 → 重组会话），超长会话不撞上限
-- **单二进制 + 桌面形态** —— GUI 子系统构建无控制台窗口，托盘图标 + 独立管理窗口；也支持服务器模式与 Docker；token 统计与请求日志落盘
+- **单二进制 + 桌面形态** —— 无控制台黑窗，托盘 + 独立管理窗口；也支持服务器模式与 Docker；token 统计与请求日志落盘
 
 ## 快速开始
 
@@ -177,6 +180,15 @@ api.cline.bot  opencode.ai/zen  api.cline.bot   你配置的任意上游
 - **上游错误**：4xx 状态码原样返回（例如 `403 RegionError` 对客户端可见），网络错误与 5xx 归一为 502
 - **Responses 专用模型**：`muse-*` 家族的免费模型（`muse-spark-1.2/1.3-contributor-free` 等）在上游只提供 OpenAI Responses 接口——直接请求 `chat/completions` 会被上游后端崩成 500。网关对这类模型自动改走上游 `/v1/responses` 端点，请求体与响应（含流式）双向翻译回 chat 格式，对客户端完全透明；tool_calls 工具调用链路与 usage 统计不受影响。翻译时 `max_tokens` 会补足上游下限（<16 会被拒），推理强度默认降到 `low`（客户端可用 `reasoning_effort` 覆盖为 minimal/low/medium/high/xhigh）——这是推理型模型，effort 不压低时容易把预算全花在思考上导致正文为空，建议 `max_tokens` 给到 512 以上
 - **上下文压缩**：按 opencode 官方算法做摘要压缩（尾部预算 → 锚定摘要模板 → 重组会话）
+
+#### opencode 伪装层
+
+出站的每个 zen 请求都与官方 opencode CLI 同形，由两层构成：
+
+- **身份头**（`internal/app/opencode_headers.go`）——逐项对位官方 `opencodeHeaders.ts`：`User-Agent: opencode/<版本>`、`x-opencode-client: cli`，以及结构合法的 `prj_` / `ses_` / `usr_` ID（prefix + 6 字节时间 hex + 14 位 base62，照抄官方 `id.ts`）。project 与 user 全进程稳定；session 由请求体指纹（模型 / system / 首条用户消息 / 工具集）确定性派生——同一会话恒得同一 ID，命中上游 prompt cache。客户端自带的 `x-opencode-*` 原样转发，非 CLI 形态的 UA 替换为官方形态。
+- **免费层形态整形**（`internal/app/zen_free_shape.go`）——免费模型只认 agent 形态：强制 `stream: true` 并补齐 `bash / edit / glob / grep / read` 五件套（chat 嵌套、responses 扁平、messages claude 三种形状按端点分别生成）；客户端要非流式时，被强制出的 SSE 由网关汇总回 JSON，调用方全程无感。付费模型不整形，避免误触发上游 agent 语义分支；免费判定与匿名凭据选择共用同一口径（`zenFreeModelEligible`）。
+
+实测边界（`docs/opencode-zen-facts.md`）：身份头**不能造成也修不好** `403 FreeTierError`（2026-09-18 A/B/C 三向对照），保留它的理由是与官方客户端完全同形；免费层真正的硬门禁是请求体形态——缺 `stream` 或缺 agent 工具一律 403，补齐后同 IP 同 key 即 200（2026-09-22 双向实测）。
 
 出口（后台 **🌐 出口代理与节点**）：
 
