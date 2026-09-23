@@ -4,6 +4,7 @@ import (
 	"free-router/internal/cline"
 	"log"
 	"net/url"
+	"sort"
 	"sync"
 	"time"
 )
@@ -144,6 +145,12 @@ func checkAllNodeHealth() {
 			groups = append(groups, nil)
 		}
 		groups[i] = append(groups[i], k)
+	}
+	// 组内排序: keys 来自 map 迭代(顺序随机), 不排则代表(groups[i][0])与复探
+	// 变体(groups[i][1])每轮掷骰 —— 同一死组有时复探到第三个变体, 判死路径与
+	// 日志都不可复现。
+	for i := range groups {
+		sort.Strings(groups[i])
 	}
 
 	record := func(key string, r nodeTestResult) {
