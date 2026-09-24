@@ -914,6 +914,44 @@ func writeStreamEmptyContentError(w http.ResponseWriter, hb *sseHeartbeat, model
 	hb.flush()
 }
 
+// writeStreamEmptyFallback 流处理器返回 >=400 且**响应头从未提交**时, 补一个真错误响应。
+//
+// ★ 为什么必须有(2026-09-24 实证, 用户报的"空包中断 agent"就是它):
+// 流处理器判定"整条流零产出"时, 为了让上层能换节点重试, 它**一个字节都不提交**
+// 就返回 502(见 lazyCommitWriter)。调用方若直接 return, net/http 会替我们发一个
+// `200 + Content-Length: 0` —— 客户端(agent 工具)收到的正是那条"空白回复",
+// 等不到内容就卡死/中断。**"没提交"不等于"没响应", 必须显式写出失败。**
+//
+// 已提交的情况不补: 那时错误帧已经写出去了, 再写正文只会拼接出破损响应。
+//
+// 候选链(routing_dispatch.go)不走这里 —— 它要先用"未提交"这个状态去换下一站,
+// 换不动了才在链尾统一 writeJSON。
+func writeStreamEmptyFallback(probe *commitProbeWriter, status int) {
+	if status < 400 || probe.committed.Load() {
+		return
+	}
+	writeJSON(probe, status, map[string]any{
+		"error": map[string]string{
+			"message": "上游未返回任何内容(整条流无有效 chunk)。已尝试换节点/出口重试; " +
+				"请重试, 若持续出现请更换出口节点或模型。",
+			"type": "empty_content",
+		},
+	})
+}
+
+// handleStreamResponseWithEmptyFallback = handleStreamResponseWithUsage + 上面的兜底。
+// 供**不打算自己换站重试**的直连路径使用(直连 zen / cline / provider)。
+//
+// 自建换站重试的路径(候选链、handleZenStreamChat)请直接用
+// handleStreamResponseWithUsage + 自己的 commitProbeWriter, 否则换站前就把
+// 错误响应写出去了、响应头被提交, 换站会把第二次的内容接在它后面。
+func handleStreamResponseWithEmptyFallback(w http.ResponseWriter, upstream *http.Response, onUsage func(map[string]any)) int {
+	probe := &commitProbeWriter{ResponseWriter: w}
+	st := handleStreamResponseWithUsage(probe, upstream, onUsage)
+	writeStreamEmptyFallback(probe, st)
+	return st
+}
+
 func handleNonStreamResponseWithUsage(w http.ResponseWriter, upstream *http.Response, onUsage func(map[string]any)) int {
 	return handleNonStreamResponseWithToolNameMap(w, upstream, onUsage, nil)
 }

@@ -58,10 +58,32 @@ const chainFailoverHeader = "chain"
 // 为什么独立: 不复用网络错 / 429 的重试预算 —— 那两类各自已有自己的窗口, 叠加起来
 // 会显著超过 5 分钟, 对 agent 来说和卡死没区别。
 //
+// 两个消费点, 各自一个**惰性起点**(第一次遇到空流才起算, 不累计请求前段耗时):
+//   - 候选链: routing_dispatch.go 的 delivered>=400 分支(换**候选站**);
+//   - 直连 zen: proxy_cline.go 的 handleZenStreamChat(换**出口**)。
+//
 // 声明为变量而不是常量: 测试要把它覆盖成**已超期**(负值)才能覆盖"预算耗尽 →
 // 交还真错误"那条分支(本仓既有做法, 见 nodeHealthFileOverride / nodeStableLoaded)。
 // 生产路径只读。
 var emptyStreamRetryBudget = 5 * time.Minute
+
+// emptyStreamExitCooldown 空回包后冷却"刚用过的那个出口"的时长。
+//
+// 取值与出口级通用冷却一致(拨号失败也是 2 分钟, 见 zenDialGuardedPinned)——
+// 空回包说明这个出口到上游的这条线路上没拿到内容, 属于同一类"这个出口现在不行"。
+// 冷却只影响选路(下一次 callZenAPI 会跳过它), 不写 quota 冷却表 —— 那不是额度问题。
+const emptyStreamExitCooldown = 2 * time.Minute
+
+// emptyStreamMaxExitRotations 一次请求内因空回包换出口的**次数上限**。
+//
+// 为什么在"5 分钟总时长"之外还要一个次数上限: 与 zenQuotaRotateBudget(429 换出口)
+// 同一条理由 —— **每次换出口都要真发一次上游请求**。没有次数上限时, 一个"系统性
+// 空回包"的模型(上游侧坏了, 换哪个出口都一样)会在 5 分钟里打上百次上游, 并且把
+// 上百个健康出口逐个写进 2 分钟冷却表 ⇒ 后续请求无出口可用。
+// 8 次 ≈ 20~25 秒(实测每次空回包约 2.8s), 仍在 agent 的请求超时之内。
+//
+// 两个上限谁先到算谁: 8 次通常先生效, 单次很慢时(如 40s/次)由 5 分钟先生效。
+const emptyStreamMaxExitRotations = 8
 
 // commitProbeWriter 记录"响应头是否已经提交" —— 空流换站重试的安全前提。
 //

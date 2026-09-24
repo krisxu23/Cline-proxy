@@ -402,7 +402,10 @@ func StartProxy(host string, port int) error {
 
 		if isStream {
 			// 终审 P2: 交付状态(空流守卫 502 等)回传, defer 才能按真实结果记账。
-			status = handleStreamResponseWithUsage(w, resp, usageFn)
+			// ★ 2026-09-24: 必须走"带兜底"的那一版 —— 空流在响应头**未提交**时返回
+			// 502 且不写任何字节, 直接 return 会让 net/http 替我们发 `200 + 空 body`,
+			// 客户端(agent)拿到的就是那条"空白回复"。见 writeStreamEmptyFallback。
+			status = handleStreamResponseWithEmptyFallback(w, resp, usageFn)
 			return
 		}
 

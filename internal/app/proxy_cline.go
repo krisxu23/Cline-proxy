@@ -49,25 +49,6 @@ func handleZenChat(w http.ResponseWriter, r *http.Request, params map[string]any
 		log.Printf("  zen: %s", out.note)
 	}
 
-	resp, rateLimited, err := callZenAPI(r.Context(), params, isStream)
-	if err != nil {
-		log.Printf("  zen api error: %v", err)
-		tracker.rec.RateLimited = rateLimited
-		status := zenErrorStatus(err)
-		// 请求轨迹: 直连路径的失败也要落"错误类别 + 消息", 否则面板只能看到裸状态码。
-		if tr := traceFrom(r.Context()); tr != nil {
-			tr.SetError(errClassForStatus(status), err.Error())
-		}
-		writeJSON(w, status, map[string]any{
-			"error": map[string]string{"message": err.Error(), "type": "api_error"},
-		})
-		tracker.finish(false, status)
-		return
-	}
-	tracker.rec.RateLimited = rateLimited
-	defer resp.Body.Close()
-	tracker.rec.Status = resp.StatusCode
-
 	usageFn := func(u map[string]any) {
 		// 镜像进请求轨迹(多协议字段名归一; 与 stats 记账互不影响)。
 		tracker.trace.ObserveUsage(u)
@@ -81,12 +62,144 @@ func handleZenChat(w http.ResponseWriter, r *http.Request, params map[string]any
 	}
 
 	if isStream {
-		st := handleStreamResponseWithUsage(w, resp, usageFn)
+		// ★ 流式走独立循环(2026-09-24): 上游**空回包**可以在"响应头未提交"时隐形
+		// 换出口重试 —— 见 handleZenStreamChat。候选链那条换站重试
+		// (routing_dispatch.go 的 delivered>=400 分支)覆盖不到这条路径。
+		st := handleZenStreamChat(w, r, params, tracker, usageFn)
 		tracker.finish(st < 400, st)
 		return
 	}
+
+	resp, rateLimited, err := callZenAPI(r.Context(), params, false)
+	if err != nil {
+		status := zenWriteUpstreamError(w, r, tracker, rateLimited, err)
+		tracker.finish(false, status)
+		return
+	}
+	tracker.rec.RateLimited += rateLimited
+	defer resp.Body.Close()
+	tracker.rec.Status = resp.StatusCode
 	st := handleNonStreamResponseWithUsage(w, resp, usageFn)
 	tracker.finish(st < 400, st)
+}
+
+// zenWriteUpstreamError 直连 zen 路径把上游错误按既有口径回给客户端:
+// 记日志 + 记账 + 落请求轨迹 + 写 JSON 错误体。返回交给 tracker.finish 的状态码。
+func zenWriteUpstreamError(w http.ResponseWriter, r *http.Request, tracker *zenStatsTracker, rateLimited int, err error) int {
+	log.Printf("  zen api error: %v", err)
+	tracker.rec.RateLimited += rateLimited
+	status := zenErrorStatus(err)
+	// 请求轨迹: 直连路径的失败也要落"错误类别 + 消息", 否则面板只能看到裸状态码。
+	if tr := traceFrom(r.Context()); tr != nil {
+		tr.SetError(errClassForStatus(status), err.Error())
+	}
+	writeJSON(w, status, map[string]any{
+		"error": map[string]string{"message": err.Error(), "type": "api_error"},
+	})
+	return status
+}
+
+// handleZenStreamChat 直连 zen 的**流式**回写, 带"空回包隐形换出口重试"。
+//
+// 用户规格(2026-09-24): 上游返回的任何错误(429 / 403 / 502 / 空回包)都必须在网关
+// **内部消化**, 不得让 agent 看到; 网关自己换节点重来, 预算 5 分钟, 只有真实结果
+// 才回给 agent。
+//
+// ★ 为什么这条路径必须单独实现(2026-09-24 23:18 用户实证):
+//
+//	直连 zen 路径(模型名形如 `zen/<model>`)根本不经过候选链 —— proxy.go 里
+//	`resolveRouteChain` 只认配置过的别名(本机配置里只有 `auto-router`), 于是
+//	落到 `routeModel(model)=="zen"` 分支。而候选链那条空流换站重试对它是无效的:
+//	用户的 agent 发的正是 `zen/muse-spark-1.3-contributor-free`, 那次空回包把 502
+//	直接甩给了 agent, agent 的工作被打断(症状从"卡死"变成"报错中断")。
+//
+//	用户要的"换节点"在候选链里是"换候选站", 在这条路径上**只能是换出口** ——
+//	候选链只有一站时同样无站可换, 所以出口级重试是两条路都需要的底座。
+//
+// 重试的安全前提是**响应头尚未提交**(proxy_stream.go 的 lazyCommitWriter 保证空回包
+// 时客户端一个字节都没收到)。已提交就改不了口 —— 再换一站会把第二次的内容接在
+// 第一次已经发出去的流后面(用户明确警告过的顺序陷阱), 比不换更糟。
+//
+// 返回最终交付状态, 口径与 handleStreamResponseWithUsage 一致(<400 为成功)。
+func handleZenStreamChat(w http.ResponseWriter, r *http.Request, params map[string]any, tracker *zenStatsTracker, usageFn func(map[string]any)) int {
+	// 观测"响应头是否已提交" —— 复用候选链那条路径同一个探针。
+	probe := &commitProbeWriter{ResponseWriter: w}
+	w = probe
+
+	// 空回包换出口的**独立时间预算**(emptyStreamRetryBudget, 用户拍板 5 分钟)。
+	// 起点是**第一次遇到空回包**的时刻(惰性), 不与网络错 / 429 的重试窗口叠加
+	// —— 那两类在 callZenAPI 内部各自有窗口。
+	// 另有一个**次数**上限(emptyStreamMaxExitRotations), 理由见其注释。
+	var deadline time.Time
+	deadlineSet := false
+	rotations := 0
+
+	for {
+		resp, rateLimited, err := callZenAPI(r.Context(), params, true)
+		if err != nil {
+			return zenWriteUpstreamError(w, r, tracker, rateLimited, err)
+		}
+		tracker.rec.RateLimited += rateLimited
+		tracker.rec.Status = resp.StatusCode
+
+		st := handleStreamResponseWithUsage(w, resp, usageFn)
+		resp.Body.Close()
+		if st < 400 {
+			return st
+		}
+
+		// 放弃换出口时的统一收尾: 响应头若仍未提交, **必须显式写出真错误** ——
+		// 否则 net/http 会替我们发一个 `200 + Content-Length: 0`, 客户端(agent 工具)
+		// 收到的就是那条"空白回复", 等不到内容就卡死/中断(用户报的"空包中断"正是它)。
+		// 已提交时是 no-op(错误帧已经写出去了, 再写正文会拼出破损响应)。
+		giveUp := func() int {
+			writeStreamEmptyFallback(probe, st)
+			return st
+		}
+
+		// 走到这里 = 流处理器判定"整条流未交付任何有价值内容"(空回包)。
+		// 只有**响应头未提交**才谈得上隐形重试 —— 此时客户端一个字节都没收到。
+		if probe.committed.Load() {
+			log.Printf("  zen: 流内空回包但响应头已提交(客户端已收到部分内容), 不再换出口, 交还 %d", st)
+			return giveUp()
+		}
+		exit := reqExitKey(r.Context())
+		if exit == "" {
+			// 直连/兜底路径没有真实出口可换 —— "换出口"是空操作, 反复重试只是
+			// 白打上游。与 429 分支同一口径(见 zen_call.go 的 cooled==0 分支)。
+			log.Printf("  zen: 流内空回包但本次未记录到真实出口(reqExit 为空) — 无出口可换, 交还 %d", st)
+			return giveUp()
+		}
+		if !deadlineSet {
+			deadline = time.Now().Add(emptyStreamRetryBudget)
+			deadlineSet = true
+		}
+		if rotations >= emptyStreamMaxExitRotations {
+			log.Printf("  zen: 流内空回包, 换出口次数已达上限(%d), 交还 %d", emptyStreamMaxExitRotations, st)
+			return giveUp()
+		}
+		if r.Context().Err() != nil {
+			log.Printf("  zen: 流内空回包但客户端已断开, 停止换出口, 交还 %d", st)
+			return giveUp()
+		}
+		if !time.Now().Before(deadline) {
+			log.Printf("  zen: 流内空回包, 换出口预算(%s)已耗尽, 交还 %d", emptyStreamRetryBudget, st)
+			return giveUp()
+		}
+		rotations++
+
+		// 冷却刚用过的那个出口: 下一次 callZenAPI 选路时会跳过它。
+		// 时长沿用出口级通用冷却(与拨号失败同口径, 见 zenDialGuardedPinned)。
+		//
+		// 注: 池子里已没有别的可用出口时, 选路会退化到兜底(直连)而不再写 reqExit,
+		// 于是 reqExitKey 会停在上一轮的值上 —— 此时这一行冷却的是同一个出口(no-op)。
+		// 不额外加"出口没变就放弃"的判断: 次数上限已经把这个退化情形收住了,
+		// 而多加一条分支要配一套状态与用例, 收益不值。
+		cooldownActualExit(r.Context(), emptyStreamExitCooldown)
+		log.Printf("  zen: 流内空回包, 冷却出口 %s 并换出口重试 %d/%d(预算剩余 %s)",
+			describeExitRaw(exit), rotations, emptyStreamMaxExitRotations,
+			time.Until(deadline).Truncate(time.Second))
+	}
 }
 
 func cleanMessages(messages []any) []any {
