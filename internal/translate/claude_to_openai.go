@@ -57,6 +57,12 @@ func ClaudeResponseToOpenAIChat(body []byte) (map[string]any, error) {
 			args, _ := json.Marshal(input)
 			idv, _ := bm["id"].(string)
 			name, _ := bm["name"].(string)
+			// 缺 id 必须补一个, 不能空 id 直透: 客户端对 tool_calls 完整性有硬
+			// 校验, 缺 id 会整体报错(2026-09-24 审查)。app 侧 repairToolCalls
+			// 兜了一道, 但源头补上更稳(流式路径未必经过它)。
+			if strings.TrimSpace(idv) == "" {
+				idv = newToolCallID()
+			}
 			toolCalls = append(toolCalls, map[string]any{
 				"id": idv, "type": "function",
 				"function": map[string]any{"name": name, "arguments": string(args)},
@@ -209,6 +215,10 @@ func ClaudeSSEToOpenAISSE(src io.Reader, dst io.Writer, model string) error {
 			if bt == "tool_use" {
 				idv, _ := bm["id"].(string)
 				name, _ := bm["name"].(string)
+				// 同非流式: 缺 id 补一个, 空 id 直透会让客户端整体报错。
+				if strings.TrimSpace(idv) == "" {
+					idv = newToolCallID()
+				}
 				toolMeta[idx] = map[string]any{"id": idv, "name": name}
 				if err := writeChunk(map[string]any{"choices": []any{map[string]any{
 					"index": 0, "delta": map[string]any{"tool_calls": []any{map[string]any{

@@ -508,7 +508,9 @@ func StartProxy(host string, port int) error {
 	fmt.Println("  管理后台(链接已含访问令牌, 直接打开即可):")
 	fmt.Printf("    %s\n", panelURL)
 	fmt.Println("  管理接口需要令牌, 可用 X-Admin-Token 头或 admin_token Cookie:")
-	fmt.Printf("    token: %s\n", token)
+	// 单独那行只打掩码(2026-09-24 审查): 它和上面 panelURL 里的 token 是同一个值,
+	// 而这行最容易被整段复制出去(截屏/贴日志)。完整令牌只落盘在 data/admin-token。
+	fmt.Printf("    token: %s  (完整令牌在 data/admin-token)\n", maskToken(token))
 	fmt.Println("  令牌落盘在 data/admin-token, 重启后不变。")
 	fmt.Println(strings.Repeat("=", 58))
 	// windowsgui 构建下没有控制台, 上面这些输出用户看不到, 必须同时进日志文件。
@@ -526,8 +528,19 @@ func StartProxy(host string, port int) error {
 	return err
 }
 
-// activeAccountCountOf 统计快照里的 active 账号数(调用方传 poolSnapshot() 的
-// 深拷贝快照, 锁外读取无竞争)。健康接口与请求守卫都必须用它实时计算 ——
+// maskToken 只保留头尾各 4 个字符, 供控制台/日志展示(2026-09-24 审查)。
+// 短令牌全掩, 避免"掩码后反而只剩原值"。
+func maskToken(t string) string {
+	if t == "" {
+		return "(空)"
+	}
+	if len(t) <= 12 {
+		return strings.Repeat("*", len(t))
+	}
+	return t[:4] + strings.Repeat("*", len(t)-8) + t[len(t)-4:]
+}
+
+// activeAccountCountOf 统计快照里的 active 账号数(调用方传 poolSnapshot() 的// 深拷贝快照, 锁外读取无竞争)。健康接口与请求守卫都必须用它实时计算 ——
 // 启动期捕获的 activeCount 快照永不刷新, 会把过期并发数长期上报给运维(P3-38)。
 func activeAccountCountOf(snap poolSnapshotData) int {
 	n := 0

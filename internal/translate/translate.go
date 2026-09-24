@@ -22,10 +22,30 @@
 package translate
 
 import (
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"strings"
+	"time"
 )
+
+// newToolCallID 生成一个 tool_call id。
+//
+// 上游(尤其免费模型)常只回 function.name 不回 id, 而客户端对完整性有硬校验:
+// 缺 id 会整体报 "tool_calls without a complete id and function name"。
+// 形态与 app 包的 genToolCallID 一致(call_<12 hex>)—— 两个包各持一份, 因为
+// translate 不能反向依赖 app(会形成导入环)。修复 2026-09-24 审查: 此前多处
+// "缺 id 即空 id 直透"。
+func newToolCallID() string {
+	b := make([]byte, 12)
+	if _, err := rand.Read(b); err != nil {
+		// 熵源不可用是极端情况: 退化成时间戳, 唯一性量级仍然够用。
+		return fmt.Sprintf("call_%d", time.Now().UnixNano())
+	}
+	return "call_" + hex.EncodeToString(b)
+}
 
 // 格式标识(与 OmniRoute formats.ts 对齐, 只保留本网关需要的)。
 const (

@@ -191,6 +191,12 @@ func ParseExpiry(exp any) int64 {
 }
 
 func OpenBrowser(url string) error {
+	// 白名单(2026-09-24 审查): url 来自上游返回的 verification_uri_complete,
+	// 上游被劫持时可以直接给 file:// 或任意 scheme, 被 rundll32/xdg-open 打开即
+	// 本地文件读取/命令触发面。只放行 https://。
+	if err := validateBrowserURL(url); err != nil {
+		return err
+	}
 	var cmd string
 	var args []string
 
@@ -221,4 +227,24 @@ func OpenBrowser(url string) error {
 
 func IsWindows() bool {
 	return strings.Contains(strings.ToLower(os.Getenv("OS")), "windows")
+}
+
+// validateBrowserURL 只放行 https:// 的绝对 URL。
+//
+// 为什么必须白名单: 被打开的目标是**上游返回**的 verification_uri_complete,
+// 不属于本进程可控内容。rundll32 url.dll,FileProtocolHandler 与 xdg-open 都会
+// 忠实执行传进去的 scheme —— file:/// 可读本地文件, 自定义 scheme 可能触发别的
+// 程序。只认 https 把面收窄到"网页"(2026-09-24 审查)。
+func validateBrowserURL(raw string) error {
+	u, err := url.Parse(strings.TrimSpace(raw))
+	if err != nil {
+		return fmt.Errorf("浏览器地址解析失败: %w", err)
+	}
+	if u.Scheme != "https" {
+		return fmt.Errorf("拒绝打开非 https 地址(只允许 https, 实际 %q)", u.Scheme)
+	}
+	if u.Host == "" {
+		return fmt.Errorf("浏览器地址缺少主机名: %q", raw)
+	}
+	return nil
 }

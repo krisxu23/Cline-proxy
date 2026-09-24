@@ -797,6 +797,19 @@ func openAIToAnthropicWithMap(openAI map[string]any, nameMap *toolNameMap, toolS
 		if um, ok := u.(map[string]any); ok {
 			usage["input_tokens"] = um["prompt_tokens"]
 			usage["output_tokens"] = um["completion_tokens"]
+			// 缓存 token 是 Anthropic 的**合法字段**, 客户端靠它算缓存命中率 ——
+			// 原实现整块丢掉(2026-09-24 审查)。OpenAI 侧把命中量放在
+			// prompt_tokens_details.cached_tokens, 写入量是平铺的
+			// cache_creation_input_tokens。
+			// 注意 total_tokens **不该**映射: Anthropic 没有这个字段。
+			if d, ok := um["prompt_tokens_details"].(map[string]any); ok {
+				if v, has := d["cached_tokens"]; has {
+					usage["cache_read_input_tokens"] = v
+				}
+			}
+			if v, has := um["cache_creation_input_tokens"]; has {
+				usage["cache_creation_input_tokens"] = v
+			}
 		}
 	}
 	out["usage"] = usage

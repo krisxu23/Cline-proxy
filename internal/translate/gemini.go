@@ -249,7 +249,10 @@ func geminiCandidatesToOpenAI(cands []any) (map[string]any, string) {
 					if fc, ok := pm["functionCall"].(map[string]any); ok {
 						name, _ := fc["name"].(string)
 						argsB, _ := json.Marshal(fc["args"])
-						id := name // Gemini 无调用 id, 用名字占位
+						// Gemini 原生不带调用 id。此前用**名字**占位 —— 并行调用同一个
+						// 工具时两条 tool_call 同 id, tool_result 配对错乱, compact 按
+						// id 去重还会误删(2026-09-24 审查)。改为每次生成唯一 id。
+						id := newToolCallID()
 						toolCalls = append(toolCalls, map[string]any{
 							"id": id, "type": "function",
 							"function": map[string]any{"name": name, "arguments": string(argsB)},
@@ -349,6 +352,16 @@ func GeminiSSEToOpenAISSE(src io.Reader, dst io.Writer, model string) error {
 		if delta != "" || len(tcs) > 0 {
 			d := map[string]any{"content": delta}
 			if hasTCs {
+				// OpenAI 流式协议靠 tool_calls[].index 让客户端把分片拼到同一个调用上。
+				// 缺 index 时客户端会把每次出现的 tool_call 当成**新的**, arguments
+				// 直接拼成非法 JSON(2026-09-24 审查)。按出现顺序补 index。
+				for i, tc := range tcs {
+					if m, ok := tc.(map[string]any); ok {
+						if _, has := m["index"]; !has {
+							m["index"] = i
+						}
+					}
+				}
 				d["tool_calls"] = tcs
 			}
 			if err := writeChunk(map[string]any{"choices": []any{map[string]any{
