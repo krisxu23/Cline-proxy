@@ -129,7 +129,10 @@ func (r *idleAbortReader) Read(p []byte) (int, error) {
 		case res := <-r.resCh:
 			stopTimer(r.timer)
 			if len(res.data) == 0 && res.err == nil {
-				r.ackCh <- struct{}{} // 空批: 立即放行, 继续等
+				// 空批必须走 ack() 而不是裸发送(2026-09-24 审查): 裸发送没有
+				// doneCh 保护, 一旦 Close/fail 恰好发生在空批这一刻, 这里会永久
+				// 阻塞 —— pump 协程等 ack、Read 等数据, 两边互等泄漏。
+				r.ack()
 				continue
 			}
 			n := copy(p, res.data)

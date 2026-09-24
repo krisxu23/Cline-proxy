@@ -1,6 +1,9 @@
 package app
 
-import "strconv"
+import (
+	"encoding/json"
+	"strconv"
+)
 
 // 逐字照抄 OmniRoute open-sse/translator/helpers/maxTokensHelper.ts (21 行)
 // + open-sse/config/constants.ts:151 / :154 的两个常量。
@@ -124,6 +127,16 @@ func toFloat64(v any) (float64, bool) {
 		return float64(n), true
 	case int64:
 		return float64(n), true
+	case json.Number:
+		// 加固(2026-09-24 审查): 若上游/未来某处改用 json.Decoder.UseNumber(),
+		// 数值会以 json.Number 出现。此前它落到 default 分支被判"非数值" ——
+		// 调用方 applyMaxOutputClamp 对非数值直接 continue, 于是**上限校验静默失效**
+		// (客户端可以要一个超过模型上限的 max_tokens)。当前全仓没有 UseNumber,
+		// 所以这条不可达, 但代价是一行, 收益是断掉一个"将来静默失效"的坑。
+		if f, err := n.Float64(); err == nil {
+			return f, true
+		}
+		return 0, false
 	case string:
 		// 空串在 `||` 层被判假, 这里只需处理非空。
 		if n == "" {

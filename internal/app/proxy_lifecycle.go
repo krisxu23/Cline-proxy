@@ -23,6 +23,19 @@ func GracefulExit() {
 	os.Exit(0)
 }
 
+// FlushPersistedState 只做"把内存态落盘"这一件事, 不 Shutdown 也不退出进程。
+//
+// 供**启动失败**路径在 os.Exit 前调用(2026-09-24 审查): msgboxFail 此前直接
+// os.Exit(1), 跳过了 doGracefulShutdown, 丢掉最后 ≤30s 的 token 计数与用量账本 ——
+// 而它们正是用户在面板上看着的数字。退出码由调用方决定, 所以这里不复用
+// GracefulExit(它固定 exit 0)。
+//
+// 两个落盘点内部各自加锁, 启动期(服务器未起、后台 ticker 未跑)调用也安全。
+func FlushPersistedState() {
+	flushPoolLocked()
+	saveUsageLedger()
+}
+
 // doGracefulShutdown 实际执行收口工作, 用 sync.Once 保证只跑一次(信号与显式
 // 退出可能同时触发)。
 func doGracefulShutdown() {

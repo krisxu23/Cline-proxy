@@ -32,8 +32,12 @@ USER appuser
 EXPOSE 3457
 
 # 健康检查: 直接打进程内 /health(无需令牌, 只回状态)。容器编排据此判定就绪/存活。
+#
+# 端口从**进程实际参数**里取(2026-09-24 审查): 此前写死 3457, 一旦用
+# `docker run ... -port 8080` 覆盖 CMD, 健康检查会永远打不通 → 容器永久 unhealthy。
+# /proc/1/cmdline 是 NUL 分隔的 argv, 转成行后取 -port 的下一行; 取不到回落 3457。
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
-  CMD wget -qO- http://127.0.0.1:3457/health || exit 1
+  CMD sh -c 'port=$(tr "\0" "\n" < /proc/1/cmdline 2>/dev/null | grep -A1 "^-port$" | tail -1); wget -qO- "http://127.0.0.1:${port:-3457}/health" || exit 1'
 
 VOLUME ["/app/data"]
 

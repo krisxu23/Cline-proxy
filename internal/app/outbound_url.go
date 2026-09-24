@@ -93,6 +93,23 @@ func resolvedLinkLocalReason(host string) string {
 		if ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() {
 			return "主机名解析到链路本地/云元数据地址 " + ip.String()
 		}
+		// 私网/回环的解析后复检(2026-09-24 审查): 字面量路径
+		// (blockedOutboundReason)本来就拦这两类, 但**域名**解析到它们此前是漏的
+		// —— "配一个公网域名、实际解析到 10/172.168/127" 即可把网关当内网探针。
+		// 这里补齐, 口径与字面量路径完全一致(含 FREE_ROUTER_ALLOW_PRIVATE_UPSTREAM
+		// 放开开关)。
+		//
+		// ★ 只在**配置期**做, 拨号期绝不做: dialViaProxy 对每个节点拨的都是
+		// 127.0.0.1:<节点端口>(本地 sing-box 入站), 在拨号层拦回环会直接打断
+		// 整个节点池。见 dialWithSSRFGuard 的注释。
+		if !privateUpstreamAllowed() {
+			if ip.IsLoopback() {
+				return "主机名解析到回环地址 " + ip.String() + "（本机自建上游请设 " + AllowPrivateUpstreamEnv + "=1）"
+			}
+			if ip.IsPrivate() {
+				return "主机名解析到私网地址 " + ip.String() + "（内网自建上游请设 " + AllowPrivateUpstreamEnv + "=1）"
+			}
+		}
 	}
 	return ""
 }

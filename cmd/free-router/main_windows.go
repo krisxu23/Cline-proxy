@@ -3,6 +3,7 @@
 package main
 
 import (
+	"free-router/internal/app"
 	"log"
 	"os"
 	"syscall"
@@ -56,5 +57,9 @@ func msgboxFail(err error) {
 	text, _ := syscall.UTF16PtrFromString("代理启动失败:\n" + err.Error() + "\n\n常见原因: 端口被占用, 可用 -port 换端口。")
 	const mbIconError = 0x10
 	mb.Call(0, uintptr(unsafe.Pointer(text)), uintptr(unsafe.Pointer(title)), mbIconError)
+	// 退出前把内存态落盘(2026-09-24 审查): 此前直接 os.Exit(1) 跳过了
+	// doGracefulShutdown, 丢掉最后 ≤30s 的 token 计数与用量账本。
+	// 不调 GracefulExit 是因为它固定 exit 0 —— 这是失败路径, 必须保持非零退出码。
+	app.FlushPersistedState()
 	os.Exit(1)
 }

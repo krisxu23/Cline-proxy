@@ -23,8 +23,16 @@ import (
 // 立即换出口重试**(见 429 分支)。
 const zenRetryAfterMaxWait = 60 * time.Second
 
-// zenQuotaRotateBudget 429 换出口的独立预算。
+// nonStreamUpstreamTimeout 非流式上游请求的**总超时**(含正文读取)。
 //
+// 传输层只有 ResponseHeaderTimeout(120s): 上游 accept 之后慢慢吐正文时, 非流式
+// 请求没有任何上限 —— goroutine 与连接会堆积(2026-09-24 审查)。给 5 分钟:
+// 非流式要等完整回答, 比流式首字节慢得多, 但也不能无限等。
+//
+// 流式**不设**总超时(长回答可以持续很久), 它靠 idleAbortReader 的空闲中断兜。
+const nonStreamUpstreamTimeout = 5 * time.Minute
+
+// zenQuotaRotateBudget 429 换出口的独立预算。//
 // 429 的语义是"**这个出口**的额度没了"(opencode 免费层按出口 IP 计), 不是
 // "这个请求有问题" —— 换一个出口就是全新的机会, 所以它值得比通用重试
 // (retries, 默认 3)更宽的预算。
@@ -272,7 +280,20 @@ func callZenAPI(ctx context.Context, params map[string]any, stream bool) (*http.
 		endpoint := base + zenEndpoint.pathFor(zenResolvedModel)
 		// attempt 级响应头超时: 只管到响应头(见 zenAttemptHeaderTimeout),
 		// 拿到 resp 即停表, 流式响应体沿用既往的空闲看门狗不额外设限。
-		attemptCtx, cancelAttempt := context.WithCancel(ctx)
+		// 非流式 attempt 加**总超时**(2026-09-24 审查): 传输层只有
+		// ResponseHeaderTimeout(120s), 上游 accept 后慢慢吐正文时非流式请求没有任何
+		// 上限 —— goroutine 与连接会堆积。cancel 交给 zenAttemptBody 在响应体关闭时
+		// 调用, 所以超时覆盖正文阶段(这正是缺口所在); 绝不能在这里 defer cancel,
+		// 那会在函数返回时掐断调用方的正文读取。
+		//
+		// 流式**不设**总超时(长回答可以持续很久), 它靠 idleAbortReader 的空闲中断兜。
+		var attemptCtx context.Context
+		var cancelAttempt context.CancelFunc
+		if stream {
+			attemptCtx, cancelAttempt = context.WithCancel(ctx)
+		} else {
+			attemptCtx, cancelAttempt = context.WithTimeout(ctx, nonStreamUpstreamTimeout)
+		}
 		headerTimer := time.AfterFunc(zenAttemptHeaderTimeout, cancelAttempt)
 		req, err := http.NewRequestWithContext(attemptCtx, "POST", endpoint, bytes.NewReader(bodyJSON))
 		if err != nil {

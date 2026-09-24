@@ -160,6 +160,11 @@ func StartProxy(host string, port int) error {
 			// append(可能触发底层数组重分配), 而这段是每个网关请求都跑的中间件。
 			p := poolSnapshot()
 			if len(p.Keys) == 0 {
+				// 免 Key 模式必须显式告警(2026-09-24 审查): 它与 corsAllowOrigin="*"
+				// 叠加后, 用户开着网关浏览恶意网页时, 任意页面都能跨站 fetch 本机
+				// 3457 盗用配额。这里只告警一次(每次请求都打会刷屏), 不改行为 ——
+				// 收紧 CORS 会打断合法的跨源客户端, 需要单独决策。
+				warnKeylessGatewayOnce()
 				next(w, r)
 				return
 			}
@@ -538,6 +543,19 @@ func maskToken(t string) string {
 		return strings.Repeat("*", len(t))
 	}
 	return t[:4] + strings.Repeat("*", len(t)-8) + t[len(t)-4:]
+}
+
+// warnKeylessGatewayOnce 免 Key 模式的启动期告警(只打一次)。
+//
+// 风险组合: 未配置任何网关 Key(免鉴权) + corsAllowOrigin="*" ⇒ 用户在本机浏览器
+// 打开任意恶意页面时, 该页面可以跨站调用 http://127.0.0.1:<port>/v1/... 消耗配额。
+// 只告警不改行为: 收紧 CORS 会打断合法的跨源客户端, 属产品决策(2026-09-24 审查)。
+var keylessGatewayWarnOnce sync.Once
+
+func warnKeylessGatewayOnce() {
+	keylessGatewayWarnOnce.Do(func() {
+		log.Printf("  ⚠️ 网关未配置任何 API Key: 请求免鉴权放行, 而 CORS 允许任意来源 —— 本机浏览器打开的任意网页都能跨站调用本网关消耗配额。建议在管理后台生成一个网关 Key。")
+	})
 }
 
 // activeAccountCountOf 统计快照里的 active 账号数(调用方传 poolSnapshot() 的// 深拷贝快照, 锁外读取无竞争)。健康接口与请求守卫都必须用它实时计算 ——
