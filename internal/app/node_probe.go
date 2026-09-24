@@ -221,20 +221,35 @@ func testNodeComprehensive(key string) nodeTestResult {
 		return result
 	}
 
-	// === 2) 出口 IP 检测(三源并发 + 国家码多数投票) ===
+	// === 2) 出口 IP 与国家(首个有效源即采用) ===
 	probeNodeExitInfo(client, &result)
 
-	// === 3) 测速 + 断流检测 ===
-	result.SpeedBPS, result.IsStalled, result.SpeedTestFailed = probeNodeSpeed(client)
-
-	// === 4) MITM + WARP 检测 ===
-	result.MITMRisk = probeMITM(client)
-	result.IsWarp = probeWarp(client)
-
-	// === 5) 出口网络分类 ===
-	result.NetworkType, result.NetConfidence = classifyNodeNetwork(&result)
+	// === 3~5) 深度检测: 测速 / MITM / WARP / 网络分类 ===
+	//
+	// 默认**关闭**(2026-09-24 计划 Task 6)。理由: 这四项都**不再参与健康判定**
+	// (见 node_health.go 的 ok 判据), 却要为每个节点各发若干真实请求 ——
+	// 千级节点重建时是主要耗时来源, 而它们的结论此前只进面板展示。
+	// 排障时设 FREE_ROUTER_PROBE_DEEP=1 打开。
+	if probeDeepEnabled() {
+		result.SpeedBPS, result.IsStalled, result.SpeedTestFailed = probeNodeSpeed(client)
+		result.MITMRisk = probeMITM(client)
+		result.IsWarp = probeWarp(client)
+		result.NetworkType, result.NetConfidence = classifyNodeNetwork(&result)
+	}
 
 	return result
+}
+
+// probeDeepEnabled 深度探测(测速 / MITM / WARP / 网络分类)开关, 默认关闭。
+//
+// 这四项的结论现在只用于面板展示, 不参与"节点是否可用"的判定 ——
+// 每节点少发若干请求, 千级节点重建的耗时与额度消耗都显著下降。
+func probeDeepEnabled() bool {
+	switch strings.ToLower(strings.TrimSpace(os.Getenv("FREE_ROUTER_PROBE_DEEP"))) {
+	case "1", "true", "yes", "on":
+		return true
+	}
+	return false
 }
 
 // --- 活性探测(三权威源并发) ---
@@ -308,11 +323,15 @@ type exitVote struct {
 // probeNodeExitInfo 并发查询三路 IP 情报, 国家码少数服从多数后写入 result:
 // 三票一致取该地区; 两票一致取多数票; 三票各异或有效票为零归空(调用方按
 // other 处理)。ASN/ISP/出口IP 取多数票源, 持平时取先返回者。
+// probeNodeExitInfo 取出口 IP 与国家。
+//
+// ★ 2026-09-24 计划 Task 6: 改为**首个有效源即采用**, 不再等齐所有源做国家码
+// 多数投票。原实现要等**全部**源返回(或各自超时)才能定国家, 慢源会把整轮探测
+// 拖到最慢者的超时; 而国家现在只是"提示" —— 地区门控的权威判据是每模型实测的
+// regionNodeOK(见 model_region.go 的 regionExitTier), 不必为它等齐所有源。
+// 其余源在后台自然结束(ch 有缓冲, 不会阻塞也不会泄漏 goroutine)。
 func probeNodeExitInfo(client *http.Client, result *nodeTestResult) {
-	type indexed struct {
-		v exitVote
-	}
-	ch := make(chan indexed, len(nodeIPEchoURLs))
+	ch := make(chan exitVote, len(nodeIPEchoURLs))
 	var wg sync.WaitGroup
 	for _, u := range nodeIPEchoURLs {
 		wg.Add(1)
@@ -356,62 +375,29 @@ func probeNodeExitInfo(client *http.Client, result *nodeTestResult) {
 					v.hasNetFlags = true
 				}
 			}
-			ch <- indexed{v: v}
+			ch <- v
 		}(u)
 	}
 	go func() {
 		wg.Wait()
 		close(ch)
 	}()
-	var votes []exitVote
-	for it := range ch {
-		votes = append(votes, it.v)
-	}
-	if len(votes) == 0 {
+
+	for v := range ch {
+		if v.ip == "" {
+			continue
+		}
+		result.ExitIP = v.ip
+		result.ExitASN = v.asn
+		result.ExitASNorg = v.asnOrg
+		result.ExitISP = v.isp
+		result.ExitCountry = v.country
+		if v.hasNetFlags {
+			result.IPAPIHosting = v.hosting
+			result.IPAPIMobile = v.mobile
+			result.IPAPIProxy = v.proxy
+		}
 		return
-	}
-	// 国家码计票(空国家码不计票, 但该票的 IP/ASN 仍可作为附带信息候选)。
-	counts := map[string]int{}
-	for _, v := range votes {
-		if v.country != "" {
-			counts[v.country]++
-		}
-	}
-	winner, best := "", 0
-	tie := false
-	for cc, n := range counts {
-		if n > best {
-			best, winner, tie = n, cc, false
-		} else if n == best {
-			tie = true
-		}
-	}
-	// 三票各异(best==1 且票数>1)或零有效票 → 无胜者, 地区留空归 other。
-	if winner == "" || (tie && best == 1 && len(counts) > 1) {
-		// 地区无法判定, 但出口 IP 仍有价值(去重折叠/面板展示用): 取首票。
-		result.ExitIP = votes[0].ip
-		result.ExitASN = votes[0].asn
-		result.ExitASNorg = votes[0].asnOrg
-		result.ExitISP = votes[0].isp
-		return
-	}
-	result.ExitCountry = winner
-	// 附带信息取"投给胜者且最先返回"的那票, 找不到则取首票。
-	chosen := votes[0]
-	for _, v := range votes {
-		if v.country == winner {
-			chosen = v
-			break
-		}
-	}
-	result.ExitIP = chosen.ip
-	result.ExitASN = chosen.asn
-	result.ExitASNorg = chosen.asnOrg
-	result.ExitISP = chosen.isp
-	if chosen.hasNetFlags {
-		result.IPAPIHosting = chosen.hosting
-		result.IPAPIMobile = chosen.mobile
-		result.IPAPIProxy = chosen.proxy
 	}
 }
 

@@ -199,6 +199,65 @@ func rememberedNodeCountry(key string) string {
 	return nodeCountryMap[key]
 }
 
+// rememberedCountryByHostPort 现算一张 "远端 host:port -> 国家" 表, 供新节点
+// 快车道复用(2026-09-24 计划 Task 8)。
+//
+// 刻意**不额外落盘**: nodeCountryMap 本来就落盘了, 而 host:port 可由
+// nodeRemoteEndpointOf 现取 —— 两份数据一份存储, 不存在不一致, 也不用改
+// node-countries.json 的形状(改形状要处理旧文件兼容)。
+func rememberedCountryByHostPort() map[string]string {
+	nodeCountryMu.Lock()
+	loadNodeCountriesLocked()
+	snapshot := make(map[string]string, len(nodeCountryMap))
+	for k, v := range nodeCountryMap {
+		snapshot[k] = v
+	}
+	nodeCountryMu.Unlock()
+
+	out := make(map[string]string, len(snapshot))
+	for k, cc := range snapshot {
+		if cc == "" {
+			continue
+		}
+		if hp := nodeRemoteEndpointOf(k); hp != "" {
+			out[hp] = cc
+		}
+	}
+	return out
+}
+
+// seedNewNodeCountries 给"国家未知的新键"按远端 host:port 继承已知国家,
+// 返回继承条数(2026-09-24 计划 Task 8)。
+//
+// 只播种、不判死: 找不到同 host:port 的已知键就保持未知 —— 未知由
+// regionExitTier 降为兜底档处理(见 model_region.go), 绝不能因为"没探到国家"
+// 就把节点标 fail。
+func seedNewNodeCountries(keys []string) int {
+	byHP := rememberedCountryByHostPort()
+	if len(byHP) == 0 {
+		return 0
+	}
+	seeded := 0
+	for _, k := range keys {
+		// 已有健康结论的键不是"新节点", 不播种(避免覆盖实测值)。
+		if _, done := healthResultOf(k); done {
+			continue
+		}
+		if rememberedNodeCountry(k) != "" {
+			continue
+		}
+		hp := nodeRemoteEndpointOf(k)
+		if hp == "" {
+			continue
+		}
+		if cc := byHP[hp]; cc != "" {
+			rememberNodeCountry(k, cc)
+			seeded++
+		}
+	}
+	return seeded
+}
+
 // nodeExitRegion 出口所属地区: 优先最近一次连通检测的实测结果, 其次是落盘的
 // 历史实测值(重启后仍可用); 都没有则归「其他地区」(手填代理也走这里)。
 func nodeExitRegion(key string) string {

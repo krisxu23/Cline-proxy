@@ -277,41 +277,53 @@ func TestProbeNodeLivenessAllDead(t *testing.T) {
 	}
 }
 
-// 地区投票: 用本地三源分别返回 US/US/CA, 必须判 US(少数服从多数),
-// 附带信息(ASN/ISP)取多数票源。源格式复用三家真实 API 的字段形状。
-func TestProbeNodeExitInfoMajorityVote(t *testing.T) {
-	us1 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+// ★ 首个成功源即采用(2026-09-24 计划 Task 6, **取代**原"三源多数投票")。
+//
+// 原实现要等**全部**源返回(或各自超时)才能定国家, 慢源会把整轮探测拖到最慢者
+// 的超时; 而国家现在只是"提示" —— 地区门控的权威判据是每模型实测的 regionNodeOK
+// (见 model_region.go 的 regionExitTier)。
+//
+// 这里让 "US 快 / CA 慢 600ms", 断言采用先到的 US 且**不等**慢源。
+// 旧实现会等满 600ms, 且两票 1:1 判平后把地区留空 —— 两种表现都能被本用例抓到。
+func TestProbeNodeExitInfoFirstSuccessWins(t *testing.T) {
+	fast := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		w.Write([]byte(`{"ip":"1.1.1.1","country_code":"US","asn":13335,"asn_organization":"CLOUDFLARENET","isp":"Cloudflare"}`))
+		w.Write([]byte(`{"ip":"1.1.1.1","country_code":"US"}`))
 	}))
-	defer us1.Close()
-	us2 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	defer fast.Close()
+	slow := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		time.Sleep(600 * time.Millisecond)
 		w.Header().Set("Content-Type", "application/json")
-		w.Write([]byte(`{"ip":"1.1.1.1","country":"US","org":"AS13335 CLOUDFLARENET"}`))
+		w.Write([]byte(`{"ip":"1.1.1.1","country_code":"CA"}`))
 	}))
-	defer us2.Close()
-	ca := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		w.Write([]byte(`{"query":"1.1.1.1","countryCode":"CA","as":"AS1234 EXAMPLE-CA","isp":"ExampleCA","org":"ExampleCA","hosting":false,"mobile":false,"proxy":false}`))
-	}))
-	defer ca.Close()
+	defer slow.Close()
 
 	prev := nodeIPEchoURLs
-	nodeIPEchoURLs = []string{us1.URL, us2.URL, ca.URL}
+	nodeIPEchoURLs = []string{fast.URL, slow.URL}
 	t.Cleanup(func() { nodeIPEchoURLs = prev })
 
+	start := time.Now()
 	var result nodeTestResult
 	probeNodeExitInfo(&http.Client{Timeout: 30 * time.Second}, &result)
+	elapsed := time.Since(start)
+
 	if result.ExitCountry != "US" {
-		t.Fatalf("两票 US 一票 CA 应判 US, got %q", result.ExitCountry)
+		t.Fatalf("应采用先返回的源(US), got %q", result.ExitCountry)
 	}
 	if result.ExitIP != "1.1.1.1" {
 		t.Fatalf("出口 IP 应为 1.1.1.1, got %q", result.ExitIP)
 	}
+	if elapsed > 300*time.Millisecond {
+		t.Fatalf("不应等慢源: 耗时 %v(应毫秒级返回)", elapsed)
+	}
 }
 
-// 地区投票三票各异: US/JP/DE 必须留空(调用方归 other), 但出口 IP 仍保留。
-func TestProbeNodeExitInfoTieGoesOther(t *testing.T) {
+// 多个源都返回有效数据时, 必须采用其中一个, **不再**因为"票数各异"把地区留空。
+//
+// 旧契约(三源投票): US/JP/DE 各一票 → 判平 → 地区留空归 other。
+// 新契约(Task 6): 首个成功源即采用 —— 留空会让地区过滤把该节点归 other,
+// 反而放大 Task 9 要修的"未知国家被放行"问题。
+func TestProbeNodeExitInfoNoVoteKeepsFirstCountry(t *testing.T) {
 	mk := func(cc string) *httptest.Server {
 		return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			w.Header().Set("Content-Type", "application/json")
@@ -329,10 +341,13 @@ func TestProbeNodeExitInfoTieGoesOther(t *testing.T) {
 
 	var result nodeTestResult
 	probeNodeExitInfo(&http.Client{Timeout: 30 * time.Second}, &result)
-	if result.ExitCountry != "" {
-		t.Fatalf("三票各异地区应留空归 other, got %q", result.ExitCountry)
+	switch result.ExitCountry {
+	case "US", "JP", "DE":
+		// 合法: 采用先返回的那个源
+	default:
+		t.Fatalf("应采用某个有效源的国家码, got %q", result.ExitCountry)
 	}
 	if result.ExitIP != "9.9.9.9" {
-		t.Fatalf("地区无法判定时出口 IP 仍应保留, got %q", result.ExitIP)
+		t.Fatalf("出口 IP 应保留, got %q", result.ExitIP)
 	}
 }

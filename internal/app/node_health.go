@@ -230,8 +230,18 @@ func checkAllNodeHealth() {
 	var mu sync.Mutex
 	// 四关失败分解(2026-09-22 审查: 汇总行只有 N/M, 逐关失败原因不落盘,
 	// "上千个节点只剩几十个"无法自查 —— 至少把分解计数写进这一行)。
-	var stageDead, stageMITM, stageStalled, stageSpeedFail, stageSlow int
+	// 失败分解只留"活性挂"(2026-09-24 计划 Task 7): MITM/断流已退出判据,
+	// 保留恒为 0 的计数只会误导排障。质量分布仍在(深度探测开启时)。
+	var stageDead, stageSpeedFail, stageSlow int
 	sem := make(chan struct{}, workers)
+
+	// 新节点国家快车道(2026-09-24 计划 Task 8): 订阅 churn 后新出现的键, 若其远端
+	// host:port 与某个已知键相同(同一台服务器换了节点名/协议), 直接继承国家 ——
+	// 免掉一次探测请求。国家探测本身在 Task 6 之后已是"单源首个成功即返回"。
+	// 找不到同 host:port 的已知键就留空(未知), 交给常规探测, 绝不因此判死。
+	if n := seedNewNodeCountries(keys); n > 0 {
+		log.Printf("  nodes: %d 个新出口按 host:port 继承了已知国家(免探测)", n)
+	}
 
 	// 按**上游服务器**分组(见 nodeRemoteEndpoints 注释)。取不到远端信息的节点
 	// 自成一组 —— 不能让它与别的节点共享结论。
@@ -258,20 +268,23 @@ func checkAllNodeHealth() {
 	}
 
 	record := func(key string, r nodeTestResult) {
-		ok := r.Alive && !r.MITMRisk && !r.IsStalled
+		// 判据只留"可达"(2026-09-24 计划 Task 7): 原为
+		// `r.Alive && !r.MITMRisk && !r.IsStalled` —— 而 MITM/断流/速度的探测
+		// 已默认关闭(Task 6, 见 node_probe.go probeDeepEnabled), 它们不再产出
+		// 结论; 即便开着, 这三项也**不该**决定一个出口能不能用:
+		//   - MITM 只影响"是否可信", 不影响"能不能连上";
+		//   - 断流/慢是**质量**问题, 由选路的 nodeSlow 降权与真实请求的失败反馈处理;
+		//   - 把质量当门槛会在上游抖动时把整池判死, 反而放大故障。
+		// 国家未知**不**判死: 未知只是"还没探到", 由 regionExitTier 降为兜底档。
+		ok := r.Alive
 		mu.Lock()
 		if ok {
 			okCount++
 		} else {
-			switch {
-			case !r.Alive:
-				stageDead++
-			case r.MITMRisk:
-				stageMITM++
-			case r.IsStalled:
-				stageStalled++
-			}
+			stageDead++
 		}
+		// 深度探测默认关闭, 下面这些质量计数只在 FREE_ROUTER_PROBE_DEEP=1 时
+		// 才有非零来源; 保留它们是为了排障时仍能看到速度/断流分布。
 		if r.Alive && r.SpeedTestFailed {
 			stageSpeedFail++ // 与判死无关, 独立统计(端点抽风量)
 		}
@@ -382,8 +395,15 @@ func checkAllNodeHealth() {
 		log.Printf("  nodes: %d 个变体与其服务器代表同判不可达, 已跳过探测(%d 台服务器分组)",
 			skipped, len(groups))
 	}
-	log.Printf("  nodes: 增强检测完成(%d 并发), %d/%d 个出口可达(去重服务器 %d 台); 失败分解: 活性挂 %d · MITM %d · 真断流 %d · 测速端点全挂 %d · 慢速降权 %d",
-		workers, okCount, len(keys), len(groups), stageDead, stageMITM, stageStalled, stageSpeedFail, stageSlow)
+	// 失败分解: 默认只可能有"活性挂"(质量项已退出判据, 见 record 的注释)。
+	// 只有开了深度探测才附上质量分布, 否则那几个计数恒为 0、纯误导。
+	if probeDeepEnabled() {
+		log.Printf("  nodes: 增强检测完成(%d 并发), %d/%d 个出口可达(去重服务器 %d 台); 失败分解: 活性挂 %d · 测速端点全挂 %d · 慢速降权 %d",
+			workers, okCount, len(keys), len(groups), stageDead, stageSpeedFail, stageSlow)
+	} else {
+		log.Printf("  nodes: 增强检测完成(%d 并发), %d/%d 个出口可达(去重服务器 %d 台); 不可达 %d(判据只留可达; 质量项需 FREE_ROUTER_PROBE_DEEP=1)",
+			workers, okCount, len(keys), len(groups), stageDead)
+	}
 	// 出口级去重(P2, freesub 语义): 按最新结果折叠同出口 IP 的重复节点,
 	// 选路只保留每组最快的 —— 之后 nodeUsable 对折叠副本返回 false。
 	recomputeExitFold()
