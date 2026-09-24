@@ -3,6 +3,7 @@ package app
 import (
 	"bufio"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"free-router/internal/kit"
 	"free-router/internal/protocol"
@@ -10,6 +11,7 @@ import (
 	"log"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -55,13 +57,20 @@ func handleStreamResponseWithUsage(w http.ResponseWriter, upstream *http.Respons
 //	形态而只做了 cloak 不做还原，它会收到自己从未声明过的工具名 → 调用静默失败。
 //	toolNameMap 为 nil 时逐字节等价于旧行为。
 //
-// lazyCommitWriter 延迟提交响应头, 直到第一段**真实正文**写出。
+// lazyCommitWriter 延迟提交响应头, 直到处理链**显式**判定"这条流确有内容"。
 //
 // ★ 为什么需要(2026-09-24, 用户规格: 上游的错误必须在网关内部消化, 不得让 agent 看到):
 // 当前是"边收边转"流水线, 一旦 WriteHeader(200) 提交, 之后发现上游是空回包 / 出错
 // 也**无法改口** —— 客户端(agent 工具)只看到一条没有内容的流, 于是空白回复、卡死。
 // 延迟提交后, "还没吐出任何真实内容"的整段时间里网关可以自由换节点重试(预算见
 // routing_dispatch.go), 客户端完全无感; 拿到第一个真实内容才提交并转为实时转发。
+//
+// ★ 提交前**攒**写出而不是"首次 Write 即提交"(2026-09-24 第二步, 关键):
+// 处理链在判定"有没有真实内容"之前就会写出脚手架帧 —— NDJSON 逐帧转发、
+// synthesizeOpenAISSEFromJSON 注入的 delta.role 帧、上游的空 choices 帧。
+// 若沿用"首次 Write 即提交", 这些帧会把 200 钉死, 空流分岔仍然只能走"已提交"
+// 分支, 整个修复当场作废。心跳同样致命: 它走 hb.writeLocked → w.Write。
+// ⇒ 提交前一律只攒不写(见 preamble), 由处理链在见到真实内容时显式 commit()。
 //
 // ★ Flush() 在提交前是 no-op: net/http 的 Flush 会**隐式提交**响应头, 而静默保活
 // (sseHeartbeat) 走的就是 write+flush —— 提交前放行 flush 等于把这个修复作废。
@@ -70,11 +79,41 @@ type lazyCommitWriter struct {
 	flusher   http.Flusher
 	pending   int // 缓存的待提交状态码, 0 = 尚未调用 WriteHeader
 	committed bool
+	// preamble 提交前累积的字节。**必须缓冲而不是丢弃**: 前导帧里有客户端收尾
+	// 要用的脚手架(role / finish_reason), 一旦判定"这条流确有内容", 它们必须
+	// 原样出现在正文之前, 否则客户端会收到一条缺头少尾的流。
+	preamble []byte
+	// overflowed 前导缓冲超过 streamPreambleMaxBytes 且始终没等到真实内容。
+	// 置真后本 writer 永久拒绝写出(commit 也变成 no-op), 于是响应头**始终未提交**,
+	// 调用方可以返回真 502 让路由层换站重试。
+	overflowed bool
+	// mu 保护以上全部可变字段。**必须有**: 心跳泵是独立 goroutine, 它走
+	// hb.writeLocked → lw.Write, 而处理链会在 markDelivered 里调 lw.commit() ——
+	// 两者并发(锁序恒为 hb.mu → lw.mu, 不会反向)。
+	mu sync.Mutex
 }
 
-// WriteHeader 200 只记下不提交(等第一段正文); 非 200 立即提交 —— 那时还没有任何
-// 正文, 没有延迟的必要, 而且错误码必须尽快送达。
+// streamPreambleMaxBytes 前导缓冲上限。提交前累积的帧都留在这里, 上游在"第一个
+// 真实内容"之前狂发垃圾帧时(实测过的形态: 每帧都是空 choices, 单帧约 60 字节)
+// 内存会单调增长 —— 这个上限就是挡它的。
+//
+// 超限的处理是"丢弃前导 + 判定该站失败"而**不是**"提交后放行": 提交了就再也换
+// 不了站, 客户端会拿到"半条垃圾流 + 错误帧"; 而路由层若再换一站, 第二次的内容
+// 就会接在那个错误帧后面(用户明确警告过的顺序陷阱), 比不换更糟。
+// 丢弃是安全的 —— 能攒到这个量级而一个真实内容都没有, 说明这条流本来就没有
+// 可交付的东西, 换站重试才是正确出路。
+const streamPreambleMaxBytes = 1 << 20
+
+// errStreamPreambleOverflow 前导缓冲超限的粘性错误。经 hb.writeLocked 记进
+// writeErr 后, 流循环会据此提前收手 —— 与"客户端断开"共用同一条提前退出路径,
+// 语义一致: 这条流已经没有继续读上游的意义。
+var errStreamPreambleOverflow = errors.New("stream preamble exceeded limit")
+
+// WriteHeader 200 只记下不提交(等处理链判定确有内容); 非 200 立即提交 —— 那时
+// 还没有任何正文, 没有延迟的必要, 而且错误码必须尽快送达。
 func (l *lazyCommitWriter) WriteHeader(code int) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
 	if l.committed {
 		return
 	}
@@ -86,27 +125,77 @@ func (l *lazyCommitWriter) WriteHeader(code int) {
 	l.committed = true
 }
 
+// Write 提交前只攒进前导缓冲。返回 len(b) 而非 0 —— 返回 0 会被 hb.writeLocked
+// 当成短写, 进而把 writeErr 置位、整条流提前收手(那正是超限时才该发生的事)。
 func (l *lazyCommitWriter) Write(b []byte) (int, error) {
-	l.commitNow()
-	return l.ResponseWriter.Write(b)
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.writeLocked(b)
+}
+
+// writeLocked 假定调用方已持锁。
+func (l *lazyCommitWriter) writeLocked(b []byte) (int, error) {
+	if l.committed {
+		return l.ResponseWriter.Write(b)
+	}
+	if l.overflowed {
+		return 0, errStreamPreambleOverflow
+	}
+	if len(l.preamble)+len(b) > streamPreambleMaxBytes {
+		l.overflowed = true
+		l.preamble = nil
+		return 0, errStreamPreambleOverflow
+	}
+	l.preamble = append(l.preamble, b...)
+	return len(b), nil
 }
 
 func (l *lazyCommitWriter) Flush() {
+	l.mu.Lock()
+	defer l.mu.Unlock()
 	if !l.committed {
 		return // 提交前不 flush(见类型注释)
 	}
 	l.flusher.Flush()
 }
 
-// commitNow 真正提交(只做一次), 把之前缓存的 200 状态码发出去。
-func (l *lazyCommitWriter) commitNow() {
-	if l.committed {
+// isCommitted / isOverflowed 供处理链判断"还能不能返回真 502"(见各空流分岔)。
+// 必须走访问器: 心跳泵会并发改这两个字段。
+func (l *lazyCommitWriter) isCommitted() bool {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.committed
+}
+
+func (l *lazyCommitWriter) isOverflowed() bool {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.overflowed
+}
+
+// commit 显式提交: 把缓存的 200 状态码与全部前导帧一次放出。只做一次, 幂等。
+//
+// 两个调用点(都在 handleStreamResponseWithToolNameMap 内):
+//   - 见到**第一个真实内容帧**时(见 markDelivered)—— 这是主路径, 前导脚手架帧
+//     在此刻随正文一起放出;
+//   - 流走到收尾且判定为**合法交付**时兜底 —— "没有正文但确实交付了东西"的流
+//     (输出侧 usage / 合法空终止态)不提交的话, 末尾合成的 finish/[DONE] 会
+//     滞留在缓冲里, 客户端收到一个 200 却一个字节都没有(比空流更隐蔽)。
+func (l *lazyCommitWriter) commit() {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.committed || l.overflowed {
 		return
 	}
 	l.committed = true
 	if l.pending != 0 {
 		l.ResponseWriter.WriteHeader(l.pending)
 	}
+	if len(l.preamble) > 0 {
+		_, _ = l.ResponseWriter.Write(l.preamble)
+		l.preamble = nil
+	}
+	l.flusher.Flush()
 }
 
 func handleStreamResponseWithToolNameMap(w http.ResponseWriter, upstream *http.Response, onUsage func(map[string]any), toolNameMap *toolNameMap) int {
@@ -118,8 +207,10 @@ func handleStreamResponseWithToolNameMap(w http.ResponseWriter, upstream *http.R
 		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": "streaming not supported for client"})
 		return http.StatusInternalServerError
 	}
-	// ★ 延迟提交: 这里只设头 + 记下待提交状态码, 真正的提交推迟到第一段真实正文
-	// 写出时(见 lazyCommitWriter 的注释)。
+	// ★ 延迟提交: 这里只设头 + 记下待提交状态码, 真正的提交推迟到处理链见到
+	// 第一个**真实内容帧**时(见下方 markDelivered)。在此之前所有写出(脚手架帧、
+	// 心跳)都只攒在 lw 的前导缓冲里, 响应头始终未提交 —— 空流因此能返回真 502
+	// 让路由层换站, 而不是交付一条没有内容的流。
 	lw := &lazyCommitWriter{ResponseWriter: w, flusher: flusher}
 	w = lw
 	flusher = lw
@@ -155,12 +246,17 @@ func handleStreamResponseWithToolNameMap(w http.ResponseWriter, upstream *http.R
 	sawFinish := false // 上游是否已发过 finish_reason
 	sawDone := false   // 上游是否已发过 [DONE]
 	lastModel := ""    // 用于兜底 chunk 的 model 字段
-	// forwardedValuableChunk 对齐 OmniRoute open-sse/utils/stream.ts 的同名状态:
-	// 只要有一帧带 content / tool_calls / finish_reason 被转发给客户端, 就置真。
+	// forwardedValuableChunk 对齐 OmniRoute open-sse/utils/stream.ts 的同名状态,
+	// 但口径是**流级**的(见 stream_delivery.go 的 chunkDeliversUserContent):
+	// 只要有一帧带**用户可见产出**(正文 / reasoning / tool_calls)就置真。
 	// 收尾时若它仍为假, 说明整条流没有交付任何有价值内容 —— 上游可能每帧都是
 	// 空 choices。这种"干净的空 200"会被客户端当成一次合法的空回合, 于是静默
 	// 结束任务且不会重试(2026-09-16 实测: 用户表现为"任务无缘无故中断, 没有
 	// 任何提示也没有报错")。必须改判成可见的失败。
+	//
+	// ★ 2026-09-24 起它同时是**响应头提交的触发条件**(见 markDelivered):
+	//   role / finish_reason 这些脚手架帧刻意不算 —— 它们若触发提交, 空流就
+	//   再也换不了站, 本次修复作废。
 	forwardedValuableChunk := false
 	// hasValidUsage 对齐 OmniRoute streamEmptyChoices.ts 的 ctx.hasValidUsage:
 	// 上游如果报告了真实 token 用量, 说明这一回合在上游侧**确实发生过**,
@@ -183,6 +279,17 @@ func handleStreamResponseWithToolNameMap(w http.ResponseWriter, upstream *http.R
 	// "[Tool call: xxx]" 被误当成真实调用。
 	// nil 语义与参考实现一致(:319-320) —— 没有工具声明时不做白名单过滤。
 	allowedToolNames := extractAllowedToolNames(streamRequestTools(upstream))
+	// markDelivered 记下"本条流已交付用户可见产出", 并在**首次**时提交响应头。
+	//
+	// ★ 提交时机 = 第一个真实内容帧, 而**不是**第一个写出帧: 处理链在此之前写出
+	// 的都是脚手架帧(NDJSON 逐帧转发 / synthesizeOpenAISSEFromJSON 注入的
+	// delta.role / 上游空 choices 帧), 它们只攒在 lw 的前导缓冲里, 此处提交后
+	// 会原样先于正文放出。于是"上游只给脚手架、不给内容"的整条流自始至终没有
+	// 提交过响应头 —— 网关可以静默换节点重试(见 routing_dispatch.go)。
+	markDelivered := func() {
+		forwardedValuableChunk = true
+		lw.commit()
+	}
 	handleLine := func(line string, residual bool) bool {
 		line = strings.TrimRight(line, "\r\n")
 		if strings.HasPrefix(line, "data:") {
@@ -272,7 +379,7 @@ func handleStreamResponseWithToolNameMap(w http.ResponseWriter, upstream *http.R
 			//   :2521-2526 collect 成功 → 从正文摘除, 并置 hasToolCalls
 			//   :2527-2528 collect 失败但形态畸形 → 清空正文(避免把畸形标记喂给 agent)
 			if collectTextualToolCalls(normalized, textualToolCalls, allowedToolNames) {
-				forwardedValuableChunk = true
+				markDelivered()
 			}
 			// 对齐 OmniRoute: 该帧是否值得转发由它是否带 content / tool_calls /
 			// finish_reason 决定。三者都没有(空 choices)的帧仍然照常透传, 但它
@@ -283,7 +390,7 @@ func handleStreamResponseWithToolNameMap(w http.ResponseWriter, upstream *http.R
 			//   有价值 —— 那对"这一帧要不要发给客户端"是对的, 对"整条流有没有
 			//   产出"是错的(2026-09-17 审查 P0-1)。详见 stream_delivery.go。
 			if chunkDeliversUserContent(normalized) {
-				forwardedValuableChunk = true
+				markDelivered()
 			}
 			if legitEmptyTerminalReason(normalized) {
 				sawLegitEmptyTerminal = true
@@ -354,7 +461,7 @@ func handleStreamResponseWithToolNameMap(w http.ResponseWriter, upstream *http.R
 					var probe map[string]any
 					if json.Unmarshal([]byte(line), &probe) == nil {
 						if chunkDeliversUserContent(probe) {
-							forwardedValuableChunk = true
+							markDelivered()
 						}
 						if legitEmptyTerminalReason(probe) {
 							sawLegitEmptyTerminal = true
@@ -397,7 +504,7 @@ func handleStreamResponseWithToolNameMap(w http.ResponseWriter, upstream *http.R
 				if streamDeliveryEmpty(forwardedValuableChunk, hasValidUsage, sawLegitEmptyTerminal) {
 					// 未提交(没写出过任何正文)→ 返回真 502 让调用方换节点重试;
 					// 已提交 → HTTP 状态码改不了, 只能补 error 帧。
-					if !lw.committed {
+					if !lw.isCommitted() {
 						log.Printf("  stream: NDJSON 流未交付任何有价值内容, 返回 502 换候选(响应头未提交)")
 						return http.StatusBadGateway
 					}
@@ -405,6 +512,12 @@ func handleStreamResponseWithToolNameMap(w http.ResponseWriter, upstream *http.R
 					writeStreamEmptyContentError(w, hb, lastModel)
 					return http.StatusBadGateway
 				}
+				// ★ 合法交付(2026-09-24): 这条分支是**提前 return**, 不经过收尾的兜底
+				// 提交 —— 所以必须在这里显式提交一次。有正文时 markValuable →
+				// markDelivered 已经提交过; 而只靠"输出侧 usage / 合法空终止态"放行的
+				// 流(零正文)尚未提交, 不补这一下, 下面两个终止帧会滞留在前导缓冲里,
+				// 客户端拿到一个 200 却零字节(比空流更隐蔽)。
+				lw.commit()
 				// 合成 finish chunk 之后才发 [DONE], 且**全程只发这一次**(P2-23②)。
 				if b, mErr := json.Marshal(protocol.EmptyOpenAIChunk("").Payload); mErr == nil {
 					hb.writeFlush([]byte("data: " + string(b) + "\n\n"))
@@ -418,7 +531,6 @@ func handleStreamResponseWithToolNameMap(w http.ResponseWriter, upstream *http.R
 		body := append([]byte(firstLine), rest...)
 		if sse, ok := synthesizeOpenAISSEFromJSON(body); ok {
 			log.Printf("%s", sseSynthesisLog("完整 JSON body", len(body)))
-			hb.writeFlush(sse)
 			// 合成的完整 JSON 同样是"是否交付了价值内容"的依据: 上游可能回一个
 			// choices 里只有空 message 的壳。
 			//
@@ -443,8 +555,12 @@ func handleStreamResponseWithToolNameMap(w http.ResponseWriter, upstream *http.R
 			if u, ok := parsedBody["usage"].(map[string]any); ok && hasOutputUsageTokens(u) {
 				hasValidUsage = true
 			}
+			// ★ 顺序(2026-09-24 第二步): **先按原始 body 判定有无真实内容并提交,
+			// 再写出合成帧**。反过来的话合成帧(含注入的 delta.role 脚手架)会先落进
+			// 前导缓冲 —— 一个几十 KB 的正常回包会被整份攒着, 白白逼近前导上限;
+			// 而空壳 body 则先白写一帧再被丢弃。
 			if fullCompletionBodyHasContent(parsedBody) {
-				forwardedValuableChunk = true
+				markDelivered()
 			}
 			// 合法空终止态同样要按**原始 body** 判定(理由同上: 合成器补的终止帧
 			// 会把任意空壳 body 都带上 finish_reason="stop", 而 "stop" 不在白名单里,
@@ -453,7 +569,7 @@ func handleStreamResponseWithToolNameMap(w http.ResponseWriter, upstream *http.R
 				sawLegitEmptyTerminal = true
 			}
 			if streamDeliveryEmpty(forwardedValuableChunk, hasValidUsage, sawLegitEmptyTerminal) {
-				if !lw.committed {
+				if !lw.isCommitted() {
 					log.Printf("  stream: 上游完整 JSON body 不含任何有价值内容, 返回 502 换候选(响应头未提交)")
 					return http.StatusBadGateway
 				}
@@ -461,6 +577,12 @@ func handleStreamResponseWithToolNameMap(w http.ResponseWriter, upstream *http.R
 				writeStreamEmptyContentError(w, hb, lastModel)
 				return http.StatusBadGateway
 			}
+			// ★ 合法交付(2026-09-24): 这条分支是**提前 return**, 不经过收尾的兜底
+			// 提交 —— 所以必须在这里显式提交一次。有正文时上面 markDelivered 已经
+			// 提交过; 而只靠"输出侧 usage / 合法空终止态"放行的流(零正文)尚未提交,
+			// 不补这一下, 合成帧会滞留在前导缓冲里, 客户端拿到 200 却零字节。
+			lw.commit()
+			hb.writeFlush(sse)
 			return http.StatusOK
 		}
 		// 合不成: firstLine 已被消费, 主循环不会再看到它 —— 终审 P3: 显式走
@@ -502,15 +624,38 @@ func handleStreamResponseWithToolNameMap(w http.ResponseWriter, upstream *http.R
 		}
 	}
 
+	// 前导缓冲超限(见 lazyCommitWriter.Write): 上游在首个真实内容之前灌入了
+	// >streamPreambleMaxBytes 的无价值帧。前导已丢弃、响应头**始终未提交** ——
+	// 直接返回真 502, 让路由层冷却本站并换下一站。
+	//
+	// 判定放在空流检查之前: 超限本身就已经说明"这条流到超限为止没有任何真实
+	// 内容", 不必再等 hasValidUsage / legitEmpty 的口径 —— 即便上游在这些垃圾帧
+	// 之间夹过一个 finish_reason=length, 交付它也没有意义(前导已丢, 客户端会收到
+	// 一条缺头少尾的流)。
+	if lw.isOverflowed() {
+		log.Printf("  stream: 上游在首个真实内容前灌入超过 %d 字节的无价值帧, 丢弃前导并返回 502 换候选(响应头未提交)",
+			streamPreambleMaxBytes)
+		return http.StatusBadGateway
+	}
+
 	// 空流拒绝(对齐 OmniRoute open-sse/utils/streamEmptyChoices.ts 的
 	// rejectEmptyChoicesStream): 整条流没交付任何有价值 chunk 时, 不能以
 	// "干净的 200" 收尾。客户端会把这种空回合当成合法结果 —— 不报错、不重试,
 	// 直接静默结束任务, 用户看到的就是"无缘无故中断"。
 	//
 	// 与上游"空流"的区别: 那种在提交前就被 probeStreamFirstEvent 拦下并换站
-	// (见 routing_dispatch.go), 这里兜的是**已提交之后**每帧都空的情况。
+	// (见 routing_dispatch.go), 这里兜的是首事件有效、后续每帧都空的情况。
+	//
+	// ★ 未提交是**常态**(2026-09-24 第二步): 处理链在见到第一个真实内容帧之前
+	// 不提交任何东西(见 markDelivered), 所以空流走的一定是上面那条 —— 一个字节
+	// 都不交付、返回真 502, 由 routing_dispatch.go 在网关内部换节点重试。
+	// 下面"已提交"那条分支现在是**防御性兜底**: 按当前代码它不可达(committed
+	// 只可能由 markDelivered 或收尾兜底 commit 触发, 两者都意味着
+	// forwardedValuableChunk 为真 ⇒ streamDeliveryEmpty 为假)。保留它是因为
+	// 一旦将来又有哪条路径在判定前写出, 客户端至少能看到一条可重试的错误帧,
+	// 而不是一个"干净的空白 200" —— 那正是本次要根治的症状。
 	if streamDeliveryEmpty(forwardedValuableChunk, hasValidUsage, sawLegitEmptyTerminal) {
-		if !lw.committed {
+		if !lw.isCommitted() {
 			log.Printf("  stream: 上游整条流未交付任何有价值内容(model=%s, 已发 finish=%v), 返回 502 换候选(响应头未提交)",
 				lastModel, sawFinish)
 			return http.StatusBadGateway
@@ -520,6 +665,11 @@ func handleStreamResponseWithToolNameMap(w http.ResponseWriter, upstream *http.R
 		writeStreamEmptyContentError(w, hb, lastModel)
 		return http.StatusBadGateway
 	}
+
+	// 走到这里说明这条流是**合法交付**(有真实内容 / 有输出侧 usage / 合法空终止态)。
+	// 必须显式提交: 末尾合成的 finish / [DONE] 也要发出去, 否则客户端会收到一个
+	// 200 却一个字节都没有 —— 比空流更隐蔽。前导缓冲(脚手架帧)在此刻一并放出。
+	lw.commit()
 
 	// 上游断流未发 [DONE](或发 [DONE] 前无 finish_reason): 合成收尾,
 	// 避免客户端报 "Stream ended without finish_reason" 或挂起等待。
@@ -724,6 +874,11 @@ func parsedUsageFromJSONBody(body []byte) (map[string]any, bool) {
 }
 
 // writeStreamEmptyContentError 交付"可见的空内容失败"。
+//
+// ★ 2026-09-24 第二步起, 它只服务**已提交**后的兜底路径(见
+// handleStreamResponseWithToolNameMap 里空流分岔的说明): 正常情况(响应头未提交)
+// 空流直接返回真 502, 一个字节都不交付, 由 routing_dispatch.go 在网关内部换站。
+// 保留它是为了"万一还有哪条路径在判定前写出"时不至于退回"干净的空白 200"。
 //
 // 帧里同时带 error(能弹提示的客户端看得到原因)与 finish_reason(只认协议
 // 终止信号的客户端也能正常收尾), 再补 [DONE]。HTTP 状态码在流式提交后无法

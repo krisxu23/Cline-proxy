@@ -7,6 +7,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 )
 
 // chainTestServer 起一个能按模型名决定成败的上游, 用来验证候选链的逐站行为。
@@ -206,6 +207,103 @@ func TestChainStreamPassesThroughWinner(t *testing.T) {
 	}
 	if len(calls) != 2 || calls[0] != "m-429" || calls[1] != "ok" {
 		t.Fatalf("stream must fail over before the first byte: %v", calls)
+	}
+}
+
+// 流式空回包必须换站, 且换站对客户端**完全无感**(2026-09-24, 用户规格:
+// 上游的错误必须在网关内部消化, 不得让 agent 看到)。
+//
+// 场景: 第一站回 200 + text/event-stream, **首事件有效**(能过 probeStreamFirstEvent,
+// 所以不会走"200 但空流"那条早断分支)但整条流零产出 —— 这正是用户报的"空白回复"形态。
+// 此前 routing_dispatch 在 delivered>=400 时无条件 return, 网关内部不换站, 客户端
+// 只能自己重试; 现在必须冷却本站 + 换下一站, 并且失败那一站的字节一个都不许泄漏。
+func TestChainStreamEmptyBodyFailsOverInvisibly(t *testing.T) {
+	var calls []string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		raw, _ := io.ReadAll(r.Body)
+		var body map[string]any
+		_ = json.Unmarshal(raw, &body)
+		model, _ := body["model"].(string)
+		calls = append(calls, model)
+		w.Header().Set("Content-Type", "text/event-stream")
+		if model == "m-silent" {
+			// 首事件"有效"(非 error-only / 非空对象 / 非脚手架形态 → 探测判就绪),
+			// 但整条流没有任何用户可见产出 → 流处理器在响应头提交前改判 502。
+			io.WriteString(w, "data: {\"id\":\"c1\",\"model\":\"mimo-test\"}\n\n")
+			io.WriteString(w, "data: [DONE]\n\n")
+			return
+		}
+		io.WriteString(w, "data: {\"choices\":[{\"delta\":{\"content\":\"po\"}}]}\n\n")
+		io.WriteString(w, "data: [DONE]\n\n")
+	}))
+	defer srv.Close()
+
+	chainTestSetup(t, srv.URL+"/v1", map[string][]string{"r": {"p1:m-silent", "p2:ok"}})
+	rec := runChain(t, "r", true)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("空流站之后换下一站必须成功, got %d: %s", rec.Code, rec.Body.String())
+	}
+	out := rec.Body.String()
+	if !strings.Contains(out, "po") {
+		t.Fatalf("胜出那一站的内容必须交付, 实得: %s", out)
+	}
+	// ★ 关键: 失败那一站的痕迹不得出现在客户端流里 —— 它一个字节都没被交付。
+	// 若这条失败, 说明"响应头未提交"这个前提被破坏(比如脚手架帧触发了提交),
+	// 第二次的内容就会接在第一次的流后面 —— 用户明确警告过的顺序陷阱。
+	if strings.Contains(out, "mimo-test") {
+		t.Fatalf("失败那一站的内容不得泄漏给客户端(换站必须无感), 实得: %s", out)
+	}
+	if len(calls) != 2 || calls[0] != "m-silent" || calls[1] != "ok" {
+		t.Fatalf("空流站之后必须换下一站, 实得调用序列: %v", calls)
+	}
+	if why := candidateSkipReason("p1", "m-silent"); !strings.Contains(why, classEmpty) {
+		t.Fatalf("空流站必须按 empty 冷却, got %q", why)
+	}
+}
+
+// 空流重试预算耗尽后必须返回**真错误**(用户规格: 超时仍未成功 → 返回一个真错误,
+// 不是空白、不是无限等)。
+//
+// 预算覆盖为负值即可让"第一次遇到空流"时就已经超期; 生产值见
+// emptyStreamRetryBudget(5 分钟)。刻意不用 0/纳秒: Windows 上 time.Now() 的
+// 单调时钟有刻度, 同一刻度内 `now.Before(now+1ns)` 仍为真, 用例会假通过。
+func TestChainStreamEmptyBudgetExhaustedReturnsRealError(t *testing.T) {
+	old := emptyStreamRetryBudget
+	emptyStreamRetryBudget = -time.Second
+	t.Cleanup(func() { emptyStreamRetryBudget = old })
+
+	var calls []string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		raw, _ := io.ReadAll(r.Body)
+		var body map[string]any
+		_ = json.Unmarshal(raw, &body)
+		model, _ := body["model"].(string)
+		calls = append(calls, model)
+		w.Header().Set("Content-Type", "text/event-stream")
+		// 每一站都是"首事件有效但整条流零产出"。
+		io.WriteString(w, "data: {\"id\":\"c1\",\"model\":\"mimo-test\"}\n\n")
+		io.WriteString(w, "data: [DONE]\n\n")
+	}))
+	defer srv.Close()
+
+	chainTestSetup(t, srv.URL+"/v1", map[string][]string{"r": {"p1:m-a", "p2:m-b"}})
+	rec := runChain(t, "r", true)
+
+	if rec.Code != http.StatusBadGateway {
+		t.Fatalf("预算耗尽必须返回真 502, got %d: %s", rec.Code, rec.Body.String())
+	}
+	body := rec.Body.String()
+	if !strings.Contains(body, "all candidates failed") {
+		t.Fatalf("必须交付真实的错误体(而不是空白), 实得: %s", body)
+	}
+	// 预算已耗尽 → 不得再换下一站
+	if len(calls) != 1 {
+		t.Fatalf("预算耗尽后不得继续换站, 实得调用序列: %v", calls)
+	}
+	// 失败的那一站仍要按 empty 记账(否则它会一直被重复选中)
+	if why := candidateSkipReason("p1", "m-a"); !strings.Contains(why, classEmpty) {
+		t.Fatalf("预算耗尽的那一站也必须按 empty 冷却, got %q", why)
 	}
 }
 

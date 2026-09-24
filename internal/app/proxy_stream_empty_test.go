@@ -1,6 +1,7 @@
 package app
 
 import (
+	"bytes"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -251,9 +252,14 @@ func TestHasOutputUsageTokens(t *testing.T) {
 
 // ─────────────────── 端到端: 真实 handleStreamResponseWithUsage ───────────────────
 
-// drainStream 用 httptest 驱动真实的流式处理函数, 返回客户端看到的全部字节。
-// 上游 body 由 frames 顺序拼接而成。
-func drainStream(t *testing.T, upstreamBody string) string {
+// drainStreamResult 用 httptest 驱动真实的流式处理函数, 返回 (交付状态码, 客户端
+// 看到的全部字节)。上游 body 由 frames 顺序拼接而成。
+//
+// ★ 2026-09-24 契约变更(用户规格: 上游的错误必须在网关内部消化, 不得让 agent 看到):
+// 空流在响应头**未提交**时不再交付任何字节, 而是返回真 502, 由 routing_dispatch.go
+// 在网关内部冷却本站 + 换下一站。所以"有没有交付错误帧"这种旧断言不再充分 ——
+// 必须同时看状态码与交付字节数。
+func drainStreamResult(t *testing.T, upstreamBody string) (int, string) {
 	t.Helper()
 	rec := httptest.NewRecorder()
 	upstream := &http.Response{
@@ -261,8 +267,36 @@ func drainStream(t *testing.T, upstreamBody string) string {
 		Body:       http.NoBody,
 	}
 	upstream.Body = nopCloser{strings.NewReader(upstreamBody)}
-	handleStreamResponseWithUsage(rec, upstream, nil)
-	return rec.Body.String()
+	status := handleStreamResponseWithUsage(rec, upstream, nil)
+	return status, rec.Body.String()
+}
+
+// drainStream 只关心交付字节的调用方沿用旧签名。
+func drainStream(t *testing.T, upstreamBody string) string {
+	t.Helper()
+	_, out := drainStreamResult(t, upstreamBody)
+	return out
+}
+
+// assertInvisibleEmptyStream 断言"这条空流被网关**内部消化**": 客户端一个字节都
+// 收不到, 调用方拿到真 502 去换下一站。
+//
+// 这是 2026-09-24 用户规格的落地 —— 上游的空回包不得让 agent 看到任何东西。旧行为
+// (200 + 一条带 empty_content 错误帧的空流)在 agent 眼里就是"空白回复": 它认不出
+// 那个自定义帧, 等不到内容就卡死。
+//
+// 断言**没有放松, 反而更严**: 旧用例只要求"必须出现 empty_content 帧"; 现在要求
+// "零字节交付" **且** "返回 502" —— 两条都比原来更难满足。
+func assertInvisibleEmptyStream(t *testing.T, body, why string) {
+	t.Helper()
+	status, out := drainStreamResult(t, body)
+	if status != http.StatusBadGateway {
+		t.Fatalf("%s: 空流必须以真 502 交还调用方(供路由层换站重试), 实得 status=%d, 交付 %d 字节:\n%s",
+			why, status, len(out), out)
+	}
+	if out != "" {
+		t.Fatalf("%s: 空流在响应头提交前不得向客户端交付任何字节, 实得 %d 字节:\n%s", why, len(out), out)
+	}
 }
 
 // 参考用例里的 emptyChoicesChunk。
@@ -278,24 +312,32 @@ func finishFrame() string {
 	return "data: " + `{"id":"c1","object":"chat.completion.chunk","model":"mimo-test","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}` + "\n\n"
 }
 
+// ── 空流用例的共同契约(2026-09-24 起) ──
+//
+// 对应用户规格: 上游返回的任何错误(429 / 403 / 502 / 空回包)都必须在网关**内部
+// 消化**, 不得让 agent 看到; 网关自己换节点重试, 只有真实结果才回给 agent。
+//
+// 因此下面每一条"必须判空"的用例, 断言都从**旧**的
+//     "必须交付一条 empty_content 错误帧(200 流内)"
+// 改为**新**的
+//     "一个字节都不交付 + 返回真 502"
+// 理由逐条写在各自用例里 —— 共同点是: 只要响应头还没提交, 就没有理由把一个
+// agent 认不出的自定义错误帧塞给它; 让路由层换一站拿到真实结果才是用户要的行为。
+//
+// 注意: "不交付任何字节"之所以能做到, 是因为处理链在见到第一个**真实内容帧**之前
+// 一个字节都不提交(proxy_stream.go 的 lazyCommitWriter + markDelivered)——
+// 脚手架帧(NDJSON 转发 / 合成器注入的 delta.role / 上游空 choices)只攒在前导缓冲里。
+
 // 对应用例 1: "an all-empty-choices stream is rejected as a retryable error"。
 // 参考断言: errored || !output.includes("[DONE]")。
-// 本网关的等价契约: 绝不能出现"干净的空 200"—— 必须带 error 帧。
+// 本网关的等价契约: 绝不能出现"干净的空 200"—— 现在进一步做到客户端零感知。
 func Test空流_全空choices必须失败(t *testing.T) {
-	out := drainStream(t, emptyChoicesFrame("1")+emptyChoicesFrame("2"))
-
-	if !strings.Contains(out, `"empty_content"`) {
-		t.Fatalf("全空 choices 流必须交付 empty_content 错误帧, 实得:\n%s", out)
-	}
-	if !strings.Contains(out, "error") {
-		t.Fatalf("必须带 error 对象, 实得:\n%s", out)
-	}
-	// 参考断言 `!output.includes("[DONE]")` 在本网关的对应形式:
-	// 允许 [DONE](客户端需要终止信号), 但它必须与 error 帧同时出现,
-	// 绝不能是"只有 [DONE] 的干净收尾"。
-	if strings.Contains(out, "[DONE]") && !strings.Contains(out, "empty_content") {
-		t.Fatalf("只有 [DONE] 的干净空 200 正是要根治的静默中断, 实得:\n%s", out)
-	}
+	// ★ 契约变更理由: 旧契约是"必须交付 empty_content 错误帧"。但那条帧是网关
+	// 自造的, agent 工具认不出它 —— 用户报的"空白回复卡死"正是这么来的。
+	// 响应头此时尚未提交(整条流只有脚手架帧), 所以正确做法是零交付 + 502,
+	// 由 routing_dispatch.go 换下一站。
+	assertInvisibleEmptyStream(t, emptyChoicesFrame("1")+emptyChoicesFrame("2"),
+		"全空 choices 流")
 }
 
 // 对应用例 2: "a stream with real content passes through unchanged"。
@@ -331,31 +373,40 @@ func Test空流_真实内容之后的空choices不影响通过(t *testing.T) {
 // 有价值, 不应判空流"。那是**帧级转发过滤**的判据 —— role 帧必须转发给客户端
 // (客户端靠它收尾), 所以帧级算"有价值"是对的。但把它当**流级产出判据**就错了:
 // 一条只发了 role 骨架帧就 [DONE] 的流, 对用户等于零产出, 必须判空并换站。
+//
+// ★ 2026-09-24 契约变更: 判空后的交付形态从"200 流 + empty_content 错误帧"改为
+// "零交付 + 真 502"。role 帧恰恰是**不能**触发提交的那种帧 —— 它若触发提交,
+// 空流就再也换不了站, 本次修复当场作废。
 func Test空流_仅骨架帧必须判空(t *testing.T) {
 	skeleton := "data: " + `{"choices":[{"index":0,"delta":{"role":"assistant"}}]}` + "\n\n"
-	out := drainStream(t, skeleton+"data: [DONE]\n\n")
-
-	if !strings.Contains(out, "empty_content") {
-		t.Fatalf("只有 role 骨架帧的流应判为空流(骨架帧不是产出), 实得:\n%s", out)
-	}
+	assertInvisibleEmptyStream(t, skeleton+"data: [DONE]\n\n",
+		"只有 role 骨架帧的流(骨架帧不是产出)")
 }
 
 // 只有 finish_reason 的流同样必须判空 —— 它是另一个脚手架帧。
 func Test空流_仅finish_reason必须判空(t *testing.T) {
-	out := drainStream(t, "data: "+`{"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}`+"\n\n")
-
-	if !strings.Contains(out, "empty_content") {
-		t.Fatalf("只有 finish_reason=stop 的流应判为空流, 实得:\n%s", out)
-	}
+	assertInvisibleEmptyStream(t, "data: "+`{"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}`+"\n\n",
+		"只有 finish_reason=stop 的流")
 }
 
 // 只有 finish_reason=length 的流**不应**判空 —— 它是"合法空终止态"
 // (被 token 上限截断, 本就不该有正文)。这条防的是"收紧判据时误杀合法空回包"。
+//
+// ★ 2026-09-24 断言**加强**: 原来只断言"没有 empty_content 帧"。新契约下这条
+// 会漏掉一种真回归 —— 合法空终止态走的是"收尾兜底提交"(见 lazyCommitWriter.commit
+// 的第二个调用点), 那里若忘了提交, 客户端会收到一个 **200 却零字节**的响应,
+// 而"没有 empty_content"照样成立。所以补上"必须真的交付终止帧 + [DONE]"。
 func Test空流_finish_reason为length属合法空不判空(t *testing.T) {
 	out := drainStream(t, "data: "+`{"choices":[{"index":0,"delta":{},"finish_reason":"length"}]}`+"\n\n")
 
 	if strings.Contains(out, "empty_content") {
 		t.Fatalf("finish_reason=length 是合法空终止态, 不应判空流, 实得:\n%s", out)
+	}
+	if !strings.Contains(out, `"finish_reason":"length"`) {
+		t.Fatalf("合法空终止态的帧必须交付给客户端(否则是 200 零字节), 实得:\n%s", out)
+	}
+	if !strings.Contains(out, "[DONE]") {
+		t.Fatalf("合法空终止态必须收尾 [DONE], 实得:\n%s", out)
 	}
 }
 
@@ -365,39 +416,39 @@ func Test空流_finish_reason为length属合法空不判空(t *testing.T) {
 //
 // 输入 token 有值只说明上游收到了 prompt, 完全不能说明它产出了东西。
 func Test空流_仅输入侧usage必须判空(t *testing.T) {
-	out := drainStream(t, "data: "+`{"id":"c1","model":"m","usage":{"prompt_tokens":1},"choices":[]}`+"\n\n")
-
-	if !strings.Contains(out, "empty_content") {
-		t.Fatalf("只有 prompt_tokens(输入侧)的流应判为空流, 实得:\n%s", out)
-	}
+	assertInvisibleEmptyStream(t, "data: "+`{"id":"c1","model":"m","usage":{"prompt_tokens":1},"choices":[]}`+"\n\n",
+		"只有 prompt_tokens(输入侧)的流")
 }
 
 // 只有**输出侧** token 的流是合法交付 —— 上游确实生成了东西(可能因
 // finish_reason=length 被截断成 0 字符, 但 completion_tokens 有值)。
+//
+// ★ 2026-09-24 断言**加强**: 与上面 length 用例同理 —— 必须真的交付, 不能只是
+// "没报错"(忘掉收尾兜底提交会退化成 200 零字节)。
 func Test空流_输出侧usage算有效交付(t *testing.T) {
 	out := drainStream(t, "data: "+`{"id":"c1","model":"m","usage":{"prompt_tokens":10,"completion_tokens":5},"choices":[]}`+"\n\n")
 
 	if strings.Contains(out, "empty_content") {
 		t.Fatalf("带输出侧 token 的流不应判空, 实得:\n%s", out)
 	}
+	if !strings.Contains(out, `"completion_tokens":5`) {
+		t.Fatalf("带输出侧 token 的帧必须交付给客户端(否则是 200 零字节), 实得:\n%s", out)
+	}
+	if !strings.Contains(out, "[DONE]") {
+		t.Fatalf("带输出侧 token 的流必须收尾 [DONE], 实得:\n%s", out)
+	}
 }
 
 // 全零 usage 是空壳, 不算有效用量。
 func Test空流_全零usage不算有效(t *testing.T) {
-	out := drainStream(t, "data: "+`{"id":"c1","model":"m","usage":{"prompt_tokens":0,"completion_tokens":0},"choices":[]}`+"\n\n")
-
-	if !strings.Contains(out, "empty_content") {
-		t.Fatalf("全零 usage 应判为空流, 实得:\n%s", out)
-	}
+	assertInvisibleEmptyStream(t, "data: "+`{"id":"c1","model":"m","usage":{"prompt_tokens":0,"completion_tokens":0},"choices":[]}`+"\n\n",
+		"全零 usage 的空壳流")
 }
 
 // reasoning 只发空白: 流级口径要的是"用户能不能看到东西", 纯空白等于零产出。
 func Test空流_仅空格reasoning必须判空(t *testing.T) {
-	out := drainStream(t, "data: "+`{"choices":[{"index":0,"delta":{"reasoning_content":"   "}}]}`+"\n\n")
-
-	if !strings.Contains(out, "empty_content") {
-		t.Fatalf("只有空白 reasoning 的流应判为空流, 实得:\n%s", out)
-	}
+	assertInvisibleEmptyStream(t, "data: "+`{"choices":[{"index":0,"delta":{"reasoning_content":"   "}}]}`+"\n\n",
+		"只有空白 reasoning 的流")
 }
 
 // 关键回归: 上游一帧内容都不给、直接发 [DONE]。
@@ -405,32 +456,27 @@ func Test空流_仅空格reasoning必须判空(t *testing.T) {
 // 脚手架, 绝不能被算成"上游交付了有价值内容", 否则这条最典型的静默中断
 // (上游空手而归 + [DONE]) 会绕过空流防护, 退回成干净的空 200。
 func Test空流_只发DONE不合成价值(t *testing.T) {
-	out := drainStream(t, "data: [DONE]\n\n")
-
-	if !strings.Contains(out, "empty_content") {
-		t.Fatalf("上游只发 [DONE] 必须判空流, 不得因网关自补的终止帧而放行, 实得:\n%s", out)
-	}
+	assertInvisibleEmptyStream(t, "data: [DONE]\n\n",
+		"上游只发 [DONE](网关自补的终止帧不算产出)")
 }
 
 // 同上, 但上游先发若干空 choices 帧再发 [DONE]。
 func Test空流_空choices后接DONE必须失败(t *testing.T) {
-	out := drainStream(t, emptyChoicesFrame("1")+"data: [DONE]\n\n")
-
-	if !strings.Contains(out, "empty_content") {
-		t.Fatalf("空 choices + [DONE] 必须判空流, 实得:\n%s", out)
-	}
+	assertInvisibleEmptyStream(t, emptyChoicesFrame("1")+"data: [DONE]\n\n",
+		"空 choices + [DONE]")
 }
 
 // 合成路径 1: 完整 JSON body 回空壳 choices —— 必须同样被判空流。
 // (这是自查发现的缺陷: 合成路径早期绕过了空流判定。)
+//
+// ★ 2026-09-24 契约变更的理由在这条上最直观: 旧行为会先 `hb.writeFlush(sse)`
+// 把合成帧(含注入的 delta.role 脚手架)写出去、把 200 提交掉, 然后才发现 body
+// 是空壳 —— 客户端因此拿到"200 + 一条它认不出的错误帧"。现在改为**先按原始
+// body 判定并提交、再写合成帧**, 空壳 body 一帧都不写。
 func Test空流_完整JSON空壳body必须失败(t *testing.T) {
 	body := `{"id":"c1","object":"chat.completion","model":"mimo-test",` +
 		`"choices":[{"index":0,"message":{"role":"assistant","content":""},"finish_reason":"stop"}]}`
-	out := drainStream(t, body)
-
-	if !strings.Contains(out, "empty_content") {
-		t.Fatalf("完整 JSON 空壳 body 应判为空流, 实得:\n%s", out)
-	}
+	assertInvisibleEmptyStream(t, body, "完整 JSON 空壳 body")
 }
 
 // 合成路径 2: 完整 JSON body 带真实内容 —— 必须正常通过(负向对照)。
@@ -445,22 +491,76 @@ func Test空流_完整JSON有内容正常通过(t *testing.T) {
 	if strings.Contains(out, "empty_content") {
 		t.Fatalf("有内容的完整 JSON 不得判为空流, 实得:\n%s", out)
 	}
+	// 合成器注入的 role 脚手架帧在前导缓冲里, 必须在提交时**先于**正文原样放出,
+	// 否则客户端会收到一条缺头少尾的流(这正是"缓冲而不是丢弃"的理由)。
+	if !strings.Contains(out, `"role":"assistant"`) {
+		t.Fatalf("前导脚手架帧必须在提交时一并交付(否则缺头), 实得:\n%s", out)
+	}
 }
 
 // 合成路径 3: NDJSON 逐行空 choices —— 必须被判空流。
 func Test空流_NDJSON空choices必须失败(t *testing.T) {
 	line := `{"id":"c1","object":"chat.completion.chunk","model":"mimo-test","choices":[]}`
-	out := drainStream(t, line+"\n"+line+"\n")
+	assertInvisibleEmptyStream(t, line+"\n"+line+"\n", "NDJSON 空 choices 流")
+}
 
-	if !strings.Contains(out, "empty_content") {
-		t.Fatalf("NDJSON 空 choices 应判为空流, 实得:\n%s", out)
+// ★ 2026-09-24 新增(自查发现的漏洞): 完整 JSON 形态的**合法空终止态**
+// (finish_reason=length, 零正文)必须正常通过, 而且必须**真的交付**。
+//
+// 这条路径是提前 return、不经过收尾的兜底提交, 所以"没有 empty_content"这个旧
+// 断言完全盖不住它: 漏掉那次 commit 就会退化成 200 零字节 —— 比空流更隐蔽。
+func Test空流_完整JSON合法空终止态必须交付(t *testing.T) {
+	// 把 idle 超时压到 1s: 完整 JSON 路径要读到底才能确认 body 形态, 而这条路径
+	// 在"body 不带换行"时会等满 idle 超时(默认 90s)。那是改动前就存在的现象
+	// (本用例不关心超时, 只关心有没有真的交付), 不压的话单条用例要跑 90 秒。
+	withTestConfig(t, &zenConfigData{StreamIdleSecs: 1})
+	body := `{"id":"c1","object":"chat.completion","model":"mimo-test",` +
+		`"choices":[{"index":0,"message":{"role":"assistant","content":""},"finish_reason":"length"}]}`
+	out := drainStream(t, body)
+
+	if strings.Contains(out, "empty_content") {
+		t.Fatalf("finish_reason=length 是合法空终止态, 不得判空流, 实得:\n%s", out)
+	}
+	if !strings.Contains(out, `"finish_reason":"length"`) {
+		t.Fatalf("合法空终止态的终止帧必须真的交付(否则是 200 零字节), 实得:\n%s", out)
+	}
+}
+
+// ★ 2026-09-24 新增(同上): NDJSON 形态只带**输出侧 usage**、零正文时也必须真的交付。
+func Test空流_NDJSON仅输出侧usage必须交付(t *testing.T) {
+	line := `{"id":"c1","object":"chat.completion.chunk","model":"mimo-test","usage":{"completion_tokens":5},"choices":[]}`
+	out := drainStream(t, line+"\n")
+
+	if strings.Contains(out, "empty_content") {
+		t.Fatalf("带输出侧 token 的 NDJSON 流不得判空, 实得:\n%s", out)
+	}
+	if !strings.Contains(out, `"completion_tokens":5`) {
+		t.Fatalf("输出侧 usage 帧必须真的交付(否则是 200 零字节), 实得:\n%s", out)
+	}
+	if !strings.Contains(out, "[DONE]") {
+		t.Fatalf("必须收尾 [DONE], 实得:\n%s", out)
 	}
 }
 
 // 合成的错误帧必须是合法 JSON 且带 finish_reason ——
 // 只认协议终止信号、不解析 error 字段的客户端也能正常收尾。
+//
+// ★ 2026-09-24 契约变更: 空流在响应头**未提交**时已经零交付(见
+// assertInvisibleEmptyStream), 这条帧不再出现在正常空流路径上。它仍是
+// "响应头已提交后才发现空流"的兜底(见 writeStreamEmptyContentError 的注释)。
+// 因此改为**直接驱动帧构造器** —— 断言一条不减(合法 JSON / 非 stop 终止帧 /
+// error.type=empty_content / retryable / 带 model), 只是不再依赖那条按当前代码
+// 已不可达的 handler 分岔。
 func Test空流_错误帧协议合法性(t *testing.T) {
-	out := drainStream(t, emptyChoicesFrame("1"))
+	rec := httptest.NewRecorder()
+	lw := &lazyCommitWriter{ResponseWriter: rec, flusher: rec}
+	// interval=0: 不起心跳泵(本用例只关心错误帧的字节形态)。
+	hb := newSSEHeartbeat(lw, lw, 0, func() []byte { return nil })
+	defer hb.Close()
+	lw.WriteHeader(http.StatusOK)
+	lw.commit() // 已提交: 此时 HTTP 状态码改不了, 失败信息只能走 SSE 帧
+	writeStreamEmptyContentError(lw, hb, "mimo-test")
+	out := rec.Body.String()
 
 	var found bool
 	for _, line := range strings.Split(out, "\n") {
@@ -620,7 +720,13 @@ func Test空流_仅顶层stop_reason必须通过(t *testing.T) {
 			out := drainStream(t, tc.body)
 			if strings.Contains(out, "empty_content") {
 				t.Fatalf("顶层 stop_reason=%s 是合法空终止态, 不得报空流 "+
-					"(hasValuableContent 不认顶层 stop_reason, 此处唯一防线就是白名单), 实得:\n%s",
+					"(chunkDeliversUserContent 不认顶层 stop_reason, 此处唯一防线就是白名单), 实得:\n%s",
+					tc.name, out)
+			}
+			// ★ 2026-09-24 断言加强: 合法空终止态靠"收尾兜底提交"才能交付, 忘掉
+			// 提交就会退化成 200 零字节 —— 而"没有 empty_content"照样成立。
+			if !strings.Contains(out, "[DONE]") {
+				t.Fatalf("顶层 stop_reason=%s 必须真的交付收尾帧(否则是 200 零字节), 实得:\n%s",
 					tc.name, out)
 			}
 		})
@@ -631,10 +737,7 @@ func Test空流_仅顶层stop_reason必须通过(t *testing.T) {
 // 防止"把整个 stop_reason 判真"这种过度放行。
 func Test空流_顶层stop_reason非白名单值仍失败(t *testing.T) {
 	body := "data: " + `{"type":"message_delta","stop_reason":"end_turn"}` + "\n\n"
-	out := drainStream(t, body)
-	if !strings.Contains(out, "empty_content") {
-		t.Fatalf("end_turn 不在 LEGIT_EMPTY 白名单内, 空内容应判失败, 实得:\n%s", out)
-	}
+	assertInvisibleEmptyStream(t, body, "顶层 stop_reason=end_turn(不在白名单)")
 }
 
 // 纯工具调用回合(无任何正文文本, finish_reason=tool_calls)必须正常通过,
@@ -664,6 +767,10 @@ func Test空流_被token上限截断必须通过(t *testing.T) {
 	if strings.Contains(out, "empty_content") {
 		t.Fatalf("被 token 上限截断是合法终止, 不得报空流, 实得:\n%s", out)
 	}
+	// ★ 2026-09-24 断言加强: 必须真的交付(收尾兜底提交一旦缺失就是 200 零字节)。
+	if !strings.Contains(out, `"finish_reason":"length"`) || !strings.Contains(out, "[DONE]") {
+		t.Fatalf("合法截断的终止帧与 [DONE] 必须真的交付, 实得:\n%s", out)
+	}
 }
 
 // 完整 JSON body 形态的纯工具调用回合(非流式回包被当成流式处理)也必须通过。
@@ -673,6 +780,10 @@ func Test空流_完整JSON纯工具调用必须通过(t *testing.T) {
 
 	if strings.Contains(out, "empty_content") {
 		t.Fatalf("完整 JSON 形态的纯工具调用回合不得报空流, 实得:\n%s", out)
+	}
+	// ★ 2026-09-24 断言加强: 工具调用必须真的到达客户端。
+	if !strings.Contains(out, "list_dir") {
+		t.Fatalf("工具调用必须真的交付给客户端, 实得:\n%s", out)
 	}
 }
 
@@ -694,22 +805,29 @@ func Test空流_完整JSON纯工具调用必须通过(t *testing.T) {
 //	帧级: finish_reason 帧 → 有价值 → **必须转发**(客户端靠它收尾)  ← 仍然成立
 //	流级: finish_reason 帧 → 不是产出 → **不算交付**              ← 本用例锁定的新语义
 //
-// 一条只发 finish_reason 就结束的流, 客户端会拿到一个"成功但空"的回合 ——
-// 不报错、不重试、任务静默中断。这正是要根治的症状。
-//
-// 因此本用例同时锁定两件相反的事: **帧要转发, 但流要判空**。
-func Test空流_仅finish_reason帧必须判空但帧仍要转发(t *testing.T) {
-	body := "data: " + `{"id":"c1","object":"chat.completion.chunk","model":"mimo-test","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}` + "\n\n" +
+// ★ 2026-09-24 契约变更(必须改输入, 不能只改断言):
+// 旧用例的输入是"**只有** finish_reason 一帧"。新契约下那种流整条判空, 于是客户端
+// 零交付(见 assertInvisibleEmptyStream)—— 那时"终止帧要转发"根本无从成立, 因为
+// 一个字节都不会发出去。而"转发 ≠ 交付"这条不变量本身仍然正确, 只是它只在
+// **已经交付过真实内容**的流上才可观测。所以输入改为"先有正文、后到终止帧":
+// 终止帧不是产出(不改变流级判定), 但必须原样转发。
+func Test空流_内容之后的终止帧仍必须转发(t *testing.T) {
+	body := contentFrame("hi") +
+		"data: " + `{"id":"c1","object":"chat.completion.chunk","model":"mimo-test","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}` + "\n\n" +
 		"data: [DONE]\n\n"
 	out := drainStream(t, body)
 
-	// ① 流级: 零产出 → 必须判空(与 P0-1 修复方向一致)
-	if !strings.Contains(out, "empty_content") {
-		t.Fatalf("只有 finish_reason 的流应判为空流(零产出), 实得:\n%s", out)
+	// ① 流级: 有真实产出 → 不得判空
+	if strings.Contains(out, "empty_content") {
+		t.Fatalf("有真实内容的流不得判空, 实得:\n%s", out)
 	}
-	// ② 帧级: 终止帧**仍然必须转发**给客户端 —— 收紧流级判据不得影响转发
+	// ② 帧级: 终止帧**必须转发**给客户端 —— 收紧流级判据不得影响转发
 	if !strings.Contains(out, `"finish_reason":"stop"`) {
 		t.Fatalf("终止帧必须转发给客户端(转发 ≠ 交付), 实得:\n%s", out)
+	}
+	// ③ 上游已发过 [DONE] 时收尾不得重复补(首行分支曾漏更新 sawDone)
+	if n := strings.Count(out, "[DONE]"); n != 1 {
+		t.Fatalf("[DONE] 应只出现一次, got %d in:\n%s", n, out)
 	}
 }
 
@@ -723,15 +841,109 @@ func Test空流_length截断的合法空回包不判空(t *testing.T) {
 	if strings.Contains(out, "empty_content") {
 		t.Fatalf("finish_reason=length 是合法空终止态, 不得判空流, 实得:\n%s", out)
 	}
+	// ★ 2026-09-24 断言加强: 必须真的交付, 不能只是"没报错"。
+	if !strings.Contains(out, `"finish_reason":"length"`) {
+		t.Fatalf("合法截断的终止帧必须交付给客户端(否则是 200 零字节), 实得:\n%s", out)
+	}
 }
 
 // 与上面对照: choices 为空数组才是参考实现定义的"空流", 必须失败。
 // (emptyChoicesChunk 的等价物, 见 stream-empty-choices-interceptor.test.ts)
 func Test空流_空choices数组才是真空流(t *testing.T) {
 	body := emptyChoicesFrame("1") + emptyChoicesFrame("2") + "data: [DONE]\n\n"
-	out := drainStream(t, body)
+	assertInvisibleEmptyStream(t, body, "choices 为空数组(参考实现定义的空流)")
+}
 
-	if !strings.Contains(out, "empty_content") {
-		t.Fatalf("choices 为空数组正是参考实现定义的空流, 必须失败, 实得:\n%s", out)
+// ─────────── lazyCommitWriter 的两条关键不变量(第二步的核心) ───────────
+
+// TestLazyCommitWriter_提交前写出不得触发提交
+//
+// 这是"空流可换站"能否成立的关键不变量: 心跳走 hb.writeLocked → w.Write, 脚手架帧
+// 同样走 w.Write。若 Write 沿用"首次写出即提交", 它们会把 200 钉死, 整个修复当场
+// 作废。⇒ **提交必须是显式的**(处理链见到第一个真实内容帧时调 commit)。
+func TestLazyCommitWriter_提交前写出不得触发提交(t *testing.T) {
+	rec := httptest.NewRecorder()
+	lw := &lazyCommitWriter{ResponseWriter: rec, flusher: rec}
+	lw.WriteHeader(http.StatusOK)
+	// interval=0: 不起泵, 手动走与 pump 完全相同的那条写路径。
+	hb := newSSEHeartbeat(lw, lw, 0, func() []byte { return openAIHeartbeatFrame })
+	defer hb.Close()
+
+	hb.writeFlush(openAIHeartbeatFrame)
+	hb.writeFlush([]byte("data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hi\"}}]}\n\n"))
+	if lw.isCommitted() {
+		t.Fatal("写出本身不得触发提交(提交必须显式), 否则心跳/脚手架帧会把 200 钉死")
+	}
+	if rec.Body.Len() != 0 {
+		t.Fatalf("提交前不得向客户端写出任何字节, 实得 %d 字节", rec.Body.Len())
+	}
+
+	// 显式提交: 前导缓冲里的帧必须按写入顺序一并放出, 且此后写出直通。
+	lw.commit()
+	if !lw.isCommitted() {
+		t.Fatal("commit 之后必须处于已提交状态")
+	}
+	out := rec.Body.String()
+	// 前导帧 = openAIHeartbeatFrame(`data: {"choices":[{"index":0,"delta":{}}]}`)
+	if !strings.Contains(out, `"delta":{}`) {
+		t.Fatalf("前导缓冲里的帧必须在提交时一并放出(不得丢弃), 实得 %q", out)
+	}
+	if strings.Index(out, `"delta":{}`) > strings.Index(out, `"content":"hi"`) {
+		t.Fatalf("前导帧必须先于正文出现, 实得 %q", out)
+	}
+}
+
+// TestLazyCommitWriter_前导超限绝不提交 前导缓冲超限时必须丢弃前导、拒绝写出,
+// 且**绝不提交**响应头 —— 只有这样调用方才能返回真 502 让路由层换站。
+//
+// 反例(会被本用例抓住): 超限时改为"提交后放行"。那样响应头被钉死, 路由层再换
+// 一站就会把第二次的内容接在第一次已经发出去的流后面 —— 用户明确警告过的顺序陷阱。
+func TestLazyCommitWriter_前导超限绝不提交(t *testing.T) {
+	rec := httptest.NewRecorder()
+	lw := &lazyCommitWriter{ResponseWriter: rec, flusher: rec}
+	lw.WriteHeader(http.StatusOK)
+
+	chunk := bytes.Repeat([]byte("x"), 64<<10)
+	var lastErr error
+	for i := 0; i < 64 && lastErr == nil; i++ { // 最多灌 4MiB, 上限 1MiB
+		_, lastErr = lw.Write(chunk)
+	}
+	if lastErr == nil {
+		t.Fatalf("超过 streamPreambleMaxBytes(%d) 后 Write 必须报错", streamPreambleMaxBytes)
+	}
+	if lw.isCommitted() {
+		t.Fatal("前导超限后绝不允许提交响应头")
+	}
+	if rec.Body.Len() != 0 {
+		t.Fatalf("前导超限不得向客户端写出任何字节, 实得 %d 字节", rec.Body.Len())
+	}
+	// 超限后 commit 必须是 no-op —— 否则调用方会误以为还能交付。
+	lw.commit()
+	if lw.isCommitted() || rec.Body.Len() != 0 {
+		t.Fatalf("超限后 commit 必须 no-op, committed=%v bytes=%d", lw.isCommitted(), rec.Body.Len())
+	}
+	if !lw.isOverflowed() {
+		t.Fatal("超限标志必须置位, 供处理链改判 502")
+	}
+}
+
+// 正常路径的负向对照: 未超限时前导缓冲原样保留, 提交后按写入顺序交付。
+func TestLazyCommitWriter_正常提交按序交付(t *testing.T) {
+	rec := httptest.NewRecorder()
+	lw := &lazyCommitWriter{ResponseWriter: rec, flusher: rec}
+	lw.WriteHeader(http.StatusOK)
+
+	if _, err := lw.Write([]byte("A")); err != nil {
+		t.Fatalf("提交前的写出不得报错: %v", err)
+	}
+	if rec.Body.Len() != 0 {
+		t.Fatalf("提交前不得有字节到达客户端, 实得 %q", rec.Body.String())
+	}
+	lw.commit()
+	if _, err := lw.Write([]byte("B")); err != nil {
+		t.Fatalf("提交后的写出不得报错: %v", err)
+	}
+	if got := rec.Body.String(); got != "AB" {
+		t.Fatalf("前导 + 正文必须按写入顺序交付, 实得 %q", got)
 	}
 }

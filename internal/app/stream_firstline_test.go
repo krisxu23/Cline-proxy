@@ -20,30 +20,21 @@ func streamUpstream(body string) *http.Response {
 
 func TestStreamFirstLineDoneNoDuplicateDone(t *testing.T) {
 	mw := &mockFlushWriter{}
-	// 极短流: 首行即 [DONE]。旧首行分支不更新 sawDone, 收尾会再补一个
-	// [DONE] —— 客户端收到重复终止帧。
+	// 极短流: 首行即 [DONE]。
 	//
-	// 注意(2026-09-16 空流防护引入后的行为变化): 上游什么都没发只给 [DONE],
-	// 在 OmniRoute 语义下 (rejectEmptyChoicesStream: 既无有价值的 chunk,
-	// 也无有效 usage) 就是**空流**, 必须判成可见失败而不是干净的收尾。
-	// 因此这条流现在以 empty_content 错误帧结尾 —— 它自身带 [DONE],
-	// 与网关的错误帧 [DONE] 合计会出现两个 [DONE], 这是"失败可见"的
-	// 必然结果, 不再是缺陷。本用例改为锁住真正的不变量:
-	//   1. 正常收尾路径不得重复补 [DONE](即不含错误帧时只有一个);
-	//   2. 若判为空流, 必须带 empty_content 错误帧(失败不得静默)。
-	handleStreamResponseWithUsage(mw, streamUpstream("data: [DONE]\n\n"), nil)
-	out := mw.String()
-
-	if strings.Contains(out, "empty_content") {
-		// 判空流: 必须显式失败, 且不得只剩一个光秃秃的 [DONE]
-		if n := strings.Count(out, "[DONE]"); n < 1 {
-			t.Fatalf("判空流后仍应交付终止帧, got %q", out)
-		}
-		return
+	// 注意(2026-09-24 契约变更, 用户规格: 上游的错误必须在网关内部消化):
+	// 上游什么都没发只给 [DONE] 就是空流。现在空流在响应头**提交前**一个字节都
+	// 不交付, 而是返回真 502 让路由层换站重试 —— 客户端看到的是"这次请求失败、
+	// 可以重试", 而不是一条带自定义错误帧的空流(agent 工具认不出那种帧, 这正是
+	// 用户报的"空白回复卡死")。
+	// 于是"重复 [DONE]"这条旧缺陷在这个形态下已不可观测, 用例改为锁住新契约;
+	// "全流只出现一个 [DONE]"由下面的有内容对照用例继续锁定。
+	status := handleStreamResponseWithUsage(mw, streamUpstream("data: [DONE]\n\n"), nil)
+	if status != http.StatusBadGateway {
+		t.Fatalf("首行即 [DONE](零内容)必须判空并返回 502, 实得 status=%d", status)
 	}
-	// 未判空流: 严格锁住"只补一次 [DONE]"
-	if n := strings.Count(out, "[DONE]"); n != 1 {
-		t.Fatalf("首行即 [DONE] 时全流应只出现一个 [DONE], got %d in %q", n, out)
+	if out := mw.String(); out != "" {
+		t.Fatalf("空流在响应头提交前不得交付任何字节, 实得 %q", out)
 	}
 }
 

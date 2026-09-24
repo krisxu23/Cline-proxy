@@ -8,6 +8,7 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"sync/atomic"
 	"time"
 )
 
@@ -16,7 +17,13 @@ import (
 // failover 的时机是"首字节之前" —— 每一站都是先拿到 *http.Response、
 // 判定状态码与内容, 确认可用后才开始写 w。因此:
 //   - 非流式: 可以先读完 body 判定"200 但无内容", 不合格就换下一站;
-//   - 流式  : 200 即开始透传, 之后中断按现有语义终止(不再换站)。
+//   - 流式  : 提交前先探首个有效事件(probeStreamFirstEvent), 空流即换站;
+//     提交之后中断按现有语义终止(不再换站)。
+//
+// ★ 2026-09-24 补上第三格: 首事件有效、**后续整条流却零产出**的空回包, 此前
+// 流处理器只能把 502 交回这里, 而这里无条件 return —— 网关内部不换站。现在
+// 只要**响应头尚未提交**(由 proxy_stream.go 的 lazyCommitWriter 保证, 见
+// commitProbeWriter) 就继续换站, 预算见 emptyStreamRetryBudget。
 //
 // 这样客户端只会看到最终胜出那一站的响应, 中间失败的站点对它是不可见的 ——
 // 也不会出现"已经回了一部分再用另一站重来"的破损响应。
@@ -41,6 +48,59 @@ type chainTarget struct {
 // chainFailoverHeader 命中候选链时回填的路由头取值, 便于在请求日志里区分。
 const chainFailoverHeader = "chain"
 
+// emptyStreamRetryBudget 空流(流内改判失败)换站重试的**独立时间预算** ——
+// 2026-09-24 用户拍板 5 分钟。
+//
+// 为什么用总时长而不是次数上限: 每次空流的耗时差异极大(实测约 11 秒, 慢出口可达
+// 数十秒), 次数上限给出的实际窗口会随上游状态剧烈漂移 —— 3 次可能 30 秒, 也可能
+// 3 分钟。用户要的是"给 agent 一个确定的等待上限", 所以直接卡总时长。
+//
+// 为什么独立: 不复用网络错 / 429 的重试预算 —— 那两类各自已有自己的窗口, 叠加起来
+// 会显著超过 5 分钟, 对 agent 来说和卡死没区别。
+//
+// 声明为变量而不是常量: 测试要把它覆盖成**已超期**(负值)才能覆盖"预算耗尽 →
+// 交还真错误"那条分支(本仓既有做法, 见 nodeHealthFileOverride / nodeStableLoaded)。
+// 生产路径只读。
+var emptyStreamRetryBudget = 5 * time.Minute
+
+// commitProbeWriter 记录"响应头是否已经提交" —— 空流换站重试的安全前提。
+//
+// ★ 为什么必须**观测**而不是按响应形状猜: 只有 OpenAI 形状的出站路径做了延迟提交
+// (proxy_stream.go 的 lazyCommitWriter), 空流时响应头尚未提交, 换一站对客户端完全
+// 无感。anthropic / responses 两条路径在进流处理器**之前**就 WriteHeader(200), 头一旦
+// 提交就再也改不了口 —— 在那里换站会把第二次的内容接在第一次**已经发出去**的流后面
+// (2026-09-24 用户明确警告过的顺序陷阱), 比不换更糟。
+//
+// 判据取自实际观测, 所以将来任何一条路径改成延迟提交, 空流换站会自动对它生效,
+// 不需要同步改这里。
+//
+// committed 用 atomic: 心跳泵是独立 goroutine, 它可能经 hb.flush_ → lw.Flush →
+// 本类型 Flush 写这个字段, 而请求 goroutine 会读它。
+type commitProbeWriter struct {
+	http.ResponseWriter
+	committed atomic.Bool
+}
+
+func (c *commitProbeWriter) WriteHeader(code int) {
+	c.committed.Store(true)
+	c.ResponseWriter.WriteHeader(code)
+}
+
+func (c *commitProbeWriter) Write(b []byte) (int, error) {
+	c.committed.Store(true)
+	return c.ResponseWriter.Write(b)
+}
+
+// Flush 必须实现: 流式处理链会断言 http.Flusher, 缺失会让 handler 直接走
+// "streaming not supported" 分支(500)。net/http 的 Flush 会**隐式提交**响应头,
+// 因此它同样意味着"已提交"。
+func (c *commitProbeWriter) Flush() {
+	c.committed.Store(true)
+	if f, ok := c.ResponseWriter.(http.Flusher); ok {
+		f.Flush()
+	}
+}
+
 // handleChainedChat 执行候选链(OpenAI 形状入口)。
 func handleChainedChat(w http.ResponseWriter, r *http.Request, params map[string]any, chain []routeCandidate, requested string) {
 	handleChainedChatAs(w, r, params, chain, requested, chainTarget{})
@@ -50,6 +110,12 @@ func handleChainedChat(w http.ResponseWriter, r *http.Request, params map[string
 func handleChainedChatAs(w http.ResponseWriter, r *http.Request, params map[string]any, chain []routeCandidate, requested string, tgt chainTarget) {
 	isStream, _ := params["stream"].(bool)
 	applyOverride(params)
+
+	// 响应头提交探针(见 commitProbeWriter): 空流换站只在"响应头尚未提交"时安全。
+	// 这里直接替换 w(而不是新增变量), 是为了保证下游**所有**回写都经过它 ——
+	// 漏掉任何一处都会得出"未提交"的错判, 进而把第二次的内容接到第一次的流后面。
+	probe := &commitProbeWriter{ResponseWriter: w}
+	w = probe
 
 	// 请求轨迹与决策轨迹: 一次链式调度同时回填"请求日志用的元数据"和
 	// "面板详情用的逐候选决策"(参照 OmniRoute 的 call_logs + decisionTrace)。
@@ -64,6 +130,11 @@ func handleChainedChatAs(w http.ResponseWriter, r *http.Request, params map[stri
 		skipped    int
 		tried      int
 	)
+	// 空流换站的时间预算(见 emptyStreamRetryBudget 的完整理由)。
+	//
+	// 起点是**第一次遇到空流**的时刻(惰性), 不是请求开始: 请求在候选链上可能已经
+	// 花掉很久(前面几站各吃一次超时), 那段时间不属于"空流重试"。
+	var emptyStreamDeadline time.Time
 	// 统计估算整包 marshal 每请求只算一次: hopParams 与 params 只差 model 名,
 	// 候选间复用同一估值(真实 usage 回来后 observeUsage 会覆盖)。
 	promptTokens := estimateJSON(params)
@@ -212,6 +283,51 @@ func handleChainedChatAs(w http.ResponseWriter, r *http.Request, params map[stri
 				delivered = chatStreamToResponses(w, resp, nil)
 			default:
 				delivered = handleStreamResponseWithToolNameMap(w, resp, observe, responseToolNameMap)
+			}
+			// ★ 流内空回包也要换站重试(2026-09-24, 用户规格: 上游的错误必须在网关
+			//   内部消化, 不得让 agent 看到)。
+			//
+			//   delivered>=400 且**响应头未提交**表示流处理器已判定"整条流未交付任何
+			//   有价值内容"(proxy_stream.go 的 lazyCommitWriter 保证此时一个字节都没
+			//   发给客户端)。此前这里无条件 return —— 网关内部不换站, 客户端只能自己
+			//   处理; 现在改成: 冷却本站(空流大概率是该出口/worker 异常) + 换下一站,
+			//   全程对客户端无感。
+			//
+			//   两个安全前提, 缺一不可:
+			//     1. !probe.committed.Load() —— 已提交就改不了口(见 commitProbeWriter);
+			//     2. 在 emptyStreamRetryBudget 之内 —— 耗尽后不再换站, 让下面的收尾
+			//        把真 502 交给客户端(用户要的"超时仍未成功 → 返回一个真错误")。
+			if delivered >= 400 && !probe.committed.Load() {
+				if emptyStreamDeadline.IsZero() {
+					emptyStreamDeadline = time.Now().Add(emptyStreamRetryBudget)
+				}
+				// 客户端已经断开(agent 自己超时/取消)时不再换站: 再试也没人收,
+				// 只会白白冷却后面的候选。
+				if r.Context().Err() == nil && time.Now().Before(emptyStreamDeadline) {
+					resp.Body.Close()
+					lastErr = fmt.Errorf("%s: 流内空回包(首事件有效但整条流无有效 chunk)", cand.String())
+					lastStatus = http.StatusBadGateway
+					markCandidateCooldown(cand.Upstream, cand.Model, classEmpty, "流内空回包")
+					recordUsageForCandidate(cand, false)
+					dec.addCandidate(cand.String(), "tried", "流内空回包", resp.StatusCode, classEmpty)
+					log.Printf("  chain: %s 流内空回包, 冷却本站并换下一站(空流预算剩余 %s)",
+						cand.String(), time.Until(emptyStreamDeadline).Truncate(time.Second))
+					continue
+				}
+				// 预算耗尽 / 客户端已走: 按失败记账后跳出, 交给链尾收尾返回真错误。
+				//
+				// 不能落到下面的"成功收尾"(tracker.finish / markCandidateSuccess):
+				// 那会把刚打的冷却清掉、并把这次失败记成 winner, 请求日志与成功率
+				// 指标都会与实际相反。
+				resp.Body.Close()
+				lastErr = fmt.Errorf("%s: 流内空回包且空流重试预算(%s)已耗尽或客户端已断开", cand.String(), emptyStreamRetryBudget)
+				lastStatus = http.StatusBadGateway
+				markCandidateCooldown(cand.Upstream, cand.Model, classEmpty, "流内空回包")
+				recordUsageForCandidate(cand, false)
+				dec.addCandidate(cand.String(), "tried", "流内空回包(预算耗尽)", resp.StatusCode, classEmpty)
+				log.Printf("  chain: %s 流内空回包, 空流重试预算(%s)已耗尽或客户端已断开, 返回真 502 给客户端",
+					cand.String(), emptyStreamRetryBudget)
+				break
 			}
 			// 这里以前从不关闭上游响应体。对比上面两条失败路径(87/154 行)都显式
 			// Close 了, 唯独流式成功这条漏掉, 而三个流式 handler 内部也都只读到
