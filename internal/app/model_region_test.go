@@ -73,6 +73,55 @@ func TestPickZenProxyForModelUnknownNodesParticipate(t *testing.T) {
 	}
 }
 
+// ★ Task 9 回归(2026-09-24): 存在"已探测确认可用"的出口时, **未知国家档不得
+// 再参与轮询**。
+//
+// 原行为是二值过滤 —— 未知与"确认可用"平起平坐, 而出口地区勾选里通常含 other,
+// 未知节点被当成 other 放行 ⇒ 地区受限模型反复撞上真正被禁的出口。
+// 实测证据: 一次 muse-spark-1.3-contributor-free 请求连撞 8 站 / 69918ms /
+// 403 RegionError, 其中 3 次网络错 + 2 次地区拒 + 2 次 429 穿插。
+func TestPickZenProxyForModelPrefersKnownUsableOverUnknown(t *testing.T) {
+	regionProxyConfig(t)
+	markRegionModelForTest(t, "m-spark")
+	list := effectiveProxyList()
+	if len(list) < 3 {
+		t.Fatalf("测试前提不成立: 需要 3 个出口, got %d", len(list))
+	}
+	// 只把最后一个标成"确认可用", 前两个保持"国家未知"。
+	setRegionNodeOK("m-spark", nodeLocalKey(list[len(list)-1]), true)
+	want := list[len(list)-1]
+
+	for i := 0; i < 8; i++ {
+		p, _ := pickZenProxyForModel("m-spark")
+		if p != want {
+			t.Fatalf("已知可用出口存在时不得再选未知国家节点: got %s, 期望 %s", p, want)
+		}
+	}
+}
+
+// 地区档位三态: 未知=1(兜底) / 确认可用=0 / 确认被拒=2。
+func TestRegionExitTier(t *testing.T) {
+	const model = "test-tier-model"
+	const key = "sbox://tier-node"
+	t.Cleanup(func() {
+		regionModelMu.Lock()
+		delete(regionNodeOK, model)
+		regionModelMu.Unlock()
+	})
+
+	if got := regionExitTier(model, key); got != 1 {
+		t.Fatalf("未探测应为兜底档 1, got %d", got)
+	}
+	setRegionNodeOK(model, key, true)
+	if got := regionExitTier(model, key); got != 0 {
+		t.Fatalf("确认可用应为档 0, got %d", got)
+	}
+	setRegionNodeOK(model, key, false)
+	if got := regionExitTier(model, key); got != 2 {
+		t.Fatalf("确认被拒应为档 2, got %d", got)
+	}
+}
+
 // 已探测确认"地区被拒"的节点要被跳过。
 func TestPickZenProxyForModelSkipsProbedBad(t *testing.T) {
 	regionProxyConfig(t)

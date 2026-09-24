@@ -314,6 +314,33 @@ func exitUpstreamFilter(modelID string) func(string) bool {
 	}
 }
 
+// regionExitTier 出口对某地区受限模型的可用档位(只看地区维度):
+//
+//	0 = 已探测确认该出口可用
+//	1 = 国家/地区未知(尚未探测) —— 兜底档
+//	2 = 已探测确认被拒 —— 排除
+//
+// 为什么必须分档而不是二值过滤(2026-09-24 计划 Task 9):
+// 未知国家此前与"确认可用"**同等**参与轮询, 而出口地区勾选里通常含 `other`,
+// 未知节点于是被当成 other 放行 —— 地区受限模型会反复撞上真正被禁的出口。
+// 实测证据: 一次 muse-spark-1.3-contributor-free 请求连撞 8 站、耗时 69918ms,
+// 最终 403 RegionError("This model is not available in your country"),
+// 其中 3 次网络错 + 2 次地区拒 + 2 次 429 穿插。
+//
+// 分档而非硬排除的理由(保住原有约束): 冷启动/探测未完成时全部节点都是未知档,
+// 硬排除会一个候选都没有 —— 那正是 exitFilterForModel 注释里"未探测不等于不可用"
+// 要防的情况。所以"有已知可用就优先用已知, 没有才退回未知"。
+func regionExitTier(modelID, key string) int {
+	ok, known := regionNodeUsable(modelID, key)
+	if !known {
+		return 1
+	}
+	if ok {
+		return 0
+	}
+	return 2
+}
+
 // exitFilterForModel 模型相关的**完整**出口过滤谓词(上游可达性 + 地区能力)。
 //
 // ★ 2026-09-17 审查 P1-1: 此前这套判据只存在于 pickZenProxyForModel 里, 而那个
@@ -344,13 +371,16 @@ func exitFilterForModel(modelID string) func(string) bool {
 	}
 }
 
-// pickZenProxyForModel 选择出口: 地区受限模型优先从"未被探测出地区拒绝"的
-// 节点中轮询, 其余模型沿用常规轮询。
+// pickZenProxyForModel 选择出口: 地区受限模型**优先**从"已探测确认地区可用"的
+// 节点中轮询; 没有这类节点时才退回"国家未知"档; 非地区受限模型沿用常规轮询。
 //
-// 注意方向: 只有"已探测确认被拒"才排除, 没有探测数据照样参与 —— 未探测
-// 不等于不可用, 否则刚启动/探测未完成时必然无候选。全部节点都确认被拒时
-// 退回常规轮询而不是直连: 对大陆禁售模型, 直连是 100% 失败,
-// 任何一个节点都比它强。
+// 方向说明(2026-09-24 计划 Task 9 起): 分档而不是二值过滤 —— 未知国家**不再**与
+// 确认可用平起平坐(那会让地区受限模型反复撞上被禁出口, 实测 8 跳 / 70 秒 / 403
+// RegionError), 但也没有硬排除(冷启动时全部节点都未知, 硬排除会零候选)。
+// 已探测确认被拒的节点始终排除。
+//
+// 全部节点都确认被拒 / 无候选时退回常规轮询而不是直连: 对大陆禁售模型,
+// 直连是 100% 失败, 任何一个节点都比它强。
 func pickZenProxyForModel(modelID string) (string, int) {
 	if exitModeDirectNow() {
 		return "", -1
@@ -368,7 +398,10 @@ func pickZenProxyForModel(modelID string) (string, int) {
 		return "", -1
 	}
 	var cooled, notDialable, notUsable, unsupported, regionBad int
-	cand := make([]int, 0, len(list))
+	// 分两档收集: preferred = 已探测确认可用; unknown = 国家未知(兜底)。
+	// 见 regionExitTier 的说明 —— 未知档不再与已知可用档平起平坐。
+	preferred := make([]int, 0, len(list))
+	unknown := make([]int, 0, len(list))
 	for i, p := range list {
 		switch {
 		case !zenProxyAvailable(p):
@@ -384,11 +417,23 @@ func pickZenProxyForModel(modelID string) (string, int) {
 			unsupported++
 			continue
 		}
-		if ok, known := regionNodeUsable(modelID, nodeLocalKey(p)); known && !ok {
+		switch regionExitTier(modelID, nodeLocalKey(p)) {
+		case 2:
 			regionBad++ // 已探测确认该出口地区被该模型拒绝
 			continue
+		case 0:
+			preferred = append(preferred, i)
+		default:
+			unknown = append(unknown, i)
 		}
-		cand = append(cand, i)
+	}
+	cand := preferred
+	if len(cand) == 0 && len(unknown) > 0 {
+		// 还没有任何"已知可用"的出口(冷启动 / 地区探测未完成) → 退回未知档。
+		// 这不是直连: 仍然是真实节点, 只是国家还没探出来。
+		log.Printf("  zen: 地区受限模型 %s 暂无已知可用出口(池 %d: 冷却 %d 未就绪 %d 不健康 %d 上游不通 %d 地区被拒 %d), 退回 %d 个国家未知出口",
+			modelID, len(list), cooled, notDialable, notUsable, unsupported, regionBad, len(unknown))
+		cand = unknown
 	}
 	if len(cand) == 0 {
 		log.Printf("  zen: 地区受限模型 %s 无候选(池 %d: 冷却 %d 未就绪 %d 不健康 %d 上游不通 %d 地区被拒 %d), 回退常规轮询",
