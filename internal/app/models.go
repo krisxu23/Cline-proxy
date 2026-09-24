@@ -2,9 +2,9 @@ package app
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"free-router/internal/cline"
+	"free-router/internal/kit"
 	"log"
 	"net/http"
 	"strings"
@@ -153,7 +153,8 @@ func syncRecommendedModels() (int, error) {
 	}
 
 	var payload recommendedPayload
-	if err := json.NewDecoder(resp.Body).Decode(&payload); err != nil {
+	// 上游响应体封顶(2026-09-24 审计 P0-2: 出口是第三方节点, 响应字节不可信; 见 kit.DecodeJSONLimit)
+	if err := kit.DecodeJSONLimit(resp.Body, &payload, kit.MaxUpstreamBodyBytes); err != nil {
 		return 0, err
 	}
 

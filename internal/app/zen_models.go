@@ -2,7 +2,6 @@ package app
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"free-router/internal/kit"
 	"log"
@@ -103,7 +102,8 @@ func decodeZenModels(resp *http.Response) (int, error) {
 			ID string `json:"id"`
 		} `json:"data"`
 	}
-	if err := json.NewDecoder(resp.Body).Decode(&payload); err != nil {
+	// 上游响应体封顶(2026-09-24 审计 P0-2: 出口是第三方节点, 响应字节不可信; 见 kit.DecodeJSONLimit)
+	if err := kit.DecodeJSONLimit(resp.Body, &payload, kit.MaxUpstreamBodyBytes); err != nil {
 		return 0, err
 	}
 	// 空目录不当作"成功同步": 既不做差量删除(上游结构变化/权限问题时, 一次

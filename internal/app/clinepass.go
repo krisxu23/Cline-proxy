@@ -227,7 +227,8 @@ func handleClinePassAnthropic(w http.ResponseWriter, r *http.Request, req anthro
 	}
 
 	var raw map[string]any
-	if err := json.NewDecoder(up.Body).Decode(&raw); err != nil {
+	// 上游响应体封顶(2026-09-24 审计 P0-2: 出口是第三方节点, 响应字节不可信; 见 kit.DecodeJSONLimit)
+	if err := kit.DecodeJSONLimit(up.Body, &raw, providerResponseMaxBytes); err != nil {
 		writeJSON(w, http.StatusBadGateway, map[string]any{
 			"error": map[string]string{"message": err.Error(), "type": "parse_error"},
 		})
@@ -287,7 +288,8 @@ func handleClinePassResponses(w http.ResponseWriter, r *http.Request, params, ch
 	}
 
 	var raw map[string]any
-	if err := json.NewDecoder(up.Body).Decode(&raw); err != nil {
+	// 上游响应体封顶(2026-09-24 审计 P0-2: 出口是第三方节点, 响应字节不可信; 见 kit.DecodeJSONLimit)
+	if err := kit.DecodeJSONLimit(up.Body, &raw, providerResponseMaxBytes); err != nil {
 		writeJSON(w, http.StatusBadGateway, map[string]any{"error": err.Error()})
 		tracker.finish(false, http.StatusBadGateway)
 		return

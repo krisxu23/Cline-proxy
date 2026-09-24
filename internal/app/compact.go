@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"free-router/internal/kit"
 	"log"
 	"net/http"
 	"sort"
@@ -284,7 +285,8 @@ func generateSummary(ctx context.Context, modelID, prompt string, maxSummary int
 	defer resp.Body.Close()
 
 	var raw map[string]any
-	if err := json.NewDecoder(resp.Body).Decode(&raw); err != nil {
+	// 上游响应体封顶(2026-09-24 审计 P0-2: 出口是第三方节点, 响应字节不可信; 见 kit.DecodeJSONLimit)
+	if err := kit.DecodeJSONLimit(resp.Body, &raw, kit.MaxUpstreamBodyBytes); err != nil {
 		return "", err
 	}
 	if data, ok := raw["data"]; ok {

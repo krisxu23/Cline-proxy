@@ -474,6 +474,11 @@ func Test空流_空choices后接DONE必须失败(t *testing.T) {
 // 是空壳 —— 客户端因此拿到"200 + 一条它认不出的错误帧"。现在改为**先按原始
 // body 判定并提交、再写合成帧**, 空壳 body 一帧都不写。
 func Test空流_完整JSON空壳body必须失败(t *testing.T) {
+	// 把 idle 超时压到 1s: 完整 JSON 路径要读到底才能确认 body 形态, 而"body 不带
+	// 换行"时会等满 idle 超时(默认 90s)。那是改动前就存在的现象(本用例不关心超时),
+	// 不压的话单条用例要跑 90 秒 —— 三条合计 270s, 占了整个 internal/app 套件的九成
+	// 时间(2026-09-24 审计 P0-1)。
+	withTestConfig(t, &zenConfigData{StreamIdleSecs: 1})
 	body := `{"id":"c1","object":"chat.completion","model":"mimo-test",` +
 		`"choices":[{"index":0,"message":{"role":"assistant","content":""},"finish_reason":"stop"}]}`
 	assertInvisibleEmptyStream(t, body, "完整 JSON 空壳 body")
@@ -481,6 +486,11 @@ func Test空流_完整JSON空壳body必须失败(t *testing.T) {
 
 // 合成路径 2: 完整 JSON body 带真实内容 —— 必须正常通过(负向对照)。
 func Test空流_完整JSON有内容正常通过(t *testing.T) {
+	// 把 idle 超时压到 1s: 完整 JSON 路径要读到底才能确认 body 形态, 而"body 不带
+	// 换行"时会等满 idle 超时(默认 90s)。那是改动前就存在的现象(本用例不关心超时),
+	// 不压的话单条用例要跑 90 秒 —— 三条合计 270s, 占了整个 internal/app 套件的九成
+	// 时间(2026-09-24 审计 P0-1)。
+	withTestConfig(t, &zenConfigData{StreamIdleSecs: 1})
 	body := `{"id":"c1","object":"chat.completion","model":"mimo-test",` +
 		`"choices":[{"index":0,"message":{"role":"assistant","content":"real answer"},"finish_reason":"stop"}]}`
 	out := drainStream(t, body)
@@ -775,6 +785,11 @@ func Test空流_被token上限截断必须通过(t *testing.T) {
 
 // 完整 JSON body 形态的纯工具调用回合(非流式回包被当成流式处理)也必须通过。
 func Test空流_完整JSON纯工具调用必须通过(t *testing.T) {
+	// 把 idle 超时压到 1s: 完整 JSON 路径要读到底才能确认 body 形态, 而"body 不带
+	// 换行"时会等满 idle 超时(默认 90s)。那是改动前就存在的现象(本用例不关心超时),
+	// 不压的话单条用例要跑 90 秒 —— 三条合计 270s, 占了整个 internal/app 套件的九成
+	// 时间(2026-09-24 审计 P0-1)。
+	withTestConfig(t, &zenConfigData{StreamIdleSecs: 1})
 	body := `{"id":"c1","object":"chat.completion","model":"mimo-test","choices":[{"index":0,"message":{"role":"assistant","content":null,"tool_calls":[{"id":"call_1","type":"function","function":{"name":"list_dir","arguments":"{}"}}]},"finish_reason":"tool_calls"}]}`
 	out := drainStream(t, body)
 

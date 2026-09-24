@@ -201,3 +201,56 @@ func TestRunCommandStartsAndReaps(t *testing.T) {
 func IsWindowsHelper() bool {
 	return os.PathSeparator == '\\'
 }
+
+// DecodeJSONLimit 是 2026-09-24 审计 P0-2 的统一封顶入口: 上游响应体由**不受我们
+// 控制**的一方决定(zen 侧还要经第三方免费出口节点那一跳), 裸 json.NewDecoder 直读
+// 会被一个不封顶的响应吃成 OOM。
+func TestDecodeJSONLimitRejectsOversizedBody(t *testing.T) {
+	// 构造一个"合法 JSON 但体积超限"的体: 必须在**体积**上被拒, 而不是报一句
+	// 含糊的 JSON 语法错 —— 排障时要能一眼区分"上游疯了"与"我们解析错了"。
+	big := `{"pad":"` + strings.Repeat("a", 4096) + `"}`
+	var out map[string]any
+	err := DecodeJSONLimit(strings.NewReader(big), &out, 1024)
+	if err == nil {
+		t.Fatal("超限响应必须被拒")
+	}
+	if !strings.Contains(err.Error(), "exceeds 1024 bytes") {
+		t.Fatalf("超限错误必须点明体积(而不是 JSON 语法错), 实得: %v", err)
+	}
+}
+
+func TestDecodeJSONLimitAcceptsBodyAtLimit(t *testing.T) {
+	body := `{"ok":true}`
+	var out map[string]any
+	if err := DecodeJSONLimit(strings.NewReader(body), &out, int64(len(body))); err != nil {
+		t.Fatalf("恰好等于上限的体应正常解码, got %v", err)
+	}
+	if out["ok"] != true {
+		t.Fatalf("解码结果不对: %#v", out)
+	}
+}
+
+// 坏 JSON 仍报解码错(不能被体积判定吞掉) —— 小体量的畸形响应是常见上游故障,
+// 把它报成"超限"会误导排查方向。
+func TestDecodeJSONLimitKeepsParseErrorForSmallBadBody(t *testing.T) {
+	var out map[string]any
+	err := DecodeJSONLimit(strings.NewReader(`{"choices"0}]`), &out, 1024)
+	if err == nil {
+		t.Fatal("坏 JSON 必须报错")
+	}
+	if strings.Contains(err.Error(), "exceeds") {
+		t.Fatalf("小体量的坏 JSON 不该被报成超限, 实得: %v", err)
+	}
+}
+
+// limit<=0 时回落到 MaxUpstreamBodyBytes(与 ReadBodyLimit 同口径)。
+func TestDecodeJSONLimitZeroLimitFallsBackToDefault(t *testing.T) {
+	var out map[string]any
+	if err := DecodeJSONLimit(strings.NewReader(`{"ok":true}`), &out, 0); err != nil {
+		t.Fatalf("limit<=0 应回落到默认上限, got %v", err)
+	}
+	big := `{"pad":"` + strings.Repeat("a", MaxUpstreamBodyBytes+16) + `"}`
+	if err := DecodeJSONLimit(strings.NewReader(big), &out, 0); err == nil {
+		t.Fatal("超过默认上限的体必须被拒")
+	}
+}

@@ -301,9 +301,18 @@ func callClineAPIFailover(ctx context.Context, params map[string]any, stream boo
 		if cerr := ctx.Err(); cerr != nil {
 			return nil, acc, cerr
 		}
-		resp, acc, err = callClineAPI(ctx, params, stream)
+		attemptCtx, cancelAttempt := clineAttemptCtx(ctx, stream)
+		resp, acc, err = callClineAPI(attemptCtx, params, stream)
 		if err == nil {
+			if cancelAttempt != nil {
+				// 正文由调用方读 —— 绝不能在此 cancel, 那会把调用方的正文读取掐断。
+				// 绑到响应体关闭上(与 zenAttemptBody 同一手法)。
+				resp.Body = &zenAttemptBody{ReadCloser: resp.Body, cancel: cancelAttempt}
+			}
 			return resp, acc, nil
+		}
+		if cancelAttempt != nil {
+			cancelAttempt() // 错误路径: 立刻归还 timer, 不留悬空的 deadline
 		}
 		if !isRetryableUpstreamError(err) {
 			return nil, acc, err
@@ -329,6 +338,28 @@ func callClineAPIFailover(ctx context.Context, params map[string]any, stream boo
 		log.Printf("  failover: attempt %d/%d failed (%v), rotating account", attempt+1, total, err)
 	}
 	return nil, acc, err
+}
+
+// clineAttemptCtx 给一次 cline 上游尝试准备 ctx。
+//
+// **非流式加总超时**(nonStreamUpstreamTimeout, 与 zen 侧同口径, 2026-09-24 审计 P1-3):
+//
+//	这条路径用的 getZenHTTPClient() 没有客户端级 Timeout, 而它的 https 侧路(h2)被
+//	RegisterProtocol 旁路了主 transport 的 ResponseHeaderTimeout —— 剩下的时间防线
+//	只有 h2 的 ReadIdleTimeout(30s)+PING(15s), 那只覆盖"对端完全不发帧"。上游
+//	"响应头到了、正文停摆"(或持续吐心跳却不收尾)时, 调用方的
+//	handleNonStreamResponseWithUsage → io.ReadAll 会一直等, handler 与 goroutine
+//	长期占着, 客户端只能自己掐。
+//
+// **流式不加**: 长回答可以持续很久, 它靠 idleAbortReader 的空闲中断兜。
+//
+// 返回的 cancel 必须绑到**响应体关闭**上(见调用点的 zenAttemptBody), 不能在本次
+// 尝试返回前调用 —— 正文是调用方读的, 提前 cancel 会把正文读取掐断。
+func clineAttemptCtx(ctx context.Context, stream bool) (context.Context, context.CancelFunc) {
+	if stream {
+		return ctx, nil
+	}
+	return context.WithTimeout(ctx, nonStreamUpstreamTimeout)
 }
 
 // isRetryableUpstreamError 判断 callClineAPI 返回的错误是否值得换账号重试。

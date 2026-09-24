@@ -1,7 +1,6 @@
 package cline
 
 import (
-	"encoding/json"
 	"fmt"
 	"free-router/internal/kit"
 	"net/url"
@@ -72,7 +71,8 @@ func WorkosDeviceAuth() (*deviceAuthResp, error) {
 	}
 
 	var d deviceAuthResp
-	if err := json.NewDecoder(resp.Body).Decode(&d); err != nil {
+	// 上游响应体封顶(2026-09-24 审计 P0-2: 出口是第三方节点, 响应字节不可信; 见 kit.DecodeJSONLimit)
+	if err := kit.DecodeJSONLimit(resp.Body, &d, kit.MaxUpstreamBodyBytes); err != nil {
 		return nil, fmt.Errorf("workos device auth decode: %w", err)
 	}
 	return &d, nil
@@ -97,7 +97,8 @@ func PollWorkosToken(deviceCode string, interval, expiresIn int) (*authenticateR
 		}
 
 		var a authenticateResp
-		if err := json.NewDecoder(resp.Body).Decode(&a); err != nil {
+		// 上游响应体封顶(2026-09-24 审计 P0-2: 出口是第三方节点, 响应字节不可信; 见 kit.DecodeJSONLimit)
+		if err := kit.DecodeJSONLimit(resp.Body, &a, kit.MaxUpstreamBodyBytes); err != nil {
 			resp.Body.Close()
 			return nil, fmt.Errorf("workos poll decode: %w", err)
 		}
@@ -141,7 +142,8 @@ func RegisterWithCline(workosAccess, workosRefresh string) (*clineAuthResp, erro
 	}
 
 	var c clineAuthResp
-	if err := json.NewDecoder(resp.Body).Decode(&c); err != nil {
+	// 上游响应体封顶(2026-09-24 审计 P0-2: 出口是第三方节点, 响应字节不可信; 见 kit.DecodeJSONLimit)
+	if err := kit.DecodeJSONLimit(resp.Body, &c, kit.MaxUpstreamBodyBytes); err != nil {
 		return nil, fmt.Errorf("cline register decode: %w", err)
 	}
 	return &c, nil
@@ -163,7 +165,8 @@ func RefreshClineToken(refreshToken string) (*clineRefreshResp, error) {
 	}
 
 	var c clineRefreshResp
-	if err := json.NewDecoder(resp.Body).Decode(&c); err != nil {
+	// 上游响应体封顶(2026-09-24 审计 P0-2: 出口是第三方节点, 响应字节不可信; 见 kit.DecodeJSONLimit)
+	if err := kit.DecodeJSONLimit(resp.Body, &c, kit.MaxUpstreamBodyBytes); err != nil {
 		return nil, fmt.Errorf("cline refresh decode: %w", err)
 	}
 	return &c, nil

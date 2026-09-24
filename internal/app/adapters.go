@@ -9,6 +9,7 @@ import (
 	"strings"
 	"sync"
 
+	"free-router/internal/kit"
 	"free-router/internal/providers"
 )
 
@@ -82,7 +83,8 @@ func (clineAdapter) Chat(ctx context.Context, req providers.ChatRequest) (*provi
 	}
 	defer resp.Body.Close()
 	var body map[string]any
-	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+	// 上游响应体封顶(2026-09-24 审计 P0-2: 出口是第三方节点, 响应字节不可信; 见 kit.DecodeJSONLimit)
+	if err := kit.DecodeJSONLimit(resp.Body, &body, providerResponseMaxBytes); err != nil {
 		return nil, err
 	}
 	if d, ok := body["data"].(map[string]any); ok {
@@ -141,7 +143,8 @@ func (zenAdapter) Chat(ctx context.Context, req providers.ChatRequest) (*provide
 	}
 	defer resp.Body.Close()
 	var body map[string]any
-	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+	// 上游响应体封顶(2026-09-24 审计 P0-2: 出口是第三方节点, 响应字节不可信; 见 kit.DecodeJSONLimit)
+	if err := kit.DecodeJSONLimit(resp.Body, &body, providerResponseMaxBytes); err != nil {
 		return nil, err
 	}
 	if d, ok := body["data"].(map[string]any); ok {

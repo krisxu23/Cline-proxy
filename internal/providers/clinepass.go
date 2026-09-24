@@ -165,14 +165,9 @@ func (p *clinepassProvider) Chat(ctx context.Context, req ChatRequest) (*ChatRes
 	defer resp.Body.Close()
 	var out map[string]any
 	// 成功路径也必须封顶: 错误分支走 kit.ReadBody(8MiB), 这里此前 Decoder 直读
-	// 无界, 被劫持/发疯端点可单请求把进程吃 OOM。超限时 LimitReader 在
-	// Max+1 处截断, 按字节判定给出明确超限错误(小 body 的坏 JSON 仍报解码错)。
-	dec := json.NewDecoder(io.LimitReader(resp.Body, kit.MaxUpstreamBodyBytes+1))
-	err = dec.Decode(&out)
-	if dec.InputOffset() > kit.MaxUpstreamBodyBytes {
-		return nil, fmt.Errorf("clinepass decode: response body exceeds %d bytes", kit.MaxUpstreamBodyBytes)
-	}
-	if err != nil {
+	// 无界, 被劫持/发疯端点可单请求把进程吃 OOM。2026-09-24 审计 P0-2 起统一走
+	// kit.DecodeJSONLimit(与 app 侧各调用点同一口径, 不再各写一份)。
+	if err = kit.DecodeJSONLimit(resp.Body, &out, kit.MaxUpstreamBodyBytes); err != nil {
 		return nil, fmt.Errorf("clinepass decode: %w", err)
 	}
 	// 解码成功后尽量读到 EOF 再 Close, h1 连接才能回池复用

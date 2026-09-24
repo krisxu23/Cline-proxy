@@ -55,6 +55,10 @@ const zenAttemptHeaderTimeout = 120 * time.Second
 //     transport 现在是按出口长期缓存复用的(zenClientForExit), 它的空闲连接
 //     由 IdleConnTimeout(90s) 自行回收, 不能在响应体关闭时关掉, 否则就把
 //     同出口复用的收益抹掉了。字段保留给"确实需要 attempt 级回收"的场景。
+//
+// 名字带 zen, 但实现与上游无关 —— 直连 cline 的非流式总超时也用它
+// (proxy_cline.go 的 callClineAPIFailover), 同样是"正文交给调用方读, cancel
+// 必须等 body 关闭"这一条约束。
 type zenAttemptBody struct {
 	io.ReadCloser
 	cancel context.CancelFunc

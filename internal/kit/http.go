@@ -92,6 +92,34 @@ func ReadBody(resp *http.Response) string {
 	return ReadBodyLimit(resp, MaxUpstreamBodyBytes)
 }
 
+// DecodeJSONLimit 按上限把响应体解成 out。
+//
+// 与 ReadBody/ReadBodyLimit 同一动机(见 MaxUpstreamBodyBytes 的注释): 上游响应体
+// 由**不受我们控制**的一方决定(zen 侧还要经第三方免费出口节点那一跳)。裸
+// `json.NewDecoder(resp.Body).Decode(...)` 会**边读边分配** —— 一个不封顶的响应
+// 就能把网关吃成 OOM, 而且比 io.ReadAll 更隐蔽: 它不先攒字节, 直接在解码过程中
+// 长出来。2026-09-24 审计 P0-2: 主路径(chat 流式/非流式)早已用 LimitReader 封顶,
+// 这里把剩下的散点收敛到同一口径。
+//
+// 用 LimitedReader 而不是"Decoder + InputOffset()"来判超限: 后者在体被截断时
+// 报的是 `unexpected EOF`(InputOffset 停在上一个**完整 token** 的位置, 不是被截断
+// 处), 于是"上游疯了"与"我们解析错了"分不开 —— 那正是这条防线最需要能区分的两件事。
+// 判据是"限额是否被读穿": 读穿了说明上游真的吐了这么多字节。
+//
+// 注意它**不**拒"小 JSON + 尾部垃圾": Decoder 只解第一个值、不会继续读, 也就不会
+// 因此分配内存(旧行为同样忽略尾部内容), 所以没有可被利用的增长面。
+func DecodeJSONLimit(r io.Reader, out any, limit int64) error {
+	if limit <= 0 {
+		limit = MaxUpstreamBodyBytes
+	}
+	lr := &io.LimitedReader{R: r, N: limit + 1}
+	derr := json.NewDecoder(lr).Decode(out)
+	if lr.N <= 0 {
+		return fmt.Errorf("upstream response body exceeds %d bytes", limit)
+	}
+	return derr
+}
+
 func Truncate(s string, maxLen int) string {
 	if len(s) <= maxLen {
 		return s

@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"encoding/json"
 	"fmt"
+	"free-router/internal/kit"
 	"io"
 	"log"
 	"net/http"
@@ -693,7 +694,8 @@ func handleResponses(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		var raw map[string]any
-		if err := json.NewDecoder(resp.Body).Decode(&raw); err != nil {
+		// 上游响应体封顶(2026-09-24 审计 P0-2: 出口是第三方节点, 响应字节不可信; 见 kit.DecodeJSONLimit)
+		if err := kit.DecodeJSONLimit(resp.Body, &raw, providerResponseMaxBytes); err != nil {
 			tracker.finish(false, http.StatusBadGateway)
 			writeJSON(w, http.StatusBadGateway, map[string]any{"error": err.Error()})
 			return
@@ -764,7 +766,8 @@ func handleResponses(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var raw map[string]any
-	if err := json.NewDecoder(up.Body).Decode(&raw); err != nil {
+	// 上游响应体封顶(2026-09-24 审计 P0-2: 出口是第三方节点, 响应字节不可信; 见 kit.DecodeJSONLimit)
+	if err := kit.DecodeJSONLimit(up.Body, &raw, providerResponseMaxBytes); err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
 		return
 	}
