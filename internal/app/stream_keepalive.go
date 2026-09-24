@@ -42,15 +42,6 @@ type sseHeartbeat struct {
 	closed   bool
 	done     chan struct{}
 	once     sync.Once
-	// committed 响应头是否已提交; commit 是"首次真实正文写出前"的一次性提交动作。
-	//
-	// ★ 为什么心跳必须等提交后才发(2026-09-24 修复"空白回复导致 agent 卡死"):
-	// http.Flusher.Flush() 会**隐式提交**响应头。若在还没写出任何正文时就发心跳,
-	// 200 就被钉死了 —— 此后发现"上游空回包"也无法再返回真 502, 只能往已提交的
-	// 200 流里塞错误帧。而客户端(agent 工具)认不出那种自定义错误帧, 只看到一条
-	// 没有内容的流 → 空白回复 → 停止工作。所以: 提交前一律不发心跳。
-	committed bool
-	commit    func()
 	// writeErr 粘性写错误: 客户端断开(broken pipe)后第一次 Write 失败即记录,
 	// 上层循环据此提前收手, 不再把整条上游流读完还往黑洞里写。
 	writeErr error
@@ -122,8 +113,7 @@ func (h *sseHeartbeat) pump() {
 		select {
 		case <-t.C:
 			h.mu.Lock()
-			// h.committed: 提交前不发心跳(见 committed 字段的说明)。
-			if !h.closed && h.committed && h.boundary && time.Since(h.last) >= h.interval {
+			if !h.closed && h.boundary && time.Since(h.last) >= h.interval {
 				if b := h.frame(); len(b) > 0 {
 					_, _ = h.writeLocked(b)
 					h.flush_() // 已持锁, 走无锁版本(公共 flush() 会二次加锁死锁)
@@ -140,38 +130,7 @@ func (h *sseHeartbeat) pump() {
 func (h *sseHeartbeat) write(b []byte) (int, error) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	h.commitLocked() // 真实正文写出前提交响应头(只做一次)
 	return h.writeLocked(b)
-}
-
-// Committed 报告响应头是否已提交(2026-09-24)。调用方据此决定"空流"还能不能
-// 以真 502 结束: 未提交 → 直接返回 502 换候选; 已提交 → 只能往流里补错误帧。
-func (h *sseHeartbeat) Committed() bool {
-	h.mu.Lock()
-	defer h.mu.Unlock()
-	return h.committed
-}
-
-// deferCommit 设置"首次真实正文写出前"的延迟提交动作(2026-09-24)。
-// 必须在任何写发生之前调用。fn 为 nil 时退化为"首次写出时不做额外动作"
-// (调用方已自行提交头, 与旧行为等价)。
-func (h *sseHeartbeat) deferCommit(fn func()) {
-	h.mu.Lock()
-	h.commit = fn
-	h.mu.Unlock()
-}
-
-// commitLocked 提交响应头(只做一次), 并把空闲计时起点挪到提交这一刻 ——
-// 否则提交前的等待会被算进第一个心跳间隔。
-func (h *sseHeartbeat) commitLocked() {
-	if h.committed {
-		return
-	}
-	h.committed = true
-	h.last = time.Now()
-	if h.commit != nil {
-		h.commit()
-	}
 }
 
 // flush 单独刷新(紧跟 write 之后)。持锁保证与 pump 的心跳写不交错。
@@ -197,7 +156,6 @@ func (h *sseHeartbeat) writeFlush(b []byte) (int, error) {
 		h.track(b)
 		return 0, nil
 	}
-	h.commitLocked() // 同 write: 真实正文写出前提交响应头
 	n, err := h.writeLocked(b)
 	h.flush_()
 	return n, err

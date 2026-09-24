@@ -211,15 +211,7 @@ func TestSSEHeartbeatInjectsOnIdle(t *testing.T) {
 	hb := newSSEHeartbeat(mw, mw, 50*time.Millisecond, func() []byte { return []byte("data: {\"heartbeat\":true}\n\n") })
 	defer hb.Close()
 
-	// ★ 契约变更(2026-09-24): 必须先写一条真实帧。响应头提交前心跳**不发** ——
-	// Flush 会隐式提交响应头, 提交前发心跳就把 200 钉死了, 此后发现"上游空回包"
-	// 也无法再返回真 502, 客户端只能拿到一条空白的 200 流(agent 工具会卡死)。
-	hb.writeFlush([]byte("data: {\"real\":1}\n\n"))
-	if !strings.Contains(mw.String(), "real") {
-		t.Fatalf("真实数据不能丢, got %q", mw.String())
-	}
-
-	// 之后静默 200ms → 期间至少注入一个心跳帧。
+	// 开局静默 200ms(不写真实数据)→ 期间至少注入一个心跳帧。
 	deadline := time.Now().Add(3 * time.Second)
 	for time.Now().Before(deadline) && !strings.Contains(mw.String(), "heartbeat") {
 		time.Sleep(10 * time.Millisecond)
@@ -227,26 +219,10 @@ func TestSSEHeartbeatInjectsOnIdle(t *testing.T) {
 	if !strings.Contains(mw.String(), "heartbeat") {
 		t.Fatalf("静默期应注入保活帧, got %q", mw.String())
 	}
-}
-
-// ★ 新契约(2026-09-24): 响应头提交前**一个字节都不许写**, 心跳也不行。
-// 这是"空流必须能以真 502 结束"的前提。
-func TestSSEHeartbeatSilentBeforeFirstContent(t *testing.T) {
-	mw := &mockFlushWriter{}
-	hb := newSSEHeartbeat(mw, mw, 20*time.Millisecond, func() []byte { return []byte("data: {\"heartbeat\":true}\n\n") })
-	defer hb.Close()
-
-	time.Sleep(200 * time.Millisecond) // 足够 pump 跑好几个 tick
-	if mw.String() != "" {
-		t.Fatalf("提交前不得写任何字节(含心跳), got %q", mw.String())
-	}
-	if hb.Committed() {
-		t.Fatal("尚未写出正文, 不该处于已提交状态")
-	}
-
-	hb.write([]byte("data: {\"real\":1}\n\n"))
-	if !hb.Committed() {
-		t.Fatal("写出真实正文后应提交响应头")
+	// 写一条真实帧, 内容必须完整出现在客户端流里(心跳只发往客户端, 与真实帧互不截断)。
+	hb.writeFlush([]byte("data: {\"real\":1}\n\n"))
+	if !strings.Contains(mw.String(), "real") {
+		t.Fatalf("真实数据不能丢, got %q", mw.String())
 	}
 }
 

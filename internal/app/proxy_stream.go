@@ -63,13 +63,11 @@ func handleStreamResponseWithToolNameMap(w http.ResponseWriter, upstream *http.R
 		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": "streaming not supported for client"})
 		return http.StatusInternalServerError
 	}
-	// ★ 响应头**延迟提交**(2026-09-24 修复"空白回复导致 agent 卡死"):
-	// 此前在这里就 `WriteHeader(http.StatusOK)`, 于是"上游空回包"发现时头已提交,
-	// 只能往 200 流里塞自定义错误帧 —— 客户端(agent 工具)认不出, 只看到一条没有
-	// 内容的流 → 空白回复 → 停止工作。现在把提交动作交给 hb.deferCommit, 在
-	// **首个真实正文写出**时才提交; 空流场景下头还没提交, 就能返回真正的 502。
-	// 见 sseHeartbeat.committed 的说明(心跳同样要等提交后才发)。
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("Connection", "keep-alive")
 	setCORSOrigin(w)
+	w.WriteHeader(http.StatusOK)
 
 	// 上游流空闲保护(P2, 参照 OmniRoute 的流式 idle 机制): 正文阶段挂起时
 	// 主动断开, 由收尾逻辑合成 finish/[DONE], 避免客户端无限等待。
@@ -86,13 +84,6 @@ func handleStreamResponseWithToolNameMap(w http.ResponseWriter, upstream *http.R
 	// 客户端写出真实字节超过间隔时, 向客户端写一个协议合法的空 delta 帧。心跳与
 	// 上游数据是两条永不相交的流 —— 从根上杜绝旧 heartbeatReader 的截帧缺陷。
 	hb := newSSEHeartbeat(w, flusher, streamHeartbeatInterval(), func() []byte { return openAIHeartbeatFrame })
-	// 头提交动作: 在首个真实正文写出前执行(见上面 setCORSOrigin 处的说明)。
-	hb.deferCommit(func() {
-		w.Header().Set("Content-Type", "text/event-stream")
-		w.Header().Set("Cache-Control", "no-cache")
-		w.Header().Set("Connection", "keep-alive")
-		w.WriteHeader(http.StatusOK)
-	})
 	defer hb.Close()
 
 	// 统一行处理器(F2 收敛): 主循环与"首行是正常 SSE"共用**同一份**实现,
@@ -344,10 +335,8 @@ func handleStreamResponseWithToolNameMap(w http.ResponseWriter, upstream *http.R
 					}
 				}
 				if streamDeliveryEmpty(forwardedValuableChunk, hasValidUsage, sawLegitEmptyTerminal) {
-					// ★ 不写任何字节(2026-09-24): 此刻响应头**尚未提交**(没有任何真实
-					// 正文写出过), 所以可以直接返回 502 让调用方换候选/交给客户端真 502。
-					// 此前往已提交的 200 流里塞 error 帧, 客户端认不出 → 空白回复卡死。
-					log.Printf("  stream: NDJSON 流未交付任何有价值内容, 返回 502 换候选(响应头未提交)")
+					log.Printf("  stream: NDJSON 流未交付任何有价值内容, 回 error 帧而非静默空 200")
+					writeStreamEmptyContentError(w, hb, lastModel)
 					return http.StatusBadGateway
 				}
 				// 合成 finish chunk 之后才发 [DONE], 且**全程只发这一次**(P2-23②)。
@@ -398,8 +387,8 @@ func handleStreamResponseWithToolNameMap(w http.ResponseWriter, upstream *http.R
 				sawLegitEmptyTerminal = true
 			}
 			if streamDeliveryEmpty(forwardedValuableChunk, hasValidUsage, sawLegitEmptyTerminal) {
-				// 同上: 响应头未提交, 直接返回 502 而不是往 200 流里塞错误帧。
-				log.Printf("  stream: 上游完整 JSON body 不含任何有价值内容, 返回 502 换候选(响应头未提交)")
+				log.Printf("  stream: 上游完整 JSON body 不含任何有价值内容, 补 error 帧")
+				writeStreamEmptyContentError(w, hb, lastModel)
 				return http.StatusBadGateway
 			}
 			return http.StatusOK
@@ -451,16 +440,7 @@ func handleStreamResponseWithToolNameMap(w http.ResponseWriter, upstream *http.R
 	// 与上游"空流"的区别: 那种在提交前就被 probeStreamFirstEvent 拦下并换站
 	// (见 routing_dispatch.go), 这里兜的是**已提交之后**每帧都空的情况。
 	if streamDeliveryEmpty(forwardedValuableChunk, hasValidUsage, sawLegitEmptyTerminal) {
-		// 分岔(2026-09-24): 若响应头**尚未提交**(没有任何真实正文写出过), 就按
-		// 真 502 结束让调用方换候选 —— 那才是客户端认得的失败形态。
-		// 已提交时无路可走: HTTP 状态码改不了, 只能补 error 帧(见
-		// writeStreamEmptyContentError 的说明)。
-		if !hb.Committed() {
-			log.Printf("  stream: 上游整条流未交付任何有价值内容(model=%s, 已发 finish=%v), 返回 502 换候选(响应头未提交)",
-				lastModel, sawFinish)
-			return http.StatusBadGateway
-		}
-		log.Printf("  stream: 上游整条流未交付任何有价值内容(model=%s, 已发 finish=%v), 响应头已提交, 回 error 帧",
+		log.Printf("  stream: 上游整条流未交付任何有价值内容(model=%s, 已发 finish=%v), 回 502 而非静默空 200",
 			lastModel, sawFinish)
 		writeStreamEmptyContentError(w, hb, lastModel)
 		return http.StatusBadGateway
