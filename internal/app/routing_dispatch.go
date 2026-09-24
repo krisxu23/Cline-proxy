@@ -67,6 +67,15 @@ func handleChainedChatAs(w http.ResponseWriter, r *http.Request, params map[stri
 	// 统计估算整包 marshal 每请求只算一次: hopParams 与 params 只差 model 名,
 	// 候选间复用同一估值(真实 usage 回来后 observeUsage 会覆盖)。
 	promptTokens := estimateJSON(params)
+	// 空流(流内改判失败)的**独立**重试预算(2026-09-24)。
+	//
+	// 为什么独立: probeStreamFirstEvent 只探**首个**事件, 首事件有效但后续整条流为空
+	// 的情况会落到流处理器内部改判 —— 此前那条路径只记账、直接 return, 网关内部不换站。
+	// 现在与"200 但空流"同口径(冷却本站 + 换下一站), 但**不能**共用网络错/429 的预算:
+	// 每次空流尝试实测约 11 秒, 叠加起来会把 70 秒变成 200 秒 —— 对 agent 来说
+	// 和卡死没区别。2 次额外重试 = 最多 3 次空流尝试。
+	const maxEmptyStreamRetries = 2
+	emptyStreamRetries := 0
 	for _, cand := range chain {
 		if why := candidateSkip(cand); why != "" {
 			skipped++
@@ -212,6 +221,23 @@ func handleChainedChatAs(w http.ResponseWriter, r *http.Request, params map[stri
 				delivered = chatStreamToResponses(w, resp, nil)
 			default:
 				delivered = handleStreamResponseWithToolNameMap(w, resp, observe, responseToolNameMap)
+			}
+			// ★ 流内空回包也要换站重试(2026-09-24): delivered>=400 表示流处理器
+			//   已判定"整条流未交付任何有价值内容"(响应头未提交时它直接返回 502)。
+			//   此前这里无条件 return —— 网关内部不换站, agent 工具只能自己处理。
+			//   现在: 冷却本站(空流大概率是该出口/worker 异常) + 换下一站,
+			//   预算独立(见 maxEmptyStreamRetries), 耗尽后才把真 502 交给客户端。
+			if delivered >= 400 && emptyStreamRetries < maxEmptyStreamRetries {
+				emptyStreamRetries++
+				resp.Body.Close()
+				lastErr = fmt.Errorf("%s: 流内空回包(首事件有效但整条流无有效 chunk)", cand.String())
+				lastStatus = http.StatusBadGateway
+				markCandidateCooldown(cand.Upstream, cand.Model, classEmpty, "流内空回包")
+				recordUsageForCandidate(cand, false)
+				dec.addCandidate(cand.String(), "tried", "流内空回包", resp.StatusCode, classEmpty)
+				log.Printf("  chain: %s 流内空回包, 冷却本站并换下一站(空流重试 %d/%d)",
+					cand.String(), emptyStreamRetries, maxEmptyStreamRetries)
+				continue
 			}
 			// 这里以前从不关闭上游响应体。对比上面两条失败路径(87/154 行)都显式
 			// Close 了, 唯独流式成功这条漏掉, 而三个流式 handler 内部也都只读到
