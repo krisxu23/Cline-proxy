@@ -89,7 +89,7 @@ ssh -T -p 443 git@ssh.github.com
 ## 3. 构建
 
 ```bash
-# go 1.27.0 已在用户 PATH（C:\Go\bin，2026-09-23 起）
+# go.mod 声明 go 1.26(与 CI 的 go-version 一致); 本机 PATH 实测为 1.27.0, 向下兼容构建。
 go build -tags "with_quic,with_grpc,with_utls" ./...            # 编译全部包(校验用)
 go build -tags "with_quic,with_grpc,with_utls" -o free-router.exe ./cmd/free-router
 go test  -count=1 -tags "with_quic,with_grpc,with_utls" ./internal/...

@@ -202,14 +202,14 @@ func handleChainedChatAs(w http.ResponseWriter, r *http.Request, params map[stri
 			delivered := resp.StatusCode
 			switch tgt.Shape {
 			case shapeAnthropic:
-				handleAnthropicStreamWithToolNameMap(w, resp, model, tgt.ToolSchemas, observe, responseToolNameMap)
+				delivered = handleAnthropicStreamWithToolNameMap(w, resp, model, tgt.ToolSchemas, observe, responseToolNameMap)
 			case shapeResponses:
 				w.Header().Set("Content-Type", "text/event-stream")
 				w.Header().Set("Cache-Control", "no-cache")
 				w.Header().Set("Connection", "keep-alive")
 				setCORSOrigin(w)
 				w.WriteHeader(http.StatusOK)
-				chatStreamToResponses(w, resp, nil)
+				delivered = chatStreamToResponses(w, resp, nil)
 			default:
 				delivered = handleStreamResponseWithToolNameMap(w, resp, observe, responseToolNameMap)
 			}

@@ -1133,8 +1133,8 @@ func handleZenAnthropic(w http.ResponseWriter, r *http.Request, req anthropicReq
 	}
 
 	if isStream {
-		handleAnthropicStreamWithUsage(w, resp, zm.ID, toolSchemas, usageFn)
-		tracker.finish(true, resp.StatusCode)
+		st := handleAnthropicStreamWithUsage(w, resp, zm.ID, toolSchemas, usageFn)
+		tracker.finish(st < 400, st)
 		return
 	}
 
@@ -1172,8 +1172,8 @@ func handleZenAnthropic(w http.ResponseWriter, r *http.Request, req anthropicReq
 // toolNameMap 对位参考实现 `utils/stream.ts:restoreClaudePassthroughToolUseName`
 // 的映射来源（chatCore.ts:2592-2610 从 translatedBody._toolNameMap 取出后
 // 一路透传到流式转换器）。为 nil 时行为与无映射版本完全一致。
-func handleAnthropicStreamWithUsage(w http.ResponseWriter, upstream *http.Response, modelName string, toolSchemas map[string]map[string]bool, onUsage func(map[string]any)) {
-	handleAnthropicStreamWithToolNameMap(w, upstream, modelName, toolSchemas, onUsage, nil)
+func handleAnthropicStreamWithUsage(w http.ResponseWriter, upstream *http.Response, modelName string, toolSchemas map[string]map[string]bool, onUsage func(map[string]any)) int {
+	return handleAnthropicStreamWithToolNameMap(w, upstream, modelName, toolSchemas, onUsage, nil)
 }
 
 // handleAnthropicStreamWithToolNameMap 是实际实现。
@@ -1183,7 +1183,7 @@ func handleAnthropicStreamWithUsage(w http.ResponseWriter, upstream *http.Respon
 //	请求侧 cloak 后上游回的是别名（如 `Read`），必须在写给 Claude Code 之前
 //	还原成客户端声明的原名（如 `read_file`），否则 CLI 报
 //	"No such tool available: Read"。
-func handleAnthropicStreamWithToolNameMap(w http.ResponseWriter, upstream *http.Response, modelName string, toolSchemas map[string]map[string]bool, onUsage func(map[string]any), toolNameMap *toolNameMap) {
+func handleAnthropicStreamWithToolNameMap(w http.ResponseWriter, upstream *http.Response, modelName string, toolSchemas map[string]map[string]bool, onUsage func(map[string]any), toolNameMap *toolNameMap) int {
 	log.Printf("  anthropic stream: starting real-time forward")
 	// P2: Flush 断言必须挪到 WriteHeader **之前** —— 旧顺序先提交 200+SSE 头,
 	// 再因 ResponseWriter 不支持 Flush 直接 return: 客户端拿到空 200 流, 既无
@@ -1193,7 +1193,7 @@ func handleAnthropicStreamWithToolNameMap(w http.ResponseWriter, upstream *http.
 		writeJSON(w, http.StatusInternalServerError, map[string]any{
 			"error": map[string]string{"message": "response writer does not support flushing", "type": "api_error"},
 		})
-		return
+		return http.StatusInternalServerError
 	}
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
@@ -1520,7 +1520,7 @@ func handleAnthropicStreamWithToolNameMap(w http.ResponseWriter, upstream *http.
 	// P3: 上游 error 帧已终止本流 —— 空流守卫不得再发第二条 error,
 	// message_delta/message_stop 收尾也一并跳过(Anthropic 语义里 error 即终止)。
 	if upstreamErrored {
-		return
+		return http.StatusBadGateway
 	}
 
 	// ★ 空流守卫(2026-09-17 审查 P0-2)。
@@ -1553,7 +1553,7 @@ func handleAnthropicStreamWithToolNameMap(w http.ResponseWriter, upstream *http.
 					"请重试; 若持续出现请更换出口节点。",
 			},
 		})
-		return
+		return http.StatusBadGateway
 	}
 
 	// Stop text block if active
@@ -1595,4 +1595,5 @@ func handleAnthropicStreamWithToolNameMap(w http.ResponseWriter, upstream *http.
 
 	emit("message_stop", map[string]any{"type": "message_stop"})
 	log.Printf("  anthropic stream done: hasText=%v tools=%d reason=%s", hasText, len(pendingTools), stopReason)
+	return http.StatusOK
 }

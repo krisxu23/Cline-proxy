@@ -197,25 +197,45 @@ func resolveSubscriptions(urls []string) {
 		}
 	}
 	subMu.Unlock()
+	// 并发抓取(上限 4): 串行时 N 个慢订阅的超时叠加, 全部抖动一次就数分钟无出口。
+	// per-sub 超时仍由 fetchSubscription 内的 subsFetchTimeout 约束; 归属合并语义不变。
+	type subResult struct {
+		u     string
+		nodes []any
+		err   error
+	}
+	results := make([]subResult, len(clean))
+	var wg sync.WaitGroup
+	sem := make(chan struct{}, 4)
+	for i, u := range clean {
+		wg.Add(1)
+		go func(i int, u string) {
+			defer wg.Done()
+			sem <- struct{}{}
+			defer func() { <-sem }()
+			nodes, err := fetchSubscription(u)
+			results[i] = subResult{u: u, nodes: nodes, err: err}
+		}(i, u)
+	}
+	wg.Wait()
 	fetched := map[string][]any{} // 本轮成功的订阅 -> 新节点
-	for _, u := range clean {
-		nodes, err := fetchSubscription(u)
-		if err != nil {
+	for _, r := range results {
+		if r.err != nil {
 			// *url.Error 的 Error() 内嵌完整请求 URL(含 userinfo 与 ?token=):
 			// 状态接口会原样回给面板、日志一条落盘等于泄露 —— 只留遮蔽后的 URL
 			// 与剥掉 URL 的内层原因。
-			reason := errReasonNoURL(err)
-			log.Printf("  订阅 %s 抓取失败: %s", maskURLForLog(u), reason)
+			reason := errReasonNoURL(r.err)
+			log.Printf("  订阅 %s 抓取失败: %s", maskURLForLog(r.u), reason)
 			subMu.Lock()
-			subStatus[u] = "❌ 抓取失败: " + maskURLForLog(u) + " — " + reason
+			subStatus[r.u] = "❌ 抓取失败: " + maskURLForLog(r.u) + " — " + reason
 			subMu.Unlock()
 			continue
 		}
-		log.Printf("  订阅 %s: 解析出 %d 个节点", maskURLForLog(u), len(nodes))
+		log.Printf("  订阅 %s: 解析出 %d 个节点", maskURLForLog(r.u), len(r.nodes))
 		subMu.Lock()
-		subStatus[u] = fmt.Sprintf("✅ %s · %d 节点", time.Now().Format("01-02 15:04"), len(nodes))
+		subStatus[r.u] = fmt.Sprintf("✅ %s · %d 节点", time.Now().Format("01-02 15:04"), len(r.nodes))
 		subMu.Unlock()
-		fetched[u] = nodes
+		fetched[r.u] = r.nodes
 	}
 	subMu.Lock()
 	prevCount := len(subNodes)

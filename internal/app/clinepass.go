@@ -221,8 +221,8 @@ func handleClinePassAnthropic(w http.ResponseWriter, r *http.Request, req anthro
 		w.Header().Set("Connection", "keep-alive")
 		setCORSOrigin(w)
 		w.WriteHeader(http.StatusOK)
-		handleAnthropicStreamWithUsage(w, up, req.Model, toolSchemas, tracker.observeUsage)
-		tracker.finish(true, up.StatusCode)
+		st := handleAnthropicStreamWithUsage(w, up, req.Model, toolSchemas, tracker.observeUsage)
+		tracker.finish(st < 400, st)
 		return
 	}
 
@@ -281,8 +281,8 @@ func handleClinePassResponses(w http.ResponseWriter, r *http.Request, params, ch
 		w.Header().Set("Connection", "keep-alive")
 		setCORSOrigin(w)
 		w.WriteHeader(http.StatusOK)
-		chatStreamToResponses(w, up, tracker.observeUsage)
-		tracker.finish(true, up.StatusCode)
+		st := chatStreamToResponses(w, up, tracker.observeUsage)
+		tracker.finish(st < 400, st)
 		return
 	}
 

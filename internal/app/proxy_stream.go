@@ -55,17 +55,19 @@ func handleStreamResponseWithUsage(w http.ResponseWriter, upstream *http.Respons
 //	形态而只做了 cloak 不做还原，它会收到自己从未声明过的工具名 → 调用静默失败。
 //	toolNameMap 为 nil 时逐字节等价于旧行为。
 func handleStreamResponseWithToolNameMap(w http.ResponseWriter, upstream *http.Response, onUsage func(map[string]any), toolNameMap *toolNameMap) int {
+	// Flusher 断言必须在 WriteHeader 之前(与 anthropic 路径同序): 否则不支持 Flush
+	// 的 writer 会先拿到已提交的空 200 流, 再也到不了 500。
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		log.Printf("  streaming not supported for client")
+		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": "streaming not supported for client"})
+		return http.StatusInternalServerError
+	}
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
 	setCORSOrigin(w)
 	w.WriteHeader(http.StatusOK)
-
-	flusher, ok := w.(http.Flusher)
-	if !ok {
-		log.Printf("  streaming not supported for client")
-		return http.StatusInternalServerError
-	}
 
 	// 上游流空闲保护(P2, 参照 OmniRoute 的流式 idle 机制): 正文阶段挂起时
 	// 主动断开, 由收尾逻辑合成 finish/[DONE], 避免客户端无限等待。

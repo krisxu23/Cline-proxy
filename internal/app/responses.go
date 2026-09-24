@@ -279,7 +279,7 @@ type responsesFnCall struct {
 }
 
 // chatStreamToResponses 将上游 chat.completions SSE 流转换为 Responses SSE 流
-func chatStreamToResponses(w http.ResponseWriter, upstream *http.Response, onUsage func(map[string]any)) {
+func chatStreamToResponses(w http.ResponseWriter, upstream *http.Response, onUsage func(map[string]any)) int {
 	model := ""
 	// 开场
 	s := newResponsesSSE(w)
@@ -542,7 +542,7 @@ func chatStreamToResponses(w http.ResponseWriter, upstream *http.Response, onUsa
 				"type":    "empty_content",
 			},
 		})
-		return
+		return http.StatusBadGateway
 	}
 	if textEmitted {
 		s.event("response.output_text.done", map[string]any{"type": "response.output_text.done", "item_id": s.msgID, "output_index": 0, "content_index": 0, "text": outText.String()})
@@ -570,6 +570,7 @@ func chatStreamToResponses(w http.ResponseWriter, upstream *http.Response, onUsa
 			"usage":       responsesUsageFromChat(lastUsage),
 		},
 	})
+	return http.StatusOK
 }
 
 // responsesUsageFromChat 将上游 chat 用法键名映射为 Responses 键名
@@ -687,8 +688,8 @@ func handleResponses(w http.ResponseWriter, r *http.Request) {
 			w.Header().Set("Connection", "keep-alive")
 			setCORSOrigin(w)
 			w.WriteHeader(http.StatusOK)
-			chatStreamToResponses(w, resp, tracker.observeUsage)
-			tracker.finish(resp.StatusCode < 400, resp.StatusCode)
+			st := chatStreamToResponses(w, resp, tracker.observeUsage)
+			tracker.finish(st < 400, st)
 			return
 		}
 		var raw map[string]any
