@@ -54,6 +54,61 @@ func handleStreamResponseWithUsage(w http.ResponseWriter, upstream *http.Respons
 //	anthropic-compatible-* 都要 cloak），而与客户端形态无关。若客户端是 OpenAI
 //	形态而只做了 cloak 不做还原，它会收到自己从未声明过的工具名 → 调用静默失败。
 //	toolNameMap 为 nil 时逐字节等价于旧行为。
+//
+// lazyCommitWriter 延迟提交响应头, 直到第一段**真实正文**写出。
+//
+// ★ 为什么需要(2026-09-24, 用户规格: 上游的错误必须在网关内部消化, 不得让 agent 看到):
+// 当前是"边收边转"流水线, 一旦 WriteHeader(200) 提交, 之后发现上游是空回包 / 出错
+// 也**无法改口** —— 客户端(agent 工具)只看到一条没有内容的流, 于是空白回复、卡死。
+// 延迟提交后, "还没吐出任何真实内容"的整段时间里网关可以自由换节点重试(预算见
+// routing_dispatch.go), 客户端完全无感; 拿到第一个真实内容才提交并转为实时转发。
+//
+// ★ Flush() 在提交前是 no-op: net/http 的 Flush 会**隐式提交**响应头, 而静默保活
+// (sseHeartbeat) 走的就是 write+flush —— 提交前放行 flush 等于把这个修复作废。
+type lazyCommitWriter struct {
+	http.ResponseWriter
+	flusher   http.Flusher
+	pending   int // 缓存的待提交状态码, 0 = 尚未调用 WriteHeader
+	committed bool
+}
+
+// WriteHeader 200 只记下不提交(等第一段正文); 非 200 立即提交 —— 那时还没有任何
+// 正文, 没有延迟的必要, 而且错误码必须尽快送达。
+func (l *lazyCommitWriter) WriteHeader(code int) {
+	if l.committed {
+		return
+	}
+	if code == http.StatusOK {
+		l.pending = code
+		return
+	}
+	l.ResponseWriter.WriteHeader(code)
+	l.committed = true
+}
+
+func (l *lazyCommitWriter) Write(b []byte) (int, error) {
+	l.commitNow()
+	return l.ResponseWriter.Write(b)
+}
+
+func (l *lazyCommitWriter) Flush() {
+	if !l.committed {
+		return // 提交前不 flush(见类型注释)
+	}
+	l.flusher.Flush()
+}
+
+// commitNow 真正提交(只做一次), 把之前缓存的 200 状态码发出去。
+func (l *lazyCommitWriter) commitNow() {
+	if l.committed {
+		return
+	}
+	l.committed = true
+	if l.pending != 0 {
+		l.ResponseWriter.WriteHeader(l.pending)
+	}
+}
+
 func handleStreamResponseWithToolNameMap(w http.ResponseWriter, upstream *http.Response, onUsage func(map[string]any), toolNameMap *toolNameMap) int {
 	// Flusher 断言必须在 WriteHeader 之前(与 anthropic 路径同序): 否则不支持 Flush
 	// 的 writer 会先拿到已提交的空 200 流, 再也到不了 500。
@@ -63,11 +118,16 @@ func handleStreamResponseWithToolNameMap(w http.ResponseWriter, upstream *http.R
 		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": "streaming not supported for client"})
 		return http.StatusInternalServerError
 	}
+	// ★ 延迟提交: 这里只设头 + 记下待提交状态码, 真正的提交推迟到第一段真实正文
+	// 写出时(见 lazyCommitWriter 的注释)。
+	lw := &lazyCommitWriter{ResponseWriter: w, flusher: flusher}
+	w = lw
+	flusher = lw
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
 	setCORSOrigin(w)
-	w.WriteHeader(http.StatusOK)
+	lw.WriteHeader(http.StatusOK)
 
 	// 上游流空闲保护(P2, 参照 OmniRoute 的流式 idle 机制): 正文阶段挂起时
 	// 主动断开, 由收尾逻辑合成 finish/[DONE], 避免客户端无限等待。
@@ -335,7 +395,13 @@ func handleStreamResponseWithToolNameMap(w http.ResponseWriter, upstream *http.R
 					}
 				}
 				if streamDeliveryEmpty(forwardedValuableChunk, hasValidUsage, sawLegitEmptyTerminal) {
-					log.Printf("  stream: NDJSON 流未交付任何有价值内容, 回 error 帧而非静默空 200")
+					// 未提交(没写出过任何正文)→ 返回真 502 让调用方换节点重试;
+					// 已提交 → HTTP 状态码改不了, 只能补 error 帧。
+					if !lw.committed {
+						log.Printf("  stream: NDJSON 流未交付任何有价值内容, 返回 502 换候选(响应头未提交)")
+						return http.StatusBadGateway
+					}
+					log.Printf("  stream: NDJSON 流未交付任何有价值内容, 响应头已提交, 回 error 帧")
 					writeStreamEmptyContentError(w, hb, lastModel)
 					return http.StatusBadGateway
 				}
@@ -387,7 +453,11 @@ func handleStreamResponseWithToolNameMap(w http.ResponseWriter, upstream *http.R
 				sawLegitEmptyTerminal = true
 			}
 			if streamDeliveryEmpty(forwardedValuableChunk, hasValidUsage, sawLegitEmptyTerminal) {
-				log.Printf("  stream: 上游完整 JSON body 不含任何有价值内容, 补 error 帧")
+				if !lw.committed {
+					log.Printf("  stream: 上游完整 JSON body 不含任何有价值内容, 返回 502 换候选(响应头未提交)")
+					return http.StatusBadGateway
+				}
+				log.Printf("  stream: 上游完整 JSON body 不含任何有价值内容, 响应头已提交, 回 error 帧")
 				writeStreamEmptyContentError(w, hb, lastModel)
 				return http.StatusBadGateway
 			}
@@ -440,7 +510,12 @@ func handleStreamResponseWithToolNameMap(w http.ResponseWriter, upstream *http.R
 	// 与上游"空流"的区别: 那种在提交前就被 probeStreamFirstEvent 拦下并换站
 	// (见 routing_dispatch.go), 这里兜的是**已提交之后**每帧都空的情况。
 	if streamDeliveryEmpty(forwardedValuableChunk, hasValidUsage, sawLegitEmptyTerminal) {
-		log.Printf("  stream: 上游整条流未交付任何有价值内容(model=%s, 已发 finish=%v), 回 502 而非静默空 200",
+		if !lw.committed {
+			log.Printf("  stream: 上游整条流未交付任何有价值内容(model=%s, 已发 finish=%v), 返回 502 换候选(响应头未提交)",
+				lastModel, sawFinish)
+			return http.StatusBadGateway
+		}
+		log.Printf("  stream: 上游整条流未交付任何有价值内容(model=%s, 已发 finish=%v), 响应头已提交, 回 error 帧",
 			lastModel, sawFinish)
 		writeStreamEmptyContentError(w, hb, lastModel)
 		return http.StatusBadGateway
