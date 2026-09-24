@@ -71,14 +71,13 @@ func saveZenModelsCacheWithSyncedAtLocked(refresh bool) {
 		return
 	}
 	path := zenModelsCachePath()
-	tmp := path + ".tmp"
-	if err := os.WriteFile(tmp, payload, 0o644); err != nil {
+	// 原子写(临时文件 + fsync + rename), 与全仓其它落盘点同一口径。
+	//
+	// 原实现自己拼 `path + ".tmp"` 再 os.Rename: 固定 .tmp 名在并发写时互踩,
+	// 且无 fsync —— 强杀中途会留半截 JSON, 下次 loadZenModelsCache 解析失败后
+	// **静默丢缓存**(2026-09-24 审查)。kit.WriteFileAtomicDefault 已把这些都做掉。
+	if err := kit.WriteFileAtomicDefault(path, payload); err != nil {
 		log.Printf("  zen: 写模型缓存失败: %v", err)
-		return
-	}
-	if err := os.Rename(tmp, path); err != nil {
-		os.Remove(tmp)
-		log.Printf("  zen: 模型缓存改名失败: %v", err)
 	}
 }
 

@@ -82,6 +82,9 @@ func loadProxyConfig() *proxyConfigData {
 
 // quarantineBadConfig 把解析不了的配置文件改名留证, 而不是删除 ——
 // 用户往往需要从里面手工捞回请求头之类的内容。
+//
+// 改名后顺手裁剪旧留证(2026-09-24 审查): 原实现只改名不清理, 每次坏配置留一份,
+// 反复坏就无限堆积。与 .bak-import-* 是同类问题, 那边已有 pruneImportBackups。
 func quarantineBadConfig(path string) {
 	bak := path + ".bad-" + time.Now().Format("20060102-150405")
 	if err := os.Rename(path, bak); err != nil {
@@ -89,6 +92,22 @@ func quarantineBadConfig(path string) {
 		return
 	}
 	log.Printf("  坏配置已保留为 %s", bak)
+	pruneBadConfigs(path, importBackupKeep)
+}
+
+// pruneBadConfigs 删除最旧的坏配置留证, 只留最近 keep 份。
+// 文件名里的时间戳(20060102-150405)按字典序即时间序, 直接排序即可。
+func pruneBadConfigs(path string, keep int) {
+	matches, err := filepath.Glob(path + ".bad-*")
+	if err != nil || len(matches) <= keep {
+		return
+	}
+	sort.Strings(matches)
+	for _, old := range matches[:len(matches)-keep] {
+		if err := os.Remove(old); err != nil {
+			log.Printf("  admin: 清理旧坏配置留证失败 %s: %v", old, err)
+		}
+	}
 }
 
 func saveProxyConfig() {

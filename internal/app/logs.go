@@ -237,7 +237,12 @@ func loadDailyRequestLogs(path string) []RequestLog {
 	}
 	// 大文件: 只 seek 到尾部窗口起点读取, 首行可能不完整 —— 解析时会自动跳过
 	// 那些解不出来的坏行。
-	if _, err := f.Seek(int64(reqLogTailBytes), io.SeekStart); err != nil {
+	//
+	// ★ 起点是 size-reqLogTailBytes, 不是 reqLogTailBytes(2026-09-24 修复):
+	//   原实现 Seek(reqLogTailBytes, SeekStart) 读的是"距文件头 64KB 处"的**中段**,
+	//   与注释承诺的"尾部窗口"不符 —— 当日日志一超过 64KB, 冷启动补载拿到的就是
+	//   一段陈旧的中段内容。同仓 stats.go 的 size-tail 写法是对的, 这里对齐。
+	if _, err := f.Seek(size-int64(reqLogTailBytes), io.SeekStart); err != nil {
 		return nil
 	}
 	buf := make([]byte, reqLogTailBytes)

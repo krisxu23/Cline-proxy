@@ -285,6 +285,33 @@ func nodeTrafficCounterOf(key string) (*nodeTrafficCounter, bool) {
 	return c, ok
 }
 
+// pruneNodeTraffic 按本轮 active 节点集合裁剪每节点流量计数器。
+//
+// 原实现只增不减(trafficCounterFor 只写不删): 订阅 churn 下摘除的节点会永久驻留
+// 内存, 面板快照也跟着越来越长(2026-09-24 审查)。裁剪时机与冷却表/健康表一致 ——
+// 都在 checkAllNodeHealth 拿到本轮 active keys 之后。
+//
+// 键空间与 keys 相同(都是 nodeLocalKey), 所以可直接比对。
+func pruneNodeTraffic(activeNodeKeys []string) int {
+	if len(activeNodeKeys) == 0 {
+		return 0 // 空集合是"实例未就绪"的中间态, 裁下去会把整张表清空
+	}
+	on := make(map[string]bool, len(activeNodeKeys))
+	for _, k := range activeNodeKeys {
+		on[k] = true
+	}
+	nodeTrafficMu.Lock()
+	dropped := 0
+	for k := range nodeTraffic {
+		if !on[k] {
+			delete(nodeTraffic, k)
+			dropped++
+		}
+	}
+	nodeTrafficMu.Unlock()
+	return dropped
+}
+
 func trafficCounterFor(key string) *nodeTrafficCounter {
 	nodeTrafficMu.Lock()
 	defer nodeTrafficMu.Unlock()

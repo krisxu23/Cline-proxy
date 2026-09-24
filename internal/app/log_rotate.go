@@ -78,22 +78,26 @@ type dailyLogFileWriter struct {
 
 // write 追加一行; 自动处理换天与过期清理。返回实际写入的文件路径(测试用)。
 func (w *dailyLogFileWriter) write(line []byte) (string, error) {
-	day := time.Now().Format("20060102")
+	// 单次取时刻: 原实现一次调用里取了三次 time.Now(), 跨午夜时可能出现
+	// "判天用旧日期、开文件用新日期、清理基准又是另一个"的错乱路径
+	// (2026-09-24 审查)。now 一次取定, 全函数复用。
+	now := time.Now()
+	day := now.Format("20060102")
 	if w.file == nil || w.day != day {
 		if w.file != nil {
 			w.file.Close()
 			w.file = nil
 		}
 		w.day = day
-		f, err := os.OpenFile(dailyLogPath(w.base, time.Now()), os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0600)
+		f, err := os.OpenFile(dailyLogPath(w.base, now), os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0600)
 		if err != nil {
 			return "", err
 		}
 		w.file = f
 		// 换天 = 清理过期文件的天然时机(每天至多一次)
-		if time.Since(w.lastGC) > 12*time.Hour {
-			cleanupOldDailyLogs(w.base, time.Now())
-			w.lastGC = time.Now()
+		if now.Sub(w.lastGC) > 12*time.Hour {
+			cleanupOldDailyLogs(w.base, now)
+			w.lastGC = now
 		}
 	}
 	if _, err := w.file.Write(append(line, '\n')); err != nil {
@@ -102,7 +106,7 @@ func (w *dailyLogFileWriter) write(line []byte) (string, error) {
 		w.file = nil
 		return "", err
 	}
-	return dailyLogPath(w.base, time.Now()), nil
+	return dailyLogPath(w.base, now), nil
 }
 
 func (w *dailyLogFileWriter) close() {

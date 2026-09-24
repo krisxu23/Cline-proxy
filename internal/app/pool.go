@@ -32,6 +32,22 @@ var (
 	// poolFlushInterval 后台 flush 周期。30s 是"用户能感知到数据更新"与"写盘频率"
 	// 的折中: 面板轮询通常 10-30s 一次, 更短没有意义; 更长则崩溃时丢的计数器更多。
 	poolFlushInterval = 30 * time.Second
+
+	// 快照序号, 用于保证"旧快照不覆盖新快照"(2026-09-24 审查):
+	//
+	// marshal 在 poolMu 内、写盘在 poolSaveMu 内, 两次并发 save 之间"谁先抢到写锁"
+	// 与"谁的快照更新"没有必然关系 —— 后 marshal 的 goroutine 可能先拿到写锁,
+	// 于是**旧快照覆盖新快照**(账号/用量回退)。触发面: 高频 markPoolDirty 与
+	// 30s ticker 的 flush 并发。
+	//
+	// 修法: 取号在 poolMu 内完成(号序 == 快照序), 写前比对已落盘的最大序号,
+	// 迟到的旧快照直接丢弃。不引入新的锁序 —— 两个入口都是"先放 poolMu 再取
+	// poolSaveMu", 与本机制无关。
+	poolSaveSeq uint64 // guarded by poolMu
+	// poolSavedSeq/poolSavedPath guarded by poolSaveMu。带 path 是因为测试会改写
+	// poolPath: 换了文件就不该拿旧文件的序号来拦新文件的写。
+	poolSavedSeq  uint64
+	poolSavedPath string
 )
 
 func init() {
@@ -221,17 +237,31 @@ func savePool() {
 	// 数据文件路径在锁内取: 后台刷盘协程与测试会分别读/写这个全局,
 	// 统一由 poolMu 串行(否则 -race 报 pool_test 写 vs 刷盘协程读)。
 	path := poolPath
+	// 取号也必须在锁内: 号序必须等于快照序, 否则"旧快照不覆盖新快照"判据失效。
+	poolSaveSeq++
+	seq := poolSaveSeq
 	poolMu.Unlock()
 	if err != nil {
 		// marshal 失败绝不能落盘: 写 nil 会清空账号池, 宁可保留旧文件。
 		log.Printf("Failed to marshal accounts: %v", err)
 		return
 	}
+	writePoolSnapshot(path, data, seq)
+}
+
+// writePoolSnapshot 落盘一份快照, 保证旧快照不覆盖新快照(见 poolSaveSeq 注释)。
+func writePoolSnapshot(path string, data []byte, seq uint64) {
 	poolSaveMu.Lock()
 	defer poolSaveMu.Unlock()
+	if poolSavedPath == path && poolSavedSeq > seq {
+		return // 已有更新的快照落盘, 本次是迟到的旧快照 —— 丢弃
+	}
 	if err := kit.WriteFileAtomicDefault(path, data); err != nil {
 		log.Printf("Failed to save accounts: %v", err)
+		return
 	}
+	poolSavedSeq = seq
+	poolSavedPath = path
 }
 
 // savePoolLocked 调用方已持 poolMu 时使用的落盘入口: 在锁内完成 marshal 得到
@@ -241,6 +271,9 @@ func savePoolLocked() {
 	data, err := json.MarshalIndent(pool, "", "  ")
 	// 同 savePool: 路径必须在释放 poolMu 之前取到, 与改写它的测试同步。
 	path := poolPath
+	// 同 savePool: 取号在池锁内, 保证号序 == 快照序。
+	poolSaveSeq++
+	seq := poolSaveSeq
 	if err != nil {
 		// marshal 失败绝不能落盘: 写 nil 会清空账号池, 宁可保留旧文件。
 		log.Printf("Failed to marshal accounts: %v", err)
@@ -248,11 +281,7 @@ func savePoolLocked() {
 		return
 	}
 	poolMu.Unlock()
-	poolSaveMu.Lock()
-	defer poolSaveMu.Unlock()
-	if err := kit.WriteFileAtomicDefault(path, data); err != nil {
-		log.Printf("Failed to save accounts: %v", err)
-	}
+	writePoolSnapshot(path, data, seq)
 }
 
 // poolPathValue 读数据文件路径。生产环境 poolPath 只在包初始化时写一次,

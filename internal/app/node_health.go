@@ -212,6 +212,11 @@ func checkAllNodeHealth() {
 	// 订阅摘除的 key 在这三张表里同样只增不减, 永久驻留。放在空池早退之后 ——
 	// 空池是 sing-box 实例故障不是订阅摘除, 此时清表会把仍在生效的 429 冷却误删。
 	pruneStaleExitKeys(keys)
+	// 每节点流量表同一时机裁剪(2026-09-24 审查): 它此前只增不减, 订阅 churn 下
+	// 摘除的节点永久驻留内存, 面板快照越来越长。
+	if n := pruneNodeTraffic(keys); n > 0 {
+		log.Printf("  nodes: 每节点流量表已按当前出口裁剪, 移除 %d 条不在订阅里的记录", n)
+	}
 	// 并发随规模走: 固定 10 并发跑 800+ 节点, 一轮要几十分钟, 远超 30 分钟周期,
 	// 导致绝大多数节点在两次周期之间始终没被测到。
 	workers := nodeTestWorkers
