@@ -127,6 +127,10 @@ func (t *zenStatsTracker) finish(ok bool, status int) {
 	t.rec.OK = ok
 	t.rec.Status = status
 	t.rec.LatencyMs = time.Since(t.started).Milliseconds()
+	// 流式提交后改判(空流守卫 502)同步进请求轨迹: 请求日志只认 wire 状态,
+	// 不经这里中转就永远记成 200(2026-09-24 空 200 事件)。SetDelivered 只收
+	// >=400, 成功路径无影响; nil-safe, 非 tracker 路径不受影响。
+	t.trace.SetDelivered(status)
 	recordZenStats(t.rec)
 }
 

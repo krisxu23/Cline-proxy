@@ -654,15 +654,22 @@ func parsedUsageFromJSONBody(body []byte) (map[string]any, bool) {
 // 终止信号的客户端也能正常收尾), 再补 [DONE]。HTTP 状态码在流式提交后无法
 // 再改, 因此失败信息只能走 SSE 帧 —— 这正是 OmniRoute 用 controller.error
 // 表达 502 的等价做法。
+//
+// finish_reason 用 "error" 而非 "stop"(2026-09-24 空 200 事件):
+// "stop" 是正常收尾语义, 只认终止信号的客户端(Cline 等)会把空流当合法回合,
+// 不报错不重试直接静默结束任务。未知值迫使客户端走错误/重试分支 —— 即使是
+// 严格校验的客户端, 顶多报"明确失败"而触发重试, 也符合"空流必须可重试"。
 func writeStreamEmptyContentError(w http.ResponseWriter, hb *sseHeartbeat, model string) {
 	payload := map[string]any{
 		"choices": []any{map[string]any{
 			"index":         0,
 			"delta":         map[string]any{},
-			"finish_reason": "stop",
+			"finish_reason": "error",
 		}},
 		"error": map[string]any{
-			"type": "empty_content",
+			"type":      "empty_content",
+			"code":      "empty_content",
+			"retryable": true,
 			"message": "上游未返回任何内容(整条流无有效 chunk)。这通常是出口节点或上游 worker " +
 				"异常所致, 请重试; 若持续出现请更换出口节点。",
 		},

@@ -497,17 +497,19 @@ func requestLogMiddleware(next http.Handler) http.Handler {
 			note = "跳过 " + strings.Join(snap.Skipped, ", ")
 		}
 		AppendReqLog(RequestLog{
-			Time:             time.Now(),
-			ID:               snap.RequestID,
-			Client:           client,
-			Method:           r.Method,
-			Path:             r.URL.Path,
-			Model:            model,
-			ResolvedModel:    snap.Resolved,
-			Route:            route,
-			Upstream:         upstream,
-			Exit:             exit.name,
-			Status:           sw.status,
+			Time:          time.Now(),
+			ID:            snap.RequestID,
+			Client:        client,
+			Method:        r.Method,
+			Path:          r.URL.Path,
+			Model:         model,
+			ResolvedModel: snap.Resolved,
+			Route:         route,
+			Upstream:      upstream,
+			Exit:          exit.name,
+			// 流式提交后改判优先: 空流守卫 502 时 wire 状态已是 200,
+			// 用轨迹里的交付状态才能记对(2026-09-24 空 200 事件)。
+			Status:           deliveredStatusOr(snap.Delivered, sw.status),
 			DurationMs:       time.Since(start).Milliseconds(),
 			TTFTMs:           ttft,
 			Stream:           snap.Stream,
@@ -524,4 +526,14 @@ func requestLogMiddleware(next http.Handler) http.Handler {
 			UsageReported:    snap.UsageReported,
 		})
 	})
+}
+
+// deliveredStatusOr 提交后改判优先: 流式空流守卫等在 WriteHeader(200) 之后才
+// 得出 502, wire 状态改不了, 请求日志必须用轨迹里的交付状态, 否则面板 200 与
+// 统计 502 自相矛盾。无改判(0)时回退 wire 状态。
+func deliveredStatusOr(delivered, wire int) int {
+	if delivered >= 400 {
+		return delivered
+	}
+	return wire
 }

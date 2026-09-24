@@ -481,11 +481,16 @@ func Test空流_错误帧协议合法性(t *testing.T) {
 			continue
 		}
 		choice := choices[0].(map[string]any)
-		if choice["finish_reason"] == "stop" {
+		// 空流错误帧不得用 finish_reason=stop(2026-09-24 空 200 事件):
+		// stop 是正常收尾语义, 客户端会当合法回合静默结束任务而不重试。
+		if fr, _ := choice["finish_reason"].(string); fr != "" && fr != "stop" {
 			found = true
 			errObj, _ := obj["error"].(map[string]any)
 			if errObj == nil || errObj["type"] != "empty_content" {
 				t.Fatalf("错误帧应带 error.type=empty_content, 实得 %#v", obj["error"])
+			}
+			if errObj["retryable"] != true {
+				t.Fatalf("空流错误帧必须标 retryable=true, 实得 %#v", obj["error"])
 			}
 			if model, _ := obj["model"].(string); model == "" {
 				t.Fatal("错误帧应带上游 model 字段(便于定位)")
@@ -493,7 +498,7 @@ func Test空流_错误帧协议合法性(t *testing.T) {
 		}
 	}
 	if !found {
-		t.Fatalf("必须交付带 finish_reason=stop 的终止帧, 实得:\n%s", out)
+		t.Fatalf("必须交付非 stop 终止帧(空流不得静默收尾), 实得:\n%s", out)
 	}
 }
 

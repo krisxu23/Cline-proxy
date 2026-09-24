@@ -225,7 +225,6 @@ func handleChainedChatAs(w http.ResponseWriter, r *http.Request, params map[stri
 			logChainResult(cand, tried, skipped)
 			return
 		}
-
 		// 非 200: 读出错误体判定类别, 再决定冷却方式
 		body, _ := io.ReadAll(io.LimitReader(resp.Body, 64<<10))
 		resp.Body.Close()

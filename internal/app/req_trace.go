@@ -38,6 +38,10 @@ type reqTrace struct {
 	Skipped   []string // "候选=原因" 列表, 供日志与面板详情展示
 	ErrClass  string
 	ErrMsg    string
+	// Delivered 流式提交后改判的最终交付状态(0 = 未改判, 用 wire 状态)。
+	// 流式 handler 先 WriteHeader(200) 再发现空流: wire 状态永远 200,
+	// 空流守卫的 502 只存在于 handler 返回值里, 不经此字段请求日志永远记错。
+	Delivered int
 
 	PromptTokens     int
 	CompletionTokens int
@@ -176,6 +180,24 @@ func (t *reqTrace) SetError(class, msg string) {
 	}
 }
 
+// SetDelivered 记录流式提交后的最终交付状态(空流改判 502 等)。
+// 只接受 >=400 的改判: 成功路径的 200 与 wire 状态一致, 无需覆盖,
+// 且防止调用方误传 0/200 把真实失败状态洗掉。
+func (t *reqTrace) SetDelivered(status int) {
+	if t == nil || status < 400 {
+		return
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.Delivered = status
+	if t.ErrClass == "" {
+		t.ErrClass = errClassForStatus(status)
+	}
+	if t.ErrMsg == "" {
+		t.ErrMsg = "上游空回包: 整条流未交付任何内容, 已改判失败(可重试)"
+	}
+}
+
 // SetTokens 记录归一后的 token 用量(来自上游 usage)。
 func (t *reqTrace) SetTokens(prompt, completion, reasoning, cache int) {
 	if t == nil {
@@ -279,6 +301,7 @@ type reqTraceSnapshot struct {
 	Skipped          []string
 	ErrClass         string
 	ErrMsg           string
+	Delivered        int
 	PromptTokens     int
 	CompletionTokens int
 	ReasoningTokens  int
@@ -303,6 +326,7 @@ func (t *reqTrace) snapshot() reqTraceSnapshot {
 		Skipped:          append([]string(nil), t.Skipped...),
 		ErrClass:         t.ErrClass,
 		ErrMsg:           t.ErrMsg,
+		Delivered:        t.Delivered,
 		PromptTokens:     t.PromptTokens,
 		CompletionTokens: t.CompletionTokens,
 		ReasoningTokens:  t.ReasoningTokens,
