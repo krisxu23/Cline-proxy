@@ -38,6 +38,9 @@ type upstreamError struct {
 	Upstream string
 	Status   int
 	Body     string
+	// RetryAfter 上游 429 携带的 Retry-After(秒级): failover 换账号前小睡,
+	// 避免把限流瞬间打满整个池。0 = 无指示, 不等待。
+	RetryAfter time.Duration
 }
 
 func (e *upstreamError) Error() string {

@@ -70,6 +70,16 @@ func StartProxy(host string, port int) error {
 		host = "127.0.0.1"
 	}
 	initLogFile()
+	// 启动期数据目录可写自检(Docker 只读 bind-mount EACCES 不再静默):
+	// ResolveDataPath 本身已做 exe-dir → pwd → UserConfigDir 回退, 这里只验证
+	// 最终选中的位置真能写。失败只大声告警不 Fatal —— 代理仍可服务, 落盘点各自报错。
+	if probe := kit.ResolveDataPath(".write-check"); probe != "" {
+		if err := os.WriteFile(probe, []byte("ok"), 0600); err != nil {
+			log.Printf("WARNING: 数据目录不可写(%s): %v —— 配置/账本/日志落盘将失败, 检查 Docker volume 挂载或目录权限", probe, err)
+		} else {
+			_ = os.Remove(probe)
+		}
+	}
 	setListenOrigin(fmt.Sprintf("http://127.0.0.1:%d", port))
 
 	// 进程级生命周期: 用 signal.NotifyContext 建立可取消的 rootCtx。

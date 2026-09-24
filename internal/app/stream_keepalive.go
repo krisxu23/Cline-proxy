@@ -42,6 +42,9 @@ type sseHeartbeat struct {
 	closed   bool
 	done     chan struct{}
 	once     sync.Once
+	// writeErr 粘性写错误: 客户端断开(broken pipe)后第一次 Write 失败即记录,
+	// 上层循环据此提前收手, 不再把整条上游流读完还往黑洞里写。
+	writeErr error
 }
 
 func newSSEHeartbeat(w http.ResponseWriter, flusher http.Flusher, interval time.Duration, frame func() []byte) *sseHeartbeat {
@@ -84,7 +87,21 @@ func (h *sseHeartbeat) writeLocked(b []byte) (int, error) {
 	if h.closed {
 		return 0, nil
 	}
-	return h.w.Write(b)
+	if h.writeErr != nil {
+		return 0, h.writeErr
+	}
+	n, err := h.w.Write(b)
+	if err != nil {
+		h.writeErr = err
+	}
+	return n, err
+}
+
+// WriteErr 返回首次客户端写错误(无错误返回 nil)。供流循环提前退出用。
+func (h *sseHeartbeat) WriteErr() error {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.writeErr
 }
 
 // pump 周期性检查空闲: 事件边界上距上次写出超过 interval 就补一帧心跳(并刷新

@@ -11,6 +11,8 @@ import (
 // handleChainedChatAs(shapeResponses) 这几个流式/子协议 handler 内部又各自 Set
 // 了一次 Origin, 收紧策略时这些点会漏改, 形成同一入口下策略不一致。抽成
 // applyCORS / setCORSOrigin 之后, 改一个点就影响所有 handler。
+// DECISION(2026-09-24, 用户确认): CORS 保持 `*` —— 部分用户面板/客户端跨域部署,
+// 收紧会直接调不通。管理后台另有 ADMIN token 鉴权, 此处不收紧。勿改。
 const (
 	corsAllowOrigin  = "*"
 	corsAllowMethods = "GET, POST, OPTIONS"

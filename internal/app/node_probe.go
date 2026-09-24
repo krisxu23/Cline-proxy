@@ -7,6 +7,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"os"
 	"regexp"
 	"strings"
 	"sync"
@@ -74,6 +75,12 @@ const (
 //	修法: 换成 (a) **IP 字面量**(DNS 无从污染) 与 (b) 国内也能正确解析到真实
 //	Cloudflare(AS13335) 的端点。`cp.cloudflare.com` 实测解析为
 //	`2606:4700::6810:84e5`(真实 Cloudflare)且本机直连 204。
+//
+// 探测 URL 均可被环境变量覆盖(默认行为不变): 内网/代理场景下公网权威源不可达时,
+// 无需改代码即可指向自建探针。逗号分隔, 空项忽略, 全空则保留默认值。
+//
+//	FREE_ROUTER_LIVENESS_URLS / FREE_ROUTER_MITM_URL / FREE_ROUTER_IP_ECHO_URLS /
+//	FREE_ROUTER_SPEEDTEST_URLS / FREE_ROUTER_TRACE_URL
 var nodeLivenessURLs = []string{
 	"https://1.1.1.1/cdn-cgi/trace",          // IP 字面量: 完全不经过 DNS, 污染无从下手
 	"https://cp.cloudflare.com/generate_204", // 国内解析正确(真实 Cloudflare)
@@ -87,7 +94,7 @@ var nodeLivenessURLs = []string{
 // (旧值 https://www.gstatic.com/generate_204 会被解析到国内 IP, 导致合法节点
 //
 //	被误判为 MITM —— 见上方 nodeLivenessURLs 的说明。)
-const nodeMITMURL = "https://1.1.1.1/cdn-cgi/trace"
+var nodeMITMURL = "https://1.1.1.1/cdn-cgi/trace"
 
 // 出口 IP 情报 URL(freesub IP_ECHO_URLS, 多路冗余)
 var nodeIPEchoURLs = []string{
@@ -103,7 +110,40 @@ var nodeSpeedTestURLs = []string{
 }
 
 // Cloudflare trace URL(warp=on 检测套壳节点)
-const nodeTraceURL = "https://www.cloudflare.com/cdn-cgi/trace"
+var nodeTraceURL = "https://www.cloudflare.com/cdn-cgi/trace"
+
+// envCSVList 读逗号分隔的环境变量, 有值才返回(调用方决定是否覆盖默认值)。
+func envCSVList(key string) []string {
+	raw := strings.TrimSpace(os.Getenv(key))
+	if raw == "" {
+		return nil
+	}
+	var out []string
+	for _, s := range strings.Split(raw, ",") {
+		if s = strings.TrimSpace(s); s != "" {
+			out = append(out, s)
+		}
+	}
+	return out
+}
+
+func init() {
+	if v := envCSVList("FREE_ROUTER_LIVENESS_URLS"); len(v) > 0 {
+		nodeLivenessURLs = v
+	}
+	if v := strings.TrimSpace(os.Getenv("FREE_ROUTER_MITM_URL")); v != "" {
+		nodeMITMURL = v
+	}
+	if v := envCSVList("FREE_ROUTER_IP_ECHO_URLS"); len(v) > 0 {
+		nodeIPEchoURLs = v
+	}
+	if v := envCSVList("FREE_ROUTER_SPEEDTEST_URLS"); len(v) > 0 {
+		nodeSpeedTestURLs = v
+	}
+	if v := strings.TrimSpace(os.Getenv("FREE_ROUTER_TRACE_URL")); v != "" {
+		nodeTraceURL = v
+	}
+}
 
 // --- 节点测试结果 ---
 

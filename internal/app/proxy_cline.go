@@ -195,6 +195,24 @@ func callClineAPIFailover(ctx context.Context, params map[string]any, stream boo
 		if !isRetryableUpstreamError(err) {
 			return nil, acc, err
 		}
+		// 429 带 Retry-After 时小睡再换账号: 上游明确说"过 N 秒再来", 立刻换号
+		// 重打只会把限流瞬间打满整个池。上限 5s, 且全程可被 ctx 取消打断。
+		var wait time.Duration
+		var ue *upstreamError
+		if errors.As(err, &ue) && ue.Status == http.StatusTooManyRequests && ue.RetryAfter > 0 {
+			wait = ue.RetryAfter
+			if wait > 5*time.Second {
+				wait = 5 * time.Second
+			}
+		}
+		if wait > 0 {
+			log.Printf("  failover: 上游要求 %v 后重试, 等待再换账号", wait)
+			select {
+			case <-ctx.Done():
+				return nil, acc, ctx.Err()
+			case <-time.After(wait):
+			}
+		}
 		log.Printf("  failover: attempt %d/%d failed (%v), rotating account", attempt+1, total, err)
 	}
 	return nil, acc, err
@@ -335,12 +353,14 @@ func callClineAPI(ctx context.Context, params map[string]any, stream bool) (*htt
 		bodyBytes, _ := io.ReadAll(resp.Body)
 		resp.Body.Close()
 		// Mark account on cooldown on rate limits
+		var retryAfter time.Duration
 		if resp.StatusCode == 429 {
 			reason := kit.Truncate(string(bodyBytes), 500)
 			duration := parseInferenceCapDuration(string(bodyBytes))
 			if duration <= 0 {
 				duration = parseRetryAfter(resp.Header.Get("Retry-After"))
 			}
+			retryAfter = duration
 			markAccountCooldown(acc, "429: "+reason, duration)
 			log.Printf("  account %s cooldown %v (reason: %s)", truncateEmail(acc.Email), duration, reason)
 		}
@@ -353,9 +373,10 @@ func callClineAPI(ctx context.Context, params map[string]any, stream bool) (*htt
 		// 回给客户端的响应码被压成 502, 真实原因(限流/下架/无权限)全部丢失。
 		// 同目录 providers_chat.go 早就用 providerError 这么做了, 这里补上。
 		return nil, acc, &upstreamError{
-			Upstream: upstreamCline,
-			Status:   resp.StatusCode,
-			Body:     kit.Truncate(string(bodyBytes), 500),
+			Upstream:   upstreamCline,
+			Status:     resp.StatusCode,
+			Body:       kit.Truncate(string(bodyBytes), 500),
+			RetryAfter: retryAfter,
 		}
 	}
 

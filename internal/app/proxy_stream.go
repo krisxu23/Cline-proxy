@@ -410,6 +410,11 @@ func handleStreamResponseWithToolNameMap(w http.ResponseWriter, upstream *http.R
 	}
 
 	for {
+		// 客户端已断开(broken pipe)时不再读上游: 粘性写错误一旦置位,
+		// 后续写必败, 继续读只是把上游流量往黑洞里倒。
+		if hb.WriteErr() != nil {
+			break
+		}
 		line, err := readStreamLine(reader)
 		// EOF 时残行(最后一帧不带换行)也要走统一处理, 不能裸写回客户端。
 		if err != nil && err != io.EOF {
@@ -420,6 +425,9 @@ func handleStreamResponseWithToolNameMap(w http.ResponseWriter, upstream *http.R
 			break
 		}
 		if handleLine(line, residual) {
+			break
+		}
+		if hb.WriteErr() != nil {
 			break
 		}
 	}

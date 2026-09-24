@@ -270,8 +270,9 @@ func invalidateExitListCache() {
 }
 
 // filterByExitRegion 只保留勾选地区的出口(未启用过滤时原样返回)。
-// 兜底: 过滤后一个出口都不剩时退回完整列表并告警 —— 宁可暂时不遵守地区限制,
-// 也不能让全网关没有出口(典型场景: 刚重启还没跑连通检测/勾选的地区暂无节点)。
+// DECISION(2026-09-24, 用户确认): 兜底保持 fallback-all —— 过滤后一个出口都不剩时
+// 退回完整列表并告警, 宁可暂时不遵守地区限制也不能让全网关没有出口(典型场景:
+// 刚重启还没跑连通检测/勾选的地区暂无节点)。fail-closed(零匹配直接 503)已否决, 勿改。
 func filterByExitRegion(list []string) []string {
 	regions := enabledExitRegions()
 	if len(regions) == 0 {
