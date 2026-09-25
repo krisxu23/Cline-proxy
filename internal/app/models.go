@@ -296,6 +296,21 @@ func apiModelList() []map[string]any {
 			"requiresStream": m.RequiresStream,
 			"syncedAt":       m.SyncedAt,
 		})
+		// OMP 下拉要选三段名 cline/cline-free/gemini-3.8-flash: 路由层 stripDisplayPrefix
+		// 已支持剥离直通同一上游，这里只多发一条别名条目，不进 modelsCache。
+		if m.ID == "cline-free/gemini-3.8-flash" {
+			out = append(out, map[string]any{
+				"id":             "cline/" + m.ID,
+				"object":         "model",
+				"created":        time.Now().UnixMilli(),
+				"owned_by":       m.Provider,
+				"source":         m.Source,
+				"status":         m.Status,
+				"cost":           m.Cost,
+				"requiresStream": m.RequiresStream,
+				"syncedAt":       m.SyncedAt,
+			})
+		}
 	}
 	return out
 }

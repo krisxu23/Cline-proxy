@@ -121,6 +121,8 @@ func setZenConfig(c *zenConfigData) {
 // 统一由 setZenConfig / updateZenConfig 在**放锁之后**调用, 保持一致的锁/IO 纪律:
 // 计算与赋值在临界区内, 慢 I/O 与重建在临界区外。
 func applyZenConfigSideEffects() {
+	// P2-5: 凭据/key 集合可能已变, 旧的"端点不支持"负向结论不再可信, 清空。
+	clearZenChatOnlyMemo()
 	// 勾选地区/代理/订阅都可能变, 出口列表缓存立即失效(否则最长 2 秒内还在用旧池)
 	invalidateExitListCache()
 	// 手动启用的模型集合也要同步: isZenFreeModel 热路径读的是缓存集合

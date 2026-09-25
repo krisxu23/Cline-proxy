@@ -55,8 +55,29 @@ var (
 	zenRespOnlyMu     sync.Mutex
 	zenRespOnlyLoaded bool
 	zenRespOnly       = map[string]bool{} // 已确认 Responses 专用(持久化)
-	zenChatOnlyMemo   = map[string]bool{} // 已确认 chat 可用/Responses 也失败(仅进程内)
+	zenChatOnlyMemo   = map[string]time.Time{} // 已确认 chat 可用/Responses 也失败(仅进程内, 记入时间用于 TTL 过期)
 )
+
+// zenChatOnlyMemoTTL 负向 memo 的存活时间(P2-5)。
+//
+// 此前是进程内永久: 一次误记(如 401/429 被判成端点不支持)会让该模型整个
+// 进程生命周期不再回退。30 分钟后自动过期, 上游修复/误记都有机会自我纠正。
+const zenChatOnlyMemoTTL = 30 * time.Minute
+
+// zenClearChatOnlyMemoForTest 测试隔离用: 清空负向 memo。
+func zenClearChatOnlyMemoForTest() {
+	zenRespOnlyMu.Lock()
+	zenChatOnlyMemo = map[string]time.Time{}
+	zenRespOnlyMu.Unlock()
+}
+
+// clearZenChatOnlyMemo 配置重载时调用: key 集合/凭据可能已变, 旧的"端点不
+// 支持"结论(可能源于旧 key 的 401 等)不再可信, 全部清空(P2-5)。
+func clearZenChatOnlyMemo() {
+	zenRespOnlyMu.Lock()
+	zenChatOnlyMemo = map[string]time.Time{}
+	zenRespOnlyMu.Unlock()
+}
 
 func zenResponsesOnlyFile() string {
 	if zenResponsesOnlyFileOverride != "" {
@@ -142,17 +163,25 @@ func zenLearnResponsesOnly(zenModelID string) {
 }
 
 // zenMemoChatOnly /responses 也调不通(或已确认 chat 正常), 进程内记住,
-// 本轮进程不再对它做 Responses 回退。
+// TTL 内不再对它做 Responses 回退(到期自动过期, 见 zenChatOnlyKnown)。
 func zenMemoChatOnly(zenModelID string) {
 	zenRespOnlyMu.Lock()
 	defer zenRespOnlyMu.Unlock()
-	zenChatOnlyMemo[zenModelID] = true
+	zenChatOnlyMemo[zenModelID] = time.Now()
 }
 
 func zenChatOnlyKnown(zenModelID string) bool {
 	zenRespOnlyMu.Lock()
 	defer zenRespOnlyMu.Unlock()
-	return zenChatOnlyMemo[zenModelID]
+	since, ok := zenChatOnlyMemo[zenModelID]
+	if !ok {
+		return false
+	}
+	if time.Since(since) > zenChatOnlyMemoTTL {
+		delete(zenChatOnlyMemo, zenModelID)
+		return false
+	}
+	return true
 }
 
 // ============ 请求转换: OpenAI chat -> Responses ============

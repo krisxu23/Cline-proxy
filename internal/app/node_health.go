@@ -8,6 +8,7 @@ import (
 	"net/url"
 	"os"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 )
@@ -232,7 +233,7 @@ func checkAllNodeHealth() {
 	// "上千个节点只剩几十个"无法自查 —— 至少把分解计数写进这一行)。
 	// 失败分解只留"活性挂"(2026-09-24 计划 Task 7): MITM/断流已退出判据,
 	// 保留恒为 0 的计数只会误导排障。质量分布仍在(深度探测开启时)。
-	var stageDead, stageSpeedFail, stageSlow int
+	var stageDead, stageAlive, stageCountryUnknown int
 	sem := make(chan struct{}, workers)
 
 	// 新节点国家快车道(2026-09-24 计划 Task 8): 订阅 churn 后新出现的键, 若其远端
@@ -276,20 +277,18 @@ func checkAllNodeHealth() {
 		//   - 断流/慢是**质量**问题, 由选路的 nodeSlow 降权与真实请求的失败反馈处理;
 		//   - 把质量当门槛会在上游抖动时把整池判死, 反而放大故障。
 		// 国家未知**不**判死: 未知只是"还没探到", 由 regionExitTier 降为兜底档。
-		ok := r.Alive
+		// 计数只留 dead/alive/country-unknown(Task 7.1): 速度/慢量不再单列,
+		// 排障看深度探测明细, 汇总行不再为恒零项占位。
+		ok := leanVerdict(r)
 		mu.Lock()
 		if ok {
 			okCount++
+			stageAlive++
+			if strings.TrimSpace(r.ExitCountry) == "" {
+				stageCountryUnknown++
+			}
 		} else {
 			stageDead++
-		}
-		// 深度探测默认关闭, 下面这些质量计数只在 FREE_ROUTER_PROBE_DEEP=1 时
-		// 才有非零来源; 保留它们是为了排障时仍能看到速度/断流分布。
-		if r.Alive && r.SpeedTestFailed {
-			stageSpeedFail++ // 与判死无关, 独立统计(端点抽风量)
-		}
-		if r.Alive && r.SpeedBPS > 0 && r.SpeedBPS < nodeSpeedSlowBPS {
-			stageSlow++ // 降权池大小
 		}
 		mu.Unlock()
 		nodeHealthMu.Lock()
@@ -395,15 +394,10 @@ func checkAllNodeHealth() {
 		log.Printf("  nodes: %d 个变体与其服务器代表同判不可达, 已跳过探测(%d 台服务器分组)",
 			skipped, len(groups))
 	}
-	// 失败分解: 默认只可能有"活性挂"(质量项已退出判据, 见 record 的注释)。
-	// 只有开了深度探测才附上质量分布, 否则那几个计数恒为 0、纯误导。
-	if probeDeepEnabled() {
-		log.Printf("  nodes: 增强检测完成(%d 并发), %d/%d 个出口可达(去重服务器 %d 台); 失败分解: 活性挂 %d · 测速端点全挂 %d · 慢速降权 %d",
-			workers, okCount, len(keys), len(groups), stageDead, stageSpeedFail, stageSlow)
-	} else {
-		log.Printf("  nodes: 增强检测完成(%d 并发), %d/%d 个出口可达(去重服务器 %d 台); 不可达 %d(判据只留可达; 质量项需 FREE_ROUTER_PROBE_DEEP=1)",
-			workers, okCount, len(keys), len(groups), stageDead)
-	}
+	// 失败分解只留 dead/alive/country-unknown(2026-09-24 Task 7.1/7.2):
+	// MITM/断流/速度已退出判据, 汇总行不再为它们占位。
+	log.Printf("  nodes: 增强检测完成(%d 并发), %d/%d 个出口可达(去重服务器 %d 台); 不可达 %d · 国家未知 %d(判据只留可达)",
+		workers, okCount, len(keys), len(groups), stageDead, stageCountryUnknown)
 	// 出口级去重(P2, freesub 语义): 按最新结果折叠同出口 IP 的重复节点,
 	// 选路只保留每组最快的 —— 之后 nodeUsable 对折叠副本返回 false。
 	recomputeExitFold()

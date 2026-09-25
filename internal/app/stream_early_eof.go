@@ -97,6 +97,7 @@ func probeStreamFirstEvent(body io.ReadCloser) (bool, io.ReadCloser, string) {
 					closer: idle,
 				}, st.upstreamDiagnostic
 			}
+			idle.Close()
 			return true, nil, st.upstreamDiagnostic
 		}
 		// 总时限 / 缓冲上限(P1-1): 任一超限即判探测失败(走空流换站)。
@@ -110,6 +111,7 @@ func probeStreamFirstEvent(body io.ReadCloser) (bool, io.ReadCloser, string) {
 					closer: idle,
 				}, st.upstreamDiagnostic
 			}
+			idle.Close()
 			return true, nil, st.upstreamDiagnostic
 		}
 	}

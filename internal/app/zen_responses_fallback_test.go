@@ -32,7 +32,9 @@ func resetZenResponsesFlavorState(t *testing.T, file string) {
 		setZenResponsesOnlyFileForTest("")
 		zenRespOnlyMu.Lock()
 		zenRespOnly = map[string]bool{}
-		zenChatOnlyMemo = map[string]bool{}
+		zenRespOnlyMu.Unlock()
+		zenClearChatOnlyMemoForTest()
+		zenRespOnlyMu.Lock()
 		zenRespOnlyLoaded = false
 		zenRespOnlyMu.Unlock()
 	})

@@ -189,6 +189,7 @@ func callZenAPI(ctx context.Context, params map[string]any, stream bool) (*http.
 		if cerr != nil {
 			// 请求没发出去 → 半开探测无判定, 释放探测标志(见 clearZenProbing)。
 			clearZenProbing()
+			noteZenEarlyFailure(dec, trace, zenResolvedModel, cerr.Error())
 			return nil, 0, cerr
 		}
 		body = converted
@@ -210,14 +211,18 @@ func callZenAPI(ctx context.Context, params map[string]any, stream bool) (*http.
 		// 宁可网关 500 也不把畸形请求发给上游换回难以理解的 400。
 		if problems := translate_registry.ValidateOutbound(translate_registry.Responses, body); len(problems) > 0 {
 			clearZenProbing()
-			return nil, 0, fmt.Errorf("responses outbound shape invalid: %s", strings.Join(problems, "; "))
+			errOutbound := fmt.Errorf("responses outbound shape invalid: %s", strings.Join(problems, "; "))
+			noteZenEarlyFailure(dec, trace, zenResolvedModel, errOutbound.Error())
+			return nil, 0, errOutbound
 		}
 	}
 
 	bodyJSON, err := json.Marshal(body)
 	if err != nil {
 		clearZenProbing()
-		return nil, 0, fmt.Errorf("marshal zen body: %w", err)
+		errMarshal := fmt.Errorf("marshal zen body: %w", err)
+		noteZenEarlyFailure(dec, trace, zenResolvedModel, errMarshal.Error())
+		return nil, 0, errMarshal
 	}
 
 	baseURLs := zenBaseURLList(cfg)
@@ -233,6 +238,7 @@ func callZenAPI(ctx context.Context, params map[string]any, stream bool) (*http.
 	case <-ctx.Done():
 		// 排队中客户端已断开 → 半开探测无判定, 释放探测标志。
 		clearZenProbing()
+		noteZenEarlyFailure(dec, trace, zenResolvedModel, ctx.Err().Error())
 		return nil, rateLimited, ctx.Err()
 	}
 	defer func() { <-sem }()
@@ -313,6 +319,11 @@ func callZenAPI(ctx context.Context, params map[string]any, stream bool) (*http.
 		// 凭据选择: 匿名模式开 && 免费模型 → 统一 "public"(opencode2api 同款
 		// 匿名档, 探针见 zen_keys.go); 否则多 key 按出口**确定性**选一把
 		// (同一出口永远用同一把 key, 见 zen_keys.go), 退役中的 key 自动跳过。
+		//
+		// ★ P2-4: 这里只能先按"上次残留出口"(首试为空→keys[0])预选一把, 把
+		// 请求体先造出来; 真正的选 key 在下方 pickUnifiedExit/setReqExit 之后
+		// 按本次真实出口重选(见 reqKeyRefresh), 否则同一出口在不同 attempt
+		// 会用不同的 key 打 —— (key, 出口)配对抖动, 正是多 key 要消除的特征。
 		reqKey := zenSelectKeyForModel(cfg, reqExitKey(ctx), zenResolvedModel)
 		// 鉴权按端点形态分流: Anthropic Messages 用 x-api-key + 版本头, 其余用
 		// Bearer。漏掉这步会拿到 401, 而 401 很容易被误判成"key 不对"。
@@ -357,6 +368,18 @@ func callZenAPI(ctx context.Context, params map[string]any, stream bool) (*http.
 		// "同一个 IP 打到底"的 bug 就原样回来了。拨号层那份写入保留(同值), 两条
 		// 路径合起来才覆盖"新建连接"与"复用连接"两种情况。
 		setReqExit(ctx, exit)
+		// ★ P2-4: 按本次真实出口重选 key(同一出口同一 key)。首试时上面的
+		// reqExitKey(ctx) 为空(直连/上一轮残留), 预选只能拿到 keys[0]; 这里
+		// exit 已是本 attempt 真正要走的出口, 用它重算才是配对的 key。匿名
+		// public 与单 key 配置下重算结果相同, 开销只是一次哈希, 无副作用。
+		if refreshed := zenSelectKeyForModel(cfg, exit, zenResolvedModel); refreshed != reqKey {
+			reqKey = refreshed
+			if zenEndpoint.usesAnthropicAuth() {
+				req.Header.Set("x-api-key", reqKey)
+			} else {
+				req.Header.Set("Authorization", "Bearer "+reqKey)
+			}
+		}
 		client := zenClientForExit(exit)
 		resp, err := client.Do(req)
 		// 响应头已到(或本次拨号已终局), 停掉响应头超时计时任务。

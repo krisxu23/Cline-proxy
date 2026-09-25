@@ -146,6 +146,12 @@ func handleChainedChatAs(w http.ResponseWriter, r *http.Request, params map[stri
 	dec := decisionTraceStart(reqIDFrom(r.Context()), requested)
 	defer dec.finish()
 
+	// Task1 入口门禁: 池空 + 地区受限链拒绝静默直连(防 h2 池污染)。
+	// 重建(loadSubCache/syncNodeBox)由 writePoolEmptyGate 内部完成。
+	if chainNeedsPoolGate(chain, requested) && writePoolEmptyGate(w, r, requested) {
+		return
+	}
+
 	var (
 		lastErr    error
 		lastStatus = http.StatusBadGateway
@@ -180,9 +186,11 @@ func handleChainedChatAs(w http.ResponseWriter, r *http.Request, params map[stri
 			status, body := chainErrorStatusBody(err)
 			class, reason := classifyCandidateFailure(status, body)
 			lastErr, lastStatus = err, upstreamErrorStatus(err)
-			applyCandidateFailure(cand, class, reason, body)
-			recordUsageForCandidate(cand, false)
-			dec.addCandidate(cand.String(), "tried", reason, status, class)
+			recordChainTryFailure(cand, class, reason, status, body, dec)
+			// 链失败路径必须落请求轨迹: tried 由循环顶记, skipped 由跳过分支记,
+			// 此处补 error class —— 收尾的 tr.SetError 只记最后一站类别,
+			// 逐站明细靠 tried/skipped 还原, 无静默丢弃。
+			tr.SetError(class, reason)
 			log.Printf("  chain: %s 失败(%s), 换下一站: %v", cand.String(), class, err)
 			continue
 		}
@@ -196,9 +204,8 @@ func handleChainedChatAs(w http.ResponseWriter, r *http.Request, params map[stri
 				if rerr != nil || int64(len(body)) > providerResponseMaxBytes {
 					lastErr = fmt.Errorf("%s: reading response: %v", cand.String(), rerr)
 					lastStatus = http.StatusBadGateway
-					markCandidateCooldown(cand.Upstream, cand.Model, classTimeout, "读取响应失败")
-					recordUsageForCandidate(cand, false)
-					dec.addCandidate(cand.String(), "tried", "读取响应失败", 0, classTimeout)
+					tr.AddAttempt()
+					recordChainTryFailure(cand, classTimeout, "读取响应失败", 0, nil, dec)
 					continue
 				}
 				if !chatBodyHasContent(body) || chainBodyOnlyBrokenToolCalls(body) {
@@ -211,8 +218,8 @@ func handleChainedChatAs(w http.ResponseWriter, r *http.Request, params map[stri
 						reason = "200 但 tool_calls 不完整"
 					}
 					markCandidateCooldown(cand.Upstream, cand.Model, classEmpty, reason)
-					recordUsageForCandidate(cand, false)
-					dec.addCandidate(cand.String(), "tried", reason, http.StatusOK, classEmpty)
+					tr.AddAttempt()
+					recordChainTryFailure(cand, classEmpty, reason, http.StatusOK, body, dec)
 					log.Printf("  chain: %s %s, 换下一站", cand.String(), reason)
 					continue
 				}
@@ -255,9 +262,8 @@ func handleChainedChatAs(w http.ResponseWriter, r *http.Request, params map[stri
 				resp.Body.Close()
 				lastErr = fmt.Errorf("%s: HTTP 200 stream with no first event", cand.String())
 				lastStatus = http.StatusBadGateway
-				markCandidateCooldown(cand.Upstream, cand.Model, classEmpty, "200 但空流")
-				recordUsageForCandidate(cand, false)
-				dec.addCandidate(cand.String(), "tried", "200 但空流", http.StatusOK, classEmpty)
+				tr.AddAttempt()
+				recordChainTryFailure(cand, classEmpty, "200 但空流", http.StatusOK, nil, dec)
 				if upstreamDiag != "" {
 					log.Printf("  chain: %s 200 但空流(early EOF), 上游诊断: %s, 换下一站", cand.String(), upstreamDiag)
 				} else {

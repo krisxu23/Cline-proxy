@@ -135,17 +135,17 @@ func zenReasoningEffortOf(params map[string]any) string {
 
 // zenEndpointUnsupported 回退失败是否表明「端点不支持该模型」。
 //
-// 只有两种证据算数: 404, 或正文里明确出现 not found / unsupported。其余状态
-// 都与端点支持无关 —— 401 是 key 问题、429 是额度问题、408 是超时、5xx 可能
-// 只是线路坏。负向 memo 是**进程内永久**的(zen_endpoints.go 每次查询都读),
-// 误记会让该模型整个进程生命周期不再回退, 正确的 zen-*-only.json 学习记录
+// ★ P2-5: 文本匹配(not found / unsupported)仅在 404 下生效 —— 非 404 即使
+// 正文含这些词也不算(401 是 key 问题、429 是额度问题、5xx 可能只是线路坏,
+// 500 更是上游把"不支持"崩成的通用错误, 由调用方的回退流程另行处理)。
+// 负向 memo 是**进程内**的(zen_responses.go, 30 分钟 TTL + 配置重载清空),
+// 误记会让该模型一段时间内不再回退, 正确的 zen-*-only.json 学习记录
 // 永远写不进去(P2-14)。
 func zenEndpointUnsupported(status int, body string) bool {
-	if status == http.StatusNotFound {
-		return true
+	if status != http.StatusNotFound {
+		return false
 	}
-	lb := strings.ToLower(body)
-	return strings.Contains(lb, "not found") || strings.Contains(lb, "unsupported")
+	return true
 }
 
 // tryZenResponsesFallback chat/completions 吃 500 时的自适应回退: 用同一出口、

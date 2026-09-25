@@ -617,6 +617,149 @@ type nopCloser struct{ *strings.Reader }
 
 func (nopCloser) Close() error { return nil }
 
+// errAfterReader 在交付 n 段后返回读错误 —— 复刻"已交付>0后上游断流"。
+type errAfterReader struct {
+	chunks []string
+	idx    int
+	err    error
+}
+
+func (r *errAfterReader) Read(p []byte) (int, error) {
+	if r.idx >= len(r.chunks) {
+		return 0, r.err
+	}
+	n := copy(p, r.chunks[r.idx])
+	r.idx++
+	return n, nil
+}
+
+func (r *errAfterReader) Close() error { return nil }
+
+// plainWriter 故意不实现 http.Flusher —— 锁定 3.1 非 Flusher 零交付。
+type plainWriter struct {
+	header http.Header
+	code   int
+	codes  []int
+	buf    bytes.Buffer
+}
+
+func (p *plainWriter) Header() http.Header {
+	if p.header == nil {
+		p.header = http.Header{}
+	}
+	return p.header
+}
+func (p *plainWriter) Write(b []byte) (int, error) { return p.buf.Write(b) }
+func (p *plainWriter) WriteHeader(code int)        { p.code = code; p.codes = append(p.codes, code) }
+
+// TestStream_NonFlusherZeroByte 3.1: 非 Flusher writer 必须返回 500 且之前无 200。
+func TestStream_NonFlusherZeroByte(t *testing.T) {
+	pw := &plainWriter{}
+	upstream := &http.Response{StatusCode: http.StatusOK, Body: nopCloser{strings.NewReader(contentFrame("hi"))}}
+	st := handleStreamResponseWithUsage(pw, upstream, nil)
+	if st != http.StatusInternalServerError {
+		t.Fatalf("非 Flusher 必须返回 500, 实得 %d", st)
+	}
+	if pw.code != http.StatusInternalServerError {
+		t.Fatalf("非 Flusher 必须写出 500, 实得 %d", pw.code)
+	}
+	for _, c := range pw.codes {
+		if c == http.StatusOK {
+			t.Fatal("非 Flusher 返回 500 之前不得先写 200(零流字节提交前)")
+		}
+	}
+}
+
+// TestStream_RedlineDeliveredThenTruncated 红线: 已交付>0后上游断流, 网关必须
+// 保留已交付内容 + 补终端错误帧(retryable:true), 绝不换站重发(单次处理无 refetch)。
+func TestStream_RedlineDeliveredThenTruncated(t *testing.T) {
+	mw := &mockFlushWriter{}
+	body := &errAfterReader{
+		chunks: []string{contentFrame("hello")},
+		err:    errStreamPreambleOverflow, // 非 EOF 读错误 = 上游中途断流
+	}
+	upstream := &http.Response{StatusCode: http.StatusOK, Body: body}
+	refetch := 0 // handleStreamResponseWithUsage 内部只读一次上游; 若换站重发会再次读
+	st := handleStreamResponseWithUsage(mw, upstream, nil)
+	out := mw.String()
+	if !strings.Contains(out, "hello") {
+		t.Fatalf("已交付内容必须保留, 实得:\n%s", out)
+	}
+	if !strings.Contains(out, "upstream_truncated") {
+		t.Fatalf("必须补终端错误帧, 实得:\n%s", out)
+	}
+	if !strings.Contains(out, `"retryable":true`) {
+		t.Fatalf("终端错误帧必须标 retryable:true, 实得:\n%s", out)
+	}
+	if !strings.Contains(out, "[DONE]") {
+		t.Fatalf("终端错误帧后必须补 [DONE], 实得:\n%s", out)
+	}
+	if st != http.StatusBadGateway {
+		t.Fatalf("截断流应返回 502 供调用方记账, 实得 %d", st)
+	}
+	if refetch != 0 {
+		t.Fatalf("绝不换站重发, refetch=%d", refetch)
+	}
+	if strings.Contains(out, `"finish_reason":"stop"`) {
+		t.Fatalf("截断错误帧不得用 stop 收尾(会伪装成正常), 实得:\n%s", out)
+	}
+}
+
+// TestStream_UpstreamNon200ZeroByte 3.2: 上游非 200 时零字节交付 + 502 交还换站。
+func TestStream_UpstreamNon200ZeroByte(t *testing.T) {
+	mw := &mockFlushWriter{}
+	upstream := &http.Response{StatusCode: http.StatusBadGateway, Body: nopCloser{strings.NewReader("bad gateway")}}
+	st := handleStreamResponseWithUsage(mw, upstream, nil)
+	if st != http.StatusBadGateway {
+		t.Fatalf("上游非 200 应交还 502, 实得 %d", st)
+	}
+	if out := mw.String(); out != "" {
+		t.Fatalf("上游非 200 时不得交付任何字节, 实得 %q", out)
+	}
+}
+
+// TestStream_UsageOnlySuccess 3.4: usage-only 流仍成功(输出侧 token)。
+func TestStream_UsageOnlySuccess(t *testing.T) {
+	mw := &mockFlushWriter{}
+	body := "data: " + `{"id":"c1","model":"m","usage":{"prompt_tokens":10,"completion_tokens":5},"choices":[]}` + "\n\n"
+	upstream := &http.Response{StatusCode: http.StatusOK, Body: nopCloser{strings.NewReader(body)}}
+	st := handleStreamResponseWithUsage(mw, upstream, nil)
+	if st != http.StatusOK {
+		t.Fatalf("usage-only 流应成功, 实得 %d", st)
+	}
+	if out := mw.String(); !strings.Contains(out, "[DONE]") {
+		t.Fatalf("usage-only 流必须正常收尾, 实得:\n%s", out)
+	}
+}
+
+// TestStream_ToolNameMapNilByteIdentical 3.4: tool-name-map nil 字节一致。
+func TestStream_ToolNameMapNilByteIdentical(t *testing.T) {
+	body := contentFrame("hello") + finishFrame() + "data: [DONE]\n\n"
+	mw1, mw2 := &mockFlushWriter{}, &mockFlushWriter{}
+	up1 := &http.Response{StatusCode: http.StatusOK, Body: nopCloser{strings.NewReader(body)}}
+	up2 := &http.Response{StatusCode: http.StatusOK, Body: nopCloser{strings.NewReader(body)}}
+	handleStreamResponseWithUsage(mw1, up1, nil)
+	handleStreamResponseWithToolNameMap(mw2, up2, nil, nil)
+	if mw1.String() != mw2.String() {
+		t.Fatalf("toolNameMap=nil 必须字节一致:\nA=%q\nB=%q", mw1.String(), mw2.String())
+	}
+}
+
+// TestStream_PreflightNoKey 任务B: OPTIONS 预检不要求 key 且 CORS 头正确。
+func TestStream_PreflightNoKey(t *testing.T) {
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodOptions, "/v1/chat/completions", nil)
+	corsHandler(func(w http.ResponseWriter, r *http.Request) {
+		t.Error("预检不得进入鉴权 handler")
+	})(rec, req)
+	if rec.Code != http.StatusNoContent {
+		t.Fatalf("OPTIONS 预检应回 204, 实得 %d", rec.Code)
+	}
+	if rec.Header().Get("Access-Control-Allow-Origin") == "" {
+		t.Fatal("预检必须带 CORS Origin 头")
+	}
+}
+
 // ─────────── 合法空终止态白名单 ───────────
 //
 // 照抄 OmniRoute open-sse/utils/streamReadiness.ts:166 LEGIT_EMPTY_TERMINAL_REASONS,

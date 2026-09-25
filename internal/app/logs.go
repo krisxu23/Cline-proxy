@@ -311,8 +311,66 @@ func protocolFromPath(path string) string {
 	}
 }
 
+// clientIPFromRequest 直连公网 peer 时 RemoteAddr 即是客户端(代理头一律忽略,
+// 防伪造); 只有直连方是回环/私网/未指定(本地反代/可信代理)时, 才信任
+// X-Forwarded-For / X-Real-IP, 且只取其中第一个公网 IP, 私网/回环/非法项跳过。
+func clientIPFromRequest(r *http.Request) string {
+	peer := r.RemoteAddr
+	if host, _, err := net.SplitHostPort(peer); err == nil {
+		peer = host
+	}
+	if peer == "" {
+		return r.RemoteAddr
+	}
+	if ip := net.ParseIP(peer); ip == nil || !isTrustedProxyPeer(ip) {
+		// 直连公网(或不可解析): 原样返回, 代理头视为可伪造, 永不覆盖。
+		if ip != nil {
+			return peer
+		}
+		return r.RemoteAddr
+	}
+	// 可信代理: XFF 先于 X-Real-IP, 首个公网 IP 胜出; 全是私网/非法则回退 peer。
+	for _, h := range strings.Split(r.Header.Get("X-Forwarded-For"), ",") {
+		if pub := firstPublicIP(h); pub != "" {
+			return pub
+		}
+	}
+	if pub := firstPublicIP(r.Header.Get("X-Real-IP")); pub != "" {
+		return pub
+	}
+	return peer
+}
+
+// isTrustedProxyPeer 回环/私网/未指定/链路本地/组播均视为本地可信代理。
+func isTrustedProxyPeer(ip net.IP) bool {
+	return ip.IsLoopback() || ip.IsPrivate() || ip.IsUnspecified() ||
+		ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() || ip.IsMulticast()
+}
+
+// firstPublicIP 单个候选项为公网 IP 时返回其规范形式, 否则返回空串。
+func firstPublicIP(s string) string {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return ""
+	}
+	if host, _, err := net.SplitHostPort(s); err == nil {
+		s = host
+	}
+	s = strings.Trim(s, "[]")
+	ip := net.ParseIP(s)
+	if ip == nil || isTrustedProxyPeer(ip) {
+		return ""
+	}
+	return ip.String()
+}
+
 // isRequestNoise 该条记录是否为管理轮询等噪音(与中间件过滤同一判定)
 func isRequestNoise(l RequestLog) bool {
+	// 上游真的上报了 usage(2xx): 一定是成功的对话, 永远不是噪声 ——
+	// 即使路由误标为 other 也必须落盘, 否则成功的对话会凭空消失。
+	if l.UsageReported && l.Status < http.StatusBadRequest {
+		return false
+	}
 	if l.Route == "admin" && l.Method == "GET" {
 		return true
 	}
@@ -416,13 +474,7 @@ func requestLogMiddleware(next http.Handler) http.Handler {
 
 		// 请求轨迹: 上游名/实际模型/尝试与跳过轨迹/错误类别/token 用量由链路上各层
 		// 回填(见 req_trace.go), 这里只负责注入与最终落盘。
-		clientIP := func() string {
-			host, _, err := net.SplitHostPort(r.RemoteAddr)
-			if err != nil {
-				return r.RemoteAddr
-			}
-			return host
-		}()
+		clientIP := clientIPFromRequest(r)
 		tr := &reqTrace{RequestID: newRequestID(r.Header.Get("X-Request-Id")), ClientIP: clientIP}
 		r = r.WithContext(withReqTrace(r.Context(), tr))
 		// 回写请求 id: 客户端可据此在自己的日志里对齐网关日志与面板详情。
@@ -474,10 +526,7 @@ func requestLogMiddleware(next http.Handler) http.Handler {
 			}
 		}
 
-		client := r.RemoteAddr
-		if host, _, err := net.SplitHostPort(client); err == nil {
-			client = host
-		}
+		client := clientIPFromRequest(r)
 		snap := tr.snapshot()
 		upstream := snap.Upstream
 		if upstream == "" {

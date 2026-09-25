@@ -201,11 +201,19 @@ func (l *lazyCommitWriter) commit() {
 func handleStreamResponseWithToolNameMap(w http.ResponseWriter, upstream *http.Response, onUsage func(map[string]any), toolNameMap *toolNameMap) int {
 	// Flusher 断言必须在 WriteHeader 之前(与 anthropic 路径同序): 否则不支持 Flush
 	// 的 writer 会先拿到已提交的空 200 流, 再也到不了 500。
+	// ★ 零交付保证(3.1): 此 return 之前不得有任何 Write/WriteHeader —— 非 Flusher
+	// 必须拿到 500 且之前无 200(由 TestStream_NonFlusherZeroByte 锁定)。
 	flusher, ok := w.(http.Flusher)
 	if !ok {
 		log.Printf("  streaming not supported for client")
 		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": "streaming not supported for client"})
 		return http.StatusInternalServerError
+	}
+	// ★ 上游状态检查必须在任何提交前(3.2): 非 200 直接按失败交还调用方换站,
+	// 不得提交 200 也不得写出一字节(调用方 probe 未提交 → 可安全换站)。
+	if upstream.StatusCode != http.StatusOK {
+		_, _ = io.Copy(io.Discard, io.LimitReader(upstream.Body, 64<<10))
+		return http.StatusBadGateway
 	}
 	// ★ 延迟提交: 这里只设头 + 记下待提交状态码, 真正的提交推迟到处理链见到
 	// 第一个**真实内容帧**时(见下方 markDelivered)。在此之前所有写出(脚手架帧、
@@ -601,6 +609,7 @@ func handleStreamResponseWithToolNameMap(w http.ResponseWriter, upstream *http.R
 		handleLine(firstLine, ferr == io.EOF)
 	}
 
+	var upstreamReadErr error
 	for {
 		// 客户端已断开(broken pipe)时不再读上游: 粘性写错误一旦置位,
 		// 后续写必败, 继续读只是把上游流量往黑洞里倒。
@@ -610,6 +619,11 @@ func handleStreamResponseWithToolNameMap(w http.ResponseWriter, upstream *http.R
 		line, err := readStreamLine(reader)
 		// EOF 时残行(最后一帧不带换行)也要走统一处理, 不能裸写回客户端。
 		if err != nil && err != io.EOF {
+			// ★ 红线: 已交付>0后的上游中途断流(非 EOF 读错误: 连接重置/
+			// idle 超时/行超限)记下, 走下面的截断收尾 —— 保留已交付 +
+			// 补终端错误帧, 绝不静默合成干净 finish/[DONE](那会伪装成
+			// "模型答完了")。客户端断开(hb.WriteErr)不进这里: 对端已走。
+			upstreamReadErr = err
 			break
 		}
 		residual := err == io.EOF && strings.TrimRight(line, "\r\n") != ""
@@ -670,6 +684,17 @@ func handleStreamResponseWithToolNameMap(w http.ResponseWriter, upstream *http.R
 	// 必须显式提交: 末尾合成的 finish / [DONE] 也要发出去, 否则客户端会收到一个
 	// 200 却一个字节都没有 —— 比空流更隐蔽。前导缓冲(脚手架帧)在此刻一并放出。
 	lw.commit()
+
+	// ★ 红线(已交付>0后上游断流): 保留已交付 + 补终端错误帧, 绝不换站重发。
+	// 已提交的流换站只会把第二站的内容接到第一站后面(顺序陷阱), 上层
+	// (routing_dispatch/handleZenStreamChat)以 probe/uncommitted 判换站,
+	// 这里只管"已发出去的内容不断、错误可见"。返回 502 让调用方记账,
+	// 但字节层面已交付内容 + 错误帧 + [DONE] 都在。
+	if upstreamReadErr != nil && forwardedValuableChunk && hb.WriteErr() == nil {
+		log.Printf("  stream: 上游在已交付后中途断流(model=%s, err=%v), 保留已交付并补终端错误帧", lastModel, upstreamReadErr)
+		writeStreamTruncatedError(w, hb, lastModel)
+		return http.StatusBadGateway
+	}
 
 	// 上游断流未发 [DONE](或发 [DONE] 前无 finish_reason): 合成收尾,
 	// 避免客户端报 "Stream ended without finish_reason" 或挂起等待。
@@ -873,7 +898,38 @@ func parsedUsageFromJSONBody(body []byte) (map[string]any, bool) {
 	return u, true
 }
 
-// writeStreamEmptyContentError 交付"可见的空内容失败"。
+// writeStreamTruncatedError 交付"已交付后上游中途断流"的终端错误帧。
+//
+// ★ 红线语义: 已交付内容必须原样保留(它们已经提交发出去了), 这里只追加
+// 一个带 error + finish_reason="error" 的终端帧 + [DONE], 让客户端"看到部分
+// 内容 + 明确失败可重试"。帧带 retryable:true。绝不换站重发 —— 已提交的流
+// 再换一站会把第二站内容接到第一站后面(顺序陷阱)。
+func writeStreamTruncatedError(w http.ResponseWriter, hb *sseHeartbeat, model string) {
+	payload := map[string]any{
+		"choices": []any{map[string]any{
+			"index":         0,
+			"delta":         map[string]any{},
+			"finish_reason": "error",
+		}},
+		"error": map[string]any{
+			"type":      "upstream_truncated",
+			"code":      "upstream_truncated",
+			"retryable": true,
+			"message": "上游流在交付过程中意外中断(已交付内容保留)。这通常是出口节点或上游 worker " +
+				"掉线所致, 请重试; 若持续出现请更换出口节点。",
+		},
+	}
+	if model != "" {
+		payload["model"] = model
+	}
+	if b, err := json.Marshal(payload); err == nil {
+		hb.write([]byte("data: " + string(b) + "\n\n"))
+	}
+	hb.write([]byte("data: [DONE]\n\n"))
+	hb.flush()
+}
+
+// writeStreamEmptyContentError 交付"可见的空内容失败".
 //
 // ★ 2026-09-24 第二步起, 它只服务**已提交**后的兜底路径(见
 // handleStreamResponseWithToolNameMap 里空流分岔的说明): 正常情况(响应头未提交)

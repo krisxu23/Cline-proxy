@@ -160,14 +160,14 @@ type nodeTestResult struct {
 	ExitASNorg  string `json:"exitAsnOrg,omitempty"`
 	ExitISP     string `json:"exitIsp,omitempty"`
 
-	// 质量
-	SpeedBPS  int64 `json:"speedBps"`
-	IsStalled bool  `json:"isStalled"`
+	// 质量(零值不落盘: 旧 node-health.json 无这些键仍可载, Task 6.4)
+	SpeedBPS  int64 `json:"speedBps,omitempty"`
+	IsStalled bool  `json:"isStalled,omitempty"`
 	// SpeedTestFailed 测速端点全挂/0 字节 —— **不是**节点的错, 不参与健康判定,
 	// 也不算慢(2026-09-22 审查 P1: 曾被无差别并入 IsStalled 判死)。
 	SpeedTestFailed bool `json:"speedTestFailed,omitempty"`
-	MITMRisk        bool `json:"mitmRisk"`
-	IsWarp          bool `json:"isWarp"`
+	MITMRisk        bool `json:"mitmRisk,omitempty"`
+	IsWarp          bool `json:"isWarp,omitempty"`
 
 	// 分类(测试后填充)
 	NetworkType   string `json:"networkType,omitempty"`   // datacenter/residential/mobile/cdn/unknown
@@ -190,6 +190,11 @@ type nodeTestResult struct {
 // Go 里请求 ctx 一旦取消, 后续 Body.Read 立刻返回 context canceled, 哪怕
 // client.Do 已经成功返回。旧写法在 Do 之后马上 cancel(), 导致出口 IP 响应
 // 读不到、测速恒为 0 字节并一律判"断流", 节点明明活着却整体检测失败。
+
+// nodeGatewayProbeURLs 网关可达门的目标 URL(2026-09-24 Task 6.2)。
+// nil = 按 healthCheckTargets() 的主机实时推导(https://host); 测试可整体替换。
+var nodeGatewayProbeURLs []string
+
 func testNodeComprehensive(key string) nodeTestResult {
 	result := nodeTestResult{LatencyMs: 99999}
 
@@ -218,6 +223,21 @@ func testNodeComprehensive(key string) nodeTestResult {
 		result.Alive = true
 		result.LatencyMs = lat
 	} else {
+		return result
+	}
+	// === 1b) 网关可达门: 上游经此出口可达才算可用 ===
+	// liveness 只证明"出口有网", 不能证明"能到 opencode.ai/zen 上游"(Task 6.2)。
+	// 任一网关主机可达即过; 全不可达则判死, 不再烧后续探测。
+	gatewayURLs := nodeGatewayProbeURLs
+	if gatewayURLs == nil {
+		for _, h := range healthCheckTargets() {
+			if h != "" {
+				gatewayURLs = append(gatewayURLs, "https://"+h)
+			}
+		}
+	}
+	if len(gatewayURLs) > 0 && !probeNodeGatewayReachable(client, gatewayURLs) {
+		result.Alive = false
 		return result
 	}
 
@@ -597,4 +617,63 @@ func probeWarp(client *http.Client) bool {
 		return false
 	}
 	return strings.Contains(string(body), "warp=on")
+}
+
+// leanVerdict 瘦判据: 可达即用, 质量项不判死(2026-09-24 Task 6.1)。
+func leanVerdict(r nodeTestResult) bool { return r.Alive }
+
+// fastLaneMaxWorkers 新节点快车道并发上限(Task 8)。
+const fastLaneMaxWorkers = 8
+
+// probeNodeGatewayReachable 网关可达门: 多源并发首个成功即返回(Task 6.2)。
+// 2xx 即判可达; 全失败才判死。各源独立 12s 超时, 体读尽后 cancel(P0 规则)。
+func probeNodeGatewayReachable(client *http.Client, urls []string) bool {
+	if len(urls) == 0 {
+		return false
+	}
+	ch := make(chan bool, len(urls))
+	for _, u := range urls {
+		go func(url string) {
+			ctx, cancel := context.WithTimeout(context.Background(), nodeProbeTimeout)
+			req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+			if err != nil {
+				cancel()
+				ch <- false
+				return
+			}
+			resp, err := client.Do(req)
+			if err != nil {
+				cancel()
+				ch <- false
+				return
+			}
+			_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 4<<10))
+			code := resp.StatusCode
+			resp.Body.Close()
+			cancel()
+			ch <- code >= 200 && code < 300
+		}(u)
+	}
+	for range urls {
+		if ok := <-ch; ok {
+			return true
+		}
+	}
+	return false
+}
+
+// summarizeProbeVerdicts 健康计数 dead/alive/country-unknown(Task 7.1)。
+// country-unknown = Alive 但 ExitCountry 为空; 速度/慢项不再单列。
+func summarizeProbeVerdicts(rs []nodeTestResult) (dead, alive, unknown int) {
+	for _, r := range rs {
+		if !r.Alive {
+			dead++
+			continue
+		}
+		alive++
+		if strings.TrimSpace(r.ExitCountry) == "" {
+			unknown++
+		}
+	}
+	return dead, alive, unknown
 }

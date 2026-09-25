@@ -1094,6 +1094,15 @@ func zenDialContext(ctx context.Context, network, addr string) (net.Conn, error)
 	}
 
 	// 代理模式但一个可用节点都没有: 是否允许直连兜底由配置决定。
+	// ★ Task1.1 直连回退写池守卫: 地区受限模型在池空时禁止直连兜底 ——
+	// 直连连接会被共享 h2 transport 缓存复用, 污染后续选路(受限模型随后永远 403)。
+	// 重建(loadSubCache/syncNodeBox)由守卫内部完成, 仍空才 fail-closed。
+	if poolEmptyDirectBlocked(modelID) {
+		if lastErr != nil {
+			return nil, lastErr
+		}
+		return nil, fmt.Errorf("没有可用节点, 且地区受限模型禁止直连兜底(防 h2 池污染)")
+	}
 	if !exitModeDirectNow() && !rescueDirectEnabled() {
 		if lastErr != nil {
 			return nil, lastErr

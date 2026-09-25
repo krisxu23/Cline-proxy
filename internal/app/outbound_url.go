@@ -35,6 +35,10 @@ func privateUpstreamAllowed() bool {
 	return v == "1" || strings.EqualFold(v, "true") || strings.EqualFold(v, "yes")
 }
 
+// lookupIPHost DNS 解析接缝(默认 net.LookupIP): 单测可替换为确定性桩,
+// 避免真实 DNS 带来的 flaky 与离线失败。仅配置期校验使用。
+var lookupIPHost = net.LookupIP
+
 // blockedOutboundHosts 已知的云元数据主机名。
 var blockedOutboundHosts = map[string]bool{
 	"metadata":                 true,
@@ -85,7 +89,7 @@ func resolvedLinkLocalReason(host string) string {
 	if net.ParseIP(host) != nil {
 		return "" // IP 字面量已由 blockedOutboundReason 判过, 无需再解析
 	}
-	ips, err := net.LookupIP(host)
+	ips, err := lookupIPHost(host)
 	if err != nil {
 		return ""
 	}
@@ -183,7 +187,13 @@ func dialWithSSRFGuard(dial func(ctx context.Context, network, addr string) (net
 			if blockedOutboundHosts[host] {
 				return nil, fmt.Errorf("目标地址被拒绝（云元数据主机名不允许作为上游）: %q", addr)
 			}
-			if ip := net.ParseIP(host); ip != nil && (ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast()) {
+			// IPv6 zone(fe80::1%eth0)先剥离再解析, 否则 ParseIP 失败导致漏拦。
+			strip := host
+			if i := strings.IndexByte(strip, '%'); i >= 0 {
+				strip = strip[:i]
+			}
+			strip = strings.Trim(strip, "[]")
+			if ip := net.ParseIP(strip); ip != nil && (ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast()) {
 				return nil, fmt.Errorf("目标地址被拒绝（链路本地地址 / 云元数据地址不允许作为上游）: %q", addr)
 			}
 		}

@@ -494,7 +494,7 @@ func callClineAPI(ctx context.Context, params map[string]any, stream bool) (*htt
 	}
 
 	if resp.StatusCode != 200 {
-		bodyBytes, _ := io.ReadAll(resp.Body)
+		bodyBytes, _ := io.ReadAll(io.LimitReader(resp.Body, providerResponseMaxBytes+1))
 		resp.Body.Close()
 		// Mark account on cooldown on rate limits
 		var retryAfter time.Duration
